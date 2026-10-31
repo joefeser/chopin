@@ -62,5 +62,6 @@ export type { Questions, StoredOpen } from "./store";
 
 export const create = Store.create;
 export const dump = Store.dump;
+export const rememberRecords = Store.rememberRecords;
 export const restore = Store.restore;
 export { changeFindings, updateFinding } from "./service-findings";

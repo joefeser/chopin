@@ -110,6 +110,30 @@ export function restore(entries: StoredOpen[]): Questions {
 	return questions;
 }
 
+/**
+ * Seed the late-arrival memory from records settled before this process
+ * opened the plan, so a late claim names who settled the card instead of
+ * reporting a cancellation nobody performed. Seeded entries live as long as
+ * the instance — they derive from durable records, not the tombstone TTL —
+ * and carry no answers: their consumers read only the status and the
+ * resolver, and the durable answers stay on the record.
+ */
+export function rememberRecords(
+	questions: Questions,
+	records: Iterable<{ id: string; status: string; resolver?: string }>,
+): Questions {
+	for (let record of records) {
+		if (questions.open.has(record.id) || questions.closed.has(record.id)) continue;
+		if (record.status !== "answered" || record.resolver === undefined) continue;
+		questions.closed.set(record.id, {
+			result: { status: "answered", answers: [], resolver: record.resolver },
+			revision: 0,
+			expires: Number.POSITIVE_INFINITY,
+		});
+	}
+	return questions;
+}
+
 function sweep(questions: Questions): void {
 	let now = Date.now();
 	for (let [id, entry] of questions.closed) {

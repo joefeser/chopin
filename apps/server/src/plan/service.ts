@@ -1543,7 +1543,10 @@ export async function open(
 		server,
 		document,
 		presence: presence.create(),
-		questions: Questions.restore(sidecar.openQuestions),
+		questions: Questions.rememberRecords(
+			Questions.restore(sidecar.openQuestions),
+			sidecar.questions.map(Questions.normalizeRecord),
+		),
 		comments: Comments.create(),
 		chat: Chat.restore(sidecar.transcript, sidecar.workflowRuns, sidecar.initiativePaused),
 		conversationPlan: sidecar.conversationPlan ?? restoreConversationPlan(undefined),

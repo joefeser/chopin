@@ -371,7 +371,8 @@ export type ExternalAnswer =
 			| "draft-in-progress"
 			| "paused"
 			| "implementation-active"
-			| "idempotency-conflict";
+			| "idempotency-conflict"
+			| "state-diverged";
 		message?: string;
 		current?: number;
 	};
@@ -448,6 +449,23 @@ export async function answerExternal(
 			return { kind: "refused", code: "stale", current: claimed.current };
 		}
 		if (claimed.reason === "resolved") {
+			// The store synthesizes "cancelled by system" when the entry is
+			// missing entirely. A record that is still open while its entry is
+			// gone means this plan's question state has diverged from the
+			// document — the claim must say that, not blame a cancellation
+			// nobody performed.
+			let record = plan.records.get(input.questionId);
+			if (
+				claimed.status === "cancelled" && claimed.resolver === "system"
+				&& record !== undefined && isOpenStatus(record.status)
+			) {
+				return {
+					kind: "refused",
+					code: "state-diverged",
+					message:
+						"the open decision's shared-draft entry is missing from this plan; reopen the document and retry",
+				};
+			}
 			return {
 				kind: "refused",
 				code: "resolved",

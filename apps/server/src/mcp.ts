@@ -164,6 +164,7 @@ export type AnswerRefusal = {
 		| "paused"
 		| "implementation-active"
 		| "idempotency-conflict"
+		| "state-diverged"
 		| "not-allowed";
 	message?: string;
 	current?: number;
