@@ -564,8 +564,21 @@ export class Graphs<Document> {
 	}
 }
 
+/** Who approved a version through an external coordination operation. */
+export type GraphApproval = {
+	/** GitHub login of the approving caller. */
+	approver: string;
+	/** Idempotency key of the approving operation. */
+	operationKey: string;
+};
+
 export function approveGraph(
-	{ graph, revision }: { graph?: Graph; revision?: number },
+	{ graph, revision, approval }: {
+		graph?: Graph;
+		revision?: number;
+		/** Present only for external approvals; a browser Build press leaves none. */
+		approval?: GraphApproval;
+	},
 ): Result<Graph> {
 	graph = graph ? copy(graph) : undefined;
 	let version = graph && current(graph);
@@ -583,6 +596,9 @@ export function approveGraph(
 		...graph.versions[graph.versions.length - 1],
 		state: "approved",
 		definition: checked.value,
+		...(approval
+			? { approver: approval.approver, operationKey: approval.operationKey }
+			: {}),
 	};
 	return { ok: true, value: graph };
 }

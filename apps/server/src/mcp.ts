@@ -116,6 +116,44 @@ export type AnsweredDecision =
 	| { kind: "answered"; settled: { choices: string[]; by: string; at: string } }
 	| { kind: "replayed"; settled: { choices: string[]; by: string; at: string } };
 
+export type ApproveImplementationInput = {
+	id: string;
+	graphVersion: number;
+	graphRevision: number;
+	planRevision: number;
+	/** The canonical digest read_coordination_snapshot returned for these bytes. */
+	digest: string;
+	idempotencyKey: string;
+};
+
+export type ApprovedGraph = {
+	state: "approved";
+	version: number;
+	revision: number;
+	planRevision: number;
+	approver: string;
+	operationKey: string;
+};
+
+export type ApprovalRefusal = {
+	kind: "refused";
+	code:
+		| "missing"
+		| "stale-plan"
+		| "reviewed-graph-changed"
+		| "digest-mismatch"
+		| "not-ready"
+		| "open-decision"
+		| "implementation-active"
+		| "not-draft"
+		| "idempotency-conflict"
+		| "not-allowed"
+		| "durability";
+	blockers?: string[];
+	openDecisions?: string[];
+	message?: string;
+};
+
 export type AnswerRefusal = {
 	kind: "refused";
 	code:
@@ -145,6 +183,17 @@ export type Coordination<Caller> = {
 	): Promise<
 		| AnsweredDecision
 		| AnswerRefusal
+		| { kind: "forbidden" }
+		| { kind: "unavailable" }
+		| { kind: "archived" }
+	>;
+	approve?(
+		caller: Caller,
+		input: ApproveImplementationInput,
+	): Promise<
+		| { kind: "approved"; graph: ApprovedGraph }
+		| { kind: "replayed"; graph: ApprovedGraph }
+		| ApprovalRefusal
 		| { kind: "forbidden" }
 		| { kind: "unavailable" }
 		| { kind: "archived" }
@@ -885,6 +934,29 @@ function shortText(value: unknown, maximum: number): value is string {
 		&& Array.from(value).length <= maximum;
 }
 
+function approveArguments(value: Record<string, unknown>): ApproveImplementationInput | undefined {
+	function counter(name: string, minimum: number): number | undefined {
+		let raw = value[name];
+		return typeof raw === "number" && Number.isInteger(raw) && raw >= minimum ? raw : undefined;
+	}
+	let digest = typeof value.digest === "string" && /^[0-9a-f]{64}$/.test(value.digest)
+		? value.digest
+		: undefined;
+	return isLocator(value.id)
+			&& shortText(value.idempotencyKey, 128)
+			&& counter("graphVersion", 1) !== undefined && counter("graphRevision", 1) !== undefined
+			&& counter("planRevision", 0) !== undefined && digest !== undefined
+		? {
+			id: value.id,
+			graphVersion: counter("graphVersion", 1)!,
+			graphRevision: counter("graphRevision", 1)!,
+			planRevision: counter("planRevision", 0)!,
+			digest,
+			idempotencyKey: value.idempotencyKey,
+		}
+		: undefined;
+}
+
 function answerArguments(value: Record<string, unknown>): AnswerDecisionInput | undefined {
 	let optionIds = Array.isArray(value.optionIds)
 			&& value.optionIds.length >= 1 && value.optionIds.length <= 32
@@ -1060,6 +1132,7 @@ export function handler<Caller>(
 		&& (!isLifecycleTool(tool.name) || options.implementations?.reportLifecycle)
 		&& (tool.name !== "read_coordination_snapshot" || options.coordination)
 		&& (tool.name !== "answer_decision" || options.coordination?.answer)
+		&& (tool.name !== "approve_implementation" || options.coordination?.approve)
 	);
 	let instructions = serviceInstructions(tools);
 
@@ -1428,6 +1501,43 @@ export function handler<Caller>(
 						code: outcome.code,
 						...(outcome.message !== undefined ? { message: outcome.message } : {}),
 						...(outcome.current !== undefined ? { current: outcome.current } : {}),
+					}, true));
+				}
+				if (tool.name === "approve_implementation") {
+					let input = approveArguments(tool.arguments);
+					if (!input) {
+						return notification
+							? undefined
+							: error(
+								call.id,
+								-32602,
+								"approve_implementation requires an id or URL, graphVersion, graphRevision, planRevision, digest and idempotencyKey",
+							);
+					}
+					let approve = options.coordination?.approve;
+					if (!approve) {
+						return respond(text({ code: "not-allowed" }, true));
+					}
+					let outcome = await approve(caller, input);
+					if (outcome.kind === "approved" || outcome.kind === "replayed") {
+						return respond(text({ state: outcome.kind, graph: outcome.graph }));
+					}
+					if (outcome.kind === "forbidden") {
+						return respond(text({ code: "repository-forbidden" }, true));
+					}
+					if (outcome.kind === "unavailable") {
+						return respond(text({ code: "document-unavailable" }, true));
+					}
+					if (outcome.kind === "archived") {
+						return respond(text({ code: "document-archived" }, true));
+					}
+					return respond(text({
+						code: outcome.code,
+						...(outcome.blockers !== undefined ? { blockers: outcome.blockers } : {}),
+						...(outcome.openDecisions !== undefined
+							? { openDecisions: outcome.openDecisions }
+							: {}),
+						...(outcome.message !== undefined ? { message: outcome.message } : {}),
 					}, true));
 				}
 				return notification ? undefined : error(call.id, -32601, "tool not found");

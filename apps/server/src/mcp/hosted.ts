@@ -18,6 +18,7 @@ import * as Rooms from "../rooms";
 import { claimImplementation, reportImplementationLifecycle } from "../tasks/plan-graphs";
 import { coordinationSnapshot } from "../tasks/coordination-snapshot";
 import { answerExternal } from "../questions/service";
+import { approveExternal } from "../coordination/approve";
 import { StorageError } from "../storage/errors";
 import { implementationLifecycle } from "../tasks/lifecycle";
 import { imagePath } from "../images/format";
@@ -29,6 +30,7 @@ import type { AuthenticatedSession } from "../auth/session";
 import type { HostedRepository } from "../agent/repository";
 import type {
 	AnswerDecisionInput,
+	ApproveImplementationInput,
 	DocumentSummary,
 	Implementation,
 	ImplementationInput,
@@ -926,6 +928,37 @@ export function hosted(
 											idempotencyKey: input.idempotencyKey,
 										}),
 								);
+							} catch (err) {
+								if (err instanceof Error && err.message === "document is unavailable") {
+									return { kind: "unavailable" as const };
+								}
+								if (err instanceof StorageError && err.failure === "missing") {
+									return { kind: "unavailable" as const };
+								}
+								throw err;
+							}
+						});
+					},
+					async approve(caller: HostedCaller, input: ApproveImplementationInput) {
+						if (!coordination.approvers.includes(caller.user.login.toLowerCase())) {
+							return { kind: "refused" as const, code: "not-allowed" as const };
+						}
+						return serializeDocument(input.id, async () => {
+							let access = await writableChannel(caller, input.id);
+							if (access.kind === "unavailable") return { kind: "unavailable" as const };
+							if (access.kind === "forbidden") return { kind: "forbidden" as const };
+							let { channel } = access;
+							if (channel.archivedAt) return { kind: "archived" as const };
+							try {
+								return await withPlanAccess(channel.id, async plan =>
+									approveExternal(plan, {
+										graphVersion: input.graphVersion,
+										graphRevision: input.graphRevision,
+										planRevision: input.planRevision,
+										digest: input.digest,
+										idempotencyKey: input.idempotencyKey,
+										approver: caller.user.login,
+									}));
 							} catch (err) {
 								if (err instanceof Error && err.message === "document is unavailable") {
 									return { kind: "unavailable" as const };
