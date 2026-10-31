@@ -344,6 +344,38 @@ export function hosted(
 		}
 	}
 
+	/**
+	 * `withPlan` for operations that own the plan queue themselves, as the
+	 * question services do: they take `Service.exclusive` inside, so holding
+	 * it here too would wait on the queue the action needs to enter.
+	 */
+	async function withPlanAccess<T>(
+		channelId: string,
+		action: (plan: Plan.Plan) => Promise<T>,
+	): Promise<T> {
+		let live = Rooms.get(channelId)?.plan;
+		if (live) {
+			await Plan.drain(live);
+			return action(live);
+		}
+		if (!persistence) throw new Error("document is unavailable");
+		let opened = await Plan.open(channelId, {
+			documentTitles: true,
+			storage: auth.storage,
+			lease: persistence.lease,
+			fatal: error => {
+				throw error;
+			},
+			onDocumentPersisted: callbacks.onDocumentPersisted,
+			onChannelRenamed: callbacks.onChannelRenamed,
+		}, silentServer);
+		try {
+			return await action(opened);
+		} finally {
+			await Plan.close(opened);
+		}
+	}
+
 	return {
 		invoke: callbacks.invokePlanner
 			? {
@@ -883,7 +915,7 @@ export function hosted(
 							let { channel } = access;
 							if (channel.archivedAt) return { kind: "archived" as const };
 							try {
-								return await withPlan(
+								return await withPlanAccess(
 									channel.id,
 									async plan =>
 										answerExternal(plan, plan.server, channel.id, {

@@ -441,7 +441,10 @@ export function claimAnswer(
 				message: `${question.header} accepts only one answer`,
 			};
 		}
-		if (!untouched(drafts[questionId])) {
+		let draft = drafts[questionId];
+		// `untouched` ignores criterion marks, so an active matrix cell blocks the
+		// settle on its own: a fresh-draft answer would silently drop that work.
+		if (!draft || !untouched(draft) || Object.keys(Question.marked(draft)).length > 0) {
 			return { ok: false, reason: "draft-in-progress" };
 		}
 	}

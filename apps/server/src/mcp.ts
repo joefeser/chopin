@@ -874,8 +874,14 @@ function isLocator(value: unknown): value is string {
 		&& value.trim().length > 0;
 }
 
+/**
+ * Trimmed and non-empty, as the persisted coordination ledger requires: a key
+ * the ledger's restore would refuse must never reach a commit, or the document
+ * it saved into could not reopen.
+ */
 function shortText(value: unknown, maximum: number): value is string {
 	return typeof value === "string" && value.trim().length > 0
+		&& value.trim() === value
 		&& Array.from(value).length <= maximum;
 }
 

@@ -5,7 +5,12 @@ import * as Store from "./store";
 
 function card(
 	id: string,
-	questions: Array<{ multiple: boolean; response?: "text"; options: string[] }>,
+	questions: Array<{
+		multiple: boolean;
+		response?: "text";
+		options: string[];
+		criteria?: string[];
+	}>,
 ) {
 	let definition = Question.decision({
 		questions: questions.map((question, index) => ({
@@ -14,6 +19,9 @@ function card(
 			question: `What should decision ${index} be?`,
 			multiple: question.multiple,
 			...(question.response ? { response: question.response } : {}),
+			...(question.criteria
+				? { criteria: question.criteria.map(id => ({ id, label: id })) }
+				: {}),
 			options: question.options.map(option => ({ id: option, label: option, description: "" })),
 		})),
 	});
@@ -32,6 +40,22 @@ function touch(questions: Store.Questions, id: string, choice: string) {
 	if (!patch) throw new Error("selection made no patch");
 	let edited = Store.edit(questions, id, [...patch.toBinary()], "ana");
 	if (!edited.open || !edited.accepted || !edited.applied) throw new Error("could not touch draft");
+}
+
+/** Mark one criterion cell, as a collaborator judging the matrix would. */
+function mark(questions: Store.Questions, id: string, cell: string, value: "yes" | null) {
+	let entry = Store.get(questions, id)!;
+	let model = Question.crdt.Model.fromBinary(entry.model.toBinary())
+		.fork() as unknown as Question.Model;
+	let cells = model.api.obj(["q0", "marks"]);
+	if (Object.hasOwn(cells.view() as object, cell)) model.api.val(["q0", "marks", cell]).set(value);
+	else cells.set({ [cell]: Question.crdt.schema.val(Question.crdt.schema.con(value)) });
+	let patch = model.api.flush();
+	if (!patch) throw new Error("mark made no patch");
+	let edited = Store.edit(questions, id, [...patch.toBinary()], "ana");
+	if (!edited.open || !edited.accepted || !edited.applied) {
+		throw new Error("could not save the mark");
+	}
 }
 
 describe("Store.claimAnswer", () => {
@@ -100,6 +124,25 @@ describe("Store.claimAnswer", () => {
 		});
 		let empty = Store.claimAnswer(questions, "w", 0, "octocat", []);
 		expect(empty).toMatchObject({ ok: false, reason: "invalid" });
+	});
+
+	it("refuses a draft whose only work is active criterion marks", () => {
+		let questions = card("w", [{ multiple: false, options: ["a", "b"], criteria: ["care"] }]);
+		mark(questions, "w", Question.markKey("a", "care"), "yes");
+		expect(
+			Store.claimAnswer(questions, "w", Store.get(questions, "w")!.revision, "octocat", ["b"]),
+		).toEqual({ ok: false, reason: "draft-in-progress" });
+		// Cleared marks leave nothing active; the settle may proceed.
+		mark(questions, "w", Question.markKey("a", "care"), null);
+		let claimed = Store.claimAnswer(
+			questions,
+			"w",
+			Store.get(questions, "w")!.revision,
+			"octocat",
+			["b"],
+		);
+		expect(claimed.ok).toBe(true);
+		if (claimed.ok) Store.rollback(questions, claimed.claim);
 	});
 
 	it("refuses a written-response card, which no option can answer", () => {

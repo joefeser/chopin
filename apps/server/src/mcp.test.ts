@@ -978,4 +978,32 @@ describe("the answer_decision protocol", () => {
 		);
 		expect((malformed as { error?: { code: number } }).error?.code).toBe(-32602);
 	});
+
+	it("rejects untrimmed keys and ids the persisted ledger would refuse", async () => {
+		let mcp = endpoint(async () => ({
+			kind: "answered" as const,
+			settled: {
+				choices: ["01M696N0PQ"],
+				by: "joefeser",
+				at: "2026-10-31T17:00:00.000Z",
+			},
+		}));
+		for (
+			let malformed of [
+				{ ...arguments_, idempotencyKey: " bridge:answer:1 " },
+				{ ...arguments_, questionId: " 01M696N0" },
+				{ ...arguments_, optionIds: [" 01M696N0PQ"] },
+			]
+		) {
+			let reply = await json(
+				await mcp(request({
+					jsonrpc: "2.0",
+					id: 9,
+					method: "tools/call",
+					params: { name: "answer_decision", arguments: malformed },
+				})),
+			);
+			expect((reply as { error?: { code: number } }).error?.code).toBe(-32602);
+		}
+	});
 });
