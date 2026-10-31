@@ -89,6 +89,7 @@ import { pendingLinks, relinkInstruction } from "./tasks/relink";
 import { BuildReadiness } from "./tasks/readiness";
 import { registerMcpRoutes } from "./mcp/routes";
 import { registerScriptedDraftRoutes } from "./coordination/scripted-drafts";
+import { livePlanAccess } from "./coordination/live-plan";
 import { registerNavigationRoutes } from "./navigation/routes";
 import * as Edit from "./plan/edit";
 import * as Service from "./plan/service";
@@ -293,18 +294,6 @@ function withChildPlan<T>(
 			evict(held.room);
 		}
 	});
-}
-
-/**
- * Serialized, queue-free access to a live document's plan, for operations
- * that take the plan's own `Service.exclusive` inside — the scripted draft
- * route's discipline, as the question services' is.
- */
-function withLivePlan<T>(
-	channelId: string,
-	action: (opened: Service.Plan) => Promise<T>,
-): Promise<T> {
-	return withDocumentLock(channelId, () => withChildPlan(channelId, action));
 }
 
 function presence(server: Server<SocketData>, room: Rooms.Room): void {
@@ -2795,7 +2784,17 @@ registerMcpRoutes(
 if (config.coordinationScriptedDrafts) {
 	registerScriptedDraftRoutes(router, hostedAuth, {
 		approvers: config.coordinationApprovers ?? [],
-		access: withLivePlan,
+		// No document lock held across the room's plan opening: a cold room
+		// opens under that lock itself, and an outer one would wait on the
+		// very open it is waiting for.
+		access: livePlanAccess({
+			transition: withDocumentTransition,
+			unavailable: id => deletingChannels.has(id) || archivingChannels.has(id),
+			closing: id => Rooms.get(id)?.closing,
+			hold: Rooms.hold,
+			evict,
+			plan: room => plan(room, server),
+		}),
 	});
 }
 implementations = registerImplementationRoutes(router, hostedAuth, {

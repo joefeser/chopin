@@ -510,4 +510,34 @@ describe("drafted-by stamping", () => {
 		});
 		expect(result.ok && result.value.versions[0]!.draftedBy).toBeUndefined();
 	});
+
+	it("stamps an approved graph's follow-up draft too", async () => {
+		let backend = new Memory();
+		backend.revisions.set("plan", 7);
+		let graphs = new Graphs(backend);
+		await graphs.revise("plan", {
+			planRevision: 7,
+			graphRevision: 0,
+			operations: [{ op: "add", task: definition().tasks[0]! }],
+			draftedBy: "script",
+		});
+		let approved = await graphs.approve("plan");
+		expect(approved.ok).toBe(true);
+		backend.revisions.set("plan", 8);
+		let redraft = await graphs.revise("plan", {
+			planRevision: 8,
+			graphRevision: 1,
+			operations: [{ op: "add", task: definition().tasks[1]! }],
+			draftedBy: "script",
+		});
+		expect(redraft).toMatchObject({
+			ok: true,
+			value: {
+				versions: [
+					{ number: 1, state: "approved", draftedBy: "script" },
+					{ number: 2, revision: 1, state: "draft", draftedBy: "script" },
+				],
+			},
+		});
+	});
 });

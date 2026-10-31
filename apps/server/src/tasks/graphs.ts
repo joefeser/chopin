@@ -536,6 +536,7 @@ export class Graphs<Document> {
 					planRevision: revision,
 					state: "draft",
 					definition: checked.value,
+					...(change.draftedBy !== undefined ? { draftedBy: change.draftedBy } : {}),
 				});
 			}
 			return { ok: true, value: graph };
