@@ -26,6 +26,7 @@ import type { Brief, CreateDocumentInput } from "./mcp/create";
 import type { UpdateDocument } from "./mcp/update";
 import type { UploadImageInput } from "./mcp/image";
 import type { Run, Version } from "./tasks/graphs";
+import type { CoordinationSnapshot } from "./tasks/coordination-snapshot";
 import type { LifecycleArguments } from "./mcp/lifecycle";
 import type { ImplementationLifecycle } from "./tasks/lifecycle";
 import type { Issue } from "@chopin/dialect";
@@ -98,6 +99,17 @@ export type Implementations<Caller> = {
 		| { kind: "forbidden" }
 		| { kind: "unavailable" }
 		| { kind: "refused"; reason: string }
+	>;
+};
+
+/** The read side of external coordination: decisions and draft graphs. */
+export type Coordination<Caller> = {
+	readSnapshot(caller: Caller, id: string): Promise<
+		| { kind: "snapshot"; snapshot: CoordinationSnapshot }
+		/** The document exists but was not created through MCP. */
+		| { kind: "refused"; code: "provenance-refused" }
+		| { kind: "refused"; code: "snapshot-unavailable" }
+		| { kind: "forbidden" }
 	>;
 };
 
@@ -200,6 +212,7 @@ export type McpOptions<Caller> = {
 	invoke?: InvokePlanner<Caller>;
 	upload?: UploadImage<Caller>;
 	implementations?: Implementations<Caller>;
+	coordination?: Coordination<Caller>;
 };
 
 type Tool = {
@@ -679,6 +692,20 @@ export const TOOLS: Tool[] = [
 		outputSchema: { type: "object", properties: {}, additionalProperties: true },
 	},
 	...LIFECYCLE_TOOLS,
+	{
+		name: "read_coordination_snapshot",
+		description:
+			"Read the coordination snapshot of a document by ID or canonical URL: every decision with its questions, options, shared-draft revision, status and settled answer including who settled it, plus the current implementation-graph draft with its version, revisions and a canonical SHA-256 digest of its validated definition. Unlike read_implementation this includes draft graphs, so an external reviewer can review the thing under review before approving it. Documents not created through create_document are refused with provenance-refused.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				id: { type: "string", minLength: 1, maxLength: MAX_DOCUMENT_LOCATOR_LENGTH },
+			},
+			required: ["id"],
+			additionalProperties: false,
+		},
+		outputSchema: { type: "object", properties: {}, additionalProperties: true },
+	},
 ];
 
 type Call = {
@@ -936,6 +963,7 @@ export function handler<Caller>(
 		&& (!["read_implementation", "start_implementation"].includes(tool.name)
 			|| options.implementations)
 		&& (!isLifecycleTool(tool.name) || options.implementations?.reportLifecycle)
+		&& (tool.name !== "read_coordination_snapshot" || options.coordination)
 	);
 	let instructions = serviceInstructions(tools);
 
@@ -1252,6 +1280,25 @@ export function handler<Caller>(
 					return outcome.kind === "refused"
 						? respond(text({ code: outcome.reason }, true))
 						: respond(text({ code: "implementation-unavailable" }, true));
+				}
+				if (tool.name === "read_coordination_snapshot") {
+					if (Object.keys(tool.arguments).length !== 1 || !isLocator(tool.arguments.id)) {
+						return notification
+							? undefined
+							: error(call.id, -32602, "read_coordination_snapshot requires an id or URL");
+					}
+					let read = options.coordination;
+					if (!read) {
+						return respond(text({ code: "snapshot-unavailable" }, true));
+					}
+					let outcome = await read.readSnapshot(caller, tool.arguments.id);
+					if (outcome.kind === "snapshot") {
+						return respond(text(outcome.snapshot));
+					}
+					if (outcome.kind === "forbidden") {
+						return respond(text({ code: "repository-forbidden" }, true));
+					}
+					return respond(text({ code: outcome.code }, true));
 				}
 				return notification ? undefined : error(call.id, -32601, "tool not found");
 			}

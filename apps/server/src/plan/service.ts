@@ -1495,6 +1495,10 @@ export async function readStored(
 	graph?: Graph;
 	execution?: Run;
 	lifecycle?: Lifecycle;
+	/** Every decision record the plan holds, normalized as on open. */
+	records: Questions.Record[];
+	/** Open questionnaires with their shared-draft revisions, as persisted. */
+	openQuestions: Questions.StoredOpen[];
 }> {
 	let restored = await restoreHosted(loaded.channel.id, loaded);
 	try {
@@ -1507,6 +1511,8 @@ export async function readStored(
 			...(restored.sidecar.builds ? { builds: restored.sidecar.builds } : {}),
 			...(restored.sidecar.execution ? { execution: restored.sidecar.execution } : {}),
 			...(restored.sidecar.lifecycle ? { lifecycle: restored.sidecar.lifecycle } : {}),
+			records: restored.sidecar.questions.map(Questions.normalizeRecord),
+			openQuestions: restored.sidecar.openQuestions,
 		};
 	} finally {
 		restored.document.doc.destroy();

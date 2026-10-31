@@ -431,3 +431,43 @@ describe("implementation task graphs", () => {
 		expect(backend.graphs.get("plan")).toEqual(before);
 	});
 });
+
+describe("definitionDigest", () => {
+	it("digests a definition independent of property insertion order", () => {
+		let first = definition();
+		let second = {
+			tasks: first.tasks.map(task => ({
+				dependsOn: task.dependsOn,
+				acceptance: task.acceptance,
+				goal: task.goal,
+				context: task.context,
+				title: task.title,
+				id: task.id,
+			})),
+		};
+		expect(Tasks.definitionDigest(second as Definition)).toBe(Tasks.definitionDigest(first));
+	});
+
+	it("changes when task order or any field changes", () => {
+		let first = definition();
+		let reordered: Definition = { tasks: [...first.tasks].toReversed() };
+		expect(Tasks.definitionDigest(reordered)).not.toBe(Tasks.definitionDigest(first));
+		let edited: Definition = {
+			tasks: [{ ...first.tasks[0]!, title: "A different title" }, ...first.tasks.slice(1)],
+		};
+		expect(Tasks.definitionDigest(edited)).not.toBe(Tasks.definitionDigest(first));
+	});
+
+	it("is pinned so reads and approvals keep agreeing on the bytes", () => {
+		expect(Tasks.definitionDigest({
+			tasks: [{
+				id: "a",
+				title: "A",
+				context: "c",
+				goal: "g",
+				acceptance: ["x"],
+				dependsOn: [],
+			}],
+		})).toBe("40ac578bebc80d0a73f99093b0f02092b5f9d22eb6760ccc092aa9e3a9da7b3d");
+	});
+});

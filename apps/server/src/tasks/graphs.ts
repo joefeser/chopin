@@ -6,6 +6,8 @@
  * revision, so a hosted backend can use the same rules as the local one.
  */
 
+import { createHash } from "node:crypto";
+
 export type Task = {
 	id: string;
 	title: string;
@@ -578,4 +580,31 @@ export function approveGraph(
 		definition: checked.value,
 	};
 	return { ok: true, value: graph };
+}
+
+/**
+ * Deterministic serialization for digesting: object keys sorted recursively so
+ * insertion order cannot change the bytes, arrays kept in order because task,
+ * acceptance and dependency order is semantic. `undefined` properties drop, the
+ * same as they do in JSON.
+ */
+function canonical(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+	if (value && typeof value === "object") {
+		let entries = Object.entries(value as Record<string, unknown>)
+			.filter(([, item]) => item !== undefined)
+			.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+			.map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`);
+		return `{${entries.join(",")}}`;
+	}
+	return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * Canonical digest of a validated definition. External coordination reads the
+ * digest beside a draft so a later approval can prove it reviewed exactly these
+ * bytes: both sides digest the validated definition, never raw input.
+ */
+export function definitionDigest(definition: Definition): string {
+	return createHash("sha256").update(canonical(definition)).digest("hex");
 }

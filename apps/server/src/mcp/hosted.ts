@@ -16,6 +16,7 @@ import { GitHubError } from "../github/client";
 import * as Plan from "../plan/service";
 import * as Rooms from "../rooms";
 import { claimImplementation, reportImplementationLifecycle } from "../tasks/plan-graphs";
+import { coordinationSnapshot } from "../tasks/coordination-snapshot";
 import { StorageError } from "../storage/errors";
 import { implementationLifecycle } from "../tasks/lifecycle";
 import { imagePath } from "../images/format";
@@ -36,7 +37,8 @@ import type {
 import type { UpdateClient, UpdateDocumentInput } from "./update";
 import type { LifecycleArguments } from "./lifecycle";
 import type { ChannelArchiveResult, ChannelRecord, Lease, StoredChannel } from "../storage/model";
-import type { ClaimResult, Run } from "../tasks/graphs";
+import type { ClaimResult, Graph, Run } from "../tasks/graphs";
+import type { Lifecycle } from "../tasks/lifecycle";
 import type { SocketData } from "../wire";
 import type { VisualAdmission } from "../agent/visual-admission";
 
@@ -118,9 +120,19 @@ function document(value: Document): PublicDocument & { url?: string } {
 	};
 }
 
+/** The stored-state fields `exposed` reads; live plans supply the same subset. */
+type ExposedState = {
+	source: string;
+	revision: number;
+	creation?: Plan.CreationMetadata;
+	graph?: Graph;
+	execution?: Run;
+	lifecycle?: Lifecycle;
+};
+
 function exposed(
 	channel: ChannelRecord,
-	state: Awaited<ReturnType<typeof Plan.readStored>>,
+	state: ExposedState,
 ): Implementation | undefined {
 	let version = state.graph?.versions.at(-1);
 	if (
@@ -808,6 +820,44 @@ export function hosted(
 					throw err;
 				}
 				return { kind: "uploaded" as const, path: imagePath(sha256, input.mimeType) };
+			},
+		},
+		coordination: {
+			async readSnapshot(caller: HostedCaller, id: string) {
+				let located = await locatedChannel(caller, id);
+				if (located === "forbidden") return { kind: "forbidden" as const };
+				if (!located) return { kind: "refused" as const, code: "snapshot-unavailable" as const };
+				let { channel } = located;
+				let live = Rooms.get(channel.id)?.plan;
+				if (live) {
+					return Plan.exclusive(live, async () => {
+						let snapshot = coordinationSnapshot({
+							channel,
+							revision: live.revision,
+							creation: live.creation,
+							records: live.records.values(),
+							openQuestions: live.questions.open.values(),
+							...(live.graph ? { graph: live.graph } : {}),
+						});
+						return snapshot
+							? { kind: "snapshot" as const, snapshot }
+							: { kind: "refused" as const, code: "provenance-refused" as const };
+					});
+				}
+				let stored = await auth.storage.collaboration.load(channel.id, auth.clock());
+				if (!stored) return { kind: "refused" as const, code: "snapshot-unavailable" as const };
+				let projected = await Plan.readStored(stored);
+				let snapshot = coordinationSnapshot({
+					channel,
+					revision: projected.revision,
+					creation: projected.creation,
+					records: projected.records,
+					openQuestions: projected.openQuestions,
+					...(projected.graph ? { graph: projected.graph } : {}),
+				});
+				return snapshot
+					? { kind: "snapshot" as const, snapshot }
+					: { kind: "refused" as const, code: "provenance-refused" as const };
 			},
 		},
 		...(persistence

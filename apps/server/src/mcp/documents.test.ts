@@ -73,6 +73,9 @@ describe("the MCP document protocol", () => {
 				startImplementation: unavailable,
 				reportLifecycle: unavailable,
 			},
+			coordination: {
+				readSnapshot: async () => ({ kind: "refused", code: "snapshot-unavailable" }),
+			},
 		});
 		let response = await mcp(request({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
 		let listed = (await response.json()).result.tools as typeof TOOLS;

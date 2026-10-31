@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 
 import { handler, TOOLS } from "./mcp";
 
-import type { DocumentReader, Implementations, LinkedDocument } from "./mcp";
+import type { Coordination, DocumentReader, Implementations, LinkedDocument } from "./mcp";
 import type { Run } from "./tasks/graphs";
 
 const document: LinkedDocument = {
@@ -684,5 +684,141 @@ describe("the MCP read protocol", () => {
 			}),
 		);
 		expect(accepted.status).toBe(200);
+	});
+});
+
+describe("the coordination snapshot protocol", () => {
+	let snapshot = {
+		document: { id: document.id, title: document.title, revision: 37 },
+		decisions: [{
+			id: "01M696N0PQQNQS9HJYXMJ5PJHR",
+			status: "answered" as const,
+			questions: [{
+				id: "q-format",
+				question: "Which format should the report use?",
+				options: [{ id: "01M696N0PQ", label: "Markdown" }],
+			}],
+			settled: { choices: ["01M696N0PQ"], by: "joefeser" },
+		}],
+		graph: {
+			state: "draft" as const,
+			version: 2,
+			revision: 3,
+			planRevision: 37,
+			digest: "d".repeat(64),
+			draftedBy: "script",
+		},
+	};
+
+	function coordinationEndpoint(
+		readSnapshot: Coordination<string>["readSnapshot"],
+	) {
+		return handler({
+			caller: () => "octocat",
+			documents: reader(),
+			coordination: { readSnapshot },
+		});
+	}
+
+	it("lists the tool only when the capability is present", async () => {
+		let listed = await json(
+			await coordinationEndpoint(async () => ({
+				kind: "refused" as const,
+				code: "snapshot-unavailable" as const,
+			}))(request({
+				jsonrpc: "2.0",
+				id: 1,
+				method: "tools/list",
+			})),
+		);
+		expect(
+			(listed.result as { tools: Array<{ name: string }> }).tools
+				.map(tool => tool.name),
+		).toContain("read_coordination_snapshot");
+
+		let without = await json(
+			await endpoint()(request({
+				jsonrpc: "2.0",
+				id: 2,
+				method: "tools/list",
+			})),
+		);
+		expect(
+			(without.result as { tools: Array<{ name: string }> }).tools
+				.map(tool => tool.name),
+		).not.toContain("read_coordination_snapshot");
+	});
+
+	it("reads a snapshot through the endpoint", async () => {
+		let mcp = coordinationEndpoint(async (_caller, id) =>
+			id === document.id
+				? { kind: "snapshot" as const, snapshot }
+				: { kind: "refused" as const, code: "snapshot-unavailable" as const }
+		);
+		let read = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 3,
+				method: "tools/call",
+				params: { name: "read_coordination_snapshot", arguments: { id: document.id } },
+			})),
+		);
+		expect((read.result as { structuredContent: unknown }).structuredContent).toEqual(snapshot);
+	});
+
+	it("distinguishes a provenance refusal from a missing snapshot on the wire", async () => {
+		let mcp = coordinationEndpoint(async (_caller, id) => {
+			if (id === "browser-doc") {
+				return { kind: "refused" as const, code: "provenance-refused" as const };
+			}
+			return { kind: "refused" as const, code: "snapshot-unavailable" as const };
+		});
+		let provenance = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 4,
+				method: "tools/call",
+				params: { name: "read_coordination_snapshot", arguments: { id: "browser-doc" } },
+			})),
+		);
+		expect((provenance.result as { structuredContent: unknown }).structuredContent).toEqual({
+			code: "provenance-refused",
+		});
+		let unavailable = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 5,
+				method: "tools/call",
+				params: { name: "read_coordination_snapshot", arguments: { id: document.id } },
+			})),
+		);
+		expect((unavailable.result as { structuredContent: unknown }).structuredContent).toEqual({
+			code: "snapshot-unavailable",
+		});
+	});
+
+	it("maps forbidden to the repository refusal and rejects malformed arguments", async () => {
+		let mcp = coordinationEndpoint(async () => ({ kind: "forbidden" as const }));
+		let forbidden = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 6,
+				method: "tools/call",
+				params: { name: "read_coordination_snapshot", arguments: { id: document.id } },
+			})),
+		);
+		expect((forbidden.result as { structuredContent: unknown }).structuredContent).toEqual({
+			code: "repository-forbidden",
+		});
+
+		let malformed = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 7,
+				method: "tools/call",
+				params: { name: "read_coordination_snapshot", arguments: {} },
+			})),
+		);
+		expect((malformed as { error?: { code: number } }).error?.code).toBe(-32602);
 	});
 });
