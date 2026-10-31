@@ -19,6 +19,7 @@ import { hosted as room } from "../plan/conversation-persistence.test-fixtures";
 import { seededPlan } from "../plan/projection-submit.test-fixtures";
 import * as Service from "../plan/service";
 import { implementationGraphs } from "../tasks/plan-graphs";
+import { definitionDigest, validate } from "../tasks/graphs";
 
 function task(id: string) {
 	return {
@@ -71,6 +72,10 @@ describe("external coordination state under concurrent room publications (D6)", 
 		let state = await cardPlan();
 		try {
 			await scriptDraft(state.plan);
+			let committed = state.plan.graph!.versions.at(-1)!;
+			let checked = validate(committed.definition);
+			if (!checked.ok) throw new Error("drafted definition is invalid");
+			let digest = definitionDigest(checked.value);
 			// The suggest turn's write: an option added through the questions
 			// service after the external commit landed.
 			let added = await Questions.addServerOption(
@@ -83,8 +88,14 @@ describe("external coordination state under concurrent room publications (D6)", 
 			);
 			if (!added.ok) throw new Error(`option addition refused: ${added.reason}`);
 
-			// The live view keeps the draft the bridge committed.
-			expect(state.plan.graph?.versions.at(-1)?.definition.tasks[0]?.id).toBe("export-writer");
+			// The live view keeps the exact draft the bridge committed.
+			expect(state.plan.graph?.versions.at(-1)).toMatchObject({
+				number: committed.number,
+				revision: committed.revision,
+				planRevision: committed.planRevision,
+				state: committed.state,
+				draftedBy: "script",
+			});
 			// And so does the persisted sidecar, after a cold reopen.
 			await Service.close(state.plan);
 			let reopened = await Service.open(
@@ -93,8 +104,18 @@ describe("external coordination state under concurrent room publications (D6)", 
 				state.context.server,
 			);
 			try {
-				expect(reopened.graph?.versions.at(-1)?.definition.tasks[0]?.id).toBe("export-writer");
-				expect(reopened.graph?.versions.at(-1)?.draftedBy).toBe("script");
+				let restored = reopened.graph?.versions.at(-1);
+				expect(restored).toMatchObject({
+					number: committed.number,
+					revision: committed.revision,
+					planRevision: committed.planRevision,
+					state: committed.state,
+					draftedBy: "script",
+				});
+				let restoredChecked = restored && validate(restored.definition);
+				if (restoredChecked && restoredChecked.ok) {
+					expect(definitionDigest(restoredChecked.value)).toBe(digest);
+				}
 			} finally {
 				await Service.close(reopened);
 			}
@@ -184,6 +205,23 @@ describe("external coordination state under concurrent room publications (D6)", 
 					kind: "refused",
 					code: "resolved",
 					message: "already answered by octocat",
+				});
+
+				// The seeded tombstone carries the durable answers, so a late
+				// submit's refusal reads like the settle it just missed.
+				let questionId = reopened.records.get(state.id)!.definition.questions[0]!.id;
+				let lateSubmit = Store.claimSubmit(
+					reopened.questions,
+					state.id,
+					state.revision,
+					"hubot",
+				);
+				expect(lateSubmit).toMatchObject({
+					ok: false,
+					reason: "resolved",
+					status: "answered",
+					resolver: "octocat",
+					answers: [{ question: questionId, choices: ["Markdown"], optionIds: [state.optionId] }],
 				});
 			} finally {
 				await Service.close(reopened);

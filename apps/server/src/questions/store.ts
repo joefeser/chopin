@@ -28,6 +28,7 @@ import type {
 	Questions,
 	StoredOpen,
 } from "./store-types";
+import type { Record } from "./records";
 
 export { reopen } from "./store-lifecycle";
 export {
@@ -113,25 +114,62 @@ export function restore(entries: StoredOpen[]): Questions {
 /**
  * Seed the late-arrival memory from records settled before this process
  * opened the plan, so a late claim names who settled the card instead of
- * reporting a cancellation nobody performed. Seeded entries live as long as
- * the instance — they derive from durable records, not the tombstone TTL —
- * and carry no answers: their consumers read only the status and the
- * resolver, and the durable answers stay on the record.
+ * reporting a cancellation nobody performed. The seeded result carries the
+ * durable answers derived from the record — a late submit's refusal reads
+ * like the settle it just missed. Seeded entries live as long as the
+ * instance: they derive from durable records, not the tombstone TTL.
  */
-export function rememberRecords(
-	questions: Questions,
-	records: Iterable<{ id: string; status: string; resolver?: string }>,
-): Questions {
+export function rememberRecords(questions: Questions, records: Iterable<Record>): Questions {
 	for (let record of records) {
 		if (questions.open.has(record.id) || questions.closed.has(record.id)) continue;
 		if (record.status !== "answered" || record.resolver === undefined) continue;
 		questions.closed.set(record.id, {
-			result: { status: "answered", answers: [], resolver: record.resolver },
+			result: {
+				status: "answered",
+				answers: seededAnswers(record),
+				resolver: record.resolver,
+			},
 			revision: 0,
 			expires: Number.POSITIVE_INFINITY,
 		});
 	}
 	return questions;
+}
+
+/** Rebuild the answers a settle would have produced from the durable record. */
+function seededAnswers(record: Record): Answer[] {
+	if (record.choices === undefined && record.answers === undefined) return [];
+	let byOption = new Map(
+		record.definition.questions.flatMap(question =>
+			question.options.map(option => [option.id, question.id] as const)
+		),
+	);
+	let labels = new Map(
+		record.definition.questions.flatMap(question =>
+			question.options.map(option => [option.id, option.label] as const)
+		),
+	);
+	let settled = new Map<string, { optionIds: string[]; choices: string[]; custom?: string }>();
+	for (let id of record.choices ?? []) {
+		let question = byOption.get(id);
+		if (question === undefined) continue;
+		let entry = settled.get(question) ?? { optionIds: [], choices: [] };
+		entry.optionIds.push(id);
+		let label = labels.get(id);
+		if (label !== undefined) entry.choices.push(label);
+		settled.set(question, entry);
+	}
+	for (let [question, custom] of Object.entries(record.answers ?? {})) {
+		let entry = settled.get(question) ?? { optionIds: [], choices: [] };
+		entry.custom = custom;
+		settled.set(question, entry);
+	}
+	return [...settled].map(([question, entry]) => ({
+		question,
+		...(entry.choices.length > 0 ? { choices: entry.choices } : {}),
+		...(entry.optionIds.length > 0 ? { optionIds: entry.optionIds } : {}),
+		...(entry.custom !== undefined ? { custom: entry.custom } : {}),
+	}));
 }
 
 function sweep(questions: Questions): void {
