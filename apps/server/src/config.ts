@@ -100,6 +100,12 @@ export type Config = {
 	/** COORDINATION_APPROVERS: GitHub logins the coordination tools act for. */
 	coordinationApprovers?: string[];
 	/**
+	 * COORDINATION_SCRIPTED_DRAFTS=on: the demo-only scripted draft route
+	 * exists. Requires the coordination family, so it inherits the approvers
+	 * and loopback-bind requirements; never offered upstream.
+	 */
+	coordinationScriptedDrafts?: boolean;
+	/**
 	 * Origin of a running Vite, when developing.
 	 *
 	 * Set, and everything that is not the socket is forwarded there; unset, and
@@ -249,6 +255,10 @@ export function load(): Config {
 	let liveSpikes = process.env.LIVE_SPIKES === "on";
 	let liveSpikesRegexJudge = liveSpikes && process.env.LIVE_SPIKES_REGEX_JUDGE === "on";
 	let externalCoordination = process.env.EXTERNAL_COORDINATION === "on";
+	let coordinationScriptedDrafts = process.env.COORDINATION_SCRIPTED_DRAFTS === "on";
+	if (coordinationScriptedDrafts && !externalCoordination) {
+		throw new Error("COORDINATION_SCRIPTED_DRAFTS requires EXTERNAL_COORDINATION=on");
+	}
 	let coordinationApprovers = [
 		...new Set(
 			(process.env.COORDINATION_APPROVERS ?? "")
@@ -356,6 +366,7 @@ export function load(): Config {
 		...(externalCoordination
 			? { externalCoordination: true as const, coordinationApprovers }
 			: {}),
+		...(coordinationScriptedDrafts ? { coordinationScriptedDrafts: true as const } : {}),
 		devClient: process.env.DEV_CLIENT || undefined,
 		storage: storage(),
 		auth: loadAuth(serverPort, selection.host),

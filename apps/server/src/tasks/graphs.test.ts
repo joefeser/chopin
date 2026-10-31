@@ -471,3 +471,43 @@ describe("definitionDigest", () => {
 		})).toBe("40ac578bebc80d0a73f99093b0f02092b5f9d22eb6760ccc092aa9e3a9da7b3d");
 	});
 });
+
+describe("drafted-by stamping", () => {
+	it("stamps a first draft and keeps the stamp on its revisions", async () => {
+		let backend = new Memory();
+		backend.revisions.set("plan", 7);
+		let graphs = new Graphs(backend);
+		let first = await graphs.revise("plan", {
+			planRevision: 7,
+			graphRevision: 0,
+			operations: [{ op: "add", task: definition().tasks[0]! }],
+			draftedBy: "script",
+		});
+		expect(first).toMatchObject({
+			ok: true,
+			value: { versions: [{ number: 1, revision: 1, draftedBy: "script" }] },
+		});
+		let revised = await graphs.revise("plan", {
+			planRevision: 7,
+			graphRevision: 1,
+			operations: [{ op: "add", task: definition().tasks[1]! }],
+			draftedBy: "script",
+		});
+		expect(revised).toMatchObject({
+			ok: true,
+			value: { versions: [{ number: 1, revision: 2, draftedBy: "script" }] },
+		});
+	});
+
+	it("leaves human and planner drafts unstamped", async () => {
+		let backend = new Memory();
+		backend.revisions.set("plan", 7);
+		let graphs = new Graphs(backend);
+		let result = await graphs.revise("plan", {
+			planRevision: 7,
+			graphRevision: 0,
+			operations: [{ op: "add", task: definition().tasks[0]! }],
+		});
+		expect(result.ok && result.value.versions[0]!.draftedBy).toBeUndefined();
+	});
+});

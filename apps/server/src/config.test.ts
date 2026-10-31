@@ -395,3 +395,25 @@ describe("external coordination configuration", () => {
 		).not.toThrow();
 	});
 });
+
+describe("scripted draft configuration", () => {
+	it("requires the coordination family, which brings approvers and loopback with it", () => {
+		expect(() => configured({ COORDINATION_SCRIPTED_DRAFTS: "on" })).toThrow(
+			"COORDINATION_SCRIPTED_DRAFTS requires EXTERNAL_COORDINATION=on",
+		);
+		let config = configured({
+			EXTERNAL_COORDINATION: "on",
+			COORDINATION_APPROVERS: "joefeser",
+			COORDINATION_SCRIPTED_DRAFTS: "on",
+		});
+		expect(config.coordinationScriptedDrafts).toBe(true);
+		expect(() =>
+			configured({
+				EXTERNAL_COORDINATION: "on",
+				COORDINATION_APPROVERS: "joefeser",
+				COORDINATION_SCRIPTED_DRAFTS: "on",
+				SERVER_HOST: "0.0.0.0",
+			})
+		).toThrow("EXTERNAL_COORDINATION requires a loopback SERVER_HOST");
+	});
+});

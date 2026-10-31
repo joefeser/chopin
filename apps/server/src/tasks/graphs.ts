@@ -90,6 +90,8 @@ export type Revision = {
 	/** The current draft revision, or zero before a graph exists. */
 	graphRevision: number;
 	operations: Operation[];
+	/** Who drafted this change, when a script authored it; stamped on the version. */
+	draftedBy?: string;
 };
 
 type Validation = Exclude<Result<Definition>, { ok: true }>;
@@ -514,6 +516,7 @@ export class Graphs<Document> {
 							planRevision: revision,
 							state: "draft",
 							definition: checked.value,
+							...(change.draftedBy !== undefined ? { draftedBy: change.draftedBy } : {}),
 						}],
 					},
 				};
@@ -524,6 +527,7 @@ export class Graphs<Document> {
 					revision: version.revision + 1,
 					planRevision: revision,
 					definition: checked.value,
+					...(change.draftedBy !== undefined ? { draftedBy: change.draftedBy } : {}),
 				};
 			} else {
 				graph.versions.push({

@@ -88,6 +88,7 @@ import { locksEditing, requestBuild } from "./tasks/builds";
 import { pendingLinks, relinkInstruction } from "./tasks/relink";
 import { BuildReadiness } from "./tasks/readiness";
 import { registerMcpRoutes } from "./mcp/routes";
+import { registerScriptedDraftRoutes } from "./coordination/scripted-drafts";
 import { registerNavigationRoutes } from "./navigation/routes";
 import * as Edit from "./plan/edit";
 import * as Service from "./plan/service";
@@ -292,6 +293,18 @@ function withChildPlan<T>(
 			evict(held.room);
 		}
 	});
+}
+
+/**
+ * Serialized, queue-free access to a live document's plan, for operations
+ * that take the plan's own `Service.exclusive` inside — the scripted draft
+ * route's discipline, as the question services' is.
+ */
+function withLivePlan<T>(
+	channelId: string,
+	action: (opened: Service.Plan) => Promise<T>,
+): Promise<T> {
+	return withDocumentLock(channelId, () => withChildPlan(channelId, action));
 }
 
 function presence(server: Server<SocketData>, room: Rooms.Room): void {
@@ -2779,6 +2792,12 @@ registerMcpRoutes(
 		? { approvers: config.coordinationApprovers ?? [] }
 		: undefined,
 );
+if (config.coordinationScriptedDrafts) {
+	registerScriptedDraftRoutes(router, hostedAuth, {
+		approvers: config.coordinationApprovers ?? [],
+		access: withLivePlan,
+	});
+}
 implementations = registerImplementationRoutes(router, hostedAuth, {
 	assess: buildReadiness && ((id, revision) => {
 		buildReadiness!.ready(id, revision);
