@@ -46,6 +46,12 @@ describe("coordinationFingerprint", () => {
 			coordinationFingerprint({ ...base, principal: "other-bot" }),
 		);
 	});
+
+	it("is independent of the caller's property insertion order", () => {
+		let a = { idempotencyKey: "k", kind: "approve", principal: "bot", payloadDigest: "d" } as const;
+		let b = { payloadDigest: "d", principal: "bot", kind: "approve", idempotencyKey: "k" } as const;
+		expect(coordinationFingerprint(a)).toBe(coordinationFingerprint(b));
+	});
 });
 
 describe("classifyCoordination", () => {
@@ -91,6 +97,33 @@ describe("restoreCoordinationOps", () => {
 		expect(() => restoreCoordinationOps([{ ...answer, kind: "approve" }])).toThrow();
 		expect(() => restoreCoordinationOps([{ ...approve, result: answer.result }])).toThrow();
 		expect(() => restoreCoordinationOps([{ ...answer, committedAt: "not a date " }])).toThrow();
+		expect(() => restoreCoordinationOps([{ ...answer, committedAt: "not-a-date" }])).toThrow();
+	});
+
+	it("refuses duplicate idempotency keys", () => {
+		expect(() => restoreCoordinationOps([answer, { ...answer, fingerprint: "x".repeat(64) }]))
+			.toThrow();
+	});
+
+	it("refuses contradictory result shapes instead of normalizing them", () => {
+		expect(() =>
+			restoreCoordinationOps([{
+				...answer,
+				result: { ...answer.result, graphVersion: 1, unrelated: true },
+			}])
+		).toThrow();
+		expect(() =>
+			restoreCoordinationOps([{
+				...answer,
+				result: { questionId: "q", choice: "c", settledBy: "s", approver: "who" },
+			}])
+		).toThrow();
+		expect(() =>
+			restoreCoordinationOps([{
+				...approve,
+				result: { ...approve.result, extra: "field" },
+			}])
+		).toThrow();
 	});
 });
 

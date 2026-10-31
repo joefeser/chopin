@@ -2011,6 +2011,7 @@ export async function publishStaged(
 	plan.records = candidate.records;
 	plan.threads = candidate.threads;
 	plan.questions = candidate.questions;
+	plan.coordinationOps = candidate.coordinationOps;
 	plan.conversationPlan = candidate.conversationPlan;
 	plan.pendingCardActions = candidate.pendingCardActions;
 	plan.conversationPlanPendingEffects = candidate.conversationPlanPendingEffects;

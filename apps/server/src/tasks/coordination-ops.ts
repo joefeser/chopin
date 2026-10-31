@@ -46,7 +46,12 @@ export function coordinationFingerprint(input: {
 	principal: string;
 	payloadDigest: string;
 }): string {
-	return createHash("sha256").update(JSON.stringify(input)).digest("hex");
+	return createHash("sha256").update(JSON.stringify({
+		idempotencyKey: input.idempotencyKey,
+		kind: input.kind,
+		principal: input.principal,
+		payloadDigest: input.payloadDigest,
+	})).digest("hex");
 }
 
 export type CoordinationClassification =
@@ -78,9 +83,25 @@ function positiveInteger(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : undefined;
 }
 
-function result(kind: CoordinationOpKind, value: unknown): CoordinationOpResult | undefined {
+/** Result records carry exactly their kind's fields; contradictory shapes refuse. */
+function exact(value: unknown, keys: string[]): Record<string, unknown> | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	let record = value as Record<string, unknown>;
+	let found = Object.keys(record).sort();
+	let expected = [...keys].sort();
+	return found.length === expected.length && found.every((key, index) => key === expected[index])
+		? record
+		: undefined;
+}
+
+function result(kind: CoordinationOpKind, value: unknown): CoordinationOpResult | undefined {
+	let record = exact(
+		value,
+		kind === "answer"
+			? ["choice", "questionId", "settledBy"]
+			: ["approver", "graphRevision", "graphVersion", "planRevision"],
+	);
+	if (!record) return undefined;
 	if (kind === "answer") {
 		let questionId = text(record.questionId, 128);
 		let choice = text(record.choice, 256);
@@ -98,11 +119,14 @@ function result(kind: CoordinationOpKind, value: unknown): CoordinationOpResult 
 		: undefined;
 }
 
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/;
+
 /** Restores stored records; malformed entries refuse the whole sidecar. */
 export function restoreCoordinationOps(value: unknown): CoordinationOpRecord[] {
 	if (value === undefined) return [];
 	if (!Array.isArray(value)) throw new Error("coordinationOps must be an array when present");
 	let records: CoordinationOpRecord[] = [];
+	let seen = new Set<string>();
 	for (let entry of value) {
 		if (!entry || typeof entry !== "object") {
 			throw new Error("coordinationOps has a malformed record");
@@ -117,11 +141,23 @@ export function restoreCoordinationOps(value: unknown): CoordinationOpRecord[] {
 		let principal = text(record.principal, 100);
 		let payloadDigest = text(record.payloadDigest, 128);
 		let committedAt = text(record.committedAt, 64);
-		if (!idempotencyKey || !kind || !fingerprint || !principal || !payloadDigest || !committedAt) {
+		if (
+			!idempotencyKey
+			|| !kind
+			|| !fingerprint
+			|| !principal
+			|| !payloadDigest
+			|| !committedAt
+			|| !ISO_TIMESTAMP.test(committedAt)
+		) {
 			throw new Error("coordinationOps has an invalid record");
 		}
+		if (seen.has(idempotencyKey)) {
+			throw new Error("coordinationOps has duplicate idempotency keys");
+		}
+		seen.add(idempotencyKey);
 		let checked = result(kind, record.result);
-		if (!checked || (kind === "answer") !== ("questionId" in checked)) {
+		if (!checked) {
 			throw new Error("coordinationOps result does not match its kind");
 		}
 		records.push({
