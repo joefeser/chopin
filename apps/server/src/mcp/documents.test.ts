@@ -76,6 +76,7 @@ describe("the MCP document protocol", () => {
 			coordination: {
 				readSnapshot: async () => ({ kind: "refused", code: "snapshot-unavailable" }),
 				answer: async () => ({ kind: "refused", code: "not-allowed" }),
+				approve: async () => ({ kind: "refused", code: "not-allowed" }),
 			},
 		});
 		let response = await mcp(request({ jsonrpc: "2.0", id: 1, method: "tools/list" }));

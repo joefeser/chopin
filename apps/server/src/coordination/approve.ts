@@ -108,33 +108,38 @@ export async function approveExternal(
 		principal: input.approver,
 		payloadDigest,
 	});
-	let classified = classifyCoordination(plan.coordinationOps, {
-		idempotencyKey: input.idempotencyKey,
-		fingerprint,
-	});
-	if (classified.kind === "replay") {
-		let result = classified.record.result;
-		if (!("graphVersion" in result)) {
-			return { kind: "refused", code: "idempotency-conflict" };
-		}
-		return {
-			kind: "replayed",
-			graph: {
-				state: "approved",
-				version: result.graphVersion,
-				revision: result.graphRevision,
-				planRevision: result.planRevision,
-				approver: result.approver,
-				operationKey: classified.record.idempotencyKey,
-			},
-		};
-	}
-	if (classified.kind === "conflict") {
-		return { kind: "refused", code: "idempotency-conflict" };
-	}
 
 	await drain(plan);
 	return exclusive(plan, async () => {
+		// Classify under the plan's own queue: two identical approvals racing
+		// here serialize, and the second must find the first's record and
+		// replay it, never refuse as not-draft. Document-level serialization
+		// by locator cannot be the authority — equivalent locators alias.
+		let classified = classifyCoordination(plan.coordinationOps, {
+			idempotencyKey: input.idempotencyKey,
+			fingerprint,
+		});
+		if (classified.kind === "replay") {
+			let result = classified.record.result;
+			if (!("graphVersion" in result)) {
+				return { kind: "refused" as const, code: "idempotency-conflict" as const };
+			}
+			return {
+				kind: "replayed" as const,
+				graph: {
+					state: "approved" as const,
+					version: result.graphVersion,
+					revision: result.graphRevision,
+					planRevision: result.planRevision,
+					approver: result.approver,
+					operationKey: classified.record.idempotencyKey,
+				},
+			};
+		}
+		if (classified.kind === "conflict") {
+			return { kind: "refused" as const, code: "idempotency-conflict" as const };
+		}
+
 		let version = plan.graph?.versions.at(-1);
 		if (!version) return { kind: "refused" as const, code: "missing" as const };
 

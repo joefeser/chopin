@@ -816,6 +816,25 @@ export const TOOLS: Tool[] = [
 		},
 		outputSchema: { type: "object", properties: {}, additionalProperties: true },
 	},
+	{
+		name: "approve_implementation",
+		description:
+			"Approve the implementation-graph draft an external review read, proving it approves exactly those bytes: supply the counters and canonical digest read_coordination_snapshot returned, with an idempotency key so an identical retry replays the original approval and a conflicting reuse is refused. Follows the browser build path's own checks — every counter and the digest must match, the plan must be ready, and no decision may still be open or reopened — then records the approver and operation key on the approved version. Refusals are typed: stale-plan, reviewed-graph-changed, digest-mismatch, not-ready (with blockers), open-decision (with the ids), implementation-active, not-draft.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				id: { type: "string", minLength: 1, maxLength: MAX_DOCUMENT_LOCATOR_LENGTH },
+				graphVersion: { type: "integer", minimum: 1 },
+				graphRevision: { type: "integer", minimum: 1 },
+				planRevision: { type: "integer", minimum: 0 },
+				digest: { type: "string", pattern: "^[0-9a-f]{64}$" },
+				idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
+			},
+			required: ["id", "graphVersion", "graphRevision", "planRevision", "digest", "idempotencyKey"],
+			additionalProperties: false,
+		},
+		outputSchema: { type: "object", properties: {}, additionalProperties: true },
+	},
 ];
 
 type Call = {

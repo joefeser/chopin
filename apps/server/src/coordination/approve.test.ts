@@ -74,6 +74,24 @@ describe("approveExternal", () => {
 		});
 	});
 
+	it("settles two identical approvals racing on the queue as approve and replay", async () => {
+		let review = await reviewable();
+		let [first, second] = await Promise.all([
+			approveExternal(review.plan, review.input),
+			approveExternal(review.plan, { ...review.input }),
+		]);
+		let kinds = [first.kind, second.kind].sort();
+		expect(kinds).toEqual(["approved", "replayed"]);
+		expect(review.plan.coordinationOps).toHaveLength(1);
+		if (first.kind === "approved" && second.kind === "replayed") {
+			expect(second.graph).toEqual(first.graph);
+		} else if (first.kind === "replayed" && second.kind === "approved") {
+			expect(first.graph).toEqual(second.graph);
+		} else {
+			throw new Error(`race produced ${kinds.join(", ")}`);
+		}
+	});
+
 	it("replays an identical retry and refuses a conflicting key reuse", async () => {
 		let review = await reviewable();
 		let approved = await approveExternal(review.plan, review.input);

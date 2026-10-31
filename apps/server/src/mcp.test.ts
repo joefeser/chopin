@@ -979,6 +979,54 @@ describe("the answer_decision protocol", () => {
 		expect((malformed as { error?: { code: number } }).error?.code).toBe(-32602);
 	});
 
+	it("lists approve_implementation only when the capability approves", async () => {
+		let withApproval = handler({
+			caller: () => "octocat",
+			documents: reader(),
+			coordination: {
+				readSnapshot: async () => ({
+					kind: "refused" as const,
+					code: "snapshot-unavailable" as const,
+				}),
+				answer: async () => ({ kind: "refused" as const, code: "not-allowed" as const }),
+				approve: async () => ({ kind: "refused" as const, code: "not-allowed" as const }),
+			},
+		});
+		let listed = await json(
+			await withApproval(request({
+				jsonrpc: "2.0",
+				id: 10,
+				method: "tools/list",
+			})),
+		);
+		let declared = (listed.result as { tools: Array<{ name: string; inputSchema: unknown }> })
+			.tools.find(tool => tool.name === "approve_implementation");
+		expect(declared?.inputSchema).toBeDefined();
+
+		let withoutApproval = handler({
+			caller: () => "octocat",
+			documents: reader(),
+			coordination: {
+				readSnapshot: async () => ({
+					kind: "refused" as const,
+					code: "snapshot-unavailable" as const,
+				}),
+				answer: async () => ({ kind: "refused" as const, code: "not-allowed" as const }),
+			},
+		});
+		let hidden = await json(
+			await withoutApproval(request({
+				jsonrpc: "2.0",
+				id: 11,
+				method: "tools/list",
+			})),
+		);
+		expect(
+			(hidden.result as { tools: Array<{ name: string }> }).tools
+				.map(tool => tool.name),
+		).not.toContain("approve_implementation");
+	});
+
 	it("rejects untrimmed keys and ids the persisted ledger would refuse", async () => {
 		let mcp = endpoint(async () => ({
 			kind: "answered" as const,
