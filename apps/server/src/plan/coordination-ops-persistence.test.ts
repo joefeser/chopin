@@ -11,7 +11,11 @@ let record: CoordinationOpRecord = {
 	fingerprint: "f".repeat(64),
 	principal: "chopin-bridge-bot",
 	payloadDigest: "d".repeat(64),
-	result: { questionId: "01M696N0", choice: "01M696N0PQQNQS9HJYXMJ5PJHR", settledBy: "joefeser" },
+	result: {
+		questionId: "01M696N0",
+		choices: ["01M696N0PQQNQS9HJYXMJ5PJHR"],
+		settledBy: "joefeser",
+	},
 	committedAt: "2026-10-31T18:00:00.000Z",
 };
 

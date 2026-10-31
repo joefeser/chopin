@@ -55,7 +55,8 @@ export {
 } from "./service-relationships";
 export type { Placement, Sections } from "./service-relationships";
 export { reopen } from "./service-reopen";
-export { submit } from "./service-submit";
+export { answerExternal, submit } from "./service-submit";
+export type { ExternalAnswer, ExternalAnswerInput } from "./service-submit";
 export { setWhy } from "./service-why";
 export type { Questions, StoredOpen } from "./store";
 

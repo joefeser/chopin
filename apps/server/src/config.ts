@@ -91,6 +91,15 @@ export type Config = {
 	 */
 	liveSpikesRegexJudge?: boolean;
 	/**
+	 * EXTERNAL_COORDINATION=on: the MCP coordination tools (reading decision
+	 * snapshots, recording external answers) exist at all. Requires a
+	 * COORDINATION_APPROVERS allowlist and, like a host-login harness auth, a
+	 * loopback bind: external coordination is a local, named-operator feature.
+	 */
+	externalCoordination?: boolean;
+	/** COORDINATION_APPROVERS: GitHub logins the coordination tools act for. */
+	coordinationApprovers?: string[];
+	/**
 	 * Origin of a running Vite, when developing.
 	 *
 	 * Set, and everything that is not the socket is forwarded there; unset, and
@@ -150,6 +159,17 @@ function port(): number {
 		throw new Error(`PORT must be a number between 1 and 65535, got ${JSON.stringify(raw)}`);
 	}
 	return value;
+}
+
+/**
+ * Whether a bind host serves this machine only. Mirrors the harness auth rule
+ * (`harness/harnesses.ts`), which likewise refuses its host-login modes on a
+ * non-loopback SERVER_HOST.
+ */
+function loopbackHost(host: string): boolean {
+	return host === "localhost" || host === "::1" || host === "[::1]"
+		|| /^127(?:\.\d{1,3}){3}$/.test(host)
+			&& host.split(".").slice(1).every(part => Number(part) <= 255);
 }
 
 /** A duration setting, in whole milliseconds from 1 second to `max`, 10 minutes by default. */
@@ -228,6 +248,15 @@ export function load(): Config {
 	let liveBuild = process.env.LIVE_BUILD === "on";
 	let liveSpikes = process.env.LIVE_SPIKES === "on";
 	let liveSpikesRegexJudge = liveSpikes && process.env.LIVE_SPIKES_REGEX_JUDGE === "on";
+	let externalCoordination = process.env.EXTERNAL_COORDINATION === "on";
+	let coordinationApprovers = [
+		...new Set(
+			(process.env.COORDINATION_APPROVERS ?? "")
+				.split(",")
+				.map(login => login.trim().toLowerCase())
+				.filter(Boolean),
+		),
+	];
 	let decisionsModel = process.env.DECISIONS_MODEL
 		|| (process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY
 			? "typesafe/jev-latest"
@@ -289,6 +318,15 @@ export function load(): Config {
 		throw new Error("AGENT_CONNECTION_MAX_SILENCE_MS must be at least AGENT_CONNECTION_TIMEOUT_MS");
 	}
 	let selection = harnessSelection();
+
+	if (externalCoordination) {
+		if (coordinationApprovers.length === 0) {
+			throw new Error("COORDINATION_APPROVERS is required when EXTERNAL_COORDINATION=on");
+		}
+		if (!loopbackHost(selection.host)) {
+			throw new Error("EXTERNAL_COORDINATION requires a loopback SERVER_HOST");
+		}
+	}
 	let serverPort = port();
 	return {
 		...selection,
@@ -315,6 +353,9 @@ export function load(): Config {
 		setupAgents: setupAgents(process.env.CHOPIN_SETUP_AGENTS),
 		liveSpikes,
 		liveSpikesRegexJudge,
+		...(externalCoordination
+			? { externalCoordination: true as const, coordinationApprovers }
+			: {}),
 		devClient: process.env.DEV_CLIENT || undefined,
 		storage: storage(),
 		auth: loadAuth(serverPort, selection.host),

@@ -14,7 +14,8 @@ export type CoordinationOpKind = "answer" | "approve";
 /** What an answer operation durably settled. */
 export type AnswerOpResult = {
 	questionId: string;
-	choice: string;
+	/** Every option the settle chose, in question order. */
+	choices: string[];
 	settledBy: string;
 };
 
@@ -98,16 +99,21 @@ function result(kind: CoordinationOpKind, value: unknown): CoordinationOpResult 
 	let record = exact(
 		value,
 		kind === "answer"
-			? ["choice", "questionId", "settledBy"]
+			? ["choices", "questionId", "settledBy"]
 			: ["approver", "graphRevision", "graphVersion", "planRevision"],
 	);
 	if (!record) return undefined;
 	if (kind === "answer") {
 		let questionId = text(record.questionId, 128);
-		let choice = text(record.choice, 256);
 		let settledBy = text(record.settledBy, 100);
-		return questionId && choice && settledBy
-			? { questionId, choice, settledBy }
+		let choices = Array.isArray(record.choices)
+				&& record.choices.length > 0
+				&& record.choices.length <= 32
+				&& record.choices.every(choice => text(choice, 256) !== undefined)
+			? record.choices as string[]
+			: undefined;
+		return questionId && settledBy && choices
+			? { questionId, choices, settledBy }
 			: undefined;
 	}
 	let graphVersion = positiveInteger(record.graphVersion);

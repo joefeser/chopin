@@ -40,6 +40,8 @@ export function configured(overrides: Record<string, string | undefined> = {}) {
 		HARNESS: undefined,
 		HARNESS_AUTH: undefined,
 		HARNESS_EXTENSIONS: undefined,
+		EXTERNAL_COORDINATION: undefined,
+		COORDINATION_APPROVERS: undefined,
 		AUTH_MODE: undefined,
 		SERVER_HOST: undefined,
 		PORT: undefined,

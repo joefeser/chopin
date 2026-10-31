@@ -824,3 +824,158 @@ describe("the coordination snapshot protocol", () => {
 		expect((malformed as { error?: { code: number } }).error?.code).toBe(-32602);
 	});
 });
+
+describe("the answer_decision protocol", () => {
+	let arguments_ = {
+		id: document.id,
+		questionId: "01M696N0",
+		revision: 5,
+		optionIds: ["01M696N0PQ"],
+		idempotencyKey: "bridge:answer:1",
+	};
+
+	function endpoint(
+		answer: Coordination<string>["answer"],
+	) {
+		return handler({
+			caller: () => "octocat",
+			documents: reader(),
+			coordination: {
+				readSnapshot: async () => ({
+					kind: "refused" as const,
+					code: "snapshot-unavailable" as const,
+				}),
+				answer,
+			},
+		});
+	}
+
+	it("is listed only when the coordination capability can answer", async () => {
+		let mcp = endpoint(async () => ({ kind: "refused", code: "not-allowed" }));
+		let listed = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 1,
+				method: "tools/list",
+			})),
+		);
+		expect(
+			(listed.result as { tools: Array<{ name: string }> }).tools.map(tool => tool.name),
+		).toContain("answer_decision");
+
+		let withoutAnswer = handler({
+			caller: () => "octocat",
+			documents: reader(),
+			coordination: {
+				readSnapshot: async () => ({
+					kind: "refused" as const,
+					code: "snapshot-unavailable" as const,
+				}),
+			},
+		});
+		let read = await json(
+			await withoutAnswer(request({
+				jsonrpc: "2.0",
+				id: 2,
+				method: "tools/list",
+			})),
+		);
+		expect(
+			(read.result as { tools: Array<{ name: string }> }).tools.map(tool => tool.name),
+		).not.toContain("answer_decision");
+	});
+
+	it("answers and replays with the settle they recorded", async () => {
+		let settled = { choices: ["01M696N0PQ"], by: "joefeser", at: "2026-10-31T17:00:00.000Z" };
+		let mcp = endpoint(async (_caller, input) =>
+			input.idempotencyKey === "bridge:answer:1"
+				? { kind: "answered" as const, settled }
+				: { kind: "replayed" as const, settled }
+		);
+		let first = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 3,
+				method: "tools/call",
+				params: { name: "answer_decision", arguments: arguments_ },
+			})),
+		);
+		expect((first.result as { structuredContent: unknown }).structuredContent).toEqual({
+			state: "answered",
+			settled,
+		});
+		let retry = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 4,
+				method: "tools/call",
+				params: { name: "answer_decision", arguments: { ...arguments_, idempotencyKey: "other" } },
+			})),
+		);
+		expect((retry.result as { structuredContent: unknown }).structuredContent).toEqual({
+			state: "replayed",
+			settled,
+		});
+	});
+
+	it("carries each typed refusal, with the current revision when stale", async () => {
+		let mcp = endpoint(async () => ({
+			kind: "refused" as const,
+			code: "stale" as const,
+			current: 7,
+		}));
+		let stale = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 5,
+				method: "tools/call",
+				params: { name: "answer_decision", arguments: arguments_ },
+			})),
+		);
+		expect((stale.result as { structuredContent: unknown }).structuredContent).toEqual({
+			code: "stale",
+			current: 7,
+		});
+
+		let codes = endpoint(async () => ({
+			kind: "refused" as const,
+			code: "draft-in-progress" as const,
+		}));
+		let refused = await json(
+			await codes(request({
+				jsonrpc: "2.0",
+				id: 6,
+				method: "tools/call",
+				params: { name: "answer_decision", arguments: arguments_ },
+			})),
+		);
+		expect((refused.result as { structuredContent: unknown }).structuredContent).toEqual({
+			code: "draft-in-progress",
+		});
+	});
+
+	it("maps document and repository refusals, and rejects malformed arguments", async () => {
+		let mcp = endpoint(async () => ({ kind: "archived" as const }));
+		let archived = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 7,
+				method: "tools/call",
+				params: { name: "answer_decision", arguments: arguments_ },
+			})),
+		);
+		expect((archived.result as { structuredContent: unknown }).structuredContent).toEqual({
+			code: "document-archived",
+		});
+
+		let malformed = await json(
+			await mcp(request({
+				jsonrpc: "2.0",
+				id: 8,
+				method: "tools/call",
+				params: { name: "answer_decision", arguments: { id: document.id } },
+			})),
+		);
+		expect((malformed as { error?: { code: number } }).error?.code).toBe(-32602);
+	});
+});

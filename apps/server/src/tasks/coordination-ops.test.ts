@@ -16,7 +16,11 @@ let answer: CoordinationOpRecord = {
 	fingerprint: "f".repeat(64),
 	principal: "chopin-bridge-bot",
 	payloadDigest: "d".repeat(64),
-	result: { questionId: "01M696N0", choice: "01M696N0PQQNQS9HJYXMJ5PJHR", settledBy: "joefeser" },
+	result: {
+		questionId: "01M696N0",
+		choices: ["01M696N0PQQNQS9HJYXMJ5PJHR"],
+		settledBy: "joefeser",
+	},
 	committedAt: "2026-10-31T16:00:00.000Z",
 };
 
@@ -115,7 +119,7 @@ describe("restoreCoordinationOps", () => {
 		expect(() =>
 			restoreCoordinationOps([{
 				...answer,
-				result: { questionId: "q", choice: "c", settledBy: "s", approver: "who" },
+				result: { questionId: "q", choices: ["c"], settledBy: "s", approver: "who" },
 			}])
 		).toThrow();
 		expect(() =>

@@ -17,6 +17,7 @@ import * as Plan from "../plan/service";
 import * as Rooms from "../rooms";
 import { claimImplementation, reportImplementationLifecycle } from "../tasks/plan-graphs";
 import { coordinationSnapshot } from "../tasks/coordination-snapshot";
+import { answerExternal } from "../questions/service";
 import { StorageError } from "../storage/errors";
 import { implementationLifecycle } from "../tasks/lifecycle";
 import { imagePath } from "../images/format";
@@ -27,6 +28,7 @@ import type { GitHubUser } from "../github/client";
 import type { AuthenticatedSession } from "../auth/session";
 import type { HostedRepository } from "../agent/repository";
 import type {
+	AnswerDecisionInput,
 	DocumentSummary,
 	Implementation,
 	ImplementationInput,
@@ -254,11 +256,18 @@ export async function locateDocument(auth: LocatorAuth, caller: HostedCaller, lo
 	return { channel, repository };
 }
 
+/** External coordination exists only where the operator named its approvers. */
+export type HostedCoordination = {
+	/** GitHub logins, lowercased, that may answer through the coordination tools. */
+	approvers: readonly string[];
+};
+
 /** Bind the backend-neutral MCP surface to hosted GitHub authentication. */
 export function hosted(
 	auth: HostedAuth,
 	persistence?: ImplementationPersistence,
 	callbacks: HostedCallbacks = {},
+	coordination?: HostedCoordination,
 ): McpOptions<HostedCaller> {
 	let directRepository = (caller: HostedCaller, owner: string, name: string) =>
 		directRepositoryFor(auth, caller, owner, name);
@@ -822,44 +831,83 @@ export function hosted(
 				return { kind: "uploaded" as const, path: imagePath(sha256, input.mimeType) };
 			},
 		},
-		coordination: {
-			async readSnapshot(caller: HostedCaller, id: string) {
-				let located = await locatedChannel(caller, id);
-				if (located === "forbidden") return { kind: "forbidden" as const };
-				if (!located) return { kind: "refused" as const, code: "snapshot-unavailable" as const };
-				let { channel } = located;
-				let live = Rooms.get(channel.id)?.plan;
-				if (live) {
-					return Plan.exclusive(live, async () => {
+		...(coordination
+			? {
+				coordination: {
+					async readSnapshot(caller: HostedCaller, id: string) {
+						let located = await locatedChannel(caller, id);
+						if (located === "forbidden") return { kind: "forbidden" as const };
+						if (!located) {
+							return { kind: "refused" as const, code: "snapshot-unavailable" as const };
+						}
+						let { channel } = located;
+						let live = Rooms.get(channel.id)?.plan;
+						if (live) {
+							return Plan.exclusive(live, async () => {
+								let snapshot = coordinationSnapshot({
+									channel,
+									revision: live.revision,
+									creation: live.creation,
+									records: live.records.values(),
+									openQuestions: live.questions.open.values(),
+									...(live.graph ? { graph: live.graph } : {}),
+								});
+								return snapshot
+									? { kind: "snapshot" as const, snapshot }
+									: { kind: "refused" as const, code: "provenance-refused" as const };
+							});
+						}
+						let stored = await auth.storage.collaboration.load(channel.id, auth.clock());
+						if (!stored) return { kind: "refused" as const, code: "snapshot-unavailable" as const };
+						let projected = await Plan.readStored(stored);
 						let snapshot = coordinationSnapshot({
 							channel,
-							revision: live.revision,
-							creation: live.creation,
-							records: live.records.values(),
-							openQuestions: live.questions.open.values(),
-							...(live.graph ? { graph: live.graph } : {}),
+							revision: projected.revision,
+							creation: projected.creation,
+							records: projected.records,
+							openQuestions: projected.openQuestions,
+							...(projected.graph ? { graph: projected.graph } : {}),
 						});
 						return snapshot
 							? { kind: "snapshot" as const, snapshot }
 							: { kind: "refused" as const, code: "provenance-refused" as const };
-					});
-				}
-				let stored = await auth.storage.collaboration.load(channel.id, auth.clock());
-				if (!stored) return { kind: "refused" as const, code: "snapshot-unavailable" as const };
-				let projected = await Plan.readStored(stored);
-				let snapshot = coordinationSnapshot({
-					channel,
-					revision: projected.revision,
-					creation: projected.creation,
-					records: projected.records,
-					openQuestions: projected.openQuestions,
-					...(projected.graph ? { graph: projected.graph } : {}),
-				});
-				return snapshot
-					? { kind: "snapshot" as const, snapshot }
-					: { kind: "refused" as const, code: "provenance-refused" as const };
-			},
-		},
+					},
+					async answer(caller: HostedCaller, input: AnswerDecisionInput) {
+						if (!coordination.approvers.includes(caller.user.login.toLowerCase())) {
+							return { kind: "refused" as const, code: "not-allowed" as const };
+						}
+						return serializeDocument(input.id, async () => {
+							let access = await writableChannel(caller, input.id);
+							if (access.kind === "unavailable") return { kind: "unavailable" as const };
+							if (access.kind === "forbidden") return { kind: "forbidden" as const };
+							let { channel } = access;
+							if (channel.archivedAt) return { kind: "archived" as const };
+							try {
+								return await withPlan(
+									channel.id,
+									async plan =>
+										answerExternal(plan, plan.server, channel.id, {
+											questionId: input.questionId,
+											revision: input.revision,
+											optionIds: input.optionIds,
+											resolver: caller.user.login,
+											idempotencyKey: input.idempotencyKey,
+										}),
+								);
+							} catch (err) {
+								if (err instanceof Error && err.message === "document is unavailable") {
+									return { kind: "unavailable" as const };
+								}
+								if (err instanceof StorageError && err.failure === "missing") {
+									return { kind: "unavailable" as const };
+								}
+								throw err;
+							}
+						});
+					},
+				},
+			}
+			: {}),
 		...(persistence
 			? {
 				implementations: {

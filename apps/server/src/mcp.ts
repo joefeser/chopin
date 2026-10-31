@@ -103,6 +103,34 @@ export type Implementations<Caller> = {
 };
 
 /** The read side of external coordination: decisions and draft graphs. */
+export type AnswerDecisionInput = {
+	id: string;
+	questionId: string;
+	/** The shared-draft revision the answer was prepared against. */
+	revision: number;
+	optionIds: string[];
+	idempotencyKey: string;
+};
+
+export type AnsweredDecision =
+	| { kind: "answered"; settled: { choices: string[]; by: string; at: string } }
+	| { kind: "replayed"; settled: { choices: string[]; by: string; at: string } };
+
+export type AnswerRefusal = {
+	kind: "refused";
+	code:
+		| "stale"
+		| "resolved"
+		| "invalid"
+		| "draft-in-progress"
+		| "paused"
+		| "implementation-active"
+		| "idempotency-conflict"
+		| "not-allowed";
+	message?: string;
+	current?: number;
+};
+
 export type Coordination<Caller> = {
 	readSnapshot(caller: Caller, id: string): Promise<
 		| { kind: "snapshot"; snapshot: CoordinationSnapshot }
@@ -110,6 +138,16 @@ export type Coordination<Caller> = {
 		| { kind: "refused"; code: "provenance-refused" }
 		| { kind: "refused"; code: "snapshot-unavailable" }
 		| { kind: "forbidden" }
+	>;
+	answer?(
+		caller: Caller,
+		input: AnswerDecisionInput,
+	): Promise<
+		| AnsweredDecision
+		| AnswerRefusal
+		| { kind: "forbidden" }
+		| { kind: "unavailable" }
+		| { kind: "archived" }
 	>;
 };
 
@@ -706,6 +744,29 @@ export const TOOLS: Tool[] = [
 		},
 		outputSchema: { type: "object", properties: {}, additionalProperties: true },
 	},
+	{
+		name: "answer_decision",
+		description:
+			"Record a human's answer to an open decision, asserted by the calling bridge: choose by option IDs at a shared-draft revision read from read_coordination_snapshot, with an idempotency key so an identical retry replays the original settle and a conflicting reuse is refused. The answer runs through the same core as the room's own submit path, settles under the caller's GitHub login, and refuses a decision whose shared draft has in-flight edits (draft-in-progress), whose revision moved (stale, carrying the current one), or that is paused, resolved or being implemented. Written-response questions cannot be answered here.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				id: { type: "string", minLength: 1, maxLength: MAX_DOCUMENT_LOCATOR_LENGTH },
+				questionId: { type: "string", minLength: 1, maxLength: 128 },
+				revision: { type: "integer", minimum: 0 },
+				optionIds: {
+					type: "array",
+					items: { type: "string", minLength: 1, maxLength: 256 },
+					minItems: 1,
+					maxItems: 32,
+				},
+				idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
+			},
+			required: ["id", "questionId", "revision", "optionIds", "idempotencyKey"],
+			additionalProperties: false,
+		},
+		outputSchema: { type: "object", properties: {}, additionalProperties: true },
+	},
 ];
 
 type Call = {
@@ -811,6 +872,34 @@ function isLocator(value: unknown): value is string {
 	return typeof value === "string"
 		&& Array.from(value).length <= MAX_DOCUMENT_LOCATOR_LENGTH
 		&& value.trim().length > 0;
+}
+
+function shortText(value: unknown, maximum: number): value is string {
+	return typeof value === "string" && value.trim().length > 0
+		&& Array.from(value).length <= maximum;
+}
+
+function answerArguments(value: Record<string, unknown>): AnswerDecisionInput | undefined {
+	let optionIds = Array.isArray(value.optionIds)
+			&& value.optionIds.length >= 1 && value.optionIds.length <= 32
+			&& value.optionIds.every(item => shortText(item, 256))
+		? value.optionIds as string[]
+		: undefined;
+	let revision = typeof value.revision === "number" && Number.isInteger(value.revision)
+			&& value.revision >= 0
+		? value.revision
+		: undefined;
+	return isLocator(value.id)
+			&& shortText(value.questionId, 128) && shortText(value.idempotencyKey, 128)
+			&& revision !== undefined && optionIds
+		? {
+			id: value.id,
+			questionId: value.questionId,
+			revision,
+			optionIds,
+			idempotencyKey: value.idempotencyKey,
+		}
+		: undefined;
 }
 
 function listArguments(
@@ -964,6 +1053,7 @@ export function handler<Caller>(
 			|| options.implementations)
 		&& (!isLifecycleTool(tool.name) || options.implementations?.reportLifecycle)
 		&& (tool.name !== "read_coordination_snapshot" || options.coordination)
+		&& (tool.name !== "answer_decision" || options.coordination?.answer)
 	);
 	let instructions = serviceInstructions(tools);
 
@@ -1299,6 +1389,40 @@ export function handler<Caller>(
 						return respond(text({ code: "repository-forbidden" }, true));
 					}
 					return respond(text({ code: outcome.code }, true));
+				}
+				if (tool.name === "answer_decision") {
+					let input = answerArguments(tool.arguments);
+					if (!input) {
+						return notification
+							? undefined
+							: error(
+								call.id,
+								-32602,
+								"answer_decision requires an id or URL, questionId, revision, optionIds and idempotencyKey",
+							);
+					}
+					let answer = options.coordination?.answer;
+					if (!answer) {
+						return respond(text({ code: "not-allowed" }, true));
+					}
+					let outcome = await answer(caller, input);
+					if (outcome.kind === "answered" || outcome.kind === "replayed") {
+						return respond(text({ state: outcome.kind, settled: outcome.settled }));
+					}
+					if (outcome.kind === "forbidden") {
+						return respond(text({ code: "repository-forbidden" }, true));
+					}
+					if (outcome.kind === "unavailable") {
+						return respond(text({ code: "document-unavailable" }, true));
+					}
+					if (outcome.kind === "archived") {
+						return respond(text({ code: "document-archived" }, true));
+					}
+					return respond(text({
+						code: outcome.code,
+						...(outcome.message !== undefined ? { message: outcome.message } : {}),
+						...(outcome.current !== undefined ? { current: outcome.current } : {}),
+					}, true));
 				}
 				return notification ? undefined : error(call.id, -32601, "tool not found");
 			}

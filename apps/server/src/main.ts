@@ -2739,38 +2739,46 @@ jobRunner = new JobRunner({
 	},
 	fatal: err => console.error("chopin: background job runner failed -", err),
 });
-registerMcpRoutes(router, hostedAuth, {
-	lease() {
-		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
-		return writerLease.held;
+registerMcpRoutes(
+	router,
+	hostedAuth,
+	{
+		lease() {
+			if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+			return writerLease.held;
+		},
 	},
-}, {
-	// A child's instruction runs on its root's Chat with the child as focus.
-	visualAdmission,
-	invokePlanner: input =>
-		invokeRouted({
-			channels: storage.channels,
-			deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
-			transition: withDocumentTransition,
-			open: rootId => openRootChat(rootId, input.session?.session.id, input.repository),
-			plannerAccount: rootId => plannerAttachments?.holding(rootId)?.userId,
-			systemTurns,
-		}, input),
-	plannerNotAttached,
-	archiveChannel,
-	isChannelDeleting: channelId => deletingChannels.has(channelId),
-	onChannelRenamed: announceChannel,
-	onChannelCreated: announceCatalogue,
-	onDocumentPersisted: target => {
-		void documentHistory.record(target);
-		if (summaryCoordinator) void summaryCoordinator.enqueueNow(target).catch(() => {});
-		liveSync?.schedule(target);
-		buildReadiness?.schedule(target);
+	{
+		// A child's instruction runs on its root's Chat with the child as focus.
+		visualAdmission,
+		invokePlanner: input =>
+			invokeRouted({
+				channels: storage.channels,
+				deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
+				transition: withDocumentTransition,
+				open: rootId => openRootChat(rootId, input.session?.session.id, input.repository),
+				plannerAccount: rootId => plannerAttachments?.holding(rootId)?.userId,
+				systemTurns,
+			}, input),
+		plannerNotAttached,
+		archiveChannel,
+		isChannelDeleting: channelId => deletingChannels.has(channelId),
+		onChannelRenamed: announceChannel,
+		onChannelCreated: announceCatalogue,
+		onDocumentPersisted: target => {
+			void documentHistory.record(target);
+			if (summaryCoordinator) void summaryCoordinator.enqueueNow(target).catch(() => {});
+			liveSync?.schedule(target);
+			buildReadiness?.schedule(target);
+		},
+		restoreChannel,
+		serializeDocument: (channelId, action) =>
+			withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),
 	},
-	restoreChannel,
-	serializeDocument: (channelId, action) =>
-		withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),
-});
+	config.externalCoordination
+		? { approvers: config.coordinationApprovers ?? [] }
+		: undefined,
+);
 implementations = registerImplementationRoutes(router, hostedAuth, {
 	assess: buildReadiness && ((id, revision) => {
 		buildReadiness!.ready(id, revision);

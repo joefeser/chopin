@@ -358,3 +358,40 @@ describe("configuration", () => {
 		refused([{ ...acme, extra: 1 }], "CHOPIN_SETUP_AGENTS[0]");
 	});
 });
+
+describe("external coordination configuration", () => {
+	it("stays off unless explicitly enabled", () => {
+		let config = configured();
+		expect(config.externalCoordination).toBeUndefined();
+		expect(config.coordinationApprovers).toBeUndefined();
+	});
+
+	it("enables with named approvers, normalized to unique lowercase logins", () => {
+		let config = configured({
+			EXTERNAL_COORDINATION: "on",
+			COORDINATION_APPROVERS: "JoeFeser, joefeser, chopin-bridge-bot",
+		});
+		expect(config.externalCoordination).toBe(true);
+		expect(config.coordinationApprovers).toEqual(["joefeser", "chopin-bridge-bot"]);
+	});
+
+	it("refuses to enable without approvers or off a loopback bind", () => {
+		expect(() => configured({ EXTERNAL_COORDINATION: "on" })).toThrow(
+			"COORDINATION_APPROVERS is required when EXTERNAL_COORDINATION=on",
+		);
+		expect(() =>
+			configured({
+				EXTERNAL_COORDINATION: "on",
+				COORDINATION_APPROVERS: "joefeser",
+				SERVER_HOST: "0.0.0.0",
+			})
+		).toThrow("EXTERNAL_COORDINATION requires a loopback SERVER_HOST");
+		expect(() =>
+			configured({
+				EXTERNAL_COORDINATION: "on",
+				COORDINATION_APPROVERS: "joefeser",
+				SERVER_HOST: "localhost",
+			})
+		).not.toThrow();
+	});
+});
