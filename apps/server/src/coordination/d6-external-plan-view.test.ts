@@ -89,13 +89,17 @@ describe("external coordination state under concurrent room publications (D6)", 
 			if (!added.ok) throw new Error(`option addition refused: ${added.reason}`);
 
 			// The live view keeps the exact draft the bridge committed.
-			expect(state.plan.graph?.versions.at(-1)).toMatchObject({
+			let published = state.plan.graph?.versions.at(-1);
+			expect(published).toMatchObject({
 				number: committed.number,
 				revision: committed.revision,
 				planRevision: committed.planRevision,
 				state: committed.state,
 				draftedBy: "script",
 			});
+			let publishedChecked = published && validate(published.definition);
+			if (!publishedChecked?.ok) throw new Error("published draft definition is invalid");
+			expect(definitionDigest(publishedChecked.value)).toBe(digest);
 			// And so does the persisted sidecar, after a cold reopen.
 			await Service.close(state.plan);
 			let reopened = await Service.open(
@@ -113,9 +117,8 @@ describe("external coordination state under concurrent room publications (D6)", 
 					draftedBy: "script",
 				});
 				let restoredChecked = restored && validate(restored.definition);
-				if (restoredChecked && restoredChecked.ok) {
-					expect(definitionDigest(restoredChecked.value)).toBe(digest);
-				}
+				if (!restoredChecked?.ok) throw new Error("reopened draft definition is invalid");
+				expect(definitionDigest(restoredChecked.value)).toBe(digest);
 			} finally {
 				await Service.close(reopened);
 			}
@@ -176,7 +179,17 @@ describe("external coordination state under concurrent room publications (D6)", 
 					idempotencyKey: "d6:answer:2",
 				},
 			);
-			if (answered.kind === "refused") throw new Error("first answer refused");
+			if (answered.kind !== "answered") {
+				throw new Error(`first answer was not settled: ${JSON.stringify(answered)}`);
+			}
+			// The live settle's own answer set — in derive's shape, the question
+			// text with labels and ids, never a custom summary.
+			let question = state.plan.records.get(state.id)!.definition.questions[0]!;
+			expect(answered.answers).toEqual([{
+				question: question.question,
+				choices: ["Markdown"],
+				optionIds: [state.optionId],
+			}]);
 			await Service.close(state.plan);
 
 			// A fresh open models every later reader: the room after an
@@ -208,21 +221,20 @@ describe("external coordination state under concurrent room publications (D6)", 
 				});
 
 				// The seeded tombstone carries the durable answers, so a late
-				// submit's refusal reads like the settle it just missed.
-				let questionId = reopened.records.get(state.id)!.definition.questions[0]!.id;
+				// submit's refusal reads exactly like the settle it just
+				// missed — the complete answer set, field for field.
 				let lateSubmit = Store.claimSubmit(
 					reopened.questions,
 					state.id,
 					state.revision,
 					"hubot",
 				);
-				expect(lateSubmit).toMatchObject({
-					ok: false,
-					reason: "resolved",
-					status: "answered",
-					resolver: "octocat",
-					answers: [{ question: questionId, choices: ["Markdown"], optionIds: [state.optionId] }],
-				});
+				if (lateSubmit.ok || lateSubmit.reason !== "resolved") {
+					throw new Error(`late submit was not resolved: ${JSON.stringify(lateSubmit)}`);
+				}
+				expect(lateSubmit.status).toBe("answered");
+				expect(lateSubmit.resolver).toBe("octocat");
+				expect(lateSubmit.answers).toEqual(answered.answers);
 			} finally {
 				await Service.close(reopened);
 			}

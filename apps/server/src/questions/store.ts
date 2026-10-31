@@ -136,40 +136,38 @@ export function rememberRecords(questions: Questions, records: Iterable<Record>)
 	return questions;
 }
 
-/** Rebuild the answers a settle would have produced from the durable record. */
+/**
+ * Rebuild the answers a settle would have produced from the durable record,
+ * in definition order, matching what `derive` emits for a live settle: the
+ * question text, labels and ids for selections (never a `custom` summary —
+ * `decide` stores summaries for written and selected answers alike), the
+ * written text only for questions without selections, and the whole marks
+ * matrix on the criteria-holding question.
+ */
 function seededAnswers(record: Record): Answer[] {
 	if (record.choices === undefined && record.answers === undefined) return [];
-	let byOption = new Map(
-		record.definition.questions.flatMap(question =>
-			question.options.map(option => [option.id, question.id] as const)
-		),
-	);
-	let labels = new Map(
-		record.definition.questions.flatMap(question =>
-			question.options.map(option => [option.id, option.label] as const)
-		),
-	);
-	let settled = new Map<string, { optionIds: string[]; choices: string[]; custom?: string }>();
-	for (let id of record.choices ?? []) {
-		let question = byOption.get(id);
-		if (question === undefined) continue;
-		let entry = settled.get(question) ?? { optionIds: [], choices: [] };
-		entry.optionIds.push(id);
-		let label = labels.get(id);
-		if (label !== undefined) entry.choices.push(label);
-		settled.set(question, entry);
+	let answers: Answer[] = [];
+	for (let question of record.definition.questions) {
+		let optionIds = (record.choices ?? []).filter(id =>
+			question.options.some(option => option.id === id)
+		);
+		if (optionIds.length > 0) {
+			answers.push({
+				question: question.question,
+				choices: optionIds.map(
+					id => question.options.find(option => option.id === id)!.label,
+				),
+				optionIds,
+				...(question.criteria && record.marks !== undefined ? { marks: record.marks } : {}),
+			});
+			continue;
+		}
+		let written = record.answers?.[question.id];
+		if (written !== undefined) {
+			answers.push({ question: question.question, custom: written });
+		}
 	}
-	for (let [question, custom] of Object.entries(record.answers ?? {})) {
-		let entry = settled.get(question) ?? { optionIds: [], choices: [] };
-		entry.custom = custom;
-		settled.set(question, entry);
-	}
-	return [...settled].map(([question, entry]) => ({
-		question,
-		...(entry.choices.length > 0 ? { choices: entry.choices } : {}),
-		...(entry.optionIds.length > 0 ? { optionIds: entry.optionIds } : {}),
-		...(entry.custom !== undefined ? { custom: entry.custom } : {}),
-	}));
+	return answers;
 }
 
 function sweep(questions: Questions): void {
