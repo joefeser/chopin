@@ -696,7 +696,8 @@ describe("the coordination snapshot protocol", () => {
 			questions: [{
 				id: "q-format",
 				question: "Which format should the report use?",
-				options: [{ id: "01M696N0PQ", label: "Markdown" }],
+				options: [{ id: "01M696N0PQ", label: "Markdown", description: "" }],
+				multiple: false,
 			}],
 			settled: { choices: ["01M696N0PQ"], by: "joefeser" },
 		}],
@@ -705,6 +706,7 @@ describe("the coordination snapshot protocol", () => {
 			version: 2,
 			revision: 3,
 			planRevision: 37,
+			definition: { tasks: [] },
 			digest: "d".repeat(64),
 			draftedBy: "script",
 		},

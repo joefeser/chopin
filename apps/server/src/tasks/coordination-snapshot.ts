@@ -12,7 +12,7 @@
 
 import { definitionDigest, validate } from "./graphs";
 
-import type { Graph, State } from "./graphs";
+import type { Definition, Graph, State } from "./graphs";
 import type { Record } from "../questions/records";
 
 /** One settle, current or superseded by a reopen. */
@@ -23,10 +23,24 @@ export type CoordinationSettled = {
 	answers?: { [questionId: string]: string };
 };
 
+export type CoordinationOption = {
+	id: string;
+	label: string;
+	description: string;
+	/** The option's own visual, as Markdown. Absent when the option has none. */
+	preview?: string;
+};
+
 export type CoordinationQuestion = {
 	id: string;
 	question: string;
-	options: Array<{ id: string; label: string }>;
+	/** Supporting context, shown only in the full decision card. */
+	description?: string;
+	options: CoordinationOption[];
+	/** Whether several options may be chosen; single-select otherwise. */
+	multiple: boolean;
+	/** Written response; options must be empty. */
+	response?: "text";
 };
 
 export type CoordinationDecision = {
@@ -46,7 +60,12 @@ export type CoordinationGraph = {
 	version: number;
 	revision: number;
 	planRevision: number;
-	/** Present when the stored definition still validates; absence is a stop. */
+	/**
+	 * The validated definition and its digest, always paired: an external
+	 * reviewer reads exactly the bytes the digest covers, which a later
+	 * approval proves it reviewed. Absence of the pair is a stop.
+	 */
+	definition?: Definition;
 	digest?: string;
 	draftedBy?: string;
 	approver?: string;
@@ -102,7 +121,17 @@ export function coordinationSnapshot(input: {
 			questions: record.definition.questions.map(question => ({
 				id: question.id,
 				question: question.question,
-				options: question.options.map(option => ({ id: option.id, label: option.label })),
+				...(question.description !== undefined
+					? { description: question.description }
+					: {}),
+				options: question.options.map(option => ({
+					id: option.id,
+					label: option.label,
+					description: option.description,
+					...(option.preview !== undefined ? { preview: option.preview } : {}),
+				})),
+				multiple: question.multiple,
+				...(question.response !== undefined ? { response: question.response } : {}),
 			})),
 			...(open.has(record.id) ? { revision: open.get(record.id)! } : {}),
 			...(record.status === "answered" && record.resolver !== undefined
@@ -130,7 +159,9 @@ export function coordinationSnapshot(input: {
 			version: current.number,
 			revision: current.revision,
 			planRevision: current.planRevision,
-			...(checked.ok ? { digest: definitionDigest(checked.value) } : {}),
+			...(checked.ok
+				? { definition: checked.value, digest: definitionDigest(checked.value) }
+				: {}),
 			...(current.draftedBy !== undefined ? { draftedBy: current.draftedBy } : {}),
 			...(current.approver !== undefined ? { approver: current.approver } : {}),
 		};

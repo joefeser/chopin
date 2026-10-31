@@ -3,30 +3,49 @@ import { describe, expect, it } from "bun:test";
 import { coordinationSnapshot } from "./coordination-snapshot";
 import { definitionDigest } from "./graphs";
 
-import type { CoordinationSnapshot } from "./coordination-snapshot";
+import type { CoordinationQuestion, CoordinationSnapshot } from "./coordination-snapshot";
 import type { Definition, Graph } from "./graphs";
 import type { Record } from "../questions/records";
 
 let channel = { id: "2fe799da-bb29-5845-8555-7498b2582dc8", title: "Release readiness" };
 
-function question(id: string, question: string, options: string[][]): Record["definition"] {
-	return {
-		questions: [{
-			id,
-			header: question,
-			question,
-			options: options.map(([id, label]) => ({ id, label, description: "" })),
+/** A multi-select question with option context, beside a written-response one. */
+let definition: Record["definition"] = {
+	questions: [
+		{
+			id: "q-format",
+			header: "Which formats may the report mix?",
+			question: "Which formats may the report mix?",
+			description: "More than one may be chosen; prose stays out of the report.",
+			options: [
+				{
+					id: "01M696N0PQ",
+					label: "Markdown",
+					description: "Prose and diagrams that reviewers can quote.",
+					preview: "```mermaid\ngraph TD\n```\n",
+				},
+				{
+					id: "01M696N0PR",
+					label: "JSON",
+					description: "A machine-checkable schema of the same content.",
+				},
+			],
+			multiple: true,
+		},
+		{
+			id: "q-why",
+			header: "Why that mix?",
+			question: "Why that mix?",
+			options: [],
 			multiple: false,
-		}],
-	};
-}
+			response: "text",
+		},
+	],
+};
 
 let open: Record = {
 	id: "01M696N0PQQNQS9HJYXMJ5PJHR",
-	definition: question("q-format", "Which format should the report use?", [
-		["01M696N0PQ", "Markdown"],
-		["01M696N0PR", "JSON"],
-	]),
+	definition,
 	status: "open",
 	origin: "conversation",
 	history: [],
@@ -43,6 +62,7 @@ let answered: Record = {
 	at: 1_793_433_600,
 	decidedAt: 1_793_433_600,
 	choices: ["01M696N0PQ"],
+	answers: { "q-why": "Markdown quotes cleanly in review." },
 };
 
 let reopened: Record = {
@@ -89,6 +109,30 @@ function snapshot(): CoordinationSnapshot | undefined {
 	});
 }
 
+/** What every decision exposes, answer semantics and option context intact. */
+let exposedQuestions: CoordinationQuestion[] = [
+	{
+		id: "q-format",
+		question: "Which formats may the report mix?",
+		description: "More than one may be chosen; prose stays out of the report.",
+		options: [
+			{
+				id: "01M696N0PQ",
+				label: "Markdown",
+				description: "Prose and diagrams that reviewers can quote.",
+				preview: "```mermaid\ngraph TD\n```\n",
+			},
+			{
+				id: "01M696N0PR",
+				label: "JSON",
+				description: "A machine-checkable schema of the same content.",
+			},
+		],
+		multiple: true,
+	},
+	{ id: "q-why", question: "Why that mix?", options: [], multiple: false, response: "text" },
+];
+
 describe("coordinationSnapshot", () => {
 	it("exposes every decision with its settle, its prior settle, and the draft graph", () => {
 		expect(snapshot()).toEqual({
@@ -97,44 +141,24 @@ describe("coordinationSnapshot", () => {
 				{
 					id: open.id,
 					status: "open",
-					questions: [{
-						id: "q-format",
-						question: "Which format should the report use?",
-						options: [
-							{ id: "01M696N0PQ", label: "Markdown" },
-							{ id: "01M696N0PR", label: "JSON" },
-						],
-					}],
+					questions: exposedQuestions,
 					revision: 5,
 				},
 				{
 					id: answered.id,
 					status: "answered",
-					questions: open.definition.questions.map(item => ({
-						id: item.id,
-						question: item.question,
-						options: item.options.map(option => ({
-							id: option.id,
-							label: option.label,
-						})),
-					})),
+					questions: exposedQuestions,
 					settled: {
 						choices: ["01M696N0PQ"],
 						by: "joefeser",
 						at: new Date(1_793_433_600 * 1_000).toISOString(),
+						answers: { "q-why": "Markdown quotes cleanly in review." },
 					},
 				},
 				{
 					id: reopened.id,
 					status: "reopened",
-					questions: open.definition.questions.map(item => ({
-						id: item.id,
-						question: item.question,
-						options: item.options.map(option => ({
-							id: option.id,
-							label: option.label,
-						})),
-					})),
+					questions: exposedQuestions,
 					revision: 0,
 					previous: {
 						choices: ["01M696N0PR"],
@@ -148,6 +172,7 @@ describe("coordinationSnapshot", () => {
 				version: 2,
 				revision: 3,
 				planRevision: 37,
+				definition: tasks,
 				digest: definitionDigest(tasks),
 				draftedBy: "script",
 			},
@@ -164,15 +189,21 @@ describe("coordinationSnapshot", () => {
 		expect(outcome).toBeUndefined();
 	});
 
-	it("digests stably across two reads of the same state", () => {
+	it("digests stably across two reads, always over the definition it returns", () => {
 		let first = snapshot();
 		let second = snapshot();
 		expect(first?.graph?.digest).toBe(second?.graph?.digest);
 		expect(first).toEqual(second);
+		expect(first?.graph?.definition).toEqual(tasks);
+		// The pairing an approval later proves: the digest covers exactly the
+		// definition the reviewer read, never a separate serialization.
+		if (first?.graph?.definition) {
+			expect(first.graph.digest).toBe(definitionDigest(first.graph.definition));
+		}
 		expect(first?.graph?.digest).toBe(definitionDigest(tasks));
 	});
 
-	it("omits the graph before one exists and its digest when the definition does not validate", () => {
+	it("omits the graph before one exists and its definition when it does not validate", () => {
 		let before = coordinationSnapshot({
 			channel,
 			revision: 4,

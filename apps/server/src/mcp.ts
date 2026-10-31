@@ -695,7 +695,7 @@ export const TOOLS: Tool[] = [
 	{
 		name: "read_coordination_snapshot",
 		description:
-			"Read the coordination snapshot of a document by ID or canonical URL: every decision with its questions, options, shared-draft revision, status and settled answer including who settled it, plus the current implementation-graph draft with its version, revisions and a canonical SHA-256 digest of its validated definition. Unlike read_implementation this includes draft graphs, so an external reviewer can review the thing under review before approving it. Documents not created through create_document are refused with provenance-refused.",
+			"Read the coordination snapshot of a document by ID or canonical URL: every decision with its questions, options, answer semantics, shared-draft revision, status and settled answer including who settled it, plus the current implementation-graph draft with its version, revisions, its validated definition and the canonical SHA-256 digest of exactly those bytes. Unlike read_implementation this includes draft graphs, so an external reviewer can review the thing under review before approving it. Documents not created through create_document are refused with provenance-refused.",
 		inputSchema: {
 			type: "object",
 			properties: {
