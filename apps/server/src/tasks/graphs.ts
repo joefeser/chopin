@@ -28,6 +28,12 @@ export type Version = {
 	planRevision: number;
 	state: State;
 	definition: Definition;
+	/** GitHub login that approved this version through an external coordination operation. */
+	approver?: string;
+	/** Idempotency key of the external coordination operation that approved it. */
+	operationKey?: string;
+	/** Set when a script drafted this version, so the disclosure is durable. */
+	draftedBy?: string;
 };
 
 export type Graph = {
@@ -185,6 +191,20 @@ function item(value: unknown, keys: string[]): Record<string, unknown> | undefin
 	return found.length === expected.length && found.every((key, index) => key === expected[index])
 		? record
 		: undefined;
+}
+
+/** Like item(), tolerating any subset of the optional keys and nothing else. */
+function shape(
+	value: unknown,
+	required: string[],
+	optional: string[],
+): Record<string, unknown> | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	let record = value as Record<string, unknown>;
+	let keys = Object.keys(record);
+	let extra = keys.filter(key => !required.includes(key) && !optional.includes(key));
+	let missing = required.filter(key => !(key in record));
+	return extra.length === 0 && missing.length === 0 ? record : undefined;
 }
 
 function definition(value: unknown): Definition | undefined {
@@ -386,18 +406,32 @@ function revise(definition: Definition, operations: unknown[]): Result<Definitio
 }
 
 /** Read a graph back from a sidecar without trusting handwritten JSON. */
+/** Optional attribution fields on stored graph versions: undefined = absent, null = invalid. */
+function attribution(value: unknown, maximum: number): string | null | undefined {
+	if (value === undefined) return undefined;
+	return typeof value === "string" && value.length > 0 && Array.from(value).length <= maximum
+		? value
+		: null;
+}
+
 export function restore(value: unknown): Graph | undefined {
 	let stored = item(value, ["versions"]);
 	if (!stored || !Array.isArray(stored.versions) || stored.versions.length === 0) return undefined;
 	let versions: Version[] = [];
 	for (let [index, value] of stored.versions.entries()) {
-		let version = item(value, ["definition", "number", "planRevision", "revision", "state"])
-			?? item(value, ["definition", "number", "planRevision", "state"]);
+		let version = shape(
+			value,
+			["definition", "number", "planRevision", "state"],
+			["revision", "approver", "operationKey", "draftedBy"],
+		);
 		let checked = version && definition(version.definition);
 		let number = version?.number;
 		let revision = version?.revision ?? 1;
 		let planRevision = version?.planRevision;
 		let versionState = state(version?.state);
+		let approver = attribution(version?.approver, 100);
+		let operationKey = attribution(version?.operationKey, 128);
+		let draftedBy = attribution(version?.draftedBy, 100);
 		if (
 			!version
 			|| typeof number !== "number"
@@ -410,6 +444,9 @@ export function restore(value: unknown): Graph | undefined {
 			|| planRevision < 0
 			|| !versionState
 			|| !checked
+			|| approver === null
+			|| operationKey === null
+			|| draftedBy === null
 		) return undefined;
 		versions.push({
 			number,
@@ -417,6 +454,9 @@ export function restore(value: unknown): Graph | undefined {
 			planRevision,
 			state: versionState,
 			definition: checked,
+			...(approver !== undefined ? { approver } : {}),
+			...(operationKey !== undefined ? { operationKey } : {}),
+			...(draftedBy !== undefined ? { draftedBy } : {}),
 		});
 	}
 	return history(versions) ? { versions } : undefined;

@@ -52,6 +52,7 @@ import * as Comments from "../comments/service";
 import * as Questions from "../questions/service";
 import { sidecarUnansweredDecisions } from "../questions/unanswered";
 import { claim, restore as restoreGraph, restoreRun } from "../tasks/graphs";
+import { restoreCoordinationOps } from "../tasks/coordination-ops";
 import { claimEligibility, restoreLifecycle, transition } from "../tasks/lifecycle";
 import { broadcast, broadcastRepository, fail, relay, reply, tell } from "../wire";
 import { documentUrl } from "../channels/document-url";
@@ -77,6 +78,7 @@ import type {
 import type { StorageAdapter } from "../storage/port";
 import type { PendingCardAction } from "../questions/card-actions";
 import type { ClaimInput, ClaimResult, Graph, Run } from "../tasks/graphs";
+import type { CoordinationOpRecord } from "../tasks/coordination-ops";
 import type { LiveBuild } from "../tasks/builds";
 import type { Lifecycle, LifecycleInput, LifecycleResult } from "../tasks/lifecycle";
 
@@ -245,6 +247,8 @@ export type Plan = {
 	questionPage?: QuestionPage;
 	/** Idempotent MCP rewrites retained so later edits do not change a replay. */
 	mcpUpdates: McpUpdateRecord[];
+	/** Idempotency and attribution for external coordination operations. */
+	coordinationOps: CoordinationOpRecord[];
 	server: Server<SocketData>;
 	document: Document;
 	presence: Presence;
@@ -346,6 +350,7 @@ type Sidecar = {
 	lifecycle?: Lifecycle;
 	live?: LiveBuild;
 	mcpUpdates?: McpUpdateRecord[];
+	coordinationOps?: CoordinationOpRecord[];
 	questions: Questions.Record[];
 	openQuestions: Questions.StoredOpen[];
 	threads: Comments.Record[];
@@ -379,6 +384,7 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 			: {}),
 		...(plan.live ? { live: plan.live } : {}),
 		...(plan.mcpUpdates.length > 0 ? { mcpUpdates: plan.mcpUpdates } : {}),
+		...(plan.coordinationOps.length > 0 ? { coordinationOps: plan.coordinationOps } : {}),
 		questions: [...plan.records.values()],
 		openQuestions: Questions.dump(plan.questions),
 		threads: [...plan.threads.values()],
@@ -583,6 +589,7 @@ function restoredState(
 	if (Object.hasOwn(item, "lifecycle")) expected.push("lifecycle");
 	if (Object.hasOwn(item, "live")) expected.push("live");
 	if (Object.hasOwn(item, "mcpUpdates")) expected.push("mcpUpdates");
+	if (Object.hasOwn(item, "coordinationOps")) expected.push("coordinationOps");
 	if (Object.hasOwn(item, "conversationPlan")) expected.push("conversationPlan");
 	if (Object.hasOwn(item, "conversationPlanRetries")) expected.push("conversationPlanRetries");
 	if (Object.hasOwn(item, "conversationPlanJobs")) expected.push("conversationPlanJobs");
@@ -709,6 +716,7 @@ function restoredState(
 		}
 	}
 	let mcpUpdates = restoreMcpUpdates(item.mcpUpdates);
+	let coordinationOps = restoreCoordinationOps(item.coordinationOps);
 	let conversationPlan = restoreConversationPlan(
 		item.conversationPlan,
 		transcript as unknown as Chat.Chat["entries"],
@@ -776,6 +784,7 @@ function restoredState(
 		...(lifecycle ? { lifecycle } : {}),
 		...(live ? { live } : {}),
 		...(mcpUpdates.length > 0 ? { mcpUpdates } : {}),
+		...(coordinationOps.length > 0 ? { coordinationOps } : {}),
 		questions: records,
 		openQuestions: openQuestions as unknown as Questions.StoredOpen[],
 		threads: threads as never[],
@@ -1524,6 +1533,7 @@ export async function open(
 		...(sidecar.creation ? { creation: sidecar.creation } : {}),
 		...(sidecar.questionPage ? { questionPage: sidecar.questionPage } : {}),
 		mcpUpdates: sidecar.mcpUpdates ?? [],
+		coordinationOps: sidecar.coordinationOps ?? [],
 		server,
 		document,
 		presence: presence.create(),
