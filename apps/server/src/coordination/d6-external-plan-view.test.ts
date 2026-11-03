@@ -321,4 +321,55 @@ describe("external coordination state under concurrent room publications (D6)", 
 			await Service.close(state.plan).catch(() => {});
 		}
 	});
+
+	it("omits attribution when the settled record never carried a resolver", async () => {
+		let state = await cardPlan();
+		try {
+			let settled = await Questions.answerExternal(
+				state.plan,
+				state.plan.server,
+				state.context.channel.id,
+				{
+					questionId: state.id,
+					revision: state.revision,
+					optionIds: [state.optionId],
+					resolver: "octocat",
+					idempotencyKey: "d7:answer:3",
+				},
+			);
+			if (settled.kind !== "answered") {
+				throw new Error(`settle failed: ${JSON.stringify(settled)}`);
+			}
+			let record = state.plan.records.get(state.id);
+			if (!record) throw new Error("card record missing");
+			// Records permit a resolver-less settle. A restored plan seeds no
+			// tombstone for one, so every entry map is empty and only the
+			// durable record knows the outcome — the refusal must name the
+			// outcome without inventing who performed it.
+			let stripped = { ...record };
+			delete stripped.resolver;
+			state.plan.records.set(state.id, stripped);
+			state.plan.questions.open.delete(state.id);
+			state.plan.questions.closed.delete(state.id);
+			let late = await Questions.answerExternal(
+				state.plan,
+				state.plan.server,
+				state.context.channel.id,
+				{
+					questionId: state.questionId,
+					revision: state.revision,
+					optionIds: [state.optionId],
+					resolver: "octocat",
+					idempotencyKey: "d7:answer:4",
+				},
+			);
+			expect(late).toMatchObject({
+				kind: "refused",
+				code: "resolved",
+				message: "already answered",
+			});
+		} finally {
+			await Service.close(state.plan).catch(() => {});
+		}
+	});
 });

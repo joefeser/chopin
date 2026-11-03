@@ -494,13 +494,17 @@ export async function answerExternal(
 							"the open decision's shared-draft entry is missing from this plan; reopen the document and retry",
 					};
 				}
-				if (record.resolver !== undefined) {
-					return {
-						kind: "refused",
-						code: "resolved",
-						message: `already ${record.status} by ${record.resolver}`,
-					};
-				}
+				// Terminal record: name the durable outcome. Attribution appears
+				// only when the record carries it — records permit a
+				// resolver-less settle, and inventing "by system" would
+				// fabricate a cancellation nobody performed.
+				return {
+					kind: "refused",
+					code: "resolved",
+					message: record.resolver !== undefined
+						? `already ${record.status} by ${record.resolver}`
+						: `already ${record.status}`,
+				};
 			}
 			return {
 				kind: "refused",
