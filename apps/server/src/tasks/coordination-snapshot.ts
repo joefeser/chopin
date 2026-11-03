@@ -69,6 +69,7 @@ export type CoordinationGraph = {
 	digest?: string;
 	draftedBy?: string;
 	approver?: string;
+	operationKey?: string;
 };
 
 export type CoordinationSnapshot = {
@@ -164,6 +165,7 @@ export function coordinationSnapshot(input: {
 				: {}),
 			...(current.draftedBy !== undefined ? { draftedBy: current.draftedBy } : {}),
 			...(current.approver !== undefined ? { approver: current.approver } : {}),
+			...(current.operationKey !== undefined ? { operationKey: current.operationKey } : {}),
 		};
 	}
 
