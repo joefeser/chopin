@@ -372,7 +372,8 @@ export type ExternalAnswer =
 			| "paused"
 			| "implementation-active"
 			| "idempotency-conflict"
-			| "state-diverged";
+			| "state-diverged"
+			| "unknown-decision";
 		message?: string;
 		current?: number;
 	};
@@ -388,6 +389,22 @@ function answerPayloadDigest(input: ExternalAnswerInput): string {
 }
 
 /**
+ * The decision a claim names. The store keys its entries by the decision
+ * card's id, and read_coordination_snapshot exposes both the card and the
+ * question ids inside it, so accept either: the card id itself, or a
+ * question id mapped to its owning card through the durable records.
+ * Anything else is unknown — the caller hears exactly that, never a
+ * synthesized cancellation.
+ */
+function resolveDecisionId(plan: Plan, ref: string): string | undefined {
+	if (plan.records.has(ref)) return ref;
+	for (let [id, record] of plan.records) {
+		if (record.definition.questions.some(question => question.id === ref)) return id;
+	}
+	return undefined;
+}
+
+/**
  * Record a human's answer, asserted by an external coordination caller,
  * through the same durable core as the room's own submit path: the same
  * pre-checks and re-checks, the same staged projection and size check, the
@@ -400,10 +417,18 @@ export async function answerExternal(
 	roomId: string,
 	input: ExternalAnswerInput,
 ): Promise<ExternalAnswer> {
+	let decisionId = resolveDecisionId(plan, input.questionId);
+	if (!decisionId) {
+		return {
+			kind: "refused",
+			code: "unknown-decision",
+			message: `no decision matches ${input.questionId}`,
+		};
+	}
 	if (Service.implementationActive(plan)) {
 		return { kind: "refused", code: "implementation-active" };
 	}
-	if (pausedForVerification(plan, input.questionId)) {
+	if (pausedForVerification(plan, decisionId)) {
 		return { kind: "refused", code: "paused" };
 	}
 
@@ -439,7 +464,7 @@ export async function answerExternal(
 
 	let claimed = Store.claimAnswer(
 		plan.questions,
-		input.questionId,
+		decisionId,
 		input.revision,
 		input.resolver,
 		input.optionIds,
@@ -450,21 +475,32 @@ export async function answerExternal(
 		}
 		if (claimed.reason === "resolved") {
 			// The store synthesizes "cancelled by system" when the entry is
-			// missing entirely. A record that is still open while its entry is
-			// gone means this plan's question state has diverged from the
-			// document — the claim must say that, not blame a cancellation
-			// nobody performed.
-			let record = plan.records.get(input.questionId);
+			// missing from both maps. A durable record with a known outcome
+			// means the entry simply never existed under the claimed key —
+			// say what actually happened to the decision, never blame a
+			// cancellation nobody performed. A record that is still open
+			// while its entry is gone means this plan's question state has
+			// diverged from the document.
+			let record = plan.records.get(decisionId);
 			if (
 				claimed.status === "cancelled" && claimed.resolver === "system"
-				&& record !== undefined && isOpenStatus(record.status)
+				&& record !== undefined
 			) {
-				return {
-					kind: "refused",
-					code: "state-diverged",
-					message:
-						"the open decision's shared-draft entry is missing from this plan; reopen the document and retry",
-				};
+				if (isOpenStatus(record.status)) {
+					return {
+						kind: "refused",
+						code: "state-diverged",
+						message:
+							"the open decision's shared-draft entry is missing from this plan; reopen the document and retry",
+					};
+				}
+				if (record.resolver !== undefined) {
+					return {
+						kind: "refused",
+						code: "resolved",
+						message: `already ${record.status} by ${record.resolver}`,
+					};
+				}
 			}
 			return {
 				kind: "refused",
@@ -494,7 +530,7 @@ export async function answerExternal(
 				fingerprint,
 				principal: input.resolver,
 				payloadDigest,
-				result: { questionId: input.questionId, choices: optionIds, settledBy: input.resolver },
+				result: { questionId: decisionId, choices: optionIds, settledBy: input.resolver },
 				committedAt,
 			},
 		},
@@ -514,12 +550,12 @@ export async function answerExternal(
 	}
 	outcome.finish();
 	notifyAnswered(plan, server, roomId, {
-		id: input.questionId,
+		id: decisionId,
 		resolver: input.resolver,
 		answers: outcome.answers,
 	}, {
 		kind: "decided",
-		id: input.questionId,
+		id: decisionId,
 		...(outcome.record.threadId ? { threadId: outcome.record.threadId } : {}),
 		actor: input.resolver,
 		optionIds: outcome.optionIds,

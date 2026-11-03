@@ -46,7 +46,9 @@ async function cardPlan() {
 	});
 	let entry = Store.get(plan.questions, id);
 	if (!entry) throw new Error("card was not open");
-	return { context, plan, id, optionId, revision: entry.revision };
+	let questionId = plan.records.get(id)?.definition.questions[0]?.id;
+	if (!questionId) throw new Error("card had no question");
+	return { context, plan, id, questionId, optionId, revision: entry.revision };
 }
 
 /** The external scripted draft, exactly as the coordination route drives it. */
@@ -264,6 +266,56 @@ describe("external coordination state under concurrent room publications (D6)", 
 			expect(diverged).toMatchObject({
 				kind: "refused",
 				code: "state-diverged",
+			});
+		} finally {
+			await Service.close(state.plan).catch(() => {});
+		}
+	});
+
+	it("answers honestly when a mis-keyed late claim meets a settled card", async () => {
+		// The rehearsal's exact shape (run 2, finding D7): the caller names
+		// the question inside the card instead of the card itself, and the
+		// card was already settled through the room's own path. Whatever the
+		// plan's entry maps hold, the durable record is the truth a claim
+		// must meet — the refusal names the settle, never a cancellation
+		// nobody performed.
+		let state = await cardPlan();
+		try {
+			let first = await Questions.answerExternal(
+				state.plan,
+				state.plan.server,
+				state.context.channel.id,
+				{
+					questionId: state.id,
+					revision: state.revision,
+					optionIds: [state.optionId],
+					resolver: "octocat",
+					idempotencyKey: "d7:answer:1",
+				},
+			);
+			if (first.kind !== "answered") {
+				throw new Error(`first answer failed: ${JSON.stringify(first)}`);
+			}
+			// Strip every entry: whatever happened to this instance's maps,
+			// the answered record survives.
+			state.plan.questions.open.delete(state.id);
+			state.plan.questions.closed.delete(state.id);
+			let late = await Questions.answerExternal(
+				state.plan,
+				state.plan.server,
+				state.context.channel.id,
+				{
+					questionId: state.questionId,
+					revision: state.revision,
+					optionIds: [state.optionId],
+					resolver: "octocat",
+					idempotencyKey: "d7:answer:2",
+				},
+			);
+			expect(late).toMatchObject({
+				kind: "refused",
+				code: "resolved",
+				message: "already answered by octocat",
 			});
 		} finally {
 			await Service.close(state.plan).catch(() => {});

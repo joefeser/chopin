@@ -165,6 +165,7 @@ export type AnswerRefusal = {
 		| "implementation-active"
 		| "idempotency-conflict"
 		| "state-diverged"
+		| "unknown-decision"
 		| "not-allowed";
 	message?: string;
 	current?: number;
@@ -797,7 +798,7 @@ export const TOOLS: Tool[] = [
 	{
 		name: "answer_decision",
 		description:
-			"Record a human's answer to an open decision, asserted by the calling bridge: choose by option IDs at a shared-draft revision read from read_coordination_snapshot, with an idempotency key so an identical retry replays the original settle and a conflicting reuse is refused. The answer runs through the same core as the room's own submit path, settles under the caller's GitHub login, and refuses a decision whose shared draft has in-flight edits (draft-in-progress), whose revision moved (stale, carrying the current one), or that is paused, resolved or being implemented. Written-response questions cannot be answered here.",
+			"Record a human's answer to an open decision, asserted by the calling bridge: choose by option IDs at a shared-draft revision read from read_coordination_snapshot, naming the decision by its card id (decisions[].id) or by the id of a question inside it (decisions[].questions[].id), with an idempotency key so an identical retry replays the original settle and a conflicting reuse is refused. The answer runs through the same core as the room's own submit path, settles under the caller's GitHub login, and refuses a decision whose shared draft has in-flight edits (draft-in-progress), whose revision moved (stale, carrying the current one), or that is paused, resolved or being implemented; an id matching no decision refuses as unknown-decision. Written-response questions cannot be answered here.",
 		inputSchema: {
 			type: "object",
 			properties: {

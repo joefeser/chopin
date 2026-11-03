@@ -57,6 +57,8 @@ describe("hosted coordination answering", () => {
 		});
 		let entry = plan.questions.open.get(id);
 		if (!entry) throw new Error("card was not open");
+		let questionId = plan.records.get(id)?.definition.questions[0]?.id;
+		if (!questionId) throw new Error("card had no question");
 		// Close the seeding instance so the hosted adapter opens the document
 		// from storage alone; two live plan instances would conflict on commit.
 		await Service.close(plan);
@@ -75,6 +77,7 @@ describe("hosted coordination answering", () => {
 			context,
 			options,
 			id,
+			questionId,
 			optionId,
 			revision: entry.revision,
 			input: {
@@ -119,6 +122,29 @@ describe("hosted coordination answering", () => {
 		} finally {
 			await Service.close(reopened);
 		}
+	});
+
+	it("resolves a question-level id to its owning card", async () => {
+		let state = await bridge();
+		// The snapshot exposes both the card id and the ids of the questions
+		// inside it; a caller naming the question must reach the same settle.
+		let answered = await state.options.coordination!.answer!(caller("octocat"), {
+			...state.input,
+			questionId: state.questionId,
+		});
+		if (answered.kind !== "answered") {
+			throw new Error(`hosted answer failed: ${JSON.stringify(answered)}`);
+		}
+		expect(answered.settled.choices).toEqual([state.optionId]);
+	});
+
+	it("refuses an id matching no decision instead of calling it cancelled", async () => {
+		let state = await bridge();
+		let refused = await state.options.coordination!.answer!(caller("octocat"), {
+			...state.input,
+			questionId: ulid(),
+		});
+		expect(refused).toMatchObject({ kind: "refused", code: "unknown-decision" });
 	});
 
 	it("replays an identical retry and refuses callers outside the allowlist", async () => {
