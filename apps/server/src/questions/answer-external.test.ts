@@ -325,4 +325,61 @@ describe("answerExternal", () => {
 		}
 		expect(handed).toEqual([]);
 	});
+
+	it("announces the settle even when the Planner handoff throws", async () => {
+		let state = await answerable();
+		// The browser path tolerates a throwing callback; the external path
+		// must too. A replay would not re-fire the hook, so a hook exception
+		// must never take the room's notification down with it.
+		let record = state.plan.records.get(state.id);
+		if (!record) throw new Error("card record missing");
+		record.origin = "planner";
+		let fired = 0;
+		let answered = await Questions.answerExternal(
+			state.plan,
+			state.plan.server,
+			state.context.channel.id,
+			{
+				questionId: state.id,
+				revision: state.revision,
+				optionIds: [state.first],
+				resolver: "octocat",
+				idempotencyKey: "d9:answer:3",
+			},
+			() => {
+				fired += 1;
+				throw new Error("handoff failed");
+			},
+		);
+		expect(fired).toBe(1);
+		if (answered.kind !== "answered") {
+			throw new Error(`external answer failed: ${JSON.stringify(answered)}`);
+		}
+		// The room heard the bridge settle despite the throwing hook.
+		expect(
+			state.context.frames.some(frame =>
+				frame.kind === "question:resolved" && frame.id === state.id
+				&& frame.resolver === "octocat"
+			),
+		).toBe(true);
+		// The retry replays without invoking the broken hook again.
+		let replayed = await Questions.answerExternal(
+			state.plan,
+			state.plan.server,
+			state.context.channel.id,
+			{
+				questionId: state.id,
+				revision: state.revision,
+				optionIds: [state.first],
+				resolver: "octocat",
+				idempotencyKey: "d9:answer:3",
+			},
+			() => {
+				fired += 1;
+				throw new Error("handoff failed");
+			},
+		);
+		expect(replayed).toEqual({ kind: "replayed", settled: answered.settled });
+		expect(fired).toBe(1);
+	});
 });

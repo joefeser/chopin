@@ -560,9 +560,16 @@ export async function answerExternal(
 	// A decision the Planner left open to act on later (an `open_decisions`
 	// card, or an ask whose turn has since gone) hands its answer over the
 	// same way the room's own Save does, so the Planner's turn starts no
-	// matter which path settled it.
+	// matter which path settled it. A throwing handoff is logged and the
+	// settle still announces, exactly as the room's own Save tolerates its
+	// callbacks — and a replay would not re-fire the hook, so the room
+	// notification must stay reachable.
 	if (plannerToActOn(outcome.record, claimed.claim.entry)) {
-		onPlannerAnswer?.(decisionId, decisionGeneration(outcome.record));
+		try {
+			onPlannerAnswer?.(decisionId, decisionGeneration(outcome.record));
+		} catch (error) {
+			console.error("[questions] could not announce a saved decision:", error);
+		}
 	}
 	notifyAnswered(plan, server, roomId, {
 		id: decisionId,
