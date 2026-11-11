@@ -17,11 +17,7 @@ import * as Plan from "../plan/service";
 import * as Rooms from "../rooms";
 import { claimImplementation, reportImplementationLifecycle } from "../tasks/plan-graphs";
 import { coordinationSnapshot } from "../tasks/coordination-snapshot";
-import {
-	answerExternal,
-	type Record as QuestionRecord,
-	type StoredOpen,
-} from "../questions/service";
+import { answerExternal, type Record as QuestionRecord } from "../questions/service";
 import { approveExternal } from "../coordination/approve";
 import { StorageError } from "../storage/errors";
 import { implementationLifecycle } from "../tasks/lifecycle";
@@ -129,7 +125,7 @@ function document(value: Document): PublicDocument & { url?: string } {
 	};
 }
 
-/** The stored-state fields `exposed` reads; live plans supply the same subset. */
+/** The stored-state fields `exposed` reads; both callers supply the records. */
 type ExposedState = {
 	source: string;
 	revision: number;
@@ -138,9 +134,7 @@ type ExposedState = {
 	execution?: Run;
 	lifecycle?: Lifecycle;
 	/** Decision records, for the unapproved-context surface beside the graph. */
-	records?: QuestionRecord[];
-	/** Open questionnaires with their shared-draft revisions, as persisted. */
-	openQuestions?: StoredOpen[];
+	records: QuestionRecord[];
 };
 
 function exposed(

@@ -170,9 +170,11 @@ export async function approveExternal(
 		}
 
 		// An open decision, by either status, is not a thing an approval
-		// settles over. The readiness helper checks only "open", so the
-		// explicit pass comes first: a reopened decision must refuse here,
-		// with its own code, rather than slip past as ready.
+		// settles over. The browser build path deliberately allows builds
+		// beside open decisions, and the readiness helpers carry no decision
+		// status at all, so this explicit pass is the only guard of its kind
+		// here: a reopened decision must refuse with its own code, never
+		// slip past as ready.
 		let openDecisions = [...plan.records.values()]
 			.filter(record => isOpenStatus(record.status))
 			.map(record => record.id);
