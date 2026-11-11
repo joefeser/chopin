@@ -19,7 +19,16 @@
  * race.
  */
 
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+	lazy,
+	Suspense,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { createPortal, flushSync } from "react-dom";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
 import { readOnly$ } from "@mdxeditor/editor";
@@ -60,6 +69,7 @@ import { fitsLegibly } from "./diagram-fit";
 import { DiagramSheet, ExpandDiagram, FitDiagram } from "./diagram-sheet";
 import { usePhone } from "../pointer";
 import { LanguageMenu } from "./language-menu";
+import { useNearAtMount, useNearViewport } from "./near-viewport";
 import { registerPreviewSelection } from "./preview-selection";
 import { diffSourceLine, lastLineStart, offsetOfLine } from "./source-offset";
 import { hiddenSides, scrollEdges } from "./tab-edges";
@@ -89,7 +99,9 @@ type Block = {
  */
 const SeeCodeDiagram = lazy(() =>
 	import("@chopin/diagrams/react").then(({ Diagram, DiagramDrawing }) => ({
-		default: function SeeCodeDiagram({ spec, idPrefix }: { spec: unknown; idPrefix: string }) {
+		default: function SeeCodeDiagram(
+			{ spec, idPrefix, near }: { spec: unknown; idPrefix: string; near?: boolean },
+		) {
 			let phone = usePhone();
 			let [expanded, setExpanded] = useState<number>();
 			let opener = useRef<HTMLButtonElement | null>(null);
@@ -98,6 +110,7 @@ const SeeCodeDiagram = lazy(() =>
 					<Diagram
 						spec={spec}
 						idPrefix={idPrefix}
+						near={near}
 						onExpand={phone
 							? (button, width) => {
 								opener.current = button;
@@ -127,6 +140,30 @@ const SeeCodeDiagram = lazy(() =>
 		},
 	}))
 );
+
+/**
+ * A SeeCode diagram's preview. A diagram that mounts a long way from the reader opens on its whole
+ * drawing instead of playing its entrance where nobody is looking, which would rewrite its step
+ * counter and controls inside the editor for each step; one in view plays as it always has.
+ */
+function SeeCodePreview({ spec, idPrefix }: { spec: unknown; idPrefix: string }) {
+	let preview = useRef<HTMLDivElement>(null);
+	let near = useNearAtMount(preview);
+	return (
+		<div
+			ref={preview}
+			className="plan-seecode"
+			contentEditable={false}
+			role="region"
+			aria-label="Diagram preview"
+			tabIndex={0}
+		>
+			<Suspense fallback={null}>
+				<SeeCodeDiagram spec={spec} idPrefix={idPrefix} near={near} />
+			</Suspense>
+		</div>
+	);
+}
 
 const WireframeView = lazy(() =>
 	import("@chopin/diagrams/wireframe/view").then(({ Wireframe }) => ({ default: Wireframe }))
@@ -330,6 +367,10 @@ function Preview(
 
 	let drawn = block.kind === "math" || block.kind === "mermaid" || block.kind === "seecode"
 		|| block.kind === "wireframe";
+	// A Mermaid drawing is made once its block is within a screen of the reader, not when the document
+	// opens. Until then the block shows its source, as it does while a drawing is on its way.
+	let element = editor.getElementByKey(block.key);
+	let near = useNearViewport(element, block.kind === "mermaid");
 
 	useEffect(() => {
 		// A block that stopped being a diagram must stop showing one. Its
@@ -344,6 +385,7 @@ function Preview(
 			setFailed(undefined);
 			return;
 		}
+		if (block.kind === "mermaid" && !near) return;
 		let cancelled = false;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		if (block.kind === "seecode") setSpec(undefined);
@@ -413,7 +455,7 @@ function Preview(
 			cancelled = true;
 			clearTimeout(timer);
 		};
-	}, [drawn, block.key, block.kind, block.inline, block.source]);
+	}, [drawn, near, block.key, block.kind, block.inline, block.source]);
 
 	/*
 	 * Hiding is applied to the DOM, never to the document: the source is still
@@ -464,7 +506,6 @@ function Preview(
 		else delete element.dataset.planEditing;
 	});
 
-	let element = editor.getElementByKey(block.key);
 	let host = element?.querySelector<HTMLElement>("[data-plan-preview]");
 	// A wireframe is chromeless: the caret going in is the way to its source.
 	let chrome = block.kind === "wireframe"
@@ -562,6 +603,24 @@ function sidesOf(element: HTMLElement): ReturnType<typeof hiddenSides> {
 }
 
 /**
+ * The object a block's markup is given to React as. React 19 compares `dangerouslySetInnerHTML` by
+ * identity and sets `innerHTML` again for any other object: the whole drawing is parsed and
+ * replaced, and the editor's mutation observer reads the page's layout, though the markup is the
+ * very string it was. The previews render again on every editor update, so a new object each time
+ * redrew every diagram and formula for every keystroke anywhere in the document.
+ */
+function useInnerHtml(html: string) {
+	return useMemo(() => ({ __html: html }), [html]);
+}
+
+/** A formula, as KaTeX drew it. */
+function Formula({ html, inline }: { html: string; inline: boolean }) {
+	let inner = useInnerHtml(html);
+	if (inline) return <span dangerouslySetInnerHTML={inner} />;
+	return <div contentEditable={false} dangerouslySetInnerHTML={inner} />;
+}
+
+/**
  * A drawn diagram in its own horizontal scroller.
  *
  * Mermaid lays text out at its authored size, so shrinking a wide chart to the
@@ -587,6 +646,16 @@ export function Diagram(
 	let phone = usePhone();
 	let expand = useRef<HTMLButtonElement>(null);
 	let [more, setMore] = useState<ReturnType<typeof hiddenSides>>();
+	let inner = useInnerHtml(html);
+	// The copy's IDs are its own, so its markers and styles never resolve to the drawing in the
+	// document.
+	let sheet = useMemo(
+		() =>
+			expanded
+				? { __html: html.replaceAll(`ace-mermaid-${id}`, `ace-mermaid-${id}-sheet`) }
+				: undefined,
+		[expanded, html, id],
+	);
 
 	useEffect(() => {
 		let element = region.current;
@@ -631,7 +700,7 @@ export function Diagram(
 				// Mermaid draws its labels as HTML. Inside the editable root, a
 				// click would otherwise put a caret in a label and type into it.
 				contentEditable={false}
-				dangerouslySetInnerHTML={{ __html: html }}
+				dangerouslySetInnerHTML={inner}
 			/>
 			{phone && !fit && <ExpandDiagram buttonRef={expand} onExpand={() => setExpanded(true)} />}
 			{!phone && !fit && <FitDiagram fitted={fitted} onToggle={() => setFitted(!fitted)} />}
@@ -643,14 +712,7 @@ export function Diagram(
 						requestAnimationFrame(() => expand.current?.focus());
 					}}
 				>
-					<div
-						className="plan-diagram-sheet-drawing"
-						// The copy's IDs are its own, so its markers and styles
-						// never resolve to the drawing in the document.
-						dangerouslySetInnerHTML={{
-							__html: html.replaceAll(`ace-mermaid-${id}`, `ace-mermaid-${id}-sheet`),
-						}}
-					/>
+					<div className="plan-diagram-sheet-drawing" dangerouslySetInnerHTML={sheet} />
 				</DiagramSheet>
 			)}
 		</>
@@ -726,19 +788,7 @@ function Rendered(
 	}
 	if (block.kind === "seecode") {
 		if (spec === undefined) return null;
-		return (
-			<div
-				className="plan-seecode"
-				contentEditable={false}
-				role="region"
-				aria-label="Diagram preview"
-				tabIndex={0}
-			>
-				<Suspense fallback={null}>
-					<SeeCodeDiagram spec={spec} idPrefix={block.key} />
-				</Suspense>
-			</div>
-		);
+		return <SeeCodePreview spec={spec} idPrefix={block.key} />;
 	}
 
 	if (!html) return null;
@@ -749,8 +799,7 @@ function Rendered(
 	// Inline math is a span inside a sentence, so what wraps it has to be one
 	// too: a block element here would put a formula somebody wrote mid-clause
 	// on a line of its own, and the rest of the sentence after it.
-	if (block.inline) return <span dangerouslySetInnerHTML={{ __html: html }} />;
-	return <div contentEditable={false} dangerouslySetInnerHTML={{ __html: html }} />;
+	return <Formula html={html} inline={block.inline} />;
 }
 
 /** Asked for with the toggle, or opened by going into the block. */

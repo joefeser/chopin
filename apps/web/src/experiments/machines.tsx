@@ -14,7 +14,7 @@ import { InlineNotice } from "@chopin/visuals/inline-notice";
 import { documentMenuKeyAction } from "../document-actions-menu";
 import { IconButton } from "../icon-button";
 import { setFavorite, setShared } from "../machine-choice";
-import { machines as liveMachines, useLiveMachines } from "../machine-summary";
+import { allMachines, machines as liveMachines, useLiveMachines } from "../machine-summary";
 import { useMenuDismissal } from "../menu-dismissal";
 import { MenuItem, MenuSeparator } from "../menu-item";
 import { motionImmediately } from "../motion-input";
@@ -29,12 +29,13 @@ import type { Machine } from "../machine-summary";
 import type { NavigationDialogMotion } from "../navigation-dialog";
 
 /**
- * The signed-in person's machines, asked for again every few seconds while the page is in view.
- * `machines` is undefined until the first answer; `error` is the server's code for the last
- * failed answer, which the page turns into words. The sidebar's count shares the same list.
+ * The signed-in person's machines, and the teammates' machines shared with them, asked for again
+ * every few seconds while the page is in view. `machines` is undefined until the first answer;
+ * `error` is the server's code for the last failed answer, which the page turns into words. The
+ * sidebar's count shares the same list.
  */
 export function useMachines() {
-	let { machines, error } = useLiveMachines(true);
+	let { machines, teammates, error } = useLiveMachines(true);
 	let [recommended, setRecommended] = useState<string | null>(null);
 	useEffect(() => {
 		let abort = new AbortController();
@@ -47,12 +48,10 @@ export function useMachines() {
 	let retry = useCallback(() => void liveMachines.load(), []);
 	/** Set or clear the favorite: starred at once, then as the server says. */
 	let favor = async (id: string, favorite: boolean) => {
-		let mark = (chosen: string | null) =>
-			liveMachines.update(list => list.map(value => ({ ...value, favorite: value.id === chosen })));
-		let before = machines?.find(value => value.favorite)?.id ?? null;
-		mark(favorite ? id : before === id ? null : before);
+		let before = allMachines({ machines, teammates })?.find(value => value.favorite)?.id ?? null;
+		liveMachines.favor(favorite ? id : before === id ? null : before);
 		try {
-			mark(await setFavorite(id, favorite));
+			liveMachines.favor(await setFavorite(id, favorite));
 		} catch {
 			void liveMachines.load();
 		}
@@ -70,7 +69,7 @@ export function useMachines() {
 			void liveMachines.load();
 		}
 	};
-	return { machines, error, recommended, forget, retry, favor, share };
+	return { machines, teammates, error, recommended, forget, retry, favor, share };
 }
 
 /**

@@ -17,6 +17,7 @@ import {
 	buildPhase,
 	buildRefusalCopy,
 	buildTabReady,
+	CONNECT_MACHINE_TO_BUILD,
 	draftRefusalCopy,
 	firstBuildStep,
 	hasBuilt,
@@ -87,8 +88,8 @@ export function useBuildPlan(
 		live,
 		planner,
 		plannerDetached,
+		plannerDisconnected,
 		room,
-		unanswered,
 		userId,
 		wire,
 	}: {
@@ -101,8 +102,9 @@ export function useBuildPlan(
 		planner: boolean;
 		/** `session:planner` reports no Planner client attached (remote harness only). */
 		plannerDetached?: boolean;
+		/** That Planner's connection dropped, and it keeps its work for its return. */
+		plannerDisconnected?: boolean;
 		room: string;
-		unanswered: number;
 		userId?: string;
 		wire?: Wire;
 	},
@@ -227,8 +229,8 @@ export function useBuildPlan(
 			connected,
 			planner,
 			plannerDetached,
+			plannerDisconnected,
 			hasContent,
-			unanswered,
 		})
 		: { kind: "plan" as const, blocked: "A child document is never built" };
 	// A refusal stands until the next press, or until a build of the changes is under way or done.
@@ -283,7 +285,7 @@ export function BuildGlyph(
 	if ("blocked" in look && look.blocked && blockers?.length) {
 		return (
 			<span className="build-glyph" aria-hidden="true">
-				<BuildBlockerGlyph tone={buildBlockerSummary(blockers).tone} />
+				<BuildBlockerGlyph />
 			</span>
 		);
 	}
@@ -448,7 +450,7 @@ export function BuildPlanButton(
 								: "build-capsule build-blocker-capsule"}
 							data-tone={summary.tone}
 						>
-							<BuildBlockerGlyph tone={summary.tone} />
+							<BuildBlockerGlyph />
 							<span className="build-capsule-label">{summary.label}</span>
 						</span>
 					}
@@ -467,10 +469,10 @@ export function BuildPlanButton(
 	}
 	let connectionReason = ("blocked" in look ? look.blocked : undefined)
 		?? ("tip" in look ? look.tip : undefined);
-	if (canEdit && documentURL && connectionReason?.startsWith("Connect a Planner")) {
+	if (canEdit && documentURL && connectionReason?.startsWith(CONNECT_MACHINE_TO_BUILD)) {
 		return (
 			<>
-				<Suspense fallback={<span className="text-sm text-text-secondary">Connect Chopin</span>}>
+				<Suspense fallback={<span className="text-sm text-text-secondary">Connect a machine</span>}>
 					<BuildConnectionPopover documentURL={documentURL} kind="planner" phone={phone} />
 				</Suspense>
 				{live}

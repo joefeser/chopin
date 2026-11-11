@@ -32,7 +32,7 @@
 				1
 			]
 		],
-		"sourceHash": "400b3dbeb9c578e95c94386baaebc06e5903e92f2b5a4671a7a5b486b29c1dc7"
+		"sourceHash": "a08ec14cab5bf5f0d0503c29021fbfabeef1479ee1ac61db53c8b70fe6bb99ca"
 	},
 	{
 		"file": "packages/question/src/react/resolved-actions.tsx",
@@ -436,9 +436,23 @@
 				"props",
 				"unresolved JSX props > UsersIcon > <LineIcon>",
 				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > PaperclipIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > MicIcon > <LineIcon>",
+				1
 			]
 		],
-		"sourceHash": "2c57992b273f5f0ce07a72ccc8b29c3c1e343cd20aefdafe2ed1773e5a749eaa"
+		"sourceHash": "d3058cfabee370f4e290411018e9dfed08186e740009bf05fa3cea81ae66f722"
 	},
 	{
 		"file": "packages/icons/src/warning.tsx",
@@ -516,6 +530,76 @@
 			]
 		],
 		"sourceHash": "399f3d192bc61cae7904baf1d5d814ce711651efec54e691f73e85e72fe4cb5c"
+	},
+	{
+		"file": "packages/icons/src/format.tsx",
+		"reason": "Icon wrapper forwards SVG accessibility, sizing, and caller styling props. Literal style/class call sites are scanned; no ambient rendering code is executed.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > BoldIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ItalicIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > StrikethroughIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > NumberedListIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > BulletedListIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > CodeBlockIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > AtSignIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > SendIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > StopIcon > <LineIcon>",
+				1
+			]
+		],
+		"sourceHash": "c29565c35d8ba447f91d88d2cdc9affd5a1f0256845c0087f159638749122612"
 	},
 	{
 		"file": "packages/visuals/src/ui/mini-bars.tsx",

@@ -113,7 +113,8 @@ and tool vocabulary remain optimized for planning.
   Routing applies to explicit member requests of at most 1,000 characters under
   `copilot-sdk`. Other turns keep their ordinary authoring behavior.
 - One Chopin process may write to a database at a time. Horizontal application
-  scaling and zero-downtime rolling deployment are not supported.
+  scaling is not supported. A deploy can overlap two processes on one database so
+  nobody sees it; see [Deploys nobody can see](docs/zero-downtime-deploys.md).
 
 ---
 
@@ -184,6 +185,11 @@ Compose project.
 
 Set `AGENT=off` to prevent Planner turns and disable the background-job runner.
 This does not disable the `/mcp` endpoint used by external coding agents.
+
+`/research` public web search calls GitHub's Copilot MCP endpoint with the signed-in
+user's App user access token. Whether that endpoint accepts a self-registered App's
+tokens for `web_search` is unconfirmed. If it refuses, the research card and server log
+say so, and [Self-hosting](docs/self-hosting.md#troubleshooting) lists what to check.
 
 ## Collaborate with the Planner
 
@@ -265,6 +271,7 @@ in a local checkout and publishes captured evidence to Chopin's native views.
 | Topic                                      | Document                                                     |
 | ------------------------------------------ | ------------------------------------------------------------ |
 | Deploy and operate an instance             | [Self-hosting](docs/self-hosting.md)                         |
+| Deploy without anyone noticing             | [Deploys nobody can see](docs/zero-downtime-deploys.md)      |
 | Configure identity and access              | [Authentication](docs/authentication.md)                     |
 | Connect an external coding agent           | [Local agent MCP](docs/local-agent-mcp.md)                   |
 | Run a document's Planner in your own agent | [Agent connection](docs/agent-connection.md)                 |

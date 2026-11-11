@@ -25,6 +25,7 @@ import { projectSuggestion, reduceSuggestionEditState } from "./project-suggesti
 import { cardRelation, RelationNote } from "./relation-note";
 import { ResolvedActions } from "./resolved-actions";
 import { TextAnswer } from "./text-answer";
+import { usePendingWork } from "./use-pending-work";
 import type { VisibleSuggestion } from "./project-suggestion";
 import type { Relation } from "../relation";
 
@@ -395,6 +396,8 @@ function AddOption(
 	let label = text?.trim() ?? "";
 	let duplicate = label ? duplicateOf(question, label) : undefined;
 	let ready = !!label && !duplicate && !disabled;
+	// Typed text is kept until the option is added, so a reload would lose it.
+	usePendingWork(!!label || pending !== null);
 
 	useEffect(() => {
 		let target = focus.current;
@@ -836,7 +839,7 @@ function Callout(
 }
 
 const EXPIRED_NOTE =
-	"Nobody answered this question, so the Planner used its best judgement for this decision.";
+	"Nobody answered this question, so Chopin used its best judgement for this decision.";
 
 /**
  * Host input an earlier Chopin closed unanswered; questions no longer expire.

@@ -34,10 +34,72 @@ export type PlannerControl = {
 	planners: PlannerAssignment[];
 	/** Why Chopin stopped asking for a document it no longer lists, by id, when it knows. */
 	stopped?: Record<string, string>;
+	/**
+	 * Listed documents a person asked to have started again now, by id: a backend that exited
+	 * starts without waiting out its backoff, and one that is running is left as it is. Sent even
+	 * when the list is unchanged; a connector from before it runs the same list and ignores it.
+	 */
+	retry?: string[];
 };
 /** The coding agent's name and version from its ACP initialize answer, when it has given one. */
 export const CONNECTOR_AGENT_HEADER = "chopin-connector-agent";
 export const CONNECTOR_AGENT_VERSION_HEADER = "chopin-connector-agent-version";
+
+/**
+ * Whether the connector runs agents inside the operating system's process sandbox, and if it
+ * can't, why and the one command that fixes it. Additive: a server or connector without these
+ * says nothing and is shown as saying nothing.
+ */
+export const CONNECTOR_SANDBOX_HEADER = "chopin-connector-sandbox";
+export const CONNECTOR_SANDBOX_REASON_HEADER = "chopin-connector-sandbox-reason";
+export const CONNECTOR_SANDBOX_FIX_HEADER = "chopin-connector-sandbox-fix";
+
+/** The sandbox each system's agents run in, through MXC, and what people call it. */
+export const SANDBOX_ENGINES = {
+	seatbelt: "macOS Seatbelt",
+	bubblewrap: "Linux bubblewrap",
+	processcontainer: "Windows ProcessContainer",
+} as const;
+export type SandboxEngineName = keyof typeof SANDBOX_ENGINES;
+
+/** What a connector says about its sandbox: the engine it uses, or `none` with why not. */
+export type SandboxReport =
+	| { engine: SandboxEngineName }
+	| { engine: "none"; reason: string; fix?: string };
+
+/** The longest reason and fix a server keeps. */
+export const SANDBOX_TEXT_LIMIT = 600;
+
+/** "Sandboxed (Linux bubblewrap)", or "Not sandboxed: <reason>". */
+export function sandboxSummary(report: SandboxReport): string {
+	return report.engine === "none"
+		? `Not sandboxed: ${report.reason}`
+		: `Sandboxed (${SANDBOX_ENGINES[report.engine]})`;
+}
+
+/** The summary with, for a machine that has none, the one fix after the reason. */
+export function sandboxLabel(report: SandboxReport): string {
+	return report.engine === "none" && report.fix
+		? `${sandboxSummary(report)} Fix: ${report.fix}`
+		: sandboxSummary(report);
+}
+
+/** The report in a request's headers, or undefined when it names none or an engine unknown here. */
+export function parseSandboxReport(
+	header: (name: string) => string | undefined,
+): SandboxReport | undefined {
+	let engine = header(CONNECTOR_SANDBOX_HEADER);
+	if (engine && Object.hasOwn(SANDBOX_ENGINES, engine)) {
+		return { engine: engine as SandboxEngineName };
+	}
+	if (engine !== "none") return undefined;
+	let text = (value: string | undefined) =>
+		value && value.length <= SANDBOX_TEXT_LIMIT && /^[\x20-\x7e]+$/.test(value) ? value : undefined;
+	let reason = text(header(CONNECTOR_SANDBOX_REASON_HEADER));
+	if (!reason) return undefined;
+	let fix = text(header(CONNECTOR_SANDBOX_FIX_HEADER));
+	return { engine: "none", reason, ...(fix ? { fix } : {}) };
+}
 
 /** The server refuses a connector whose protocol it does not support; it must not retry. */
 export const CONNECTOR_UPDATE_REQUIRED = "connector-update-required";

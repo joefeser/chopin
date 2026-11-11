@@ -1,6 +1,14 @@
 /** The shared chat, grouped for reading rather than event delivery. */
 
-import { useCallback, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
+import {
+	lazy,
+	Suspense,
+	useCallback,
+	useEffect,
+	useLayoutEffect,
+	useRef,
+	useSyncExternalStore,
+} from "react";
 import {
 	CloseIcon,
 	MessageForwardIcon,
@@ -14,20 +22,27 @@ import { parseChildDocumentPath } from "@chopin/protocol/document-url";
 import { ChopinMark, Face, openCommentThread, useCardMeta } from "@chopin/editor";
 import { EmptyState } from "@chopin/visuals";
 
+import { deletable, deliveryOf, failureOf } from "./delivery";
+import { DeliveryMark, FailedLine, MessageMenu } from "./message-delivery";
 import { MessageMarkdown } from "./markdown";
 import { MessageMarkers } from "../conversation-plan/markers";
 import type { ExcerptCorrectionAction } from "../conversation-plan/analysis-overview";
 import type { CardLink } from "../conversation-plan/links";
 import { capitalize, displayText, group, workAnnouncement, workPhase } from "./model";
+import { movedOffers, slideOffset } from "./offer-motion";
 import { WorkProgress } from "./work-progress";
 import { clearSourceHighlight, highlightSource } from "../conversation-plan/source";
 import type { ChatDestination } from "../conversation-plan/source";
+
+/** The files of a message are drawn by code that loads when a message first has some. */
+let MessageFiles = lazy(() => import("./attachments/message-files"));
 
 /** Message analysis is a development diagnostic; the browser suite builds it in too. */
 const ANALYSIS = import.meta.env.DEV || import.meta.env.VITE_MESSAGE_ANALYSIS === "on";
 
 import type { Chat, ConversationPlan } from "@chopin/protocol";
 import type { CompletedWork, Group, Message } from "./model";
+import type { OfferPlace } from "./offer-motion";
 import type { CardMetaStore, QuestionnaireStore } from "@chopin/editor";
 import type { Transport } from "@chopin/question/react";
 import { ActivityLine, DecisionPrompt } from "./decision-entry";
@@ -206,11 +221,15 @@ function DecisionSystemEntry(
 let LEADING_MENTION = /^\s*@chopin\b[^\S\n]*/i;
 
 function MessageBody(
-	{ enter, handle, message, onWithdraw, ...markers }: {
+	{ enter, handle, message, onDelete, onRetry, onWithdraw, quietFailures, room, ...markers }: {
 		enter: boolean;
 		handle: string;
 		message: Message;
+		room?: string;
+		onDelete: (id: string) => void;
+		onRetry: (id: string) => void;
 		onWithdraw: (id: string) => void;
+		quietFailures: boolean;
 	} & PlanMarkers,
 ) {
 	let toPlanner = message.to === "planner" && message.author.kind === "member";
@@ -220,7 +239,13 @@ function MessageBody(
 		? message.references?.filter(item => item.start >= lead)
 			.map(item => ({ ...item, start: item.start - lead, end: item.end - lead }))
 		: message.references;
-	if (!toPlanner && !displayText(text) && message.author.kind === "member") text = "Ask Chopin";
+	if (
+		!toPlanner && !displayText(text) && message.author.kind === "member"
+		&& !message.attachments?.length
+	) text = "Ask Chopin";
+	// Only the sender sees how far a message has got, and may take it back until it is delivered.
+	let own = message.author.kind === "member" && message.author.handle === handle;
+	let delivery = own ? deliveryOf(message) : undefined;
 
 	return (
 		<div
@@ -260,9 +285,13 @@ function MessageBody(
 							mention={toPlanner ? "@chopin" : undefined}
 							references={references}
 							source={text}
+							streaming={!!message.streaming}
 						/>
 						{message.streaming && <span className="ml-0.5">▍</span>}
 					</div>
+					{delivery && delivery !== "failed" && <DeliveryMark mark={delivery} />}
+					{delivery && deletable(message) && delivery !== "failed"
+						&& <MessageMenu onDelete={() => onDelete(message.id)} />}
 					{message.queued && message.author.kind === "member" && message.author.handle === handle
 						&& (
 							<button
@@ -277,6 +306,18 @@ function MessageBody(
 							</button>
 						)}
 				</div>
+			)}
+			{!!message.attachments?.length && room && (
+				<Suspense fallback={null}>
+					<MessageFiles channelId={room} files={message.attachments} />
+				</Suspense>
+			)}
+			{delivery === "failed" && !quietFailures && (
+				<FailedLine
+					onDelete={() => onDelete(message.id)}
+					onRetry={() => onRetry(message.id)}
+					reason={failureOf(message)}
+				/>
 			)}
 			{ANALYSIS && !message.queued && markers.onCardLink && markers.onRetryAnalysis && (
 				<MessageMarkers
@@ -296,13 +337,28 @@ function MessageBody(
 }
 
 function MessageGroup(
-	{ enter, entering, group: item, handle, onWithdraw, ...markers }: {
+	{
+		enter,
+		entering,
+		group: item,
+		handle,
+		onDelete,
+		onRetry,
+		onWithdraw,
+		quietFailures,
+		room,
+		...markers
+	}: {
 		/** The whole group entered; `entering` holds messages that joined it later. */
+		room?: string;
 		enter: boolean;
 		entering: ReadonlySet<string>;
 		group: Extract<ResearchTranscriptItem, { kind: "messages" }>;
 		handle: string;
+		onDelete: (id: string) => void;
+		onRetry: (id: string) => void;
 		onWithdraw: (id: string) => void;
+		quietFailures: boolean;
 	} & PlanMarkers,
 ) {
 	let first = item.messages[0]!;
@@ -360,13 +416,19 @@ function MessageGroup(
 						handle={handle}
 						key={message.id}
 						message={message}
+						onDelete={onDelete}
+						onRetry={onRetry}
 						onWithdraw={onWithdraw}
+						quietFailures={quietFailures}
+						room={room}
 					/>
 				))}
 			</div>
 		</div>
 	);
 }
+
+let noop = () => {};
 
 export function Transcript(
 	{
@@ -386,6 +448,9 @@ export function Transcript(
 		onAddExcerpt,
 		onOpenChild,
 		room,
+		onDelete = noop,
+		onRetry = noop,
+		quietFailures = false,
 		onRetryAnalysis,
 		onRetryJob,
 		onWithdraw,
@@ -417,6 +482,12 @@ export function Transcript(
 		handle: string;
 		/** False until the current connection's history has arrived. */
 		live?: boolean;
+		/** Take back a message that was not delivered. */
+		onDelete?: (id: string) => void;
+		/** Send a message that could not be sent again. */
+		onRetry?: (id: string) => void;
+		/** The page's connection banner shows: a message's "Couldn't send" gives way to it, and is back with the connection. */
+		quietFailures?: boolean;
 		onWithdraw: (id: string) => void;
 		queued: Chat.Waiting[];
 		suspendedWork?: CompletedWork;
@@ -429,9 +500,18 @@ export function Transcript(
 	let pinned = useRef(true);
 	// Growth follows only a reader resting on the last line, not one a few pixels up.
 	let flush = useRef(true);
+	// The reader is following the newest line: true from the last time they were near it until they
+	// scroll up. Unlike `pinned` it does not give way when a row grows under them, which lengthens the
+	// distance without their having moved.
+	let follow = useRef(true);
+	let scrolledTo = useRef(0);
+	// The animation frame in which the transcript next moves to its newest line.
+	let pin = useRef(0);
 	let previous = useRef<{ groups: Set<string>; atoms: Set<string>; planned: boolean }>(undefined);
 	let entered = useRef(new Set<string>());
-	let places = useRef(new Map<string, { at: string; top: number }>());
+	let places = useRef(new Map<string, OfferPlace>());
+	let stamp = useRef(0);
+	let offered = useRef(false);
 	let sourceOwner = useRef({});
 	let groups = researchTranscript(
 		group(entries, queued, working, completedWork, suspendedWork),
@@ -532,9 +612,14 @@ export function Transcript(
 				entering.has(message.id) && message.author.kind === "member"
 				&& message.author.handle === handle
 			)
-		) pinned.current = true;
-		// Rows that arrived behind a hidden Chat (the phone tab) are not news when it opens.
-		if (!active || !scroller.current?.getClientRects().length) {
+		) {
+			pinned.current = true;
+			follow.current = true;
+		}
+		// Rows that arrived behind a hidden Chat (the phone tab) are not news when it opens. Only a
+		// row carrying a mark can be told apart from news, so with none the question is not asked: it
+		// forces a layout, and this runs after every render.
+		if (entered.current.size > 0 && (!active || !scroller.current?.getClientRects().length)) {
 			entered.current.clear();
 			for (let row of stack.current?.querySelectorAll("[data-chat-enter]") ?? []) {
 				row.removeAttribute("data-chat-enter");
@@ -547,47 +632,99 @@ export function Transcript(
 		}
 	});
 
+	// Where every offer card is painted now, content-relative so the reader's own scrolling is not
+	// motion. Every read comes before the map is replaced.
+	let stampOffers = useCallback(() => {
+		let element = scroller.current;
+		// A transcript that has never had an offer card has nothing to look for on every resize.
+		if (!element || (!offered.current && places.current.size === 0)) return;
+		let cards = [...element.querySelectorAll<HTMLElement>("[data-chat-placement]")];
+		let top = element.getBoundingClientRect().top;
+		let scrolled = element.scrollTop;
+		places.current = new Map(
+			cards.map(card => [card.dataset.chatOffer!, {
+				at: card.dataset.chatPlacement!,
+				top: card.getBoundingClientRect().top - top + scrolled,
+			}]),
+		);
+	}, []);
+
 	// An offer that follows a newer message slides from where it was last painted rather than
-	// teleporting. Positions are kept content-relative so the reader's own scrolling is not motion.
+	// teleporting. Only a change of which card follows which message can start a slide, so that, and
+	// nothing else, is what this waits for. Where the cards are painted is kept current by the
+	// observer below and by the frame after each change.
+	let offerPlacements = keyed.flatMap(({ item }) =>
+		item.kind === "research"
+			? [
+				`${item.offer.id}@${
+					item.offer.workflow?.placementMessageId ?? item.offer.source.messageId
+				}`,
+			]
+			: []
+	).join("\n");
+	offered.current = offerPlacements !== "";
 	useLayoutEffect(() => {
 		let element = scroller.current;
 		if (!element) return;
-		let scrolled = element.scrollTop;
-		if (active && pinned.current) element.scrollTop = element.scrollHeight;
-		let reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
-		let cards = () => [
-			...element.querySelectorAll<HTMLElement>("[data-chat-placement]"),
-		];
-		let place = (card: HTMLElement) =>
-			card.getBoundingClientRect().top - element.getBoundingClientRect().top;
-		for (let card of cards()) {
-			let last = places.current.get(card.dataset.chatOffer!);
-			if (!last || last.at === card.dataset.chatPlacement || reduce) continue;
-			for (let running of card.getAnimations()) running.cancel();
-			let offset = last.top - scrolled - place(card);
-			if (Math.abs(offset) < 1) continue;
-			let tokens = getComputedStyle(card);
-			let duration = tokens.getPropertyValue("--acc-expand").trim();
-			card.animate([{ transform: `translateY(${offset}px)` }, { transform: "none" }], {
-				duration: parseFloat(duration) * (duration.endsWith("ms") ? 1 : 1000),
-				easing: tokens.getPropertyValue("--motion-move"),
-			});
+		// Which cards follow a different message is read from their attributes, before anything is
+		// measured, and only those cards are measured and moved.
+		let moved = movedOffers(
+			[...element.querySelectorAll<HTMLElement>("[data-chat-placement]")].map(card => ({
+				card,
+				offer: card.dataset.chatOffer!,
+				placement: card.dataset.chatPlacement!,
+			})),
+			places.current,
+		);
+		if (moved.length > 0 && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+			let scrolled = element.scrollTop;
+			if (active && pinned.current) element.scrollTop = element.scrollHeight;
+			// A running slide is cancelled so that the card is measured where it now is. Then every
+			// read for every card, one layout in all, and only then the writes.
+			for (let { card } of moved) for (let running of card.getAnimations()) running.cancel();
+			let top = element.getBoundingClientRect().top;
+			let slides: { card: HTMLElement; offset: number; duration: string; easing: string }[] = [];
+			for (let { card, offer } of moved) {
+				let offset = slideOffset(
+					places.current.get(offer)!,
+					scrolled,
+					card.getBoundingClientRect().top - top,
+				);
+				if (Math.abs(offset) < 1) continue;
+				let tokens = getComputedStyle(card);
+				slides.push({
+					card,
+					offset,
+					duration: tokens.getPropertyValue("--acc-expand").trim(),
+					easing: tokens.getPropertyValue("--motion-move"),
+				});
+			}
+			for (let { card, duration, easing, offset } of slides) {
+				card.animate([{ transform: `translateY(${offset}px)` }, { transform: "none" }], {
+					duration: parseFloat(duration) * (duration.endsWith("ms") ? 1 : 1000),
+					easing,
+				});
+			}
 		}
-		let frame = requestAnimationFrame(() => {
-			places.current = new Map(
-				cards().map(card => [card.dataset.chatOffer!, {
-					at: card.dataset.chatPlacement!,
-					top: place(card) + element.scrollTop,
-				}]),
-			);
-		});
-		return () => cancelAnimationFrame(frame);
-	});
+		stamp.current = requestAnimationFrame(stampOffers);
+		return () => cancelAnimationFrame(stamp.current);
+	}, [active, offerPlacements, stampOffers]);
 
+	// Any render may grow a row, so every render keeps a reader near the bottom on the newest line.
+	// Whether the reader is following is decided here, before the render's growth can move them; the
+	// move waits for the animation frame. `scrollHeight` asks the browser to lay the page out, and
+	// read in the commit that has just changed the transcript it made the layout twice for a render
+	// that came after another in the same task: once for the read, once for the frame. In the frame
+	// one render or twenty make it once, and the frame's own layout serves it.
 	useLayoutEffect(() => {
-		let element = scroller.current;
-		if (active && pinned.current && element) element.scrollTop = element.scrollHeight;
-	}, [active, entries, queued]);
+		if (!active || !follow.current) return;
+		cancelAnimationFrame(pin.current);
+		pin.current = requestAnimationFrame(() => {
+			let element = scroller.current;
+			if (element && follow.current) element.scrollTop = element.scrollHeight;
+		});
+	});
+	useEffect(() => () => cancelAnimationFrame(pin.current), []);
 
 	// Rows grow after they mount (streaming, work details, offer cards) and the pane resizes
 	// (phone keyboard, composer, window); a reader at the bottom stays on the newest line.
@@ -596,11 +733,13 @@ export function Transcript(
 		if (!active || !element || !stack.current) return;
 		let observer = new ResizeObserver(() => {
 			if (flush.current) element.scrollTop = element.scrollHeight;
+			// Layout is current here, so reading the cards forces nothing.
+			stampOffers();
 		});
 		observer.observe(stack.current);
 		observer.observe(element);
 		return () => observer.disconnect();
-	}, [active]);
+	}, [active, stampOffers]);
 
 	useEffect(() => {
 		if (!active || !sourceDestination) return;
@@ -611,6 +750,8 @@ export function Transcript(
 		if (!message) return;
 		pinned.current = false;
 		flush.current = false;
+		follow.current = false;
+		cancelAnimationFrame(pin.current);
 		message.scrollIntoView({ block: "center", inline: "nearest" });
 		let exact = highlightSource(sourceOwner.current, message, sourceDestination.source);
 		message.dataset.sourceExact = String(exact);
@@ -631,6 +772,10 @@ export function Transcript(
 				let distance = element.scrollHeight - element.scrollTop - element.clientHeight;
 				pinned.current = distance < 48;
 				flush.current = distance <= 2;
+				// Near the newest line is following it; moving up leaves it.
+				if (pinned.current) follow.current = true;
+				else if (element.scrollTop < scrolledTo.current) follow.current = false;
+				scrolledTo.current = element.scrollTop;
 			}}
 		>
 			<span
@@ -714,7 +859,11 @@ export function Transcript(
 								group={item}
 								handle={handle}
 								key={key}
+								onDelete={onDelete}
+								onRetry={onRetry}
+								quietFailures={quietFailures}
 								onWithdraw={onWithdraw}
+								room={room}
 								sourceDestination={sourceDestination}
 							/>
 						)
@@ -739,9 +888,8 @@ export function Transcript(
 										: "Talk it through with your collaborators."}
 									{emptyHint.planner && !emptyHint.automatic && (
 										<>
-											{" "}Mention{" "}
-											<strong className="font-medium text-text-secondary">@chopin</strong>{" "}
-											to ask the Planner
+											{" "}Use <strong className="font-medium text-text-secondary">@</strong>{" "}
+											to ask Chopin
 											{emptyHint.references ? ", or " : "."}
 										</>
 									)}

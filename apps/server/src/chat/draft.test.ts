@@ -9,6 +9,7 @@ import { MemoryStorage } from "../storage/memory/adapter";
 import { openPlan } from "../testing/plan";
 import { draftInstruction, draftRefusal } from "../tasks/draft";
 import { implementationGraphs } from "../tasks/plan-graphs";
+import { expectPlain } from "../testing/plain-words";
 import * as Chat from "./service";
 
 import type { Server } from "bun";
@@ -198,10 +199,9 @@ test("a task draft queued behind another turn stays out of the visible queue", a
 test("a task draft is refused without a Planner or when the notice cannot be saved", async () => {
 	let { context, prompts } = await setup();
 	context.config.agent = false;
-	expect(await Chat.draftTasks(context, "ana", 1, "Prepare.", "@ana asked.")).toEqual({
-		ok: false,
-		reason: "the Planner is not running",
-	});
+	let off = await Chat.draftTasks(context, "ana", 1, "Prepare.", "@ana asked.");
+	expect(off).toEqual({ ok: false, reason: "Chopin is not running" });
+	expectPlain(off.ok ? "" : off.reason, "a task draft's refusal");
 	context.config.agent = true;
 	context.persist = async () => {
 		throw new Error("disk full");
@@ -242,10 +242,9 @@ test("a task draft is refused while no remote Planner is attached, and runs once
 test("a task draft takes the same limits as a Chat message, even with the Planner idle", async () => {
 	let { context, prompts } = await setup();
 	context.chat.pendingSends = 20;
-	expect(await Chat.draftTasks(context, "ana", 1, "Prepare.", "@ana asked.")).toEqual({
-		ok: false,
-		reason: "the Planner queue is full",
-	});
+	let full = await Chat.draftTasks(context, "ana", 1, "Prepare.", "@ana asked.");
+	expect(full).toEqual({ ok: false, reason: "the reply queue is full" });
+	expectPlain(full.ok ? "" : full.reason, "a task draft's refusal");
 	context.chat.pendingSends = 0;
 	context.chat.waiting = Array.from({ length: 20 }, (_, index) => ({
 		id: `held-${index}`,
@@ -255,7 +254,7 @@ test("a task draft takes the same limits as a Chat message, even with the Planne
 	expect(context.chat.busy).toBe(false);
 	expect(await Chat.draftTasks(context, "ana", 1, "Prepare.", "@ana asked.")).toEqual({
 		ok: false,
-		reason: "the Planner queue is full",
+		reason: "the reply queue is full",
 	});
 	expect(context.chat.draft).toBeUndefined();
 	expect(context.chat.entries).toEqual([]);
@@ -289,6 +288,40 @@ test("a draft whose turn finishes before its answer is answered as ended", async
 	held.resolve();
 	expect(await asked).toMatchObject({ ok: true, existing: false, state: "ended" });
 	expect(context.chat.draft).toBeUndefined();
+});
+
+test("open decisions neither refuse a draft nor make the Planner wait for them", async () => {
+	let { plan } = await openPlan("# Plan\n\nReady enough to build.\n");
+	expect(draftInstruction(plan, "ana").text).not.toContain("still open");
+	for (let status of ["open", "reopened"] as const) {
+		plan.records.set(status, {
+			id: status,
+			status,
+			origin: "planner",
+			definition: {
+				questions: [{
+					id: "question",
+					header: "Rollout",
+					question: "How should we deploy?",
+					multiple: false,
+					options: [],
+				}],
+			},
+			history: [],
+			optionOrigins: {},
+			editors: [],
+		});
+	}
+	expect(draftRefusal(plan)).toBeUndefined();
+	for (let build of [false, true]) {
+		let { text } = draftInstruction(plan, "ana", build);
+		expect(text).toContain("Decisions that are still open do not hold this graph back");
+		expect(text).toContain("best judgment");
+		expect(text).toContain("never answer or close a decision");
+	}
+	// Every other blocker still refuses it.
+	plan.threads.set("accepted", { id: "accepted", status: "accepted", notes: [] } as never);
+	expect(draftRefusal(plan)).toBe("resolve accepted comments awaiting plan changes first");
 });
 
 test("the draft instruction comes from the plan and refuses an unsettled one", async () => {

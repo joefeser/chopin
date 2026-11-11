@@ -8,8 +8,10 @@ import {
 	parseDocumentPath,
 } from "@chopin/protocol/document-url";
 import { instruction, MENTION } from "@chopin/protocol/address";
+import { offeredCommand } from "@chopin/protocol/commands";
 
 import { isChannelId } from "../channels/id";
+import { documentPointers } from "./pointers";
 import {
 	parseResearchAnswerArtifact,
 	parseResearchEvidenceArtifact,
@@ -77,6 +79,28 @@ export class ChatReferenceError extends Error {
 	}
 }
 
+/**
+ * A command that cannot run, refused in words a person reads in the composer: the Planner does not
+ * offer it, offers none, or the message is not one a command can open.
+ */
+export class ChatCommandError extends ChatReferenceError {
+	constructor(message: string) {
+		super(message);
+		this.name = "ChatCommandError";
+	}
+}
+
+/**
+ * A mention of a part of the document, or a file, that cannot be taken, refused in words a person
+ * reads in the composer: the part is gone, the path is not one, or the files cannot be listed.
+ */
+export class ChatMentionError extends ChatReferenceError {
+	constructor(message: string) {
+		super(message);
+		this.name = "ChatMentionError";
+	}
+}
+
 export type ReferenceServiceOptions = {
 	storage: StorageAdapter;
 	current: (channelId: string) => Promise<DocumentTarget | undefined>;
@@ -90,6 +114,13 @@ export type ResolveReferences = {
 	text: string;
 	destination: Wire.Destination;
 	requests?: Wire.ReferenceRequest[];
+	/** What the document's Planner reports now, which a command request is checked against. */
+	commands?: readonly Wire.CommandOption[];
+	/**
+	 * Whether a path is a file of the document's repository, or undefined when the repository's
+	 * files cannot be listed. Absent where nothing can list them.
+	 */
+	fileExists?: (path: string) => Promise<boolean | undefined>;
 };
 
 export type ResolvedMessage = {
@@ -130,7 +161,20 @@ function safeBoundary(text: string, boundary: number): boolean {
 	return !(previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff);
 }
 
-function token(text: string, start: number, end: number, marker: "#" | "%"): string {
+type Marker = "#" | "%" | "/" | "@";
+
+/** The character a reference's token opens with. */
+function markerOf(kind: Wire.Reference["kind"]): Marker {
+	return kind === "document"
+		? "#"
+		: kind === "research"
+		? "%"
+		: kind === "command"
+		? "/"
+		: "@";
+}
+
+function token(text: string, start: number, end: number, marker: Marker): string {
 	if (
 		!Number.isSafeInteger(start) || !Number.isSafeInteger(end)
 		|| start < 0 || end <= start || end > text.length || end - start > MAX_TOKEN
@@ -170,11 +214,63 @@ function request(value: unknown): Wire.ReferenceRequest {
 		) throw new ChatReferenceError("Research reference is invalid.");
 		return item as Wire.ReferenceRequest;
 	}
+	if (item.kind === "command") {
+		if (
+			!exact(item, ["commandKind", "end", "kind", "name", "start"])
+			|| typeof item.name !== "string" || typeof item.commandKind !== "string"
+		) throw new ChatReferenceError("Command request is invalid.");
+		return item as Wire.ReferenceRequest;
+	}
+	if (item.kind === "heading") {
+		if (!exact(item, ["anchor", "end", "kind", "start"]) || typeof item.anchor !== "string") {
+			throw new ChatReferenceError("Heading reference is invalid.");
+		}
+		return item as Wire.ReferenceRequest;
+	}
+	if (item.kind === "decision") {
+		if (
+			!exact(item, ["decisionId", "end", "kind", "start"]) || typeof item.decisionId !== "string"
+		) {
+			throw new ChatReferenceError("Decision reference is invalid.");
+		}
+		return item as Wire.ReferenceRequest;
+	}
+	if (item.kind === "file") {
+		if (!exact(item, ["end", "kind", "path", "start"]) || typeof item.path !== "string") {
+			throw new ChatReferenceError("File reference is invalid.");
+		}
+		return item as Wire.ReferenceRequest;
+	}
 	throw new ChatReferenceError("Reference kind is invalid.");
+}
+
+/** A path from the repository's root, written plainly: no `..`, `.`, empty part, backslash or control. */
+function plainPath(value: string): boolean {
+	return value.length > 0 && !hasControlCharacter(value) && !value.includes("\\")
+		&& !value.startsWith("/")
+		&& value.split("/").every(part => part !== "" && part !== "." && part !== "..");
 }
 
 function isWord(value: string | undefined): boolean {
 	return value !== undefined && /[A-Za-z0-9_]/.test(value);
+}
+
+/** What a request points at, so two requests for one target are told apart from two targets. */
+function requestTarget(item: Wire.ReferenceRequest): string {
+	switch (item.kind) {
+		case "document":
+			return `document:${item.channelId}`;
+		case "research":
+			return `research:${item.workspaceId}`;
+		case "command":
+			return `command:${item.commandKind}:${item.name}`;
+		case "heading":
+			return `heading:${item.anchor}`;
+		case "decision":
+			return `decision:${item.decisionId}`;
+		case "file":
+			return `file:${item.path}`;
+	}
 }
 
 function requests(text: string, value: unknown): Wire.ReferenceRequest[] {
@@ -192,12 +288,14 @@ function requests(text: string, value: unknown): Wire.ReferenceRequest[] {
 		if (item.start < previousEnd) {
 			throw new ChatReferenceError("References must be sorted and disjoint.");
 		}
-		let marker: "#" | "%" = item.kind === "document" ? "#" : "%";
-		token(text, item.start, item.end, marker);
+		token(text, item.start, item.end, markerOf(item.kind));
 		previousEnd = item.end;
-		let target = `${item.kind}:${item.kind === "document" ? item.channelId : item.workspaceId}`;
+		let target = requestTarget(item);
 		if (targets.has(target)) throw new ChatReferenceError("Reference targets must be unique.");
 		targets.add(target);
+	}
+	if (parsed.filter(item => item.kind === "command").length > 1) {
+		throw new ChatCommandError("A message can run one command.");
 	}
 	return parsed;
 }
@@ -416,6 +514,41 @@ function reference(value: unknown): Wire.Reference {
 		) throw new ChatReferenceError("Stored research reference is invalid.");
 		return item as Wire.ResearchReference;
 	}
+	if (item.kind === "command") {
+		if (
+			!(typeof item.id === "string" && ULID.test(item.id))
+			|| !exact(item, ["commandKind", "end", "id", "kind", "label", "name", "start"])
+			|| !Number.isSafeInteger(item.start) || !Number.isSafeInteger(item.end)
+			|| typeof item.name !== "string" || typeof item.commandKind !== "string"
+			|| item.label !== `/${item.name}`
+			|| hasControlCharacter(item.label) || item.label.length > MAX_TOKEN
+		) throw new ChatReferenceError("Stored command reference is invalid.");
+		return item as unknown as Wire.CommandReference;
+	}
+	if (item.kind === "heading" || item.kind === "decision" || item.kind === "file") {
+		let identity = item.kind === "heading"
+			? "anchor"
+			: item.kind === "decision"
+			? "decisionId"
+			: "path";
+		let fields = ["end", "id", "kind", "label", "start", identity];
+		if (item.kind === "heading") fields.push("level", "line");
+		if (
+			!(typeof item.id === "string" && ULID.test(item.id))
+			|| !exact(item, fields)
+			|| !Number.isSafeInteger(item.start) || !Number.isSafeInteger(item.end)
+			|| typeof item[identity] !== "string"
+			|| typeof item.label !== "string" || !item.label.startsWith("@") || item.label.length < 2
+			|| hasControlCharacter(item.label) || [...item.label].length > MAX_LABEL
+			|| (item.kind === "file" && item.label !== `@${item.path}`)
+			|| (item.kind === "heading" && (
+				!Number.isSafeInteger(item.level) || (item.level as number) < 1
+				|| (item.level as number) > 6
+				|| !Number.isSafeInteger(item.line) || (item.line as number) < 1
+			))
+		) throw new ChatReferenceError("Stored mention is invalid.");
+		return item as unknown as Wire.Reference;
+	}
 	throw new ChatReferenceError("Stored reference kind is invalid.");
 }
 
@@ -436,24 +569,42 @@ export function restoreReferences(
 		if (item.start < previousEnd) {
 			throw new ChatReferenceError("Stored references are not disjoint.");
 		}
-		token(text, item.start, item.end, item.kind === "document" ? "#" : "%");
+		token(text, item.start, item.end, markerOf(item.kind));
 		if (text.slice(item.start, item.end) !== item.label) {
 			throw new ChatReferenceError("Stored reference label does not match its range.");
 		}
 		if (
-			scope
+			scope && (item.kind === "document" || item.kind === "research")
 			&& (item.repositoryId !== scope.repositoryId
 				|| item.kind === "document" && item.channelId === scope.channelId
 				|| item.kind === "research" && item.parentChannelId !== scope.channelId)
 		) throw new ChatReferenceError("Stored reference is outside its parent document.");
 		if (seenIds.has(item.id)) throw new ChatReferenceError("Stored reference id is duplicated.");
 		seenIds.add(item.id);
-		let target = `${item.kind}:${item.kind === "document" ? item.channelId : item.workspaceId}`;
+		let target = storedTarget(item);
 		if (targets.has(target)) throw new ChatReferenceError("Stored reference target is duplicated.");
 		targets.add(target);
 		previousEnd = item.end;
 	}
 	return restored;
+}
+
+/** What a stored reference points at, so one target is never held twice in a message. */
+function storedTarget(item: Wire.Reference): string {
+	switch (item.kind) {
+		case "document":
+			return `document:${item.channelId}`;
+		case "research":
+			return `research:${item.workspaceId}`;
+		case "command":
+			return `command:${item.commandKind}:${item.name}`;
+		case "heading":
+			return `heading:${item.anchor}`;
+		case "decision":
+			return `decision:${item.decisionId}`;
+		case "file":
+			return `file:${item.path}`;
+	}
 }
 
 function state(value: Job.Detail | undefined): Job.State | undefined {
@@ -639,7 +790,82 @@ export class ReferenceService {
 			throw new ChatReferenceError("Current document is unavailable.");
 		}
 
+		// Read once, and only for a message that points at the document's own parts.
+		let pointers: ReturnType<typeof documentPointers> | undefined;
+		let pointersOf = async () =>
+			pointers ??= documentPointers(
+				currentDocument(await this.#current(parent.id), parent.id).source,
+			);
 		let resolved = await Promise.all(requested.map(async item => {
+			if (item.kind === "command") {
+				if (input.destination !== "planner") {
+					throw new ChatCommandError("A command runs in the Planner's turn, so it goes to Chopin.");
+				}
+				if (!input.commands?.length) {
+					throw new ChatCommandError(
+						`The Planner has not reported any commands, so /${item.name} cannot run.`,
+					);
+				}
+				let offered = offeredCommand(input.commands, item.name, item.commandKind);
+				if (!offered) {
+					throw new ChatCommandError(
+						`/${item.name} is not one of the commands the Planner offers.`,
+					);
+				}
+				return {
+					kind: "command" as const,
+					start: item.start,
+					end: item.end,
+					label: `/${offered.name}`,
+					name: offered.name,
+					commandKind: offered.kind,
+				};
+			}
+			if (item.kind === "heading" || item.kind === "decision") {
+				let found = await pointersOf();
+				if (item.kind === "heading") {
+					let heading = found.headings.find(value => value.anchor === item.anchor);
+					if (!heading) throw new ChatMentionError("That heading is no longer in the document.");
+					return {
+						kind: "heading" as const,
+						start: item.start,
+						end: item.end,
+						label: `@${heading.text}`,
+						anchor: heading.anchor,
+						level: heading.level,
+						line: heading.line,
+					};
+				}
+				let decision = found.decisions.find(value => value.id === item.decisionId);
+				if (!decision) throw new ChatMentionError("That Decision is no longer in the document.");
+				return {
+					kind: "decision" as const,
+					start: item.start,
+					end: item.end,
+					label: `@${decision.title || "Decision"}`,
+					decisionId: decision.id,
+				};
+			}
+			if (item.kind === "file") {
+				if (!plainPath(item.path)) throw new ChatReferenceError("File path is invalid.");
+				if ([...`@${item.path}`].length > MAX_LABEL) {
+					throw new ChatMentionError("That path is too long to mention.");
+				}
+				let there = await input.fileExists?.(item.path);
+				if (there === undefined) {
+					throw new ChatMentionError(
+						"This repository's files cannot be listed right now, so a file cannot be mentioned.",
+					);
+				}
+				if (!there) throw new ChatMentionError("That file is not in the repository.");
+				return {
+					kind: "file" as const,
+					start: item.start,
+					end: item.end,
+					label: `@${item.path}`,
+					path: item.path,
+				};
+			}
 			if (item.kind === "document") {
 				if (item.channelId === parent.id) {
 					throw new ChatReferenceError("A document cannot reference itself.");
@@ -693,11 +919,19 @@ export class ReferenceService {
 			ids.add(id);
 			return reference({ id, ...item });
 		});
-		return canonicalMessage(input.text, input.destination, references);
+		let message = canonicalMessage(input.text, input.destination, references);
+		let command = message.references?.find(reference => reference.kind === "command");
+		if (command && command.start !== 0) {
+			throw new ChatCommandError("A command has to open the message.");
+		}
+		return message;
 	}
 
 	async read(input: ReadReference): Promise<unknown> {
 		let stored = reference(input.reference);
+		if (stored.kind !== "document" && stored.kind !== "research") {
+			throw new ChatReferenceError("This reference points at a place and is not read by id.");
+		}
 		let parent = await this.#storage.channels.get(input.channelId);
 		if (
 			!parent || parent.repositoryId !== input.repositoryId

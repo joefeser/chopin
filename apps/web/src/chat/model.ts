@@ -13,8 +13,17 @@ export type Message = {
 	streaming?: boolean;
 	tools?: Chat.Activity[];
 	references?: Chat.Reference[];
+	/** The images and files sent with it. */
+	attachments?: Chat.Attachment[];
 	/** Set only when the sender addressed the Planner. */
 	to?: Chat.Destination;
+	/** How far a message to the machine has got; see `deliveryOf`. */
+	deliveryState?: Chat.DeliveryState;
+	deliveryFailure?: Chat.DeliveryFailure;
+	/** Only this browser has it so far (`delivery.ts`), why it was refused, and whether it can be dropped. */
+	echo?: true;
+	failure?: string;
+	deletable?: boolean;
 	queued: boolean;
 	working?: boolean;
 	workDisconnected?: boolean;

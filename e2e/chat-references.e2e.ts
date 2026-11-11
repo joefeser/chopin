@@ -114,82 +114,22 @@ test("typed references survive Planner send, reload, navigation, and a mobile ch
 		`@chopin Compare #${targetTitle} and %OAuth with [external docs](https://example.com).`;
 	await expectChatValue(draft, expected);
 	let send = chat.getByRole("button", { name: "Send message" });
-	await send.hover();
-	await page.evaluate(() => {
-		let record = { ends: 0, starts: 0 };
-		Reflect.set(window, "__feedbackAlertTransitions", record);
-		document.addEventListener("transitionstart", event => {
-			if (
-				event.target instanceof Element
-				&& event.target.matches('[data-motion-feedback="alert"]')
-			) record.starts++;
-		}, true);
-		document.addEventListener("transitionend", event => {
-			if (
-				event.target instanceof Element
-				&& event.target.matches('[data-motion-feedback="alert"]')
-			) record.ends++;
-		}, true);
-	});
 	await send.click();
+
+	// A refusal is said on the message itself, in a line of its own, never above the composer, and
+	// the composer is free at once.
+	let message = chat.locator("[data-chat-message-id]").filter({ hasText: "Compare" });
+	let failed = message.locator("[data-chat-failed]");
+	await expect(failed).toContainText("Couldn't send.");
+	await expect(failed).toContainText("Unavailable");
+	expect((await failed.textContent())!.length).toBeLessThan(200);
+	await expect(chat.getByRole("alert")).toHaveCount(0);
+	await expectChatValue(draft, "");
+	await expect(draft).toHaveAttribute("contenteditable", "true");
 	await expect(send).toBeDisabled();
-	await expect(draft).toHaveAttribute("contenteditable", "false");
-	await expect(draft).toHaveAttribute("aria-disabled", "true");
-	let error = chat.getByRole("alert");
-	await expect(error).toContainText("Message not sent: Unavailable");
 
-	expect(
-		await error.evaluate(element =>
-			getComputedStyle(element).transitionDuration.split(",").some(duration =>
-				parseFloat(duration) > 0
-			)
-		),
-	).toBe(true);
-	await expect.poll(() =>
-		page.evaluate(() => {
-			let record = Reflect.get(window, "__feedbackAlertTransitions") as {
-				ends: number;
-				starts: number;
-			};
-			return record.starts > 0 && record.ends >= record.starts;
-		})
-	).toBe(true);
-	expect((await error.locator("span").last().textContent())!.length).toBeLessThan(150);
-	await expectChatValue(draft, expected);
-	await expect(draft).toBeFocused();
-	await expect(send).toBeEnabled();
-	let starts = await page.evaluate(() => {
-		let record = Reflect.get(window, "__feedbackAlertTransitions") as { starts: number };
-		return record.starts;
-	});
-	await draft.press("ArrowLeft");
-	await error.evaluate(() =>
-		new Promise<void>(resolve => {
-			requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-		})
-	);
-	await expect(error).toHaveCSS("transition-duration", "0s");
-	expect(
-		await page.evaluate(() => {
-			let record = Reflect.get(window, "__feedbackAlertTransitions") as { starts: number };
-			return record.starts;
-		}),
-	).toBe(starts);
-	await error.hover();
-	await error.evaluate(() =>
-		new Promise<void>(resolve => {
-			requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
-		})
-	);
-	expect(
-		await page.evaluate(() => {
-			let record = Reflect.get(window, "__feedbackAlertTransitions") as { starts: number };
-			return record.starts;
-		}),
-	).toBe(starts);
-	await draft.press("End");
-	await draft.press("Enter");
-
+	// Try again sends it as it was: the same request, so the server takes it once.
+	await message.getByRole("button", { name: "Try again" }).click();
 	await expect.poll(() => sent).toHaveLength(1);
 	expect(attempts).toHaveLength(2);
 	expect(attempts[0]!.requestId).toMatch(
@@ -210,7 +150,6 @@ test("typed references survive Planner send, reload, navigation, and a mobile ch
 		],
 	});
 	await expectChatValue(draft, "");
-	await expect(draft).toBeFocused();
 	let documentLink = chat.getByRole("link", { name: `#${targetTitle}`, exact: true });
 	await expect(documentLink).toHaveAttribute("href", targetPath);
 	await expect(documentLink).not.toHaveAttribute("target", "_blank");
@@ -303,39 +242,75 @@ test("an empty picker leaves arrows and Enter to the editor", async ({ join, pag
 	await expectChatValue(draft, "");
 });
 
-test("a disconnect rejects a pending send without losing its draft", async ({ join, page, seed }) => {
-	await seed("# Pending chat send\n");
-	await page.emulateMedia({ reducedMotion: "reduce" });
+/** Answers each Chat send by closing the connection under it, or by refusing it as a server would. */
+async function answerSends(page: Page, answer: "close" | "refuse") {
+	let connections = { opened: 0 };
 	await page.routeWebSocket("**/ws?**", route => {
+		connections.opened++;
 		let server = route.connectToServer();
 		route.onMessage(message => {
 			if (typeof message === "string") {
-				let frame = JSON.parse(message) as { kind: string };
-				if (frame.kind === "chat:send") return void route.close();
+				let frame = JSON.parse(message) as { kind: string; rid: string };
+				if (frame.kind === "chat:send") {
+					if (answer === "close") return void route.close();
+					return void route.send(JSON.stringify({
+						kind: "session:error",
+						ts: 0,
+						rid: frame.rid,
+						message: "Unavailable",
+					}));
+				}
 			}
 			server.send(message);
 		});
 		server.onMessage(message => route.send(message));
 	});
+	return connections;
+}
+
+test("a disconnect rejects a pending send without losing its draft, and leaves no strip beside the composer", async ({ join, page, seed }) => {
+	await seed("# Pending chat send\n");
+	let connections = await answerSends(page, "close");
 
 	let chat = chatPane(await join("ana"));
 	let draft = chatInput(chat);
 	let value = "Keep this draft through disconnect";
 	await draft.fill(value);
+	let before = connections.opened;
+	await chat.getByRole("button", { name: "Send message" }).click();
+	// The connection comes back, and the connection banner, not the composer, spoke for it.
+	await expect.poll(() => connections.opened).toBeGreaterThan(before);
+	await expect(chat.getByRole("alert")).toHaveCount(0);
+	await expect(chat.getByText(/Message not sent|Check the connection/)).toHaveCount(0);
+	await expectChatValue(draft, value);
+	await expect(draft).toBeFocused();
+});
+
+test("a refused send keeps its draft, and its strip does not animate when motion is reduced", async ({ join, page, seed }) => {
+	await seed("# Refused chat send\n");
+	await page.emulateMedia({ reducedMotion: "reduce" });
+	await answerSends(page, "refuse");
+
+	let chat = chatPane(await join("ana"));
+	let draft = chatInput(chat);
+	let value = "Keep this draft through a refusal";
+	await draft.fill(value);
 	await page.evaluate(() => {
 		let record = { starts: 0 };
-		Reflect.set(window, "__disconnectAlertTransitions", record);
+		Reflect.set(window, "__refusalAlertTransitions", record);
 		document.addEventListener("transitionstart", event => {
 			if (
 				event.target instanceof Element
-				&& event.target.matches('[data-motion-feedback="alert"]')
+				&& event.target.matches('[data-motion-feedback="alert"], [data-error-banner]')
 			) record.starts++;
 		}, true);
 	});
 	await chat.getByRole("button", { name: "Send message" }).click();
 	let error = chat.getByRole("alert");
-	await expect(error).toContainText("Check the connection and try again");
+	await expect(error).toContainText("Message not sent: Unavailable");
 	await expect(error).toHaveCSS("transition-duration", "0s");
+	// Nor does it enter: with reduced motion the banner has no animation either.
+	await expect(error).toHaveCSS("animation-name", "none");
 	await error.evaluate(() =>
 		new Promise<void>(resolve =>
 			requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
@@ -343,7 +318,7 @@ test("a disconnect rejects a pending send without losing its draft", async ({ jo
 	);
 	expect(
 		await page.evaluate(() =>
-			(Reflect.get(window, "__disconnectAlertTransitions") as { starts: number }).starts
+			(Reflect.get(window, "__refusalAlertTransitions") as { starts: number }).starts
 		),
 	).toBe(0);
 	await expectChatValue(draft, value);

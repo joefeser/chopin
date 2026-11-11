@@ -1,4 +1,6 @@
 import { useEffect, useSyncExternalStore } from "react";
+import type { SandboxReport } from "@chopin/protocol/connector";
+import { sameJson } from "./same-json";
 
 /** One of the signed-in person's paired machines, as `GET /api/connector/machines` lists it. */
 export type Machine = {
@@ -16,6 +18,8 @@ export type Machine = {
 	hostname: string | null;
 	platform: { os: string; arch: string } | null;
 	agent: { name: string; version?: string } | null;
+	/** Whether its agents run in the system's process sandbox; null when it said nothing. */
+	sandbox: SandboxReport | null;
 	/** The background service runs it. */
 	service: boolean;
 	/** It runs Planners for documents too. */
@@ -28,9 +32,35 @@ export type Machine = {
 	finishing?: number;
 };
 
-export type MachineSummary = { paired: number; connected: number };
+/**
+ * A teammate's machine shared with the person, as `GET /api/connector/machines` lists it: read-only,
+ * so without what only its owner sees or changes.
+ */
+export type TeammateMachine = {
+	id: string;
+	label: string;
+	teammate: true;
+	owner: { login: string; avatarUrl: string };
+	/** The repositories it serves the person in: ones its owner and the person can both push to. */
+	repositories: string[];
+	connected: boolean;
+	/** When it was paired, in milliseconds: the order machines are listed in, as the person's own are. */
+	createdAt: number;
+	lastSeenAt: number;
+	/** The chopin release it runs, known only while it is connected with a release build. */
+	version: string | null;
+	/** The background service runs it. */
+	service: boolean;
+	/** The person's own favorite, which Automatic prefers; no one else sees whose. */
+	favorite: boolean;
+};
 
-export async function listMachines(signal?: AbortSignal): Promise<Machine[]> {
+/** How many machines the person can run work on, their own and teammates' shared ones, and how many are connected now. */
+export type MachineSummary = { total: number; connected: number };
+
+export async function listMachines(
+	signal?: AbortSignal,
+): Promise<Array<Machine | TeammateMachine>> {
 	let response = await fetch("/api/connector/machines", { signal });
 	let result = await response.json();
 	if (!response.ok) throw new Error(result.error ?? "Could not load your machines");
@@ -39,21 +69,62 @@ export async function listMachines(signal?: AbortSignal): Promise<Machine[]> {
 
 export function summarizeMachines(machines: readonly Pick<Machine, "connected">[]): MachineSummary {
 	return {
-		paired: machines.length,
+		total: machines.length,
 		connected: machines.filter(machine => machine.connected).length,
 	};
 }
 
 /**
- * The Machines entry's accessible name. It repeats the visible paired count whenever that differs
- * from the connected one, so the name always contains what the entry shows.
+ * The order every list of machines is in: newest paired first, then by id, as the server lists
+ * the person's own machines (`created_at DESC, id`). Their own and teammates' use this one.
+ */
+export function newestFirst(
+	a: { id: string; createdAt: number },
+	b: { id: string; createdAt: number },
+): number {
+	return b.createdAt - a.createdAt || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+}
+
+/**
+ * Everything the person can run work on, as one list: their own machines and the teammates'
+ * shared with them, sorted together, newest first; undefined until the first answer.
+ */
+export function allMachines(
+	{ machines, teammates }: Pick<LiveMachines, "machines" | "teammates">,
+): Array<Machine | TeammateMachine> | undefined {
+	return machines && [...machines, ...teammates ?? []].sort(newestFirst);
+}
+
+/** The summary of everything in a live list: the person's own machines and the teammates' machines shared with them. */
+export function summarizeLive(live: LiveMachines): MachineSummary | undefined {
+	let all = allMachines(live);
+	return all && summarizeMachines(all);
+}
+
+/**
+ * The login of a teammate's machine's owner, where another machine in the list has the same
+ * name, to tell them apart; undefined for the person's own and for a name that is alone.
+ */
+export function ownerHint(
+	machine: { label: string; owner?: { login: string } },
+	all: readonly { label: string }[],
+): string | undefined {
+	let name = machine.label.toLowerCase();
+	return machine.owner && all.filter(other => other.label.toLowerCase() === name).length > 1
+		? machine.owner.login
+		: undefined;
+}
+
+/**
+ * The Machines entry's accessible name. It repeats the visible total whenever that differs from
+ * the connected count, so the name always contains what the entry shows.
  */
 export function machinesLabel(summary: MachineSummary | undefined): string {
 	if (!summary) return "Machines";
-	let connected = summary.connected ? `${summary.connected} connected` : "none connected";
-	return summary.paired && summary.paired !== summary.connected
-		? `Machines, ${summary.paired} paired, ${connected}`
-		: `Machines, ${connected}`;
+	if (summary.total && summary.total !== summary.connected) {
+		return `Machines, ${summary.connected || "none"} of ${summary.total} connected`;
+	}
+	return `Machines, ${summary.connected ? `${summary.connected} connected` : "none connected"}`;
 }
 
 /** Whether a machine's chopin release is older than the one this server recommends. */
@@ -75,24 +146,36 @@ export function updateAvailable(version: string | null, recommended: string | nu
 	return current.prerelease && !wanted.prerelease;
 }
 
+export function isTeammate(machine: Machine | TeammateMachine): machine is TeammateMachine {
+	return "teammate" in machine && machine.teammate === true;
+}
+
+function isOwn(machine: Machine | TeammateMachine): machine is Machine {
+	return !isTeammate(machine);
+}
+
 /** How often the list is asked again while a document or the Machines page is in view. */
 export const LIVE_MS = 3000;
 
 export type LiveMachines = {
-	/** Undefined until the first answer. */
+	/** The person's own machines; undefined until the first answer. */
 	machines?: Machine[];
+	/** Teammates' machines shared with them; undefined until the first answer. */
+	teammates?: TeammateMachine[];
 	/** The server's code for the last failed answer; empty after a good one. */
 	error: string;
 };
 
 /**
- * One copy of the person's machine list for the whole page, so the sidebar's count, a document's
- * machine buttons and the Machines page agree. `watch` hears every answer. While anything `poll`s,
- * the list is asked again every `interval` ms the page is visible, so a machine going offline or
- * coming back shows within seconds; otherwise it is asked on `load` alone.
+ * One copy of the person's machine list, and the teammates' machines shared with them, for the
+ * whole page, so the sidebar's count, a document's machine buttons and the Machines page agree.
+ * `watch` hears each answer that says something new: one that repeats what the page holds is
+ * dropped, so a poll every few seconds renders nothing until a machine changes. While anything
+ * `poll`s, the list is asked again every `interval` ms the page is visible, so a machine going
+ * offline or coming back shows within seconds; otherwise it is asked on `load` alone.
  */
 export function machineFeed(
-	list: (signal: AbortSignal) => Promise<Machine[]>,
+	list: (signal: AbortSignal) => Promise<Array<Machine | TeammateMachine>>,
 	{ interval = LIVE_MS, visible = () => true }: { interval?: number; visible?: () => boolean } = {},
 ) {
 	let current: LiveMachines = { error: "" };
@@ -114,12 +197,18 @@ export function machineFeed(
 			abort?.abort();
 			let mine = abort = new AbortController();
 			try {
-				let machines = await list(mine.signal);
+				let listed = await list(mine.signal);
 				if (mine.signal.aborted) return;
-				set({ machines, error: "" });
+				let answer = {
+					machines: listed.filter(isOwn),
+					teammates: listed.filter(isTeammate),
+					error: "",
+				};
+				if (!sameJson(current, answer)) set(answer);
 			} catch (error) {
 				if (mine.signal.aborted) return;
-				set({ ...current, error: error instanceof Error ? error.message : "unavailable" });
+				let message = error instanceof Error ? error.message : "unavailable";
+				if (current.error !== message) set({ ...current, error: message });
 			}
 		}
 		schedule();
@@ -142,9 +231,24 @@ export function machineFeed(
 			};
 		},
 		load,
-		/** Change the list here at once, as when a machine is removed, before the server says. */
+		/** Change the person's own list here at once, as when a machine is removed, before the server says. */
 		update(change: (machines: Machine[]) => Machine[]) {
 			if (current.machines) set({ ...current, machines: change(current.machines) });
+		},
+		/** Mark the person's favorite, one of the machines in either list or none, before the server says. */
+		favor(chosen: string | null) {
+			if (!current.machines) return;
+			set({
+				...current,
+				machines: current.machines.map(machine => ({
+					...machine,
+					favorite: machine.id === chosen,
+				})),
+				teammates: current.teammates?.map(machine => ({
+					...machine,
+					favorite: machine.id === chosen,
+				})),
+			});
 		},
 	};
 }
@@ -174,8 +278,8 @@ export function useLiveMachines(poll = false): LiveMachines {
 	return value;
 }
 
-/** How many machines are paired and connected, live; undefined until loaded or after a failure. */
+/** How many machines the person can run work on, their own and teammates' shared ones, and how many are connected, live; undefined until loaded or after a failure. */
 export function useMachineSummary(): MachineSummary | undefined {
-	let { machines: list, error } = useLiveMachines();
-	return list && !error ? summarizeMachines(list) : undefined;
+	let live = useLiveMachines();
+	return live.error ? undefined : summarizeLive(live);
 }

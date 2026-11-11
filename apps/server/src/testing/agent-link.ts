@@ -1,7 +1,7 @@
 import { createConnection, createServer } from "node:net";
 
 import { AGENT_PATH, AGENT_SUBPROTOCOL } from "@chopin/agent-link";
-import { agentUrl, connectAgent } from "@chopin/agent-link/client";
+import { AgentRefused, agentUrl, connectAgent, WIRE } from "@chopin/agent-link/client";
 
 import { AdmissionDenied } from "../auth/admission";
 import { GitHubError } from "../github/client";
@@ -13,8 +13,8 @@ import { MemoryStorage } from "../storage/memory/adapter";
 import type { AgentClient, AgentHandlers, TurnContext } from "@chopin/agent-link/client";
 import type { AddressInfo, Socket } from "node:net";
 import type { ServerWebSocket } from "bun";
-import type { Repository } from "../github/client";
-import type { AttachmentAuth } from "../harness/remote/attachments";
+import type { Repository, RepositoryPage } from "../github/client";
+import type { AttachmentAuth, PlannerAttachmentOptions } from "../harness/remote/attachments";
 import type { AgentAuth, AgentSocketData } from "../harness/remote/endpoint";
 import type { AgentLink } from "../harness/remote/link";
 import type { MachinePlanners } from "../harness/remote/machine-planners";
@@ -67,7 +67,14 @@ function scoreRepository(owner: string, name: string, push: boolean): Repository
  * account without access, the denied account fails admission, and every other
  * token is rejected by GitHub.
  */
-export async function linkAuth(channelId?: string) {
+/** What a hosted process keeps a browser login with: the encrypted credentials a restart restores. */
+export const LINK_PERSISTENCE = {
+	key: new Uint8Array(32).fill(5),
+	origin: "https://chopin.test",
+	clientId: "link-test",
+};
+
+export async function linkAuth(channelId?: string, options: { persistent?: boolean } = {}) {
 	let storage = new MemoryStorage();
 	let now = new Date();
 	for (let account of Object.values(ACCOUNTS)) {
@@ -76,6 +83,7 @@ export async function linkAuth(channelId?: string) {
 	let clock = { skewMs: 0 };
 	let revocations = new Set<(sessionId: string) => Promise<void>>();
 	let sessions = new Sessions(storage, false, () => new Date(Date.now() + clock.skewMs), {
+		...(options.persistent ? { persistence: LINK_PERSISTENCE } : {}),
 		onRevoked: async id => {
 			for (let revoked of revocations) await revoked(id);
 		},
@@ -140,6 +148,47 @@ export async function linkAuth(channelId?: string) {
 					?? machineAccount(token);
 				return account ? scoreRepository(owner, name, account.push) : undefined;
 			},
+			/** The head of octo-org/score's default branch, which a machine with no checkout clones. */
+			async branchHead() {
+				return "b".repeat(40);
+			},
+			/** The App is installed on octo-org for every account that has a browser login or a machine. */
+			async installations(token: string) {
+				let account = Object.values(ACCOUNTS).find(value => loginToken(value.login) === token)
+					?? machineAccount(token);
+				return {
+					installations: account
+						? [{
+							id: "1",
+							account: { login: "octo-org", avatarUrl: "", type: "organization" },
+							repositorySelection: "all",
+							configureUrl: "https://github.test/octo-org",
+							suspended: false,
+							permissions: {
+								contents: true,
+								pullRequests: true,
+								checks: false,
+								statuses: false,
+								issues: false,
+							},
+						}]
+						: [],
+					nextPage: undefined,
+				};
+			},
+			/** octo-org/score, with the role the account has there. */
+			async installationRepositories(
+				token: string,
+				_installation?: string,
+				_page?: number,
+			): Promise<RepositoryPage> {
+				let account = Object.values(ACCOUNTS).find(value => loginToken(value.login) === token)
+					?? machineAccount(token);
+				return {
+					repositories: account ? [scoreRepository("octo-org", "score", account.push)] : [],
+					nextPage: undefined,
+				};
+			},
 		},
 	};
 	return {
@@ -173,10 +222,15 @@ export function linkServer(
 	graceMs = 2_000,
 	liveness?: { pingEveryMs: number; pongTimeoutMs: number; maxSilenceMs?: number },
 	planners?: MachinePlanners,
+	holds: {
+		attachments?: PlannerAttachments;
+		options?: PlannerAttachmentOptions;
+		catalogChanged?: (channelId: string) => void;
+	} = {},
 ) {
 	let links: AgentLink[] = [];
 	let sockets = new Set<ServerWebSocket<AgentSocketData>>();
-	let attachments = new PlannerAttachments(auth, graceMs);
+	let attachments = holds.attachments ?? new PlannerAttachments(auth, graceMs, holds.options);
 	let server = Bun.serve<AgentSocketData>({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -198,6 +252,7 @@ export function linkServer(
 					timeoutMs,
 					revalidateEveryMs,
 					...liveness,
+					catalogChanged: holds.catalogChanged,
 					register(_channelId, link) {
 						links.push(link);
 						return () => {
@@ -461,6 +516,40 @@ export async function slowUplink(url: string, bytes: number, everyMs: number) {
 }
 
 /**
+ * A TCP proxy in front of a link server whose client side can be cut while its server side stays
+ * open and silent, as a client's network going away looks to a server that has not noticed yet.
+ */
+export async function cuttableProxy(url: string) {
+	let target = new URL(url);
+	let pairs: Array<{ client: Socket; upstream: Socket }> = [];
+	let proxy = createServer(client => {
+		let upstream = createConnection(Number(target.port), target.hostname);
+		pairs.push({ client, upstream });
+		client.on("data", chunk => upstream.write(chunk));
+		upstream.on("data", chunk => {
+			if (!client.destroyed) client.write(chunk);
+		});
+		client.on("error", () => {});
+		upstream.on("error", () => {});
+	});
+	await new Promise<void>(resolve => proxy.listen(0, "127.0.0.1", resolve));
+	return {
+		url: `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`,
+		/** The client's side ends; the server's side stays open and hears nothing more. */
+		cut() {
+			for (let { client } of pairs) client.destroy();
+		},
+		stop() {
+			for (let { client, upstream } of pairs) {
+				client.destroy();
+				upstream.destroy();
+			}
+			proxy.close();
+		},
+	};
+}
+
+/**
  * A TCP proxy to `url` that forwards both ways until `hold()`, then keeps reading
  * what the server sends, one read every `everyMs`, and forwards none of it, as a
  * buffering proxy in front of a client that went quiet. The server's queue keeps
@@ -469,12 +558,14 @@ export async function slowUplink(url: string, bytes: number, everyMs: number) {
 export async function holdingProxy(url: string, everyMs: number) {
 	let target = new URL(url);
 	let sockets: Socket[] = [];
+	let clients: Socket[] = [];
 	let timers: ReturnType<typeof setInterval>[] = [];
 	let held = false;
 	let swallowed = 0;
 	let proxy = createServer(client => {
 		let upstream = createConnection(Number(target.port), target.hostname);
 		sockets.push(client, upstream);
+		clients.push(client);
 		client.on("data", chunk => upstream.write(chunk));
 		upstream.on("data", (chunk: Buffer) => {
 			if (!held) return void client.write(chunk);
@@ -496,6 +587,10 @@ export async function holdingProxy(url: string, everyMs: number) {
 		hold() {
 			held = true;
 			for (let socket of sockets) socket.pause();
+		},
+		/** From now on what the client sends reaches the server again, though the server's bytes still do not. */
+		hearClient() {
+			for (let socket of clients) socket.resume();
 		},
 		/** Server bytes read and dropped since `hold()`. */
 		get swallowed() {
@@ -560,7 +655,48 @@ export function attach(
 	handlers: AgentHandlers,
 	token = MEMBER_TOKEN,
 ): Promise<AgentClient> {
-	return connectAgent({ url, token, document, handlers });
+	// Tests of a drop that ends everything need a client that does not ask to be resumed.
+	return connectAgent({ url, token, document, handlers, resumable: false });
+}
+
+/**
+ * What a backend does after its link was closed because the server is restarting, as
+ * docs/agent-connection.md states the `restart-notice` rule: connect again at once, and retry a
+ * `resume` the server refused with `retry` every 250 ms until the `reconnectWithinMs` the server
+ * announced has passed, then on the backend's own backoff (`fallbackMs`). Any other refusal is
+ * final and thrown. Resolves with the client that got its sessions back.
+ */
+export async function resumeAfterRestart(
+	previous: AgentClient,
+	options: {
+		url: string;
+		document: string;
+		handlers: AgentHandlers;
+		token?: string;
+		fallbackMs?: number;
+	},
+): Promise<{ client: AgentClient; attempts: number }> {
+	let closed = await previous.closed;
+	let resume = await previous.resumption;
+	if (!resume) throw new Error("The link held nothing to resume.");
+	let deadline = Date.now() + (closed.reconnectWithinMs ?? 0);
+	for (let attempts = 1;; attempts++) {
+		try {
+			let client = await connectAgent({
+				url: options.url,
+				token: options.token ?? MEMBER_TOKEN,
+				document: options.document,
+				handlers: options.handlers,
+				resume,
+			});
+			return { client, attempts };
+		} catch (error) {
+			if (error instanceof AgentRefused && !error.retry) throw error;
+			await Bun.sleep(
+				Date.now() < deadline ? WIRE.restartResumeRetryMs : options.fallbackMs ?? 1_000,
+			);
+		}
+	}
 }
 
 /**

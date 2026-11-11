@@ -14,7 +14,49 @@ export type TranscriptAction =
 	| { kind: "delta"; id: string; text: string }
 	| { kind: "tool"; entryId: string; activity: Chat.Activity }
 	| { kind: "turn"; turn?: Chat.Turn }
+	| { kind: "removed"; id: string }
 	| { kind: "responded" };
+
+/**
+ * How the turn in progress is shown. `current` says the transcript is this connection's own, and
+ * `quiet` that a restart is being waited out in silence (`silentRestart`).
+ *
+ * A turn whose transcript is not current is marked disconnected, as soon as the connection that
+ * carried it is gone. A restart is the exception: the page says nothing of it, so the turn goes on
+ * showing as working and a restart that ends in moments leaves no trace.
+ */
+export function progressOf(
+	state: TranscriptState,
+	current: boolean,
+	quiet: boolean,
+): { working?: Chat.Turn; suspended?: CompletedWork } {
+	if (current || quiet) return { working: state.turn };
+	if (!state.turn || !state.activeAnchorId) return {};
+	return {
+		suspended: {
+			turnId: state.turn.id,
+			entryOffset: state.turn.entryOffset,
+			endOffset: state.entries.length,
+			anchorId: state.activeAnchorId,
+		},
+	};
+}
+
+/**
+ * Whether a restart is being waited out in silence, given whether it was a moment ago. It begins
+ * with a loss the server said was a restart (`restarting`) and lasts through the moment after the
+ * connection opens again, until the transcript is current (`current`). It ends once the page speaks
+ * of the connection (`spoken`) and does not begin again for the rest of that outage. A loss that
+ * was not a restart never begins it.
+ */
+export function silentRestart(
+	was: boolean,
+	restarting: boolean,
+	current: boolean,
+	spoken: boolean,
+): boolean {
+	return !current && !spoken && (was || restarting);
+}
 
 export let initialTranscript: TranscriptState = { entries: [], completedWork: [] };
 
@@ -109,6 +151,25 @@ export function transcriptReducer(
 				completedWork: sameTurn
 					? state.completedWork
 					: finish(state, action.turn?.entryOffset ?? state.entries.length),
+			});
+		}
+		case "removed": {
+			let index = state.entries.findIndex(entry => entry.id === action.id);
+			if (index < 0) return state;
+			// Everything after it moves up one place, and the turn and the finished work that
+			// count entries from the start move with it.
+			let earlier = (offset: number) => index < offset ? offset - 1 : offset;
+			return withAnchor({
+				...state,
+				entries: state.entries.filter((_, at) => at !== index),
+				turn: state.turn
+					? { ...state.turn, entryOffset: earlier(state.turn.entryOffset) }
+					: undefined,
+				completedWork: state.completedWork.map(item => ({
+					...item,
+					entryOffset: earlier(item.entryOffset),
+					endOffset: index < item.endOffset ? item.endOffset - 1 : item.endOffset,
+				})),
 			});
 		}
 		case "responded":

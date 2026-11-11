@@ -4,6 +4,17 @@ export { CopyIcon } from "./copy";
 export { DocumentsIcon } from "./documents";
 export { ChopinIcon } from "./filled";
 export {
+	AtSignIcon,
+	BoldIcon,
+	BulletedListIcon,
+	CodeBlockIcon,
+	ItalicIcon,
+	NumberedListIcon,
+	SendIcon,
+	StopIcon,
+	StrikethroughIcon,
+} from "./format";
+export {
 	IssueCompletedIcon,
 	IssueNotPlannedIcon,
 	IssueOpenIcon,
@@ -48,7 +59,9 @@ export {
 	MessageForwardIcon,
 	MessageIcon,
 	MessagePlusIcon,
+	MicIcon,
 	MinusIcon,
+	PaperclipIcon,
 	PauseIcon,
 	PencilIcon,
 	PlayIcon,

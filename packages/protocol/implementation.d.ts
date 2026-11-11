@@ -7,7 +7,13 @@ export type CheckoutContext = { repository: string; branch?: string; commit: str
 export type BuildRequest = {
 	id: string;
 	retryOf?: string;
+	/** The person who asked for the build. */
 	user: string;
+	/**
+	 * Whose machine runs it, when it is not `user`'s: the owner of the teammate's shared machine
+	 * `user` chose for the document. That machine runs the agent with its owner's GitHub account.
+	 */
+	machineOwner?: string;
 	connectionId: string;
 	/** The paired machine it runs on; builds stored before machines were recorded have none. */
 	machineId?: string;
@@ -97,6 +103,8 @@ export type LiveSnapshot = {
 export type BuildMachine = {
 	/** The machine's paired name, as its owner last renamed it. */
 	label: string;
+	/** Whose machine it is, when it is a teammate's shared machine the build's starter chose. */
+	owner?: string;
 	/** It ran as a background service rather than an interactive session. */
 	service: boolean;
 	/**
@@ -141,7 +149,10 @@ export type ImplementationSnapshot = {
 	blockers: string[];
 	/** Required investigations, with concrete reasons; completion still needs evidence review. */
 	buildInvestigations?: Array<{ id: string; brief: string; reason: string }>;
-	/** No unresolved decisions, accepted changes, or required investigations. */
+	/**
+	 * No accepted changes awaiting plan changes and no required investigations. Open decisions never
+	 * make it false.
+	 */
 	buildReady: boolean;
 	/** `build` is queued on a connection that starts it once its running prototype finishes. */
 	waitingForPrototype?: true;
@@ -152,7 +163,7 @@ export type ImplementationSnapshot = {
 	waitingForDocument?: { title?: string };
 	/**
 	 * A one-click Build plan is waiting for its tasks: `by` (a user id) pressed it at `revision`.
-	 * It holds through open decisions and reloads until the build starts or is cancelled.
+	 * It survives a reload, and any blocker that remains, until the build starts or is cancelled.
 	 */
 	buildRequested?: { by: string; revision: number };
 	lifecycle: Pick<Plan.Lifecycle, "execution" | "activity" | "history">;

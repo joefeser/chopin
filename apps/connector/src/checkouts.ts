@@ -1,13 +1,33 @@
 import { existsSync } from "node:fs";
 import { mkdir, readdir, realpath, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { redacted } from "./connection";
+import { removePlantedRedirects } from "./git-directories";
+import { gitAsync, gitSync } from "./git-host";
 import { gitCredentials, type GitHubToken } from "./github-token";
+import { CLONES } from "./sandbox-policy";
 import { segment, workspace } from "./workspace";
 
-const exec = promisify(execFile);
+/** What git says when it reached GitHub over SSH and had nothing to authenticate with. */
+const SSH_FAILURE =
+	/Could not read from remote repository|Permission denied \(publickey\)|Host key verification failed/i;
+
+/**
+ * Why a failed git command went to SSH, when it did: the person's Git configuration rewrites the
+ * repository's https URL (`url.<base>.insteadOf`), and the service has no SSH agent. Asked of
+ * this process's Git configuration as it is, without the rules `gitCredentials` adds, and only for
+ * failures that look like SSH. Undefined when git's own message says it.
+ */
+export function sshCause(detail: string, repository: string): string | undefined {
+	if (!SSH_FAILURE.test(detail)) return undefined;
+	let url = `https://github.com/${repository}.git`;
+	let asked = gitSync(["ls-remote", "--get-url", url], { timeout: 10_000 });
+	let effective = asked.status === 0 ? asked.stdout.trim() : "";
+	if (!effective || effective.startsWith("https://")) return undefined;
+	return `${detail} Git rewrites ${url} to ${effective} (a url.<base>.insteadOf rule in its configuration), `
+		+ "and this service has no SSH agent or key to use it with. Remove that rule, or clone the "
+		+ "repository over https and give it with --checkout";
+}
 
 /** The checkouts `chopin connect` registered, by GitHub repository (`owner/name`) to their root. */
 export type Registered = Record<string, string>;
@@ -44,7 +64,7 @@ export async function registerCheckouts(paths: string[]): Promise<Registered> {
 /** Where an on-demand clone of `repository` lives: `<base>/repos/<owner>/<repo>`, lowercase. */
 export function clonePath(directory: string, repository: string) {
 	let [owner = "", name = ""] = repository.toLowerCase().split("/");
-	return join(directory, "repos", segment(owner), segment(name));
+	return join(directory, CLONES, segment(owner), segment(name));
 }
 
 /** The clones in `<base>/repos/<owner>/<repo>`, with their repository as their folders name it. */
@@ -54,7 +74,7 @@ export async function clones(directory: string) {
 		(await readdir(path, { withFileTypes: true }).catch(() => []))
 			.filter(entry => entry.isDirectory() && !entry.name.endsWith(".tmp"))
 			.map(entry => entry.name).sort();
-	let base = join(directory, "repos");
+	let base = join(directory, CLONES);
 	for (let owner of await folders(base)) {
 		for (let name of await folders(join(base, owner))) {
 			let path = join(base, owner, name);
@@ -113,10 +133,10 @@ export function checkouts(options: { directory: string; registered: Registered }
 			return locked(path, async () => {
 				let github = await token?.();
 				if (!github) throw new Error(noCheckout(repository));
-				let env = gitCredentials(github.file);
+				let env = gitCredentials(github.file, repository);
 				let run = async (args: string[], cwd?: string) => {
 					try {
-						await exec("git", args, {
+						await gitAsync(args, {
 							...(cwd ? { cwd } : {}),
 							env: { ...process.env, ...env, GIT_TERMINAL_PROMPT: "0" },
 							timeout: 30 * 60_000,
@@ -129,6 +149,7 @@ export function checkouts(options: { directory: string; registered: Registered }
 							lines.find(line => line.startsWith("fatal:")) ?? (lines.at(-1)
 								|| (error as Error).message),
 						);
+						detail = sshCause(detail, repository) ?? detail;
 						throw new Error(
 							`Couldn't ${args[0] === "clone" ? "clone" : "fetch"} ${repository} (${detail}).`,
 							{ cause: error },
@@ -136,6 +157,8 @@ export function checkouts(options: { directory: string; registered: Registered }
 					}
 				};
 				if (existsSync(join(path, ".git"))) {
+					// Runs of this clone's worktrees ran agents that could write its git directory.
+					removePlantedRedirects(path);
 					await run(["fetch", "--quiet", "--prune", "origin"], path);
 				} else {
 					await mkdir(dirname(path), { recursive: true, mode: 0o700 });

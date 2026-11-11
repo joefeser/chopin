@@ -28,7 +28,44 @@ export const AGENT_FEATURES = {
 	 * the turn's host tools include `upload_plan_image`, which stores an image the Planner made.
 	 */
 	decisionOptionPreviews: "decision-option-previews",
+	/**
+	 * After a link drops unexpectedly, the server keeps the sessions that have a live or paused
+	 * run, an open question or an answer the client has not acknowledged, however long the client
+	 * stays away, and the same account's next link takes them back with `resume`. The client
+	 * acknowledges each `input-result` with `input-received`. Without the feature a closed link
+	 * ends everything it held.
+	 */
+	resumableSessions: "resumable-sessions",
+	/**
+	 * Before the server closes a link with 1012 because it is restarting, it sends `restarting`
+	 * with `reconnectWithinMs`, the time a new process is expected to take over in. A client that
+	 * offers the feature connects again at once on that close, and retries a `resume` refused
+	 * with `retry` every 250 ms until `reconnectWithinMs` has passed, then returns to its own
+	 * backoff. A `resume` that comes inside that time before the server can decide is held and
+	 * answered when it can, not refused, so a `retry` refusal is one the server gives after it.
+	 * Without the feature the server only closes with 1012.
+	 */
+	restartNotice: "restart-notice",
+	/**
+	 * The client may report what it offers in one `capabilities` message: the models it can run,
+	 * each with the thinking levels it supports, and room for commands. A person's choice of model
+	 * and thinking level then reaches the client in the turn's `model` and `thinkingLevel`. Without
+	 * the feature, or without a report, a document's composer offers no choice and a turn carries
+	 * only the deployment's own `model`, as before.
+	 */
+	capabilityCatalog: "capability-catalog",
+	/**
+	 * A turn carries the images and text files a person sent with the message that began it, in
+	 * `attachments`, each with its bytes as base64 (at most `MAX_LINK_ATTACHMENT_BYTES` in all). A
+	 * client that does not ask never sees the field: its turn carries the text files written into
+	 * the prompt, and a note in words for an image it cannot be given. Images are only ever sent
+	 * where the model the turn names reports `image` among its `inputTypes`.
+	 */
+	attachments: "attachments",
 } as const;
+
+/** How often a client that offered `restart-notice` retries a `resume` refused with `retry`. */
+export const RESTART_RESUME_RETRY_MS = 250;
 
 /** The upgrade request header naming the features a client asks for, comma-separated. */
 export const AGENT_FEATURES_HEADER = "chopin-agent-features";
@@ -36,11 +73,19 @@ export const AGENT_FEATURES_HEADER = "chopin-agent-features";
 /** The largest message either side may send, in UTF-8 bytes. */
 export const MAX_LINK_MESSAGE_BYTES = 2 * 1024 * 1024;
 
+/**
+ * The most a turn's images and files may total, in bytes before base64: they travel inside the
+ * turn's own message, which the cap above bounds, with room left for the prompt and the tools.
+ */
+export const MAX_LINK_ATTACHMENT_BYTES = 1024 * 1024;
+
 /** WebSocket close codes a Chopin server uses to end a link. */
 export const LINK_CLOSE = {
 	detached: 1000,
 	/** The client answered no protocol ping for the server's timeout. */
 	unresponsive: 1001,
+	/** The server is restarting; the client connects again at once. */
+	restarting: 1012,
 	malformed: 1008,
 	tooLarge: 1009,
 	failed: 1011,
@@ -62,6 +107,9 @@ const MAX_RUNS = 64;
 const MAX_STAGES = 64;
 const MAX_QUESTIONS = 16;
 const MAX_OPTIONS = 32;
+const MAX_TURN_ATTACHMENTS = 20;
+/** The most questions one link keeps open at a time. */
+const MAX_OPEN_REQUESTS = 16;
 
 const id = z.string().min(1).max(MAX_ID);
 const name = z.string().min(1).max(MAX_NAME);
@@ -96,7 +144,8 @@ const usage = z.strictObject({
  * Chopin's host tools are called with `host-tool-call` instead.
  */
 export const streamPartSchema = z.discriminatedUnion("type", [
-	z.strictObject({ type: z.literal("stream-start"), modelId: name.optional() }),
+	// The model a client ran is one its own catalog may have named, so it is bounded by the frame only.
+	z.strictObject({ type: z.literal("stream-start"), modelId: z.string().optional() }),
 	z.strictObject({ type: z.literal("text-start"), id }),
 	z.strictObject({ type: z.literal("text-delta"), id, delta: text }),
 	z.strictObject({ type: z.literal("text-end"), id }),
@@ -135,8 +184,119 @@ export const streamPartSchema = z.discriminatedUnion("type", [
 	z.strictObject({ type: z.literal("error"), error: note }),
 ]);
 
+/**
+ * One image or text file of a turn. `kind` is what its bytes are, `mediaType` the type it was kept
+ * under (a text file is always `text/plain`), `size` its length in bytes and `data` those bytes as
+ * base64, never more than `MAX_LINK_ATTACHMENT_BYTES` across a turn.
+ */
+export const turnAttachment = z.strictObject({
+	id,
+	name: z.string().min(1).max(255),
+	kind: z.enum(["image", "file"]),
+	mediaType: z.string().min(1).max(MAX_NAME),
+	size: count,
+	data: z.string().max(MAX_LINK_MESSAGE_BYTES),
+});
+
 /** A plain identifier: no spaces, quotes, `:` or `=`, so it cannot hold an assignment. */
 const identifier = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+
+/**
+ * One model a client can run. `id` is the exact string the turn's `model` carries when a person
+ * chooses it, kept as the client wrote it. `thinkingLevels` lists the levels the model supports in
+ * the order to show them, as strings the client defines (Atomic's are `off`, `minimal`, `low`,
+ * `medium`, `high`, `xhigh` and `max`); absent or empty means the model has no reasoning control.
+ * `provider` groups the model in the picker.
+ *
+ * A catalog is read as it was written. Nothing says how a model, a level or a command is spelled
+ * or how long its text runs, so a value of the right type is never refused and never changed: an
+ * odd entry cannot close the link, whatever it holds. Any number of entries is taken, and a field
+ * this version has no use for is ignored and kept, so a client can report more than Chopin shows.
+ * Only the frame's own limit bounds a catalog. What nobody could be asked for, a model with an
+ * empty `id` or an empty level, is read like any string and left out afterwards (`usableCatalog`).
+ */
+export const catalogModelSchema = z.looseObject({
+	id: z.string(),
+	name: z.string(),
+	provider: z.looseObject({ id: z.string(), name: z.string().optional() }).optional(),
+	description: z.string().optional(),
+	thinkingLevels: z.array(z.string()).optional(),
+	/**
+	 * What the model reads: `text`, and `image` where it reads images. Absent reads as text only,
+	 * so an image is never sent with a turn to a model that has not said it reads them.
+	 */
+	inputTypes: z.array(z.string()).optional(),
+});
+
+/**
+ * One command a client offers, such as a skill, a prompt template or a workflow. `kind` says
+ * which, as a string the client defines. Chopin keeps the entries it is given and shows none of
+ * them yet.
+ */
+export const catalogCommandSchema = z.looseObject({
+	name: z.string(),
+	description: z.string().optional(),
+	kind: z.string(),
+});
+
+/**
+ * What a client offers, as one value that grows by adding fields rather than messages. A report
+ * replaces the earlier one whole; a field it leaves out is offered no longer. `models.default` is
+ * the model, and the thinking level, the client uses when a turn names none.
+ */
+export const capabilityCatalogSchema = z.looseObject({
+	models: z.looseObject({
+		available: z.array(catalogModelSchema),
+		default: z.looseObject({ id: z.string(), thinkingLevel: z.string().optional() }).optional(),
+	}).optional(),
+	commands: z.array(catalogCommandSchema).optional(),
+});
+
+/**
+ * What Chopin offers of a client's catalog, and what it left out, each as words for a log. A turn
+ * names a model by its `id`, so a model whose `id` is empty is malformed: its entry is skipped,
+ * and no other is touched. A thinking level that is empty cannot be chosen either, so it is
+ * dropped from its model's levels (a model left with none has no reasoning control), and a
+ * default that names no model, or an empty level for the default, is dropped. That an empty id or
+ * level can then never be chosen is the whole of the rule: nothing else about an entry is judged,
+ * the schema still reads every string, and a catalog with nothing to skip comes back as it was.
+ */
+export function usableCatalog(
+	catalog: CapabilityCatalog,
+): { catalog: CapabilityCatalog; skipped: string[] } {
+	let models = catalog.models;
+	if (!models) return { catalog, skipped: [] };
+	let skipped: string[] = [];
+	let available: CatalogModel[] = [];
+	for (let model of models.available) {
+		if (model.id === "") {
+			skipped.push(`the model named ${JSON.stringify(model.name)} has no id`);
+		} else if (model.thinkingLevels?.includes("")) {
+			skipped.push(`${model.id} lists an empty thinking level`);
+			available.push({
+				...model,
+				thinkingLevels: model.thinkingLevels.filter(level => level !== ""),
+			});
+		} else available.push(model);
+	}
+	let { default: fallback, ...rest } = models;
+	if (fallback?.id === "") {
+		skipped.push("the default model has no id");
+		fallback = undefined;
+	} else if (fallback?.thinkingLevel === "") {
+		skipped.push("the default thinking level is empty");
+		let { thinkingLevel: _, ...withoutLevel } = fallback;
+		fallback = withoutLevel;
+	}
+	if (skipped.length === 0) return { catalog, skipped };
+	return {
+		catalog: {
+			...catalog,
+			models: { ...rest, available, ...(fallback ? { default: fallback } : {}) },
+		},
+		skipped,
+	};
+}
 
 /**
  * The structured error a failed `tool-result` may carry as its `result`, either
@@ -233,6 +393,12 @@ const checkout = z.strictObject({
 	head: z.string().max(MAX_ID).optional(),
 });
 
+/** The sessions a link holds, each with the `input-request` ids still waiting on an answer. */
+const heldSessions = z.array(z.strictObject({
+	session: id,
+	requests: z.array(id).max(MAX_OPEN_REQUESTS),
+})).max(MAX_RUNS);
+
 /** Every message a client sends. */
 export const clientMessageSchema = z.discriminatedUnion("type", [
 	z.strictObject({
@@ -280,6 +446,12 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
 		input: inputSchema,
 	}),
 	z.strictObject({ type: z.literal("input-cancel"), request: id }),
+	/**
+	 * With `resumable-sessions`: the client has settled the question `request`, whether or not
+	 * this is the first time it hears its `input-result`. The server keeps a result, and the
+	 * session that waits to deliver it, until this arrives.
+	 */
+	z.strictObject({ type: z.literal("input-received"), request: id }),
 	z.strictObject({
 		type: z.literal("runs"),
 		session: id,
@@ -294,6 +466,16 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
 		message: note.optional(),
 	}),
 	z.strictObject({ type: z.literal("detach") }),
+	/**
+	 * With `capability-catalog`: what the client offers now, sent right after `attached` (and
+	 * after any `resume`, which stays the first message) and again whenever it changes.
+	 */
+	z.strictObject({ type: z.literal("capabilities"), catalog: capabilityCatalogSchema }),
+	/**
+	 * With `resumable-sessions`, the first message after `attached`: the sessions this client
+	 * still holds from a link that dropped, and the questions each still waits on.
+	 */
+	z.strictObject({ type: z.literal("resume"), sessions: heldSessions }),
 ]);
 
 const toolSpec = z.strictObject({
@@ -312,7 +494,11 @@ const responseFormat = z.discriminatedUnion("type", [
 	}),
 ]);
 
-/** Why a server refused an attach. */
+/**
+ * Why a server refused an attach. Only `unavailable` is transient, and the refusal says so with
+ * `retry`; every other code is a decision, including `planner-attached`, whoever holds the
+ * document.
+ */
 export const refusalCodeSchema = z.enum([
 	"unsupported-version",
 	"repository-forbidden",
@@ -337,7 +523,22 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 		}),
 		features: z.array(identifier).max(16).optional(),
 	}),
-	z.strictObject({ type: z.literal("refused"), code: refusalCodeSchema, message: note }),
+	z.strictObject({
+		type: z.literal("refused"),
+		code: refusalCodeSchema,
+		message: note,
+		/**
+		 * True only when Chopin could not decide (`unavailable`: a check of the document or the
+		 * account failed): a client that resumes keeps what it holds and tries again with the same
+		 * `resume`. Absent on every refusal that is a decision about this account or document.
+		 */
+		retry: z.literal(true).optional(),
+	}),
+	z.strictObject({
+		type: z.literal("restarting"),
+		/** The longest a new process is expected to take to take over, in milliseconds. */
+		reconnectWithinMs: z.number().int().nonnegative(),
+	}),
 	z.strictObject({
 		type: z.literal("error"),
 		code: z.enum(["malformed-message", "message-too-large", "protocol"]),
@@ -354,7 +555,22 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 		turn: id,
 		prompt: text,
 		instructions: text.optional(),
-		model: z.string().max(MAX_NOTE).optional(),
+		/**
+		 * The model's id as the client's catalog (or the operator's `MODEL`) spelled it, bounded by
+		 * the frame only, so a model a catalog may list can be chosen.
+		 */
+		model: z.string().optional(),
+		/**
+		 * With `capability-catalog`: the thinking level a person chose for the document, one of the
+		 * levels the client reported for `model` (or for its default model when `model` is absent),
+		 * as it spelled it. Absent when nobody chose one: the client uses its own.
+		 */
+		thinkingLevel: z.string().optional(),
+		/**
+		 * With `attachments`: the images and files sent with the message that began the turn, in the
+		 * order they were sent. Absent when it had none, and always for a client that did not ask.
+		 */
+		attachments: z.array(turnAttachment).max(MAX_TURN_ATTACHMENTS).optional(),
 		tools: z.array(toolSpec).max(MAX_TOOLS),
 		responseFormat: responseFormat.optional(),
 	}),
@@ -377,8 +593,18 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 	z.strictObject({ type: z.literal("stop"), request: id, session: id, run: id.optional() }),
 	z.strictObject({ type: z.literal("resume"), request: id, session: id, run: id.optional() }),
 	z.strictObject({ type: z.literal("destroy"), session: id }),
+	/**
+	 * The answer to `resume`: the sessions the server kept and gave back, each with the questions
+	 * it still holds, open or answered meanwhile. Anything the client held that is not listed has
+	 * ended.
+	 */
+	z.strictObject({ type: z.literal("resumed"), sessions: heldSessions }),
 ]);
 
+export type CapabilityCatalog = z.infer<typeof capabilityCatalogSchema>;
+export type CatalogModel = z.infer<typeof catalogModelSchema>;
+export type TurnAttachment = z.infer<typeof turnAttachment>;
+export type CatalogCommand = z.infer<typeof catalogCommandSchema>;
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 export type ServerMessage = z.infer<typeof serverMessageSchema>;
 export type StreamPart = z.infer<typeof streamPartSchema>;

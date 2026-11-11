@@ -48,6 +48,7 @@ import * as edit from "./edit";
 import * as room from "./room";
 import * as Chat from "../chat/service";
 import { restoreReferences } from "../chat/references";
+import { entriesForStorage, mergePointers } from "../chat/stored-pointers";
 import * as Comments from "../comments/service";
 import * as Questions from "../questions/service";
 import { sidecarUnansweredDecisions } from "../questions/unanswered";
@@ -69,6 +70,8 @@ import type { Brief, CreationOrigin } from "../mcp";
 import { researchProjectionAllowed, ResearchProjectionConflict } from "../storage/model";
 import type {
 	ChannelRecord,
+	DeferredTurnChange,
+	DeferredTurnOutcome,
 	InitialChannel,
 	JsonValue,
 	Lease,
@@ -129,6 +132,16 @@ type Meter = {
 export type Backend = {
 	/** Product documents enforce a leading title; standalone domain rooms remain generic. */
 	documentTitles?: boolean;
+	/**
+	 * Whether a rebuilt remote Planner hold still keeps the document's workflow runs for its client,
+	 * so the cards Chat stored stay live when it opens, marked disconnected once its client is away.
+	 */
+	plannerKeepsRuns?: (channelId: string) => "live" | "down" | undefined;
+	/**
+	 * A document's room has opened: a rebuilt remote Planner hold waits again, for its client, for
+	 * the answers to the questions it left open there.
+	 */
+	rejoinPlannerQuestions?: (plan: Plan, server: Server<SocketData>) => void;
 	storage: StorageAdapter;
 	lease: () => Lease;
 	fatal: (error: unknown) => void;
@@ -215,6 +228,8 @@ type Persistence = Backend & {
 	committedSource: string;
 	committedDocument: Uint8Array;
 	committedSidecar: JsonValue;
+	/** The revision and sequence this process last wrote a checkpoint for. */
+	checkpointed?: { revision: number; sequence: number };
 	closing: boolean;
 	/** The member whose batch is committing, for derived work that follows their edit. */
 	editor?: string;
@@ -388,7 +403,7 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 		questions: [...plan.records.values()],
 		openQuestions: Questions.dump(plan.questions),
 		threads: [...plan.threads.values()],
-		transcript: chat.entries,
+		transcript: entriesForStorage(chat.entries),
 		conversationPlan: plan.conversationPlan,
 		...(plan.conversationPlanRetries.length
 			? { conversationPlanRetries: plan.conversationPlanRetries }
@@ -693,6 +708,7 @@ function restoredState(
 			|| Array.isArray(entry.author)
 		) throw new Error("hosted channel has an invalid transcript entry");
 		validateNotice(entry, savedMessages);
+		mergePointers(entry);
 		if (Object.hasOwn(entry, "references")) {
 			let author = entry.author as Record<string, JsonValue>;
 			if (author.kind !== "member") {
@@ -1006,14 +1022,16 @@ async function commitHosted(
 	allowArchived = false,
 	researchProjections: ResearchProjectionChange[] = [],
 	notifyDocumentPersisted = true,
-): Promise<void> {
+	deferredTurns: DeferredTurnChange[] = [],
+): Promise<DeferredTurnOutcome[] | undefined> {
 	let durable = plan.persistence;
 	if (
 		!update && captured.sidecarText === durable.lastSidecar
 		&& (captured.title === undefined || captured.title === durable.committedTitle)
+		&& deferredTurns.length === 0
 	) {
 		scheduleCheckpoint(plan);
-		return;
+		return undefined;
 	}
 	try {
 		let previousSource = durable.committedSource;
@@ -1033,6 +1051,7 @@ async function commitHosted(
 			now: new Date(),
 			...(researchProjections.length > 0 ? { researchProjections } : {}),
 			...(allowArchived ? { allowArchived: true } : {}),
+			...(deferredTurns.length > 0 ? { deferredTurns } : {}),
 		});
 		if (!result.repeated) {
 			durable.revision = result.revision;
@@ -1093,6 +1112,7 @@ async function commitHosted(
 			}
 		}
 		scheduleCheckpoint(plan);
+		return result.deferredTurns;
 	} catch (err) {
 		if (!(err instanceof ResearchProjectionConflict)) durable.fatal(err);
 		throw err;
@@ -1226,8 +1246,16 @@ export function tellRepositoryUnanswered(
 	});
 }
 
+/** A checkpoint of what is committed, unless this process already wrote one of exactly that. */
+async function checkpointIfStale(plan: Plan): Promise<void> {
+	let { checkpointed, revision, sequence } = plan.persistence;
+	if (checkpointed?.revision === revision && checkpointed.sequence === sequence) return;
+	await checkpointHosted(plan);
+}
+
 async function checkpointHosted(plan: Plan): Promise<void> {
 	let durable = plan.persistence;
+	let written = { revision: durable.revision, sequence: durable.sequence };
 	try {
 		await durable.storage.collaboration.checkpoint({
 			channelId: durable.channelId,
@@ -1243,6 +1271,7 @@ async function checkpointHosted(plan: Plan): Promise<void> {
 			sidecar: durable.committedSidecar,
 			createdAt: new Date(),
 		});
+		durable.checkpointed = written;
 		plan.document.checkpoint = new Uint8Array(durable.committedDocument);
 	} catch (err) {
 		durable.fatal(err);
@@ -1302,8 +1331,34 @@ async function replaceHosted(plan: Plan, operationId: string, captured: Captured
 export function persist(plan: Plan, chat?: () => ChatView): Promise<void> {
 	let commit = () =>
 		commitHosted(plan, undefined, `state:${crypto.randomUUID()}`, capture(plan, chat?.()));
-	let pending = plan.flushing.then(commit, commit);
+	// Not mapped to void: a second step here would move every save a tick later.
+	let pending = plan.flushing.then(commit, commit) as Promise<unknown> as Promise<void>;
 	plan.flushing = pending;
+	return pending;
+}
+
+/**
+ * `persist`, with changes to the deferred Planner requests written in the same transaction, and
+ * what each did. A request is durable no later than the entry that acknowledges it.
+ */
+export function persistDeferred(
+	plan: Plan,
+	chat?: () => ChatView,
+	deferredTurns?: DeferredTurnChange[],
+): Promise<DeferredTurnOutcome[]> {
+	let commit = () =>
+		commitHosted(
+			plan,
+			undefined,
+			`state:${crypto.randomUUID()}`,
+			capture(plan, chat?.()),
+			false,
+			[],
+			true,
+			deferredTurns,
+		).then(outcomes => outcomes ?? []);
+	let pending = plan.flushing.then(commit, commit);
+	plan.flushing = pending.then(() => {});
 	return pending;
 }
 
@@ -1336,6 +1391,18 @@ export async function drain(plan: Plan): Promise<void> {
 	await plan.flushing;
 }
 
+/**
+ * Commit what is admitted and checkpoint it, while the document stays open and in use. A
+ * restart does this for every document before it stops serving, so what is left to write when
+ * the last of them closes is little.
+ */
+export async function settle(plan: Plan): Promise<void> {
+	await drain(plan);
+	let checkpoint = () => checkpointIfStale(plan);
+	plan.flushing = plan.flushing.then(checkpoint, checkpoint);
+	await plan.flushing;
+}
+
 /** One gate for every path that can mutate a plan during implementation. */
 export function implementationActive(plan: Plan): boolean {
 	return plan.claiming || !!plan.execution || plan.builds.some(locksEditing);
@@ -1349,7 +1416,7 @@ export function persistExclusive(plan: Plan, allowArchived = false): Promise<voi
 		`state:${crypto.randomUUID()}`,
 		capture(plan),
 		allowArchived,
-	);
+	).then(() => {});
 }
 
 type RestoredHosted = {
@@ -1506,13 +1573,13 @@ export async function readStored(
 		return {
 			source: room.project(restored.document),
 			revision: restored.sidecar.revision,
+			records: restored.sidecar.questions.map(Questions.normalizeRecord),
+			openQuestions: restored.sidecar.openQuestions,
 			...(restored.sidecar.creation ? { creation: restored.sidecar.creation } : {}),
 			...(restored.sidecar.graph ? { graph: restored.sidecar.graph } : {}),
 			...(restored.sidecar.builds ? { builds: restored.sidecar.builds } : {}),
 			...(restored.sidecar.execution ? { execution: restored.sidecar.execution } : {}),
 			...(restored.sidecar.lifecycle ? { lifecycle: restored.sidecar.lifecycle } : {}),
-			records: restored.sidecar.questions.map(Questions.normalizeRecord),
-			openQuestions: restored.sidecar.openQuestions,
 		};
 	} finally {
 		restored.document.doc.destroy();
@@ -1548,7 +1615,12 @@ export async function open(
 			sidecar.questions.map(Questions.normalizeRecord),
 		),
 		comments: Comments.create(),
-		chat: Chat.restore(sidecar.transcript, sidecar.workflowRuns, sidecar.initiativePaused),
+		chat: Chat.restore(
+			sidecar.transcript,
+			sidecar.workflowRuns,
+			sidecar.initiativePaused,
+			backend.plannerKeepsRuns?.(id),
+		),
 		conversationPlan: sidecar.conversationPlan ?? restoreConversationPlan(undefined),
 		conversationPlanRetries: sidecar.conversationPlanRetries ?? [],
 		conversationPlanJobs: sidecar.conversationPlanJobs ?? [],
@@ -1635,6 +1707,7 @@ export async function open(
 	}
 
 	rememberImplementationLock(plan);
+	backend.rejoinPlannerQuestions?.(plan, server);
 	return plan;
 }
 
@@ -2430,7 +2503,7 @@ export async function close(plan: Plan): Promise<void> {
 	await Chat.close(plan.chat);
 	await plan.flushing;
 	await commitHosted(plan, undefined, `state:${crypto.randomUUID()}`, capture(plan), true);
-	await checkpointHosted(plan);
+	await checkpointIfStale(plan);
 	Questions.shutdown(plan.questions);
 	presence.destroy(plan.presence);
 	plan.document.doc.destroy();

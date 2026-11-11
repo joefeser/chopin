@@ -1,13 +1,31 @@
 import { spawn } from "node:child_process";
+import { mkdir } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { Readable } from "node:stream";
 import type { PlannerAssignment } from "@chopin/protocol/connector";
 import { redacted } from "./connection";
-import { classifyConnectorError, connectorMessage, plannerCredential } from "./machine";
+import {
+	classifyConnectorError,
+	connectorMessage,
+	plannerCredential,
+	type PlannerStartFailure,
+	reportPlannerFailure,
+} from "./machine";
+import { ConnectorError } from "./mcp";
 import { backoff, delay, HEALTHY_MS, transient } from "./reconnect";
 import type { Output } from "./output";
-import { type GitHubToken, githubToken } from "./github-token";
-import { type ChosenPlanners, plannerWorktree, type StartFailures } from "./workspace";
+import { gitCredentials, type GitHubToken, githubToken } from "./github-token";
+import { type PlannerTokenFile, plannerTokenFile } from "./planner-token";
+import {
+	type ChosenPlanners,
+	plannerWorktree,
+	preparePlannerWorktree,
+	type StartFailures,
+	tokenFolder,
+} from "./workspace";
 import type { Checkouts } from "./checkouts";
+import { type Sandbox, spawnIn } from "./sandbox";
 
 /** How long a stopped Planner backend has to exit before it is killed. */
 const STOP_GRACE_MS = 5000;
@@ -82,6 +100,8 @@ export async function servePlanners(options: {
 	githubRefused?: (message: string, repository: string) => void;
 	/** How long before it expires the GitHub token is replaced; for tests. */
 	renewGitHubBeforeMs?: number;
+	/** Where each backend starts: the machine's process sandbox, else plainly. */
+	sandbox?: Sandbox;
 }) {
 	await Promise.all(options.documents.map(document => servePlanner({ ...options, document })));
 }
@@ -97,6 +117,8 @@ export async function servePlanners(options: {
  * the link of a Planner it stops asking for, so the exit can come before the poll's answer. Until
  * an answer, `running` leaves the document out, which Chopin answers at once if it still wants it;
  * `unchanged` hears an answer that changed nothing, so one that leaves it out withdraws it.
+ * `retry` names the documents a person asked to have started again now: one that exited starts
+ * without waiting out its backoff, and one that is running is left as it is.
  */
 export function dispatchedPlanners(options: {
 	url: string;
@@ -116,6 +138,7 @@ export function dispatchedPlanners(options: {
 	githubRefused?: (message: string, repository: string) => void;
 	/** How long before it expires the GitHub token is replaced; for tests. */
 	renewGitHubBeforeMs?: number;
+	sandbox?: Sandbox;
 }) {
 	type Backend = {
 		url: string;
@@ -124,6 +147,10 @@ export function dispatchedPlanners(options: {
 		served: Promise<void>;
 		/** Set while it exited by itself and waits on Chopin's answer: whether to start it again. */
 		exited?: (again: boolean) => void;
+		/** Set while it waits out its backoff before starting again: cuts that wait short. */
+		hurry?: () => void;
+		/** A person asked for it again while it waited on Chopin's answer: skip the next backoff. */
+		hurried?: boolean;
 	};
 	let running = new Map<string, Backend>();
 	let own = new Set(options.documents);
@@ -146,8 +173,9 @@ export function dispatchedPlanners(options: {
 		);
 	return {
 		running: () => [...running].filter(([, backend]) => !backend.exited).map(([id]) => id),
-		assign(planners: PlannerAssignment[], stopped?: Record<string, string>) {
+		assign(planners: PlannerAssignment[], stopped?: Record<string, string>, retry?: string[]) {
 			let wanted = new Map(planners.map(value => [value.id, value]));
+			let now = new Set(retry);
 			for (let [id, backend] of running) {
 				let planner = wanted.get(id);
 				if (!planner) {
@@ -156,6 +184,11 @@ export function dispatchedPlanners(options: {
 				}
 				// A renamed document keeps its id; Chopin names its new address.
 				if (!backend.own) backend.url = planner.url;
+				// Only a backend that is not running is hurried: a running one may hold work.
+				if (now.has(id)) {
+					if (backend.hurry) backend.hurry();
+					else if (backend.exited) backend.hurried = true;
+				}
 				backend.exited?.(true);
 			}
 			for (let [id, planner] of wanted) {
@@ -171,6 +204,26 @@ export function dispatchedPlanners(options: {
 						address: () => backend.url,
 						id: planner.id,
 						signal,
+						pause: async (ms: number) => {
+							let now = () =>
+								options.output.say(
+									options.output.style.dim(
+										`… Starting the Planner for ${backend.url} again now, as someone asked.`,
+									),
+								);
+							if (backend.hurried) {
+								backend.hurried = false;
+								now();
+								return;
+							}
+							let cut = new AbortController();
+							backend.hurry = () => {
+								now();
+								cut.abort();
+							};
+							await delay(ms, AbortSignal.any([signal, cut.signal]));
+							backend.hurry = undefined;
+						},
 						again: () =>
 							new Promise<boolean>(resolve => {
 								let answer = (again: boolean) => {
@@ -232,16 +285,38 @@ async function servePlanner(options: {
 	githubRefused?: (message: string, repository: string) => void;
 	/** How long before it expires the GitHub token is replaced; for tests. */
 	renewGitHubBeforeMs?: number;
+	sandbox?: Sandbox;
 	/**
 	 * For a dispatched Planner: once the backend exits by itself, whether Chopin still asks for it,
 	 * so it starts again. Without it, a backend that exits is always started again.
 	 */
 	again?: () => Promise<boolean>;
+	/** Waits out a backoff before starting again, which a person's asking may cut short. */
+	pause?: (ms: number) => Promise<void>;
 }) {
 	let { output, signal } = options;
 	let healthyMs = options.healthyMs ?? HEALTHY_MS;
 	let values = Object.values(options.env ?? {});
 	let current = () => options.address?.() ?? options.document;
+	let pause = options.pause ?? ((ms: number) => delay(ms, signal));
+	// Launches in a row that exited before staying up, and whether Chopin was told of them.
+	let streak = 0;
+	let reported = false;
+	let unsupported = false;
+	// Best effort: a person reading the document, not the Planner, is who this is for.
+	let report = (document: string, failure: PlannerStartFailure | undefined) => {
+		if (unsupported || signal.aborted) return;
+		void reportPlannerFailure(
+			options.url,
+			options.machine,
+			document,
+			failure,
+			AbortSignal.any([signal, AbortSignal.timeout(REPORT_MS)]),
+		).catch(error => {
+			// A server from before the report does not know the route, and never will.
+			if (error instanceof ConnectorError && error.status === 404) unsupported = true;
+		});
+	};
 	for (let attempt = 0; !signal.aborted;) {
 		let document = current();
 		let started = Date.now();
@@ -271,30 +346,36 @@ async function servePlanner(options: {
 				output.style.dim(`… Can't get a Planner credential for ${document}; retrying in `)
 					+ output.style.dim(`${Math.ceil(wait / 1000)}s.`),
 			);
-			await delay(wait, signal);
+			await pause(wait);
 			continue;
 		}
 		// Chopin names the document's repository, whose checkout the backend runs in.
 		let repository = credential.repository ?? "";
+		// Reports name the document by its id, which Chopin can check without asking GitHub.
+		let reportedAs = credential.document ?? options.id ?? document;
 		let worktree = await plannerWorktree(
 			options.directory,
 			repository,
 			credential.document ?? options.id ?? document,
 		);
+		// Its tokens are kept in a folder of their own, which is all of them a sandbox is shown.
+		let tokenDirectory = tokenFolder(worktree);
+		await mkdir(tokenDirectory, { recursive: true, mode: 0o700 }).catch(() => {});
 		// The machine's own GitHub token, where Chopin gives one; without one the backend still starts
 		// in a registered checkout.
 		let github = await githubToken({
 			url: options.url,
 			machine: options.machine,
 			repository,
-			file: `${worktree}.github-token`,
+			file: join(tokenDirectory, "github"),
 			...(options.githubRefused ? { refused: options.githubRefused } : {}),
 			...(options.renewGitHubBeforeMs === undefined
 				? {}
 				: { renewBeforeMs: options.renewGitHubBeforeMs }),
 		});
 		let launched = Date.now();
-		let outcome: { how: string; stderr?: string };
+		let tokens: PlannerTokenFile | undefined;
+		let outcome: { how: string; stderr?: string; reason?: string };
 		let checkout = await options.checkouts.resolve(repository, async () => github).then(
 			value => value.root,
 			(error: unknown) => {
@@ -304,26 +385,64 @@ async function servePlanner(options: {
 		);
 		if (checkout) {
 			output.say(`› Planner for ${document} started.`);
-			let healthy = setTimeout(() => void options.failures?.started(document), healthyMs);
+			let healthy = setTimeout(() => {
+				void options.failures?.started(document);
+				// Once it stays up, what was told to Chopin about its failing is no longer true.
+				if (reported) {
+					reported = false;
+					report(reportedAs, undefined);
+				}
+			}, healthyMs);
+			// The backend may outlive its credential when its link drops, so it can read a new one.
+			tokens = await plannerTokenFile({
+				url: options.url,
+				machine: options.machine,
+				document,
+				file: join(tokenDirectory, "planner"),
+				first: credential,
+			});
+			// A backend in the sandbox can't make its own worktree of the checkout (see
+			// `preparePlannerWorktree`), so it is made here. Never fatal: a backend that has no use
+			// for one starts all the same, and one that has says why itself.
+			if (options.sandbox && options.sandbox.report.engine !== "none") {
+				await preparePlannerWorktree(checkout, worktree).catch(error =>
+					output.say(
+						output.style.dim(
+							`… Couldn't make the worktree for ${document}'s Planner: ${
+								redacted(error instanceof Error ? error.message : String(error)).split("\n")[0]
+							}`,
+						),
+					)
+				);
+			}
 			outcome = await launch(
 				{ ...options, document, cwd: checkout },
 				credential.token,
 				worktree,
 				github,
+				repository,
+				tokens,
 			);
+			await tokens?.stop();
 			clearTimeout(healthy);
 		} else {
 			output.error(`Can't start the Planner for ${document}: ${outcome!.how}`);
 		}
-		let { how, stderr } = outcome!;
+		let { how, stderr, reason } = outcome!;
 		await github?.stop();
 		if (signal.aborted) return;
 		// Renamed while it ran: say so by its new address.
 		document = current();
 		// What the backend printed may hold its credential, a GitHub token or an --env value.
-		let secrets = [credential.token, ...github?.secrets() ?? [], ...values];
+		let secrets = [
+			credential.token,
+			...tokens?.secrets() ?? [],
+			...github?.secrets() ?? [],
+			...values,
+		];
 		let ended = Date.now();
 		let early = ended - launched < healthyMs;
+		streak = early ? streak + 1 : 0;
 		let failed = (at: number, retryAt?: number) =>
 			options.failures?.failed({
 				kind: "planner",
@@ -344,6 +463,14 @@ async function servePlanner(options: {
 		if (early) {
 			let at = Date.now();
 			await failed(at, at + wait);
+			// What Chopin's people read in the document: why, and how often in a row.
+			reported = true;
+			report(reportedAs, {
+				attempts: streak,
+				how: plain(redacted(how, secrets)),
+				...(reason ? { reason: plain(redacted(reason, secrets)) } : {}),
+				at: ended,
+			});
 		}
 		output.say(
 			output.style.dim(
@@ -352,8 +479,43 @@ async function servePlanner(options: {
 				}s.`,
 			),
 		);
-		await delay(wait, signal);
+		await pause(wait);
 	}
+}
+
+/** How many of a backend's last stderr lines are kept to find why it exited. */
+const TAIL_LINES = 8;
+/** How long the connector waits on Chopin to take a report of a failing Planner backend. */
+const REPORT_MS = 10_000;
+/** The longest reason or `how` told to Chopin, in characters. */
+const REASON_CHARS = 300;
+
+// Terminal colors and other control characters are what a backend's colored output adds.
+// oxlint-disable-next-line no-control-regex
+const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+// oxlint-disable-next-line no-control-regex
+const CONTROL = /[\u0000-\u0008\u000b-\u001f\u007f]/g;
+const TIMESTAMP =
+	/^\[?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?\s*/;
+/** A line that only announces the backend is leaving, which is never why. */
+const LEAVING = /^(?:exiting|exited|shutting down|terminating|aborting|quitting)\b/i;
+
+/**
+ * The line of a backend's last stderr output that says why it exited: the last one that is not
+ * blank and does not merely announce that it is exiting, without its colors or leading time, else
+ * the last line. Undefined when it printed nothing.
+ */
+export function startFailureReason(lines: string[]): string | undefined {
+	let cleaned = lines
+		.map(line => line.replace(ANSI, "").replace(TIMESTAMP, "").replace(CONTROL, " ").trim())
+		.filter(Boolean);
+	return cleaned.findLast(line => !LEAVING.test(line)) ?? cleaned.at(-1);
+}
+
+/** Text told to Chopin: the home directory as `~`, and short. Mask secrets before this. */
+function plain(text: string, home = homedir()) {
+	let shown = home.length > 1 ? text.replaceAll(home, "~") : text;
+	return shown.length > REASON_CHARS ? `${shown.slice(0, REASON_CHARS - 1)}…` : shown;
 }
 
 /** Longer than this, a backend's output line is dropped rather than passed on unmasked. */
@@ -401,7 +563,8 @@ function passMasked(
 }
 
 /**
- * Run the backend once; resolves with how it exited and the first line of its stderr. Its stdout
+ * Run the backend once; resolves with how it exited, the first line of its stderr and the one that
+ * says why it exited (see `startFailureReason`). Its stdout
  * and stderr still reach this process's own, masked by `passMasked`: its credential, the --env
  * values and anything token-shaped. Aborting stops it, then kills it.
  */
@@ -413,40 +576,66 @@ async function launch(
 		cwd: string;
 		signal: AbortSignal;
 		env?: Record<string, string>;
+		sandbox?: Sandbox;
 	},
 	token: string,
 	worktree: string,
 	github?: GitHubToken,
-): Promise<{ how: string; stderr?: string }> {
-	let child = spawn(options.command[0]!, options.command.slice(1), {
-		cwd: options.cwd,
-		env: {
-			...process.env,
-			...options.env,
-			CHOPIN_URL: options.url,
-			CHOPIN_DOCUMENT: options.document,
-			CHOPIN_PLANNER_TOKEN: token,
-			CHOPIN_CHECKOUT: options.cwd,
-			CHOPIN_WORKTREE: worktree,
-			...(github
-				? {
-					CHOPIN_GITHUB_TOKEN: github.token,
-					CHOPIN_GITHUB_TOKEN_EXPIRES_AT: new Date(github.expiresAt).toISOString(),
-					CHOPIN_GITHUB_TOKEN_FILE: github.file,
-				}
-				: {}),
-		},
-		stdio: ["ignore", "pipe", "pipe"],
-		// Its own process group, so Ctrl-C reaches it only through the connector stopping it.
-		detached: process.platform !== "win32",
-	});
+	repository?: string,
+	tokens?: PlannerTokenFile,
+): Promise<{ how: string; stderr?: string; reason?: string }> {
+	let child;
+	try {
+		child = spawnIn(options.sandbox, {
+			command: options.command,
+			cwd: options.cwd,
+			env: {
+				...process.env,
+				...options.env,
+				// Its own git, and its agent's, reach GitHub with this token over https, whatever
+				// the person's Git configuration says about GitHub URLs or SSH.
+				...(github && repository ? gitCredentials(github.file, repository) : {}),
+				CHOPIN_URL: options.url,
+				CHOPIN_DOCUMENT: options.document,
+				CHOPIN_PLANNER_TOKEN: token,
+				...(tokens ? { CHOPIN_PLANNER_TOKEN_FILE: tokens.file } : {}),
+				CHOPIN_CHECKOUT: options.cwd,
+				CHOPIN_WORKTREE: worktree,
+				...(github
+					? {
+						CHOPIN_GITHUB_TOKEN: github.token,
+						CHOPIN_GITHUB_TOKEN_EXPIRES_AT: new Date(github.expiresAt).toISOString(),
+						CHOPIN_GITHUB_TOKEN_FILE: github.file,
+					}
+					: {}),
+			},
+			stdin: "ignore",
+			// It writes its own worktree, which the connector made for it, and nothing of the checkout
+			// it runs in, which is the person's and read-only; it sees nothing of its siblings' or of
+			// anyone's tokens but its own.
+			writable: [worktree],
+			own: [worktree, tokenFolder(worktree)],
+		});
+	} catch (error) {
+		return { how: error instanceof Error ? error.message : String(error) };
+	}
 	// Read as each line is passed on, so a GitHub token renewed meanwhile is masked too.
-	let secrets = () => [token, ...github?.secrets() ?? [], ...Object.values(options.env ?? {})];
+	let secrets = () => [
+		token,
+		...tokens?.secrets() ?? [],
+		...github?.secrets() ?? [],
+		...Object.values(options.env ?? {}),
+	];
 	let first: string | undefined;
+	// The last lines it printed, for the one that says why it exited.
+	let tail: string[] = [];
 	let drained = Promise.all([
 		passMasked(child.stdout!, "stdout", secrets),
 		passMasked(child.stderr!, "stderr", secrets, text => {
-			first ??= text.split("\n").map(line => line.trim()).find(Boolean);
+			let lines = text.split("\n").map(line => line.trim()).filter(Boolean);
+			first ??= lines[0];
+			tail.push(...lines.map(line => line.slice(0, 1000)));
+			if (tail.length > TAIL_LINES) tail.splice(0, tail.length - TAIL_LINES);
 		}),
 	]);
 	let exited = new Promise<string>(resolve => {
@@ -466,7 +655,8 @@ async function launch(
 	if (how === undefined || process.platform !== "win32") await stopBackend(child);
 	how ??= await exited;
 	await Promise.race([drained, new Promise(resolve => setTimeout(resolve, 500))]);
-	return { how, ...(first ? { stderr: first } : {}) };
+	let reason = startFailureReason(tail);
+	return { how, ...(first ? { stderr: first } : {}), ...(reason ? { reason } : {}) };
 }
 
 /** How a backend's processes are stopped: on which platform, running which commands, how patiently. */

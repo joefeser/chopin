@@ -72,9 +72,12 @@ agent connection instead check their caller-supplied GitHub bearer token directl
 Every path applies the instance admission policy. Under `HARNESS=remote` the
 server calls no model provider; the attached client does.
 
-The application holds an exclusive database-wide writer lease. It refuses to
-start beside another active Chopin process and stops if it can no longer renew
-the lease. This is a single-writer design, not an application cluster.
+The application holds an exclusive database-wide writer lease and stops if it can
+no longer renew it. By default it refuses to start beside another active Chopin
+process. Started with `HANDOVER=wait`, a process instead waits in standby and takes
+the lease when the holder releases it, which is how a deploy overlaps two processes
+without a gap anyone sees; see [Deploys nobody can see](zero-downtime-deploys.md).
+Only the holder serves. This is a single-writer design, not an application cluster.
 
 ## Workspace packages
 
@@ -151,8 +154,7 @@ the `chopin.agent.v1` subprotocol and carries a GitHub bearer, checked like
 needs push or administration access to its repository, rechecked before every
 session and turn and periodically while attached. Attaching makes the account's
 live browser login the document's Planner owner, one client per document; a
-document without one refuses `@chopin` and `invoke_planner` with
-`planner-not-attached`. The connection closes when that login ends or the document's
+document without one saves `@chopin` and `invoke_planner` until a client attaches. The connection closes when that login ends or the document's
 Planner is reset.
 Turns run on the client's model; Chopin's host
 tools, Decisions, and room writes still run in the server under the document's

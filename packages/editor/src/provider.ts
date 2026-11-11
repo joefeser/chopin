@@ -13,6 +13,7 @@
 import { applyAwarenessUpdate, Awareness, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
 
+import { trackPendingWork } from "@chopin/protocol/pending-work";
 import type { Plan } from "@chopin/protocol";
 import type { Provider } from "@lexical/yjs";
 import type { Transport } from "./transport";
@@ -21,6 +22,7 @@ type Listener<T> = (value: T) => void;
 
 type Events = {
 	sync: boolean;
+	unsaved: boolean;
 	status: { status: string; message?: string };
 	update: unknown;
 	reload: Y.Doc;
@@ -154,6 +156,12 @@ export class PlanProvider implements Provider {
 		this.#wire = options.wire;
 		this.#doc = options.doc;
 		this.awareness = new Awareness(options.doc) as PlanProvider["awareness"];
+		trackPendingWork(this);
+	}
+
+	/** Whether an update has not been acknowledged yet, which a reload would lose. */
+	get unsaved(): boolean {
+		return this.#outbox.size > 0;
 	}
 
 	get epoch(): string | undefined {
@@ -429,11 +437,13 @@ export class PlanProvider implements Provider {
 		// Anything the server or the sync layer applied is already shared.
 		if (origin === this || !this.#connected) return;
 
+		let wasSaved = !this.unsaved;
 		let id = `${Date.now().toString(36)}-${this.#counter++}`;
 		this.#outbox.set(id, update);
 		this.#outboxBytes += update.byteLength;
 		this.#unsent.add(id);
 		if (this.saturated) this.#coalesce();
+		if (wasSaved) this.#emit("unsaved", true);
 
 		if (!this.#pacing) this.#flush();
 	};
@@ -522,6 +532,7 @@ export class PlanProvider implements Provider {
 		this.#sends.delete(id);
 		// The server is accepting again, so the next resend need not wait long.
 		this.#resendDelay = RESEND_MS;
+		if (!this.unsaved) this.#emit("unsaved", false);
 	}
 
 	#remote(event: Plan.Update): void {
@@ -579,6 +590,7 @@ export class PlanProvider implements Provider {
 
 		this.#emit("sync", false);
 		this.#options.onReset?.(reason, lost);
+		if (lost) this.#emit("unsaved", false);
 	}
 
 	get synced(): boolean {

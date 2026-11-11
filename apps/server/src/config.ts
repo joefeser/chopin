@@ -14,6 +14,7 @@ import { setupAgents } from "./setup-agents";
 import { DEFAULT_COPILOT_MODEL } from "./harness/copilot-sdk/model";
 
 import type { SetupAgent } from "@chopin/protocol/agents";
+import type { AttachmentLimits } from "@chopin/protocol/attachment";
 import type { AuthConfig } from "./auth/config";
 import type { StorageConfig } from "./storage/registry";
 
@@ -57,6 +58,20 @@ export type Config = {
 	agent: boolean;
 	backgroundJobs: boolean;
 	webResearch: boolean;
+	/**
+	 * What a Chat message may carry, as configured: `CHAT_ATTACHMENT_MAX_BYTES` for one file,
+	 * `CHAT_ATTACHMENT_MAX_COUNT` files per message (0 turns files off) and
+	 * `CHAT_ATTACHMENT_MAX_TOTAL_BYTES` for all of a message's. Under `HARNESS=remote` the limits in
+	 * force are lower still; see `attachmentLimits`.
+	 */
+	chatAttachments: AttachmentLimits;
+	/**
+	 * Dictation's server transcription: `TRANSCRIPTION_MODEL` as `openai/<model>`, off unless it is
+	 * set. With it, a person's browser that has no on-device speech recognition may send a recording
+	 * of what they dictate to this server, which sends it to the provider; without it no audio is
+	 * ever sent anywhere. `TRANSCRIPTION_MAX_BYTES` bounds a recording.
+	 */
+	transcription?: { provider: "openai"; model: string; maxBytes: number };
 	/** Attempt deadline of one public-web evidence attempt, in milliseconds. Defaults to 10 minutes. */
 	researchEvidenceTimeoutMs?: number;
 	/** Explicitly enables the conversation-derived cards prototype. */
@@ -114,10 +129,36 @@ export type Config = {
 	 * a build and would make development quietly serve stale files.
 	 */
 	devClient: string | undefined;
+	/** The built web client's directory. Defaults to `apps/web/dist`. */
+	clientDir: string | undefined;
+	/** How this process takes over from, and hands over to, another on the same database. */
+	handover: Handover;
 	/** Durable service storage. */
 	storage: StorageConfig;
 	/** GitHub identity and short-lived OAuth attempt encryption. */
 	auth: AuthConfig;
+};
+
+/**
+ * What a restart does with a second process on the same database (`HANDOVER`, and the
+ * `HANDOVER_*` durations).
+ */
+export type Handover = {
+	/**
+	 * `HANDOVER=wait`: when another process holds the writer lease, start in standby and wait for
+	 * its release instead of exiting.
+	 */
+	wait: boolean;
+	/** How long a stopping process lets running Planner turns finish while it keeps serving. */
+	turnWaitMs: number;
+	/** How long readiness stays off while the process still serves, for a proxy's next check. */
+	unreadyMs: number;
+	/** How long the cut waits for requests already in flight before it closes them. */
+	requestWaitMs: number;
+	/** How long after the cut a remote Planner is expected to be back, and shown as attached. */
+	plannerWindowMs: number;
+	/** How long a standby process holds a request that needs the lease before it answers 503. */
+	holdMs: number;
 };
 
 const DEFAULT_PORT = 8787;
@@ -176,6 +217,76 @@ function loopbackHost(host: string): boolean {
 	return host === "localhost" || host === "::1" || host === "[::1]"
 		|| /^127(?:\.\d{1,3}){3}$/.test(host)
 			&& host.split(".").slice(1).every(part => Number(part) <= 255);
+}
+
+/** A whole-number setting between `min` and `max`, read from the environment. */
+function whole(name: string, fallback: number, min: number, max: number): number {
+	let raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	let value = Number(raw);
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < min || value > max) {
+		throw new Error(`${name} must be a whole number between ${min} and ${max}`);
+	}
+	return value;
+}
+
+function transcription(): Config["transcription"] {
+	let raw = process.env.TRANSCRIPTION_MODEL;
+	if (!raw || raw === "off") return undefined;
+	let match = /^(openai)\/(\S{1,100})$/.exec(raw);
+	if (!match) {
+		throw new Error(
+			"TRANSCRIPTION_MODEL must be off, or openai/<model> such as openai/gpt-4o-mini-transcribe",
+		);
+	}
+	if (!process.env.OPENAI_API_KEY) {
+		throw new Error("TRANSCRIPTION_MODEL=openai/... needs OPENAI_API_KEY");
+	}
+	return {
+		provider: "openai",
+		model: match[2]!,
+		maxBytes: whole("TRANSCRIPTION_MAX_BYTES", 5_242_880, 1, 26_214_400),
+	};
+}
+
+function chatAttachments(): AttachmentLimits {
+	let limits = {
+		maxBytes: whole("CHAT_ATTACHMENT_MAX_BYTES", 1_048_576, 1, 16_777_216),
+		maxCount: whole("CHAT_ATTACHMENT_MAX_COUNT", 5, 0, 20),
+		maxTotalBytes: whole("CHAT_ATTACHMENT_MAX_TOTAL_BYTES", 4_194_304, 1, 67_108_864),
+	};
+	if (limits.maxTotalBytes < limits.maxBytes) {
+		throw new Error(
+			"CHAT_ATTACHMENT_MAX_TOTAL_BYTES must be at least CHAT_ATTACHMENT_MAX_BYTES",
+		);
+	}
+	return limits;
+}
+
+/** A duration setting that may be zero, in whole milliseconds up to `max`. */
+function duration(name: string, fallback: number, max: number): number {
+	let raw = process.env[name];
+	if (raw === undefined) return fallback;
+	let value = Number(raw);
+	if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value > max) {
+		throw new Error(`${name} must be an integer between 0 and ${max} milliseconds`);
+	}
+	return value;
+}
+
+function handover(): Handover {
+	let mode = process.env.HANDOVER;
+	if (mode !== undefined && mode !== "" && mode !== "wait" && mode !== "off") {
+		throw new Error(`HANDOVER must be wait or off, got ${JSON.stringify(mode)}`);
+	}
+	return {
+		wait: mode === "wait",
+		turnWaitMs: duration("HANDOVER_TURN_WAIT_MS", 10_000, 600_000),
+		unreadyMs: duration("HANDOVER_UNREADY_MS", 300, 60_000),
+		requestWaitMs: duration("HANDOVER_REQUEST_WAIT_MS", 1_000, 60_000),
+		plannerWindowMs: duration("HANDOVER_PLANNER_WINDOW_MS", 10_000, 600_000),
+		holdMs: duration("HANDOVER_HOLD_MS", 20_000, 120_000),
+	};
 }
 
 /** A duration setting, in whole milliseconds from 1 second to `max`, 10 minutes by default. */
@@ -350,6 +461,8 @@ export function load(): Config {
 		agent,
 		backgroundJobs,
 		webResearch: agent && backgroundJobs && process.env.WEB_RESEARCH !== "off",
+		chatAttachments: chatAttachments(),
+		transcription: transcription(),
 		researchEvidenceTimeoutMs: researchEvidenceTimeoutMs(),
 		conversationPlan,
 		conversationInitiativeModel,
@@ -368,6 +481,8 @@ export function load(): Config {
 			: {}),
 		...(coordinationScriptedDrafts ? { coordinationScriptedDrafts: true as const } : {}),
 		devClient: process.env.DEV_CLIENT || undefined,
+		clientDir: process.env.CLIENT_DIR || undefined,
+		handover: handover(),
 		storage: storage(),
 		auth: loadAuth(serverPort, selection.host),
 	};

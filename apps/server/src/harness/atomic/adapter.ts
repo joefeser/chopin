@@ -4,7 +4,8 @@
  * A Planner session that Chopin registers by session ID runs as a full Atomic
  * session: Atomic builtins, the operator's Atomic resources, a channel working
  * directory, and Chopin as HostInput. Its own turns only offer the tools in
- * `FULL_PLANNER_TOOLS` beside Chopin's; the workflows it starts keep their
+ * `FULL_PLANNER_TOOLS`, the read-only tools the operator's `chopin.plannerTools`
+ * setting adds, and Chopin's; the workflows it starts keep their
  * stages' tools. Every other session (the summary and research workers) stays
  * isolated: only Chopin host tools, no host resources, and a checked per-turn
  * tool boundary.
@@ -26,6 +27,7 @@ import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fullPlanner, settleEndedRuns, workflowRuns } from "./full";
+import { atomicThinkingLevels } from "../catalog";
 
 import type {
 	HarnessV1,
@@ -38,6 +40,8 @@ import type {
 	HarnessV1StreamPart,
 	HarnessV1ToolSpec,
 } from "@ai-sdk/harness";
+import type { Chat as Wire } from "@chopin/protocol";
+import type { PlannerTurn } from "../turn-level";
 import type {
 	AgentSession,
 	AgentSessionEvent,
@@ -72,7 +76,6 @@ export const FULL_PLANNER_TOOLS: ReadonlySet<string> = new Set([
 	"read",
 	"find",
 	"search",
-	"ast_grep",
 	"web_search",
 	"code_search",
 	"fetch_content",
@@ -82,6 +85,40 @@ export const FULL_PLANNER_TOOLS: ReadonlySet<string> = new Set([
 	"intercom",
 	"codemode",
 ]);
+
+/** Atomic tools that change files, run commands or start agents, which no setting gives a Planner's own turns. */
+const WRITING_TOOLS: ReadonlySet<string> = new Set([
+	"bash",
+	"edit",
+	"write",
+	"kill",
+	"subagent",
+	"todo",
+]);
+
+/**
+ * The tools an operator adds to a full Planner's own turns beside `FULL_PLANNER_TOOLS`, named in
+ * `chopin.plannerTools` of the agent directory's `settings.json`: read-only tools a package or
+ * extension registers, such as a structural code search. Only the operator's file is read; a
+ * checkout's project settings can't widen what a Planner may call.
+ */
+export function operatorPlannerTools(operatorSettings: unknown): ReadonlySet<string> {
+	let chopin = (operatorSettings as { chopin?: { plannerTools?: unknown } } | null)?.chopin;
+	let names = chopin?.plannerTools;
+	if (names === undefined) return new Set();
+	if (!Array.isArray(names) || !names.every(name => typeof name === "string" && name !== "")) {
+		throw new Error("chopin.plannerTools in the Atomic settings must be a list of tool names.");
+	}
+	let writing = names.filter(name => WRITING_TOOLS.has(name));
+	if (writing.length > 0) {
+		throw new Error(
+			`chopin.plannerTools names ${
+				writing.join(", ")
+			}, which can change files, run commands or start agents; a Planner's own turns stay read-only.`,
+		);
+	}
+	return new Set(names);
+}
 
 const GATEWAY_PROVIDER = "vercel-ai-gateway";
 const OPERATION_TIMEOUT_MS = 10_000;
@@ -111,12 +148,9 @@ async function optionalFile(path: string): Promise<string | undefined> {
  * `.atomic/settings.json` can add project packages the way it does for a local
  * Atomic session; the empty per-channel directory has none.
  */
-async function fullSettings(agentDir: string, cwd: string): Promise<SettingsManager> {
+async function fullSettings(operator: object, cwd: string): Promise<SettingsManager> {
 	let scopes: Record<"global" | "project", string | undefined> = {
-		global: JSON.stringify({
-			...JSON.parse(await optionalFile(join(agentDir, "settings.json")) ?? "{}"),
-			...SETTINGS,
-		}),
+		global: JSON.stringify({ ...operator, ...SETTINGS }),
 		project: await optionalFile(join(cwd, ".atomic", "settings.json")),
 	};
 	let manager = SettingsManager.fromStorage({
@@ -138,9 +172,70 @@ const ZERO_USAGE = {
 	outputTokens: { total: undefined, text: undefined, reasoning: undefined },
 };
 
+type Level = ReturnType<AgentSession["getAvailableThinkingLevels"]>[number];
+
+/**
+ * The level the session's current model runs when nobody has chosen one, as Atomic starts a
+ * session on a model: the level saved for that model in the operator's settings, else their
+ * default, else `medium` (Atomic's own default, which it does not export). A level the model does
+ * not support is clamped when it is set. It is the model's, not the level the session happened to
+ * hold when a person chose one, which belonged to whichever model the session started on.
+ */
+function ownLevel(session: AgentSession): Level {
+	let { model, settingsManager } = session;
+	return (model && settingsManager.getModelThinkingLevel(model.provider, model.id))
+		?? settingsManager.getDefaultThinkingLevel() ?? "medium";
+}
+
 type ProviderConfig = Parameters<ModelRuntime["registerProvider"]>[1];
 type Model = NonNullable<ReturnType<ModelRuntime["getModel"]>>;
 type ToolOutcome = { output: unknown; isError?: boolean };
+
+/**
+ * The models a person may choose for a document's Planner: every chat model the runtime has
+ * credentials for that `resolveModel` would run, as `provider/model`, with each model's thinking
+ * levels from the model itself. They are listed as the runtime reports them: in its order, which
+ * the picker groups by provider where each first appears, and an entry it reports twice stays
+ * twice, each with its own levels. A choice of that id runs the first, as `resolveModel` finds
+ * it, and the catalog's readers resolve it the same way. `defaultModel` is the deployment's,
+ * whose entry is always listed.
+ */
+export async function atomicCatalog(
+	runtime: Pick<ModelRuntime, "getAvailable" | "getModel" | "getProvider">,
+	settings: Pick<AtomicSettings, "auth" | "providers">,
+	defaultModel: string | undefined,
+): Promise<Wire.ModelCatalog> {
+	let listed: Array<[id: string, model: Model]> = [];
+	for (let model of await runtime.getAvailable()) {
+		if (!providerAllowed(settings, model.provider)) continue;
+		listed.push([`${model.provider}/${model.id}`, model]);
+	}
+	let fallback: Model | undefined;
+	if (defaultModel) {
+		try {
+			fallback = resolveModel(runtime, settings, defaultModel);
+		} catch {
+			// A default Atomic cannot run is not offered; its turns fail as they always did.
+		}
+		if (fallback && !listed.some(([id]) => id === defaultModel)) {
+			listed.push([defaultModel, fallback]);
+		}
+	}
+	return {
+		models: listed.map(([id, model]) => {
+			let levels = atomicThinkingLevels(model);
+			return {
+				id,
+				name: model.name,
+				provider: { id: model.provider, name: runtime.getProvider(model.provider)?.name },
+				description: contextLabel(model.contextWindow),
+				...(levels.length ? { thinkingLevels: levels } : {}),
+				...(model.input ? { inputTypes: [...model.input] } : {}),
+			};
+		}),
+		...(fallback ? { default: { model: defaultModel! } } : {}),
+	};
+}
 
 export type AtomicSettings = {
 	auth: AtomicAuthMode;
@@ -161,6 +256,8 @@ export type AtomicSettings = {
 	 * `ATOMIC_WORKFLOW_JOURNAL_PATH`; the process environment is left unchanged.
 	 */
 	journal?: string;
+	/** The directory an isolated session's working directory is created in; the system's when absent. */
+	tempRoot?: string;
 };
 
 export class ToolBoundaryError extends Error {
@@ -252,6 +349,20 @@ export function turnSystemPrompt(
 	return [instructions, result].filter(Boolean).join("\n\n") || ATOMIC_DEFAULT_SYSTEM_PROMPT;
 }
 
+/** Whether `HARNESS_AUTH` lets this provider's models run: the gateway's, and ones code registered. */
+function providerAllowed(
+	settings: Pick<AtomicSettings, "auth" | "providers">,
+	provider: string,
+): boolean {
+	return settings.auth !== "ai-gateway" || provider === GATEWAY_PROVIDER
+		|| Object.hasOwn(settings.providers ?? {}, provider);
+}
+
+function contextLabel(tokens: number): string {
+	if (tokens >= 1_000_000) return `${+(tokens / 1_000_000).toFixed(1)}M token context`;
+	return `${Math.round(tokens / 1_000)}K token context`;
+}
+
 /** Looks up `provider/model` without letting Atomic substitute a default. */
 export function resolveModel(
 	runtime: Pick<ModelRuntime, "getModel">,
@@ -263,10 +374,7 @@ export function resolveModel(
 	let provider = requested.slice(0, slash);
 	let model = slash > 0 ? runtime.getModel(provider, requested.slice(slash + 1)) : undefined;
 	if (!model) throw new Error(`Atomic does not recognize model ${requested}`);
-	if (
-		settings.auth === "ai-gateway" && provider !== GATEWAY_PROVIDER
-		&& !Object.hasOwn(settings.providers ?? {}, provider)
-	) {
+	if (!providerAllowed(settings, provider)) {
 		throw new Error(
 			`HARNESS_AUTH ai-gateway allows only ${GATEWAY_PROVIDER} models, not ${requested}`,
 		);
@@ -313,13 +421,36 @@ function bounded<T>(operation: Promise<T>, message: string): Promise<T> {
 	]).finally(() => clearTimeout(timer));
 }
 
-function promptText(prompt: HarnessV1PromptTurnOptions["prompt"]): string {
-	if (typeof prompt === "string") return prompt;
-	if (typeof prompt.content === "string") return prompt.content;
-	return prompt.content.map(part => {
-		if (part.type !== "text") throw unsupported(`${part.type} prompt parts`);
-		return part.text;
-	}).join("\n\n");
+/** An image as Atomic's prompt takes it. */
+type ImageContent = { type: "image"; data: string; mimeType: string };
+
+/**
+ * What a turn's prompt comes to for Atomic: its text, with each text file written into it under its
+ * name, and each image as the image Atomic's own prompt takes. Anything else is not offered.
+ */
+export function promptParts(
+	prompt: HarnessV1PromptTurnOptions["prompt"],
+): { text: string; images: ImageContent[] } {
+	if (typeof prompt === "string") return { text: prompt, images: [] };
+	if (typeof prompt.content === "string") return { text: prompt.content, images: [] };
+	let texts: string[] = [];
+	let images: ImageContent[] = [];
+	for (let part of prompt.content) {
+		if (part.type === "text") texts.push(part.text);
+		else if (part.type === "image" || part.type === "file" && part.mediaType.startsWith("image/")) {
+			let data = part.type === "image" ? part.image : part.data;
+			let mimeType = part.mediaType ?? "image/png";
+			if (!(data instanceof Uint8Array)) throw unsupported("image prompt parts that are not bytes");
+			images.push({ type: "image", data: Buffer.from(data).toString("base64"), mimeType });
+		} else if (part.type === "file" && part.data instanceof Uint8Array) {
+			texts.push(
+				`<file name=${JSON.stringify(part.filename ?? "file")}>\n${
+					new TextDecoder().decode(part.data)
+				}\n</file>`,
+			);
+		} else throw unsupported(`${part.type} prompt parts`);
+	}
+	return { text: texts.join("\n\n"), images };
 }
 
 function sameNames(actual: readonly string[], expected: readonly string[]): boolean {
@@ -463,10 +594,85 @@ function listen(run: Run, signal: AbortSignal | undefined): void {
 	void run.done.catch(() => {}).finally(() => signal.removeEventListener("abort", run.stop));
 }
 
+/**
+ * The commands an Atomic session in `cwd` offers as `/name`: its prompt templates, its skills
+ * (named `skill:name`, as Atomic invokes them) and the workflows registered for it. It reads them
+ * from a session built as a Planner's is, in the operator's agent directory and the checkout, and
+ * ends that session at once: nothing is sent to a model. Atomic's own extension commands are not
+ * listed, since a person could not run them from a message.
+ */
+export async function sessionCommands(
+	runtime: ModelRuntime,
+	settings: Pick<AtomicSettings, "extensions">,
+	cwd: string,
+	agentDir = getAgentDir(),
+): Promise<Wire.CommandOption[]> {
+	let operator = JSON.parse(await optionalFile(join(agentDir, "settings.json")) ?? "{}");
+	let settingsManager = await fullSettings(operator, cwd);
+	let loader = new DefaultResourceLoader({
+		cwd,
+		agentDir,
+		settingsManager,
+		additionalExtensionPaths: [...settings.extensions ?? []],
+	});
+	await loader.reload();
+	let { session } = await createAgentSession({
+		cwd,
+		agentDir,
+		modelRuntime: runtime,
+		fallbackModels: [],
+		sessionManager: SessionManager.inMemory(cwd),
+		settingsManager,
+		resourceLoader: loader,
+	});
+	try {
+		let commands: Wire.CommandOption[] = [];
+		for (let template of session.promptTemplates) {
+			commands.push({ name: template.name, description: template.description, kind: "prompt" });
+		}
+		for (let skill of loader.getSkillCatalog?.().commands ?? []) {
+			commands.push({
+				name: `skill:${skill.name}`,
+				description: skill.description,
+				kind: "skill",
+			});
+		}
+		let workflow = session.getToolDefinition("workflow");
+		if (workflow) {
+			let listed = await workflow.execute(
+				"chopin-commands",
+				{ action: "list" } as never,
+				undefined,
+				undefined,
+				session.extensionRunner.createContext() as never,
+			);
+			let items = (JSON.parse(resultText(listed)) as { items?: unknown }).items;
+			for (let item of Array.isArray(items) ? items : []) {
+				let { name, description } = item as { name?: unknown; description?: unknown };
+				if (typeof name !== "string") continue;
+				commands.push({
+					name,
+					...(typeof description === "string" ? { description } : {}),
+					kind: "workflow",
+				});
+			}
+		}
+		return commands;
+	} finally {
+		await session.dispose();
+	}
+}
+
 /** Host-process `HarnessV1` implementation over `@bastani/atomic`. */
 export function createAtomicAdapter(
 	settings: AtomicSettings,
-): HarnessV1 & { shutdown(): Promise<void> } {
+): HarnessV1 & {
+	shutdown(): Promise<void>;
+	/** What a document's Planner can be set to run; see `atomicCatalog`. */
+	catalog(defaultModel: string | undefined): Promise<Wire.ModelCatalog>;
+	/** The commands a Planner working in `cwd` offers; see `sessionCommands`. */
+	commands(cwd: string): Promise<Wire.CommandOption[]>;
+} {
 	if (!ATOMIC_AUTH_MODES.includes(settings.auth)) {
 		throw new Error(`HARNESS_AUTH ${settings.auth} is not a supported atomic authentication mode`);
 	}
@@ -494,6 +700,8 @@ export function createAtomicAdapter(
 				systemPrompt: ATOMIC_DEFAULT_SYSTEM_PROMPT,
 			};
 			let live: { session: AgentSession; signature: string; release: () => void } | undefined;
+			/** Whether a person's level is applied to the session now. */
+			let levelChosen = false;
 			let current: Run | undefined;
 			let closed: Promise<void> | undefined;
 
@@ -599,7 +807,9 @@ export function createAtomicAdapter(
 				}
 			}
 
-			async function prepare(turn: HarnessV1PromptTurnOptions): Promise<AgentSession> {
+			let plannerTools: ReadonlySet<string> = new Set();
+
+			async function prepare(turn: PlannerTurn): Promise<AgentSession> {
 				if (turn.skills.length > 0) throw unsupported("skills");
 				let hostNames = turn.tools.map(spec => spec.name);
 				if (hostNames.includes(ATOMIC_RESULT_TOOL_NAME)) {
@@ -618,10 +828,18 @@ export function createAtomicAdapter(
 				policy.hostNames = hostNames;
 				policy.structured = false;
 				if (!live) {
-					if (!full) directory ??= await mkdtemp(join(tmpdir(), "chopin-atomic-planner-"));
+					if (!full) {
+						directory ??= await mkdtemp(
+							join(settings.tempRoot ?? tmpdir(), "chopin-atomic-planner-"),
+						);
+					}
 					let cwd = full?.cwd ?? directory!;
 					let agentDir = full ? getAgentDir() : directory!;
-					if (full) settingsManager = await fullSettings(agentDir, cwd);
+					if (full) {
+						let operator = JSON.parse(await optionalFile(join(agentDir, "settings.json")) ?? "{}");
+						plannerTools = operatorPlannerTools(operator);
+						settingsManager = await fullSettings(operator, cwd);
+					}
 					// The journal holds workflow inputs and outputs; Atomic would create its directory world-readable.
 					if (full && settings.journal) {
 						await mkdir(dirname(settings.journal), { recursive: true, mode: 0o700 });
@@ -696,7 +914,23 @@ export function createAtomicAdapter(
 				) {
 					await live.session.setModel(model);
 				}
+				await applyLevel(live.session, turn.thinkingLevel);
 				return live.session;
+			}
+
+			/**
+			 * A person's thinking level for this turn, or the model's own again once nobody's is
+			 * chosen. Atomic clamps a level to what the model supports; the server only ever sends
+			 * one the catalog listed for it.
+			 */
+			async function applyLevel(session: AgentSession, level: string | undefined): Promise<void> {
+				if (level !== undefined) {
+					await session.setThinkingLevel(level as Level);
+					levelChosen = true;
+				} else if (levelChosen) {
+					await session.setThinkingLevel(ownLevel(session));
+					levelChosen = false;
+				}
 			}
 
 			async function close(): Promise<void> {
@@ -737,15 +971,16 @@ export function createAtomicAdapter(
 				sessionId: startOptions.sessionId,
 				isResume: false,
 
-				async doPromptTurn(turn: HarnessV1PromptTurnOptions): Promise<HarnessV1PromptControl> {
+				async doPromptTurn(turn: PlannerTurn): Promise<HarnessV1PromptControl> {
 					if (closed) throw new Error("Atomic session is closed.");
 					if (current) throw new Error("Atomic session already has an active turn.");
-					let text = promptText(turn.prompt);
+					let { text, images } = promptParts(turn.prompt);
 					let agent = await prepare(turn);
 					let structured = turn.responseFormat?.type === "json";
 					let names = full
 						? agent.getAllTools().map(tool => tool.name).filter(name =>
-							FULL_PLANNER_TOOLS.has(name) || policy.hostNames.includes(name)
+							FULL_PLANNER_TOOLS.has(name) || plannerTools.has(name)
+							|| policy.hostNames.includes(name)
 						)
 						: policy.hostNames;
 					let expected = structured ? [...names, ATOMIC_RESULT_TOOL_NAME] : names;
@@ -785,7 +1020,10 @@ export function createAtomicAdapter(
 							if (!run.stopped) {
 								run.emit({ type: "stream-start", modelId: agent.model?.id });
 								await agent.agent.waitForIdle();
-								await agent.prompt(text, { expandPromptTemplates: !!full });
+								await agent.prompt(text, {
+									expandPromptTemplates: !!full,
+									...(images.length ? { images } : {}),
+								});
 							}
 							if (run.failure) throw run.failure;
 							if (run.stopped) return;
@@ -841,6 +1079,14 @@ export function createAtomicAdapter(
 			};
 			open.add(handle);
 			return handle;
+		},
+
+		async catalog(defaultModel) {
+			return atomicCatalog(await (runtime ??= createRuntime(settings)), settings, defaultModel);
+		},
+
+		async commands(cwd) {
+			return sessionCommands(await (runtime ??= createRuntime(settings)), settings, cwd);
 		},
 
 		async shutdown() {

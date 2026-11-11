@@ -8,11 +8,15 @@ import {
 	AGENT_SUBPROTOCOL,
 	AGENT_VERSION,
 	encodeMessage,
+	LINK_CLOSE,
+	MAX_LINK_ATTACHMENT_BYTES,
 	MAX_LINK_MESSAGE_BYTES,
 	MAX_LINK_NOTE_LENGTH,
 	parseClientMessage,
 	parseServerMessage,
+	RESTART_RESUME_RETRY_MS,
 	toolErrorSchema,
+	usableCatalog,
 } from "./protocol";
 
 describe("Agent connection messages", () => {
@@ -318,10 +322,76 @@ describe("Agent connection messages", () => {
 			featuresHeader: AGENT_FEATURES_HEADER,
 			runStageDeltas: AGENT_FEATURES.runStageDeltas,
 			decisionOptionPreviews: AGENT_FEATURES.decisionOptionPreviews,
+			resumableSessions: AGENT_FEATURES.resumableSessions,
+			restartNotice: AGENT_FEATURES.restartNotice,
+			capabilityCatalog: AGENT_FEATURES.capabilityCatalog,
+			attachments: AGENT_FEATURES.attachments,
+			restartResumeRetryMs: RESTART_RESUME_RETRY_MS,
 		});
+		expect(AGENT_FEATURES.restartNotice).toBe("restart-notice");
+		expect(LINK_CLOSE.restarting).toBe(1012);
 		let source = await Bun.file(new URL("./client.ts", import.meta.url)).text();
 		let imports = [...source.matchAll(/^import\s+(type\s+)?/gm)];
 		expect(imports.every(match => match[1])).toBe(true);
+	});
+
+	it("marks a refusal as worth retrying only when the server says so", () => {
+		let transient = { type: "refused", code: "unavailable", message: "x", retry: true } as const;
+		expect(parseServerMessage(encodeMessage(transient))).toEqual({ ok: true, message: transient });
+		expect(parseServerMessage(JSON.stringify({ ...transient, retry: false }))).toMatchObject({
+			ok: false,
+		});
+		expect(
+			parseServerMessage(
+				JSON.stringify({ type: "refused", code: "planner-attached", message: "x" }),
+			),
+		)
+			.toMatchObject({ ok: true });
+	});
+
+	it("tells a client when a new process is expected, with a whole number of milliseconds", () => {
+		let restarting = { type: "restarting", reconnectWithinMs: 10_000 } as const;
+		expect(parseServerMessage(encodeMessage(restarting))).toEqual({
+			ok: true,
+			message: restarting,
+		});
+		for (let reconnectWithinMs of [-1, 1.5, "10", undefined]) {
+			expect(parseServerMessage(JSON.stringify({ type: "restarting", reconnectWithinMs })))
+				.toMatchObject({ ok: false });
+		}
+	});
+
+	it("carries a client's acknowledgement of an answer by its request, and no more", () => {
+		expect(parseClientMessage(encodeMessage({ type: "input-received", request: "r1" })))
+			.toEqual({ ok: true, message: { type: "input-received", request: "r1" } });
+		for (let message of [{ type: "input-received" }, { type: "input-received", request: "" }]) {
+			expect(parseClientMessage(JSON.stringify(message))).toMatchObject({ ok: false });
+		}
+		expect(parseClientMessage(JSON.stringify({ type: "input-received", request: "r", extra: 1 })))
+			.toMatchObject({ ok: false });
+	});
+
+	it("carries the sessions a resuming client holds, each with the requests it still waits on", () => {
+		let held = [{ session: "s1", requests: ["r1", "r2"] }, { session: "s2", requests: [] }];
+		expect(AGENT_FEATURES.resumableSessions).toBe("resumable-sessions");
+		expect(parseClientMessage(encodeMessage({ type: "resume", sessions: held })))
+			.toEqual({ ok: true, message: { type: "resume", sessions: held } });
+		expect(parseServerMessage(encodeMessage({ type: "resumed", sessions: held })))
+			.toEqual({ ok: true, message: { type: "resumed", sessions: held } });
+		for (
+			let sessions of [
+				[{ session: "", requests: [] }],
+				[{ session: "s", requests: [""] }],
+				[{ session: "s", requests: Array.from({ length: 17 }, (_, i) => `r${i}`) }],
+				[{ session: "s" }],
+				[{ session: "s", requests: [], extra: true }],
+			]
+		) {
+			expect(parseClientMessage(JSON.stringify({ type: "resume", sessions }))).toMatchObject({
+				ok: false,
+				code: "malformed-message",
+			});
+		}
 	});
 
 	it("derives the link URL from a Chopin origin", () => {
@@ -330,5 +400,363 @@ describe("Agent connection messages", () => {
 		expect(agentUrl("http://127.0.0.1:8787").href).toBe("ws://127.0.0.1:8787/api/v1/agent");
 		expect(agentUrl("ws://127.0.0.1:1/custom").href).toBe("ws://127.0.0.1:1/custom");
 		expect(() => agentUrl("ftp://chopin.test")).toThrow("http(s) or ws(s)");
+	});
+});
+
+describe("The capability catalog", () => {
+	let catalog = {
+		models: {
+			available: [
+				{
+					id: "acme/large:preview",
+					name: "Large",
+					provider: { id: "acme", name: "Acme" },
+					description: "Slower and more careful.",
+					thinkingLevels: ["off", "low", "high", "xhigh"],
+				},
+				{ id: "acme/small", name: "Small" },
+			],
+			default: { id: "acme/small" },
+		},
+		commands: [{ name: "release-notes", kind: "skill", description: "Draft release notes." }],
+	};
+
+	it("is a feature a client asks for, named as the documentation names it", () => {
+		expect(AGENT_FEATURES.capabilityCatalog).toBe("capability-catalog");
+		expect(WIRE.capabilityCatalog).toBe(AGENT_FEATURES.capabilityCatalog);
+	});
+
+	it("round-trips models, thinking levels and commands exactly as reported", () => {
+		let message = { type: "capabilities" as const, catalog };
+		let parsed = parseClientMessage(JSON.stringify(message));
+		expect(parsed).toEqual({ ok: true, message });
+		expect(encodeMessage(message)).toBe(JSON.stringify(message));
+	});
+
+	it("accepts an empty report and keeps the order, duplicates and spelling of what it names", () => {
+		expect(parseClientMessage(JSON.stringify({ type: "capabilities", catalog: {} }))).toEqual({
+			ok: true,
+			message: { type: "capabilities", catalog: {} },
+		});
+		let odd = {
+			models: {
+				available: [
+					{ id: "Z/b", name: "B", thinkingLevels: ["high", "off", "high"] },
+					{ id: "Z/b", name: "B again" },
+					{ id: "a/c", name: "C" },
+				],
+			},
+		};
+		let parsed = parseClientMessage(JSON.stringify({ type: "capabilities", catalog: odd }));
+		expect(parsed).toEqual({ ok: true, message: { type: "capabilities", catalog: odd } });
+	});
+
+	it("accepts every string a client reports as it was written, however it is spelled or how long", () => {
+		// The protocol does not say how a model, a level or a command is spelled, so none is refused.
+		let odd = {
+			models: {
+				available: [
+					{
+						id: `acme/${"x".repeat(300)}`,
+						name: "n".repeat(129),
+						provider: { id: "p".repeat(200), name: "P".repeat(200) },
+						description: "d".repeat(4_001),
+						thinkingLevels: ["extra high", "deep thought", "\u4f4e", "x".repeat(300), "a:b=c", ""],
+					},
+					{ id: "", name: "" },
+					{ id: 'with space \n and "quotes"', name: "Line\nbreak", thinkingLevels: [] },
+				],
+				default: { id: "y".repeat(300), thinkingLevel: "extra high" },
+			},
+			commands: [
+				{ name: "n".repeat(200), description: "d".repeat(5_000), kind: "slash command" },
+				{ name: "", kind: "" },
+			],
+		};
+		let message = { type: "capabilities" as const, catalog: odd };
+		expect(parseClientMessage(JSON.stringify(message))).toEqual({ ok: true, message });
+	});
+
+	it("refuses only a value of the wrong type, which no client of this feature sends", () => {
+		let refused = (value: unknown) =>
+			parseClientMessage(JSON.stringify({ type: "capabilities", catalog: value })).ok;
+		expect(refused({ models: { available: [{ id: 3, name: "x" }] } })).toBe(false);
+		expect(refused({ models: { available: [{ id: "a" }] } })).toBe(false);
+		expect(refused({ models: { available: "none" } })).toBe(false);
+		expect(refused({ models: { available: [{ id: "a", name: "x", thinkingLevels: "high" }] } }))
+			.toBe(false);
+		expect(refused({ models: { available: [{ id: "a", name: "x", thinkingLevels: [3] }] } }))
+			.toBe(false);
+		expect(refused({ models: { available: [{ id: "a", name: "x", description: 3 }] } }))
+			.toBe(false);
+		expect(refused({ models: { available: [], default: { thinkingLevel: "low" } } })).toBe(false);
+		expect(refused({ commands: [{ name: "x", kind: 3 }] })).toBe(false);
+		expect(refused({ commands: [{ kind: "skill" }] })).toBe(false);
+	});
+
+	it("bounds a report only by the frame it travels in", () => {
+		let big = { models: { available: [{ id: "a".repeat(MAX_LINK_MESSAGE_BYTES), name: "x" }] } };
+		expect(parseClientMessage(JSON.stringify({ type: "capabilities", catalog: big })))
+			.toMatchObject({
+				ok: false,
+				code: "message-too-large",
+			});
+	});
+
+	it("takes as many models and commands as the frame holds, and a description as long as a skill's", () => {
+		// Atomic's own models number 1,774 and its skills describe themselves in up to 925 characters.
+		let large = {
+			models: {
+				available: Array.from({ length: 1_774 }, (_, index) => ({
+					id: `provider/model-${index}`,
+					name: `Model ${index}`,
+					provider: { id: `provider-${index % 40}` },
+					thinkingLevels: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+				})),
+			},
+			commands: Array.from({ length: 600 }, (_, index) => ({
+				name: `skill-${index}`,
+				kind: "skill",
+				description: "d".repeat(925),
+			})),
+		};
+		let parsed = parseClientMessage(JSON.stringify({ type: "capabilities", catalog: large }));
+		expect(parsed).toEqual({ ok: true, message: { type: "capabilities", catalog: large } });
+		let described = {
+			models: { available: [{ id: "a", name: "x", description: "d".repeat(4_000) }] },
+		};
+		expect(parseClientMessage(JSON.stringify({ type: "capabilities", catalog: described })).ok)
+			.toBe(true);
+	});
+
+	it("ignores a field it has no use for and keeps it as written, so a report can grow", () => {
+		let grown = {
+			models: {
+				available: [{
+					id: "a",
+					name: "A",
+					provider: { id: "p", homepage: "https://example.test" },
+					price: { input: 1, output: 3 },
+					thinkingLevels: ["low"],
+				}],
+				default: { id: "a", why: "cheapest" },
+				recommended: ["a"],
+			},
+			commands: [{ name: "x", kind: "skill", aliases: ["y"] }],
+			attachments: { images: true },
+			mentions: [{ kind: "file" }],
+		};
+		let parsed = parseClientMessage(JSON.stringify({ type: "capabilities", catalog: grown }));
+		expect(parsed).toEqual({ ok: true, message: { type: "capabilities", catalog: grown } });
+		// Only the catalog is read this way: a message is still strict.
+		expect(
+			parseClientMessage(JSON.stringify({ type: "capabilities", catalog: {}, extra: 1 })).ok,
+		)
+			.toBe(false);
+	});
+
+	it("rides a turn as an optional thinking level beside the model, and old turns still parse", () => {
+		let turn = {
+			type: "turn" as const,
+			session: "s",
+			turn: "t",
+			prompt: "p",
+			tools: [],
+		};
+		expect(parseServerMessage(JSON.stringify(turn))).toEqual({ ok: true, message: turn });
+		let chosen = { ...turn, model: "acme/large:preview", thinkingLevel: "high" };
+		expect(parseServerMessage(JSON.stringify(chosen))).toEqual({ ok: true, message: chosen });
+		// What the client reported is what comes back, however it is spelled or how long.
+		let odd = { ...turn, model: `acme/${"m".repeat(5_000)}`, thinkingLevel: "very high" };
+		expect(parseServerMessage(JSON.stringify(odd))).toEqual({ ok: true, message: odd });
+		let long = {
+			type: "part" as const,
+			session: "s",
+			turn: "t",
+			part: {
+				type: "stream-start" as const,
+				modelId: odd.model,
+			},
+		};
+		expect(parseClientMessage(JSON.stringify(long))).toEqual({ ok: true, message: long });
+	});
+});
+
+describe("What Chopin can offer of a capability catalog", () => {
+	it("skips a model whose id is empty and keeps every other entry, in the order given", () => {
+		let reported = {
+			models: {
+				available: [
+					{ id: "a", name: "A" },
+					{ id: "", name: "Blank", thinkingLevels: ["low"] },
+					{ id: "b", name: "B", description: "Second." },
+					{ id: "a", name: "A again" },
+				],
+				default: { id: "b" },
+			},
+			commands: [{ name: "notes", kind: "skill" }],
+		};
+		let { catalog, skipped } = usableCatalog(reported);
+		expect(catalog).toEqual({
+			models: {
+				available: [
+					{ id: "a", name: "A" },
+					{ id: "b", name: "B", description: "Second." },
+					{ id: "a", name: "A again" },
+				],
+				default: { id: "b" },
+			},
+			commands: [{ name: "notes", kind: "skill" }],
+		});
+		expect(skipped).toEqual(['the model named "Blank" has no id']);
+	});
+
+	it("drops an empty level from a model's levels and keeps the others as written", () => {
+		let { catalog, skipped } = usableCatalog({
+			models: {
+				available: [
+					{ id: "a", name: "A", thinkingLevels: ["", "high", "extra high", "", "high"] },
+					{ id: "b", name: "B", thinkingLevels: [""] },
+					{ id: "c", name: "C", thinkingLevels: ["low"] },
+				],
+			},
+		});
+		// A model left with no level has no reasoning control, as one that listed none.
+		expect(catalog.models?.available).toEqual([
+			{ id: "a", name: "A", thinkingLevels: ["high", "extra high", "high"] },
+			{ id: "b", name: "B", thinkingLevels: [] },
+			{ id: "c", name: "C", thinkingLevels: ["low"] },
+		]);
+		expect(skipped).toEqual(["a lists an empty thinking level", "b lists an empty thinking level"]);
+	});
+
+	it("takes no default that names no model, and no empty level for a default", () => {
+		let models = [{ id: "a", name: "A", thinkingLevels: ["low"] }];
+		expect(usableCatalog({ models: { available: models, default: { id: "" } } })).toEqual({
+			catalog: { models: { available: models } },
+			skipped: ["the default model has no id"],
+		});
+		expect(
+			usableCatalog({
+				models: { available: models, default: { id: "a", thinkingLevel: "", why: "cheapest" } },
+			}),
+		).toEqual({
+			catalog: { models: { available: models, default: { id: "a", why: "cheapest" } } },
+			skipped: ["the default thinking level is empty"],
+		});
+	});
+
+	it("leaves a catalog with nothing to skip exactly as the client wrote it, fields it does not use included", () => {
+		let reported = {
+			models: {
+				available: [
+					{
+						id: "x".repeat(300),
+						name: "",
+						description: "",
+						thinkingLevels: ["extra high", "\u4f4e"],
+						price: { input: 1 },
+					},
+				],
+				default: { id: "x".repeat(300), thinkingLevel: "extra high" },
+				recommended: ["a"],
+			},
+			attachments: { images: true },
+		};
+		let { catalog, skipped } = usableCatalog(reported);
+		expect(catalog).toEqual(reported);
+		expect(skipped).toEqual([]);
+		expect(usableCatalog({})).toEqual({ catalog: {}, skipped: [] });
+		expect(usableCatalog({ commands: [{ name: "", kind: "" }] }).catalog).toEqual({
+			commands: [{ name: "", kind: "" }],
+		});
+	});
+});
+
+describe("Images and files in a turn", () => {
+	let turn = {
+		type: "turn" as const,
+		session: "s",
+		turn: "t",
+		prompt: "@ana: What is this?",
+		tools: [],
+	};
+	let image = {
+		id: "a1",
+		name: "shot.png",
+		kind: "image" as const,
+		mediaType: "image/png",
+		size: 7,
+		data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]).toString("base64"),
+	};
+	let file = {
+		id: "a2",
+		name: "notes.md",
+		kind: "file" as const,
+		mediaType: "text/plain",
+		size: 8,
+		data: Buffer.from("# Notes\n").toString("base64"),
+	};
+
+	it("is a feature a client asks for, named as the documentation names it", () => {
+		expect(AGENT_FEATURES.attachments).toBe("attachments");
+		expect(WIRE.attachments).toBe(AGENT_FEATURES.attachments);
+		// A turn's files fit inside one message with room for its prompt and tools.
+		expect(MAX_LINK_ATTACHMENT_BYTES * 4 / 3).toBeLessThan(MAX_LINK_MESSAGE_BYTES);
+	});
+
+	it("round-trips a turn's files, in order, with their bytes as base64", () => {
+		let message = { ...turn, attachments: [image, file] };
+		let parsed = parseServerMessage(JSON.stringify(message));
+		expect(parsed).toEqual({ ok: true, message });
+		expect(encodeMessage(message)).toBe(JSON.stringify(message));
+	});
+
+	it("keeps the turn an older client sees exactly as it was: the field is optional and never sent empty", () => {
+		expect(parseServerMessage(JSON.stringify(turn))).toEqual({ ok: true, message: turn });
+		expect(encodeMessage(turn)).toBe(JSON.stringify(turn));
+		expect(JSON.stringify(turn)).not.toContain("attachments");
+	});
+
+	it("refuses a file the protocol does not describe", () => {
+		for (
+			let bad of [
+				{ ...file, kind: "document" },
+				{ ...file, size: -1 },
+				{ ...file, name: "" },
+				{ ...file, extra: true },
+				{ id: "a3", name: "x", kind: "file", mediaType: "text/plain", size: 0 },
+			]
+		) {
+			expect(
+				parseServerMessage(JSON.stringify({ ...turn, attachments: [bad] })),
+				JSON.stringify(bad),
+			)
+				.toMatchObject({ ok: false });
+		}
+		expect(parseServerMessage(JSON.stringify({ ...turn, attachments: "shot.png" }))).toMatchObject({
+			ok: false,
+		});
+	});
+
+	it("takes what a model reads as a catalog reports it, and leaves the rest of the catalog alone", () => {
+		let reported = {
+			models: {
+				available: [
+					{ id: "acme/vision", name: "Vision", inputTypes: ["text", "image"] },
+					{ id: "acme/text", name: "Text", inputTypes: ["text"] },
+					{ id: "acme/unsaid", name: "Unsaid" },
+				],
+			},
+		};
+		let message = { type: "capabilities" as const, catalog: reported };
+		expect(parseClientMessage(JSON.stringify(message))).toEqual({ ok: true, message });
+		expect(usableCatalog(reported)).toEqual({ catalog: reported, skipped: [] });
+		expect(
+			parseClientMessage(JSON.stringify({
+				type: "capabilities",
+				catalog: { models: { available: [{ id: "a", name: "A", inputTypes: "image" }] } },
+			})),
+		).toMatchObject({ ok: false });
 	});
 });

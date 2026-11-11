@@ -89,6 +89,8 @@ type SessionOptions = {
 	authorize?: (user: UserRecord, accessToken: string) => Promise<boolean>;
 	beforeRefresh?: (sessionId: string, revision: number) => Promise<void>;
 	onRevoked?: (sessionId: string) => Promise<void>;
+	/** A stored login came back in this process, because its browser sent its cookie. */
+	onRestored?: (sessionId: string) => void;
 	invalidate?: (accessToken: string) => void;
 	persist?: (sessionId: string, grant: GitHubTokenGrant, revision: number) => Promise<void>;
 	cookieSuffix?: string;
@@ -239,6 +241,7 @@ export class Sessions {
 	readonly #refreshes = new Map<string, Promise<MemorySession | undefined>>();
 	readonly #revocations = new Map<string, Promise<boolean>>();
 	readonly #pendingDeletes = new Set<string>();
+	#refreshing = true;
 	#migrated = false;
 	readonly cookieName: string;
 
@@ -451,6 +454,7 @@ export class Sessions {
 			current = next;
 		}
 		this.#sessions.set(id, current);
+		this.#options.onRestored?.(id);
 		return current;
 	}
 
@@ -501,6 +505,15 @@ export class Sessions {
 				&& current.accessExpiresAt > this.#clock()
 			? current.accessToken
 			: undefined;
+	}
+
+	/**
+	 * Never ask GitHub to refresh a login again. A refresh token is single-use, so a refresh begun
+	 * while a replacement process restores the same login could spend the token the replacement
+	 * holds. A login keeps working on the access token it has until that expires.
+	 */
+	stopRefreshing(): void {
+		this.#refreshing = false;
 	}
 
 	/** Run one idempotent GitHub read, refreshing and retrying once after a 401. */
@@ -633,7 +646,7 @@ export class Sessions {
 			return this.#sessions.get(id);
 		}
 		if (current.source) return this.#rotateDelegated(current, rejectedRevision);
-		let refresh = this.#options.refresh;
+		let refresh = this.#refreshing ? this.#options.refresh : undefined;
 		if (!refresh) {
 			if (current.accessExpiresAt > now && rejectedRevision === undefined) return current;
 			throw new GitHubTokenError("GitHub token refresh is not configured");

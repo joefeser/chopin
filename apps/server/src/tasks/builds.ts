@@ -2,6 +2,7 @@ import { z } from "zod";
 import { activityText } from "@chopin/protocol/activity";
 import { changedBlocks } from "./changes";
 import { approveGraph, validate } from "./graphs";
+import { unapprovedContext } from "./open-decisions";
 import { planningReadiness } from "./plan-graphs";
 import {
 	claimEligibility,
@@ -35,6 +36,7 @@ let buildSchema = z.object({
 	id: z.string().uuid(),
 	retryOf: z.string().uuid().optional(),
 	user: z.string().min(1).max(128),
+	machineOwner: z.string().min(1).max(128).optional(),
 	connectionId: z.string().min(1).max(128),
 	/** The paired machine it runs on; builds stored before machines were recorded have none. */
 	machineId: z.string().min(1).max(128).optional(),
@@ -69,6 +71,11 @@ let buildSchema = z.object({
 			: build.baseRevision === undefined && build.targetRevision === undefined,
 	"invalid rebuild revisions",
 );
+
+/** Whose connection runs a build: its requester's, or the teammate's whose shared machine it went to. */
+export function runner(build: Pick<BuildRequest, "user" | "machineOwner">): string {
+	return build.machineOwner ?? build.user;
+}
 
 /** Whether a build closes document editing. A rebuild works from a sealed delta instead. */
 export function locksEditing(build: { state: string; kind?: string }): boolean {
@@ -178,6 +185,7 @@ type BuildInput = {
 	graphVersion: number;
 	graphRevision: number;
 	user: string;
+	machineOwner?: string;
 	connectionId: string;
 	machineId: string;
 	machineService?: true;
@@ -204,6 +212,7 @@ export async function queueBuild(plan: Plan, input: BuildInput): Promise<BuildRe
 				&& existing.planRevision === input.planRevision
 			) {
 				let sameOwnerAndCheckout = existing.user === input.user
+					&& existing.machineOwner === input.machineOwner
 					&& existing.connectionId === input.connectionId
 					&& existing.repositoryId === input.repositoryId
 					&& existing.checkout.repository === input.checkout.repository
@@ -262,8 +271,13 @@ export type RebuildConnections = {
 	list: (repositoryId: string, owner?: string) => Connection[];
 	assign: (connectionId: string, documentId: string) => void;
 	assigned: (connectionId: string) => string | undefined;
-	/** Whether the connection may take its owner's work on this document: their machine choice. */
-	allows?: (documentId: string, connection: Connection) => boolean;
+	/** Whether the connection may take `person`'s work on this document: their machine choice. */
+	allows?: (documentId: string, connection: Connection, person: string) => boolean;
+	/**
+	 * The live connections of the teammate's shared machine that is `person`'s favorite, while they
+	 * chose no machine for the document: what Automatic prefers for work they press.
+	 */
+	favoriteShared?: (repositoryId: string, person: string, documentId: string) => Connection[];
 };
 
 export type RebuildResult =
@@ -271,7 +285,7 @@ export type RebuildResult =
 	| { kind: "busy" }
 	| { kind: "unchanged" }
 	| { kind: "unavailable" }
-	/** A person's Build waits, like Build plan, for open decisions and accepted comments. */
+	/** A person's Build waits, like Build plan, for accepted comments and required investigations. */
 	| { kind: "blocked"; blockers: string[] };
 
 /** Whether any build or claim is in flight, including rebuilds that leave editing open. */
@@ -291,8 +305,11 @@ export function stoppedForRevision(plan: Plan, revision = plan.revision): boolea
  *
  * Under LIVE_BUILD the live build's user keeps ownership; its original connection is preferred,
  * and another of the same user's connections for this repository stands in once that one has gone.
- * A person who presses Build instead (`by`) builds the edits on their own connection. A connection
- * already holding another document's build is skipped so the rebuild cannot strand that build.
+ * A person who presses Build instead (`by`) builds the edits on their own connection, or on the
+ * teammate's shared machine they chose for the document, or made their favorite while they chose
+ * none, which comes before the original connection; automatic work never leaves its owner's
+ * machines. A connection already holding another document's build is skipped so the rebuild cannot
+ * strand that build.
  */
 /** The checkout a connection says it has of a repository, else `fallback`. */
 function checkoutFor(
@@ -315,7 +332,7 @@ export async function queueRebuild(
 	options: {
 		/** An automatic rebuild runs only on a connection whose owner opted in when pairing it. */
 		automatic?: boolean;
-		/** Who pressed Build; a pressed rebuild runs on their own agent. */
+		/** Who pressed Build; a pressed rebuild runs on the agent of the machine they chose. */
 		by?: string;
 	} = {},
 ): Promise<RebuildResult> {
@@ -334,13 +351,20 @@ export async function queueRebuild(
 		let original = plan.builds.find(build => build.id === live.buildId);
 		let usable = (connection: Connection | undefined) => {
 			let assigned = connection && connections.assigned(connection.id);
-			return !!connection && connection.owner === owner
+			return !!connection
+				&& (connection.owner === owner
+					? connections.allows?.(plan.id, connection, owner) ?? true
+					: !options.automatic && !!connection.shared
+						&& !!connections.allows?.(plan.id, connection, owner))
 				&& serves(connection, live.repositoryId)
 				&& (!options.automatic || connection.autoRun === true)
-				&& (connections.allows?.(plan.id, connection) ?? true)
 				&& (assigned === undefined || assigned === plan.id);
 		};
-		let connection = original && connections.get(original.connectionId);
+		// Their favorite shared machine, where it can take the work, is what Automatic now prefers.
+		let connection = options.automatic
+			? undefined
+			: connections.favoriteShared?.(live.repositoryId, owner, plan.id).find(usable);
+		connection ??= original && connections.get(original.connectionId);
 		if (!usable(connection)) {
 			connection = connections.list(live.repositoryId, owner).find(usable);
 		}
@@ -367,6 +391,7 @@ export async function queueRebuild(
 			id: crypto.randomUUID(),
 			kind: "rebuild",
 			user: owner,
+			...(connection.owner !== owner ? { machineOwner: connection.owner } : {}),
 			connectionId: connection.id,
 			machineId: connection.machineId,
 			...(connection.about?.service ? { machineService: true } : {}),
@@ -466,7 +491,10 @@ export function renewQueued(plan: Plan, id: string): Promise<void> {
 	});
 }
 
-/** Persist pickup before the companion receives permission to spawn a process. */
+/**
+ * Persist pickup before the companion receives permission to spawn a process. `user` owns the
+ * connection that picks it up: the build's requester, or the owner of the shared machine it runs on.
+ */
 export function pickBuild(
 	plan: Plan,
 	user: string,
@@ -477,7 +505,7 @@ export function pickBuild(
 	return exclusive(plan, async () => {
 		let build = plan.builds.at(-1);
 		if (
-			!build || build.user !== user || build.connectionId !== connectionId
+			!build || runner(build) !== user || build.connectionId !== connectionId
 			|| build.state !== "queued"
 		) {
 			return;
@@ -532,6 +560,7 @@ export function rebindBuild(
 	});
 }
 
+/** `user` owns the connection that reports it, as for pickBuild(). */
 export function reportBuild(
 	plan: Plan,
 	user: string,
@@ -550,7 +579,7 @@ export function reportBuild(
 	return exclusive(plan, async () => {
 		let current = plan.builds.at(-1);
 		if (
-			!current || current.id !== id || current.user !== user
+			!current || current.id !== id || runner(current) !== user
 			|| current.connectionId !== connectionId
 		) {
 			throw new Error("build is unavailable");
@@ -846,6 +875,7 @@ export function readRebuild(plan: Plan, buildId: string) {
 			})),
 			tasks,
 			...(outstanding.length ? { outstanding } : {}),
+			...unapprovedContext(plan.records.values()),
 		};
 	});
 }

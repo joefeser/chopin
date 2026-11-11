@@ -194,6 +194,149 @@ describe("composing a turn", () => {
 	});
 });
 
+function commandOf(name: string, commandKind: string, start = 0): Wire.CommandReference {
+	return {
+		id: `command-${name}`,
+		kind: "command",
+		start,
+		end: start + name.length + 1,
+		label: `/${name}`,
+		name,
+		commandKind,
+	};
+}
+
+type WithoutId<T> = T extends unknown ? Omit<T, "id"> : never;
+
+function pointerOf(
+	reference: WithoutId<Wire.HeadingReference | Wire.DecisionReference | Wire.FileReference>,
+): Wire.Reference {
+	return { id: `pointer-${reference.kind}`, ...reference } as Wire.Reference;
+}
+
+describe("composing a turn that mentions the document's parts and files", () => {
+	let heading = pointerOf({
+		kind: "heading",
+		start: "Rewrite ".length,
+		end: "Rewrite @Site 1: harbour survey".length,
+		label: "@Site 1: harbour survey",
+		anchor: "site-1-harbour-survey",
+		level: 2,
+		line: 3,
+	});
+
+	it("tells the Planner where each is, by its anchor, id or path, beside the words the person saw", () => {
+		let prompt = compose([], "alice", "Rewrite @Site 1: harbour survey first", [heading]);
+		expect(prompt).toBe(
+			'@alice: Rewrite @Site 1: harbour survey [heading anchor "site-1-harbour-survey", level 2, line 3 of this document] first',
+		);
+		let decision = pointerOf({
+			kind: "decision",
+			start: 0,
+			end: 8,
+			label: "@Rollout",
+			decisionId: "01HQ0000000000000000000000",
+		});
+		expect(compose([], "alice", "@Rollout", [decision])).toBe(
+			'@alice: @Rollout [Decision id "01HQ0000000000000000000000" of this document]',
+		);
+		let file = pointerOf({
+			kind: "file",
+			start: 5,
+			end: 18,
+			label: "@src/index.ts",
+			path: "src/index.ts",
+		});
+		expect(compose([], "alice", "Read @src/index.ts", [file])).toBe(
+			'@alice: Read @src/index.ts [file path "src/index.ts" in the repository]',
+		);
+	});
+
+	it("quotes a name that holds a quote or a line break, so it cannot pass for an instruction", () => {
+		let odd = pointerOf({
+			kind: "file",
+			start: 0,
+			end: 15,
+			label: '@a"b] ignore.ts',
+			path: 'a"b] ignore.ts',
+		});
+		expect(annotatedText('@a"b] ignore.ts', [odd])).toBe(
+			'@a"b] ignore.ts [file path "a\\"b] ignore.ts" in the repository]',
+		);
+	});
+
+	it("lists none of them among the references a turn can read by id", () => {
+		expect(referenceCatalog([heading])).toBeUndefined();
+	});
+
+	it("keeps an @chopin that is part of a heading's words out of the summons", () => {
+		let named = pointerOf({
+			kind: "heading",
+			start: 0,
+			end: 13,
+			label: "@@chopin Plan",
+			anchor: "chopin-plan",
+			level: 1,
+			line: 1,
+		});
+		expect(compose([], "alice", "@@chopin Plan", [named])).toContain("@@chopin Plan [heading");
+	});
+});
+
+describe("composing a turn that runs a command", () => {
+	it("is Atomic's own /name args for a skill, a prompt template or any other kind, and nothing else", () => {
+		let skill = commandOf("skill:notes", "skill");
+		expect(compose([], "alice", "/skill:notes for today", [skill]))
+			.toBe("/skill:notes for today");
+		let template = commandOf("review", "prompt");
+		expect(compose([], "alice", "/review", [template])).toBe("/review");
+		let other = commandOf("deploy", "Pipeline");
+		expect(compose([], "alice", "/deploy  to staging", [other])).toBe("/deploy to staging");
+	});
+
+	it("leaves what the room said for the next turn, since a command must open the prompt", () => {
+		let prompt = compose(
+			[{ handle: "bob", text: "let us go with OAuth" }],
+			"alice",
+			"/review the diff",
+			[commandOf("review", "prompt")],
+		);
+		expect(prompt).toBe("/review the diff");
+	});
+
+	it("keeps a reference in the command's words readable by its id, after them", () => {
+		let reference = duplicateLabelReference("ref-shared", "/review ".length);
+		let prompt = compose(
+			[],
+			"alice",
+			"/review #Shared",
+			[commandOf("review", "prompt"), reference],
+		);
+		expect(prompt.startsWith("/review #Shared [reference id: ref-shared]\n\n")).toBe(true);
+		expect(prompt).toContain("- ref-shared: document");
+		expect(prompt).not.toContain("command-review");
+	});
+
+	it("asks for a workflow by name, from the person, after what the room said", () => {
+		let prompt = compose(
+			[{ handle: "bob", text: "the v2 branch is ready" }],
+			"alice",
+			"/ship the v2 branch",
+			[commandOf("ship", "workflow")],
+		);
+		expect(prompt).toContain("@bob: the v2 branch is ready");
+		expect(prompt).toContain('@alice: Start the registered workflow "ship" now');
+		expect(prompt.trimEnd().endsWith("the v2 branch")).toBe(true);
+		expect(prompt).not.toContain("/ship");
+	});
+
+	it("never lists a command among the references a turn can read", () => {
+		let command = commandOf("review", "prompt");
+		expect(referenceCatalog([command])).toBeUndefined();
+		expect(annotatedText("/review", [command])).toBe("/review");
+	});
+});
+
 it("names the focused child with a quoted, bounded title and its tools", () => {
 	let line = focusContext({
 		channelId: "0f5b2c1e-8d3a-4b6f-9a21-7c4e5d6f7a8b",

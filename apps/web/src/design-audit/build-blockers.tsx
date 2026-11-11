@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { CONNECT_MACHINE_TO_BUILD } from "../build-model";
 import { BuildPlanButton } from "../build-plan-button";
 import { AuditPlate } from "./frame";
 
@@ -7,7 +8,7 @@ import type { BuildBlocker } from "../build-blockers";
 
 let noop = () => {};
 let build: BuildPlan = {
-	look: { kind: "plan", blocked: "Waiting on decisions and investigations" },
+	look: { kind: "plan", blocked: "Waiting on investigations" },
 	tabReady: false,
 	needsAgent: false,
 	busy: false,
@@ -16,12 +17,6 @@ let build: BuildPlan = {
 	rebuildNeedsAgent: false,
 	rebuilding: false,
 	reload: noop,
-};
-let decision: BuildBlocker = {
-	kind: "decision",
-	id: "cache",
-	question: "expiry",
-	title: "How should the cache expire?",
 };
 let investigations: BuildBlocker[] = [
 	{ kind: "investigation", id: "startup", title: "Compare cold-start times" },
@@ -37,14 +32,13 @@ export function BuildBlockerAudit() {
 			description="Production capsules and named blockers. Hover or click, then select a row."
 		>
 			<div className="flex flex-wrap items-center gap-3">
-				{[[decision], investigations, [decision, ...investigations]].map((items, index) => (
+				{[investigations.slice(0, 1), investigations].map((items, index) => (
 					<BuildPlanButton
 						blockers={items}
 						build={build}
 						canEdit
 						key={index}
-						onBlockerSelect={item =>
-							setSelected(`${item.kind === "decision" ? "Review" : "Open"}: ${item.title}`)}
+						onBlockerSelect={item => setSelected(`Open: ${item.title}`)}
 						onHover={noop}
 						onOpen={noop}
 					/>
@@ -54,7 +48,7 @@ export function BuildBlockerAudit() {
 				<BuildPlanButton
 					build={{
 						...build,
-						look: { kind: "plan", blocked: "Connect a Planner to this document to build" },
+						look: { kind: "plan", blocked: CONNECT_MACHINE_TO_BUILD },
 					}}
 					canEdit
 					documentURL="http://localhost:8787/githubnext/chopin/cache-plan"

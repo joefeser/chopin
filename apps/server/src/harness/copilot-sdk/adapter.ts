@@ -76,7 +76,37 @@ function bounded<T>(
 	});
 }
 
-function defaultConnect(): RuntimeSource {
+/**
+ * The only variables the CLI inherits from the server besides its own
+ * hardening flag: a proxy and the certificate authorities a proxy setup
+ * needs. The SDK treats the `env` it is given as the CLI's whole
+ * environment, so anything not listed here never reaches it.
+ */
+const FORWARDED_ENV = [
+	"HTTPS_PROXY",
+	"HTTP_PROXY",
+	"NO_PROXY",
+	"https_proxy",
+	"http_proxy",
+	"no_proxy",
+	"NODE_EXTRA_CA_CERTS",
+	"SSL_CERT_FILE",
+	"SSL_CERT_DIR",
+];
+
+function cliEnvironment(source: NodeJS.ProcessEnv): Record<string, string> {
+	let env: Record<string, string> = {};
+	for (let name of FORWARDED_ENV) {
+		let value = source[name];
+		if (value !== undefined) env[name] = value;
+	}
+	// Deliberately omits COPILOT_ENABLE_BUILTIN_GITHUB_MCP: GitHub tools
+	// reach the Planner as host tools instead.
+	env.COPILOT_PLUGIN_DIR_ONLY = "true";
+	return env;
+}
+
+export function defaultConnect(): RuntimeSource {
 	let cli = locate();
 	if (!cli.ok) throw new Error(cli.reason);
 	let home = mkdtempSync(join(tmpdir(), "chopin-copilot-planner-"));
@@ -87,9 +117,7 @@ function defaultConnect(): RuntimeSource {
 			baseDirectory: home,
 			connection: RuntimeConnection.forStdio({ path: cli.path }),
 			useLoggedInUser: false,
-			// Deliberately omits COPILOT_ENABLE_BUILTIN_GITHUB_MCP: GitHub tools
-			// reach the Planner as host tools instead.
-			env: { COPILOT_PLUGIN_DIR_ONLY: "true" },
+			env: cliEnvironment(process.env),
 			logLevel: "info",
 		});
 		return { client, cleanup: () => rmSync(home, { recursive: true, force: true }) };
@@ -147,12 +175,36 @@ function unsupported(capability: string): () => Promise<never> {
 	};
 }
 
-function promptText(prompt: HarnessV1PromptTurnOptions["prompt"]): string {
-	if (typeof prompt === "string") return prompt;
-	if (typeof prompt.content === "string") return prompt.content;
-	return prompt.content
-		.map(part => (part.type === "text" ? part.text : ""))
-		.join("");
+type Blob = { type: "blob"; data: string; mimeType: string; displayName?: string };
+
+/**
+ * What a turn's prompt comes to for the Copilot SDK: its text, with each text file written into it
+ * under its name, and each image as the blob attachment the SDK takes.
+ */
+export function promptParts(
+	prompt: HarnessV1PromptTurnOptions["prompt"],
+): { prompt: string; attachments: Blob[] } {
+	if (typeof prompt === "string") return { prompt, attachments: [] };
+	if (typeof prompt.content === "string") return { prompt: prompt.content, attachments: [] };
+	let texts: string[] = [];
+	let attachments: Blob[] = [];
+	for (let part of prompt.content) {
+		if (part.type === "text") texts.push(part.text);
+		else if (part.type === "image" && part.image instanceof Uint8Array) {
+			attachments.push({
+				type: "blob",
+				data: Buffer.from(part.image).toString("base64"),
+				mimeType: part.mediaType ?? "image/png",
+			});
+		} else if (part.type === "file" && part.data instanceof Uint8Array) {
+			texts.push(
+				`<file name=${JSON.stringify(part.filename ?? "file")}>\n${
+					new TextDecoder().decode(part.data)
+				}\n</file>`,
+			);
+		}
+	}
+	return { prompt: texts.join("\n\n"), attachments };
 }
 
 type TurnState = {
@@ -475,7 +527,12 @@ export function createCopilotSdk(
 					turn.abortSignal?.addEventListener("abort", onAbort, { once: true });
 
 					if (turn.abortSignal?.aborted) onAbort();
-					else session.send({ prompt: promptText(turn.prompt) }).catch(err => settled.reject(err));
+					else {
+						let { prompt, attachments } = promptParts(turn.prompt);
+						session.send({ prompt, ...(attachments.length ? { attachments } : {}) }).catch(err =>
+							settled.reject(err)
+						);
+					}
 
 					return {
 						async submitToolResult({ toolCallId, output: result, isError }) {

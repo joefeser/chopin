@@ -44,12 +44,21 @@ export declare namespace Session {
 	export type Outgoing =
 		| Hello
 		| Presence
+		| People
 		| Access
 		| Channel
 		| Deleted
 		| Planner
+		| Restarting
 		| Failure
 		| Ping;
+
+	/** The per-file, per-message count and per-message total caps, each a server setting. */
+	export type AttachmentSettings = {
+		maxBytes: number;
+		maxCount: number;
+		maxTotalBytes: number;
+	};
 
 	/** A member, as everyone else sees them. */
 	export type Member = {
@@ -59,6 +68,20 @@ export declare namespace Session {
 		client: string;
 		/** Roster profile when the connection claimed a demo actor; the handle is the roster ID. */
 		actor?: { name: string; avatar: string };
+		/**
+		 * The profile picture GitHub's API returned for this login when they signed in, as the server
+		 * stored it. Optional: absent for a demo actor and from a server that predates it, and a
+		 * client then falls back to the picture at `github.com/<handle>.png`, which does not exist
+		 * for every account (an Enterprise Managed User's `name_company`, for one).
+		 */
+		avatarUrl?: string;
+	};
+
+	/** A person a document names, with the picture GitHub gave their login. */
+	export type Person = {
+		/** The GitHub login, as written wherever the document names the person. */
+		login: string;
+		avatarUrl: string;
 	};
 
 	/** Sent once, immediately, to the socket that just joined. */
@@ -80,6 +103,22 @@ export declare namespace Session {
 		webResearch: boolean;
 		chatReferences: boolean;
 		chatSendAcks: boolean;
+		/**
+		 * The caps on what a message may carry, where this server takes images and files: absent
+		 * from a server that does not, and the composer then offers none.
+		 */
+		attachments?: AttachmentSettings;
+		/**
+		 * Set where the deployment configured a transcription model for dictation, naming the
+		 * provider it sends audio to. Absent by default: no audio is ever sent to the server.
+		 */
+		transcription?: { provider: string };
+		/**
+		 * The build of the client this server serves: the entry script its page names. A tab whose own
+		 * build, sent as the socket's `build` query parameter, differs knows a newer server answered.
+		 * Absent when the server serves no built client.
+		 */
+		build?: string;
 	};
 
 	/** Durable channel metadata changed while this room was open. */
@@ -106,30 +145,68 @@ export declare namespace Session {
 	};
 
 	/**
-	 * Who holds this document's remote Planner. `held` is a client that detached or
-	 * dropped and keeps the document until `until` (ISO 8601) unless it reattaches.
-	 * `starting` is a paired machine of `login`'s asked to start it, which has yet to
-	 * attach. Only the GitHub login is named, never its machine or checkout.
+	 * Who holds this document's remote Planner. `held` is a client that detached and
+	 * keeps the document until `until` (ISO 8601) unless it reattaches. `disconnected`
+	 * is a client whose connection dropped while it had workflow runs or open questions
+	 * Chopin keeps for it: there is no deadline, and it resumes them when it reconnects
+	 * (see docs/agent-connection.md). `starting` is a paired machine of `login`'s asked to start it, which has yet to
+	 * attach; with `failure`, its backend has exited before attaching more than once in a
+	 * row, and with `attempt`, its backend has exited before attaching at least once, so the launch
+	 * in flight or next is that one. `attempt` is absent until one has, and never a guess. Only the
+	 * GitHub login is named, never its machine or checkout.
 	 */
 	export type PlannerAttachment =
 		| { state: "attached"; login: string }
 		| { state: "held"; login: string; until: string }
-		| { state: "starting"; login: string }
+		| { state: "disconnected"; login: string }
+		| { state: "starting"; login: string; failure?: PlannerStartFailure; attempt?: number }
 		| { state: "none" };
 
 	/**
+	 * Why a machine's Planner backend keeps failing to start, as its connector last said.
+	 * `reason` is the last line the backend wrote to stderr that says why, else how it ended,
+	 * with credentials masked and the home directory as `~`. `attempts` counts the launches
+	 * in a row that exited before staying up and `at` is when the last one did (ISO 8601).
+	 * The connector is retrying until the Planner attaches, which clears it.
+	 */
+	export type PlannerStartFailure = {
+		attempts: number;
+		reason: string;
+		at: string;
+	};
+
+	/**
 	 * Sent only under `HARNESS=remote`: once after `Hello`, then to the whole room
-	 * whenever a client attaches, detaches, its grace period ends, or its ownership
+	 * whenever a client attaches, detaches or disconnects, its grace period ends, or its ownership
 	 * is released by a sign-out, a Planner reset or the server closing its link, and
 	 * whenever a machine is asked to start it or stops being asked.
 	 * Other harnesses never send it.
 	 */
 	export type Planner = KIND<"session:planner"> & { planner: PlannerAttachment };
 
+	/**
+	 * The server is about to close this socket with 1012 because it is restarting, and a new process
+	 * is expected to take over within `reconnectWithinMs`. Sent just before the close, so a client
+	 * that sees the close as anything but 1012 still treats it as a restart. Older clients ignore it.
+	 */
+	export type Restarting = KIND<"session:restarting"> & { reconnectWithinMs: number };
+
 	/** Broadcast whenever the membership of the room changes. */
 	export type Presence = KIND<"session:presence"> & {
 		members: Member[];
 	};
+
+	/**
+	 * The profile pictures of people this document names who are not in the room, so that an
+	 * author who has left is drawn as themselves: whoever spoke in Chat or in a comment thread,
+	 * whoever settled or was asked about a decision, and whoever started a build. Sent to a
+	 * socket before it is greeted with the document, and to the whole room when someone the room
+	 * has not met is named by something said after, such as a coding agent's message posted
+	 * through MCP. Present people carry theirs in `Member`. It goes only to sockets joined to the
+	 * room, which are allowed to read it. Optional: an older client ignores the frame and guesses
+	 * from each login.
+	 */
+	export type People = KIND<"session:people"> & { people: Person[] };
 
 	/** A request could not be served. Carries the `rid` it answers. */
 	export type Failure = KIND<"session:error"> & {
@@ -138,8 +215,24 @@ export declare namespace Session {
 		 * Set for a refusal the client presents in full rather than as a generic
 		 * failure. `planner-not-attached`: a Planner request under `HARNESS=remote`
 		 * to a document no client is attached to; `message` says how to attach one.
+		 * `planner-queue-full`: too many requests wait behind the Planner's running turn right now
+		 * (never said of a machine that is away, which keeps every request). The request itself is
+		 * fine and is sent again, with the same request id, once some have been answered.
+		 * `temporarily-unavailable`: a refusal of a `chat:send` for a passing reason (storage busy,
+		 * the room changing, too many sends being handled for a machine that is there, a lookup of a
+		 * reference or of the open child that failed). The message is fine and is sent again, with
+		 * the same request id, and is kept once and delivered once even if an earlier attempt was
+		 * saved before its answer was lost. Any
+		 * refusal of a send without a code or with `planner-not-attached` is final.
+		 * `message-not-deletable`: the answer to a `chat:delete` that is final: the machine already
+		 * took the message, or it is not the sender's. Any other refusal of a delete is for a passing
+		 * reason, and the delete is asked again.
 		 */
-		code?: "planner-not-attached";
+		code?:
+			| "planner-not-attached"
+			| "planner-queue-full"
+			| "temporarily-unavailable"
+			| "message-not-deletable";
 	};
 
 	/** Liveness, and the smallest thing that proves request correlation works. */
@@ -161,6 +254,7 @@ export declare namespace Sidebar {
 		| Catalogue
 		| Watched
 		| Snapshot
+		| Session.Restarting
 		| Session.Failure
 		| Session.Ping;
 

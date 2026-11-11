@@ -103,6 +103,16 @@ export class PostgresMachineStore implements MachineStore {
 			return rows.map(machine);
 		});
 	}
+	shared() {
+		return this.run("list shared machines", async () => {
+			let rows = await this.sql<MachineRow[]>`
+				SELECT ${this.sql.unsafe(COLUMNS)} FROM machines
+				WHERE shared AND revoked_at IS NULL
+				ORDER BY created_at DESC, id
+			`;
+			return rows.map(machine);
+		});
+	}
 	seen(id: string, now: Date) {
 		return this.run("record machine contact", async () => {
 			await this.sql`
@@ -163,14 +173,20 @@ export class PostgresMachineStore implements MachineStore {
 			}));
 	}
 	share(id: string, userId: string, shared: boolean) {
-		return this.run("share machine", async () => {
-			let updated = await this.sql<{ id: string }[]>`
-				UPDATE machines SET shared = ${shared}
-				WHERE id = ${id} AND user_id = ${userId} AND revoked_at IS NULL
-				RETURNING id
-			`;
-			return updated.length > 0;
-		});
+		return this.run("share machine", () =>
+			this.sql.begin(async transaction => {
+				let updated = await transaction<{ id: string }[]>`
+					UPDATE machines SET shared = ${shared}
+					WHERE id = ${id} AND user_id = ${userId} AND revoked_at IS NULL
+					RETURNING id
+				`;
+				if (updated.length && !shared) {
+					await transaction`
+						DELETE FROM machine_favorites WHERE machine_id = ${id} AND user_id <> ${userId}
+					`;
+				}
+				return updated.length > 0;
+			}));
 	}
 	serve(id: string, repository: MachineRepository) {
 		return this.run("record a machine's repository", async () => {
@@ -203,11 +219,13 @@ export class PostgresMachineStore implements MachineStore {
 				`;
 				return;
 			}
-			// Only the person's own unrevoked machine; anything else is missing.
+			// The person's own unrevoked machine, or one its owner shares with teammates; anything
+			// else is missing.
 			let inserted = await this.sql<{ machineId: string }[]>`
 				INSERT INTO machine_choices (channel_id, user_id, machine_id, chosen_at)
 				SELECT ${choice.channelId}, ${choice.userId}, id, ${now} FROM machines
-				WHERE id = ${choice.machineId} AND user_id = ${choice.userId} AND revoked_at IS NULL
+				WHERE id = ${choice.machineId} AND (user_id = ${choice.userId} OR shared)
+					AND revoked_at IS NULL
 				ON CONFLICT (channel_id, user_id)
 				DO UPDATE SET machine_id = EXCLUDED.machine_id, chosen_at = EXCLUDED.chosen_at
 				RETURNING machine_id AS "machineId"
@@ -231,11 +249,14 @@ export class PostgresMachineStore implements MachineStore {
 				await this.sql`DELETE FROM machine_favorites WHERE user_id = ${favorite.userId}`;
 				return;
 			}
-			// Only the person's own unrevoked machine; anything else is missing.
+			// The person's own unrevoked machine, or one its owner shares with teammates; anything
+			// else is missing.
 			let inserted = await this.sql<{ machineId: string }[]>`
 				INSERT INTO machine_favorites (user_id, machine_id, chosen_at)
 				SELECT ${favorite.userId}, id, ${now} FROM machines
-				WHERE id = ${favorite.machineId} AND user_id = ${favorite.userId} AND revoked_at IS NULL
+				WHERE id = ${favorite.machineId} AND (user_id = ${favorite.userId} OR shared)
+					AND revoked_at IS NULL
+				FOR SHARE
 				ON CONFLICT (user_id)
 				DO UPDATE SET machine_id = EXCLUDED.machine_id, chosen_at = EXCLUDED.chosen_at
 				RETURNING machine_id AS "machineId"

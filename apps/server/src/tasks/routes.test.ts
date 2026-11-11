@@ -18,6 +18,30 @@ import type { HostedAuth } from "../auth/routes";
 
 let checkout = { repository: "owner/repository", branch: "main", commit: "a".repeat(40) };
 
+/** A stored decision nobody has answered yet, or one somebody reopened. */
+function decision(id: string, status: "open" | "reopened" = "open") {
+	return {
+		id,
+		status,
+		origin: "planner",
+		definition: {
+			questions: [{
+				id: `${id}-question`,
+				header: "Rollout",
+				question: "How should we deploy?",
+				multiple: false,
+				options: [
+					{ id: `${id}-canary`, label: "Canary", description: "" },
+					{ id: `${id}-rolling`, label: "Rolling", description: "" },
+				],
+			}],
+		},
+		history: [],
+		optionOrigins: {},
+		editors: [],
+	} as never;
+}
+
 test("opening an archived document cannot start a new readiness review", async () => {
 	let assessments = 0;
 	let context = await setup({ assess: () => assessments++ });
@@ -191,6 +215,8 @@ async function setup(
 			...(options.resumeMs === undefined ? {} : { resumeMs: options.resumeMs }),
 			connections: current.connections,
 			refuseOffline: current.refuseOffline,
+			takers: current.takers,
+			mayTake: current.mayTake,
 			machineChoices: current.machineChoices,
 			busy: async connectionId =>
 				(await current.service.store.active()).some(item =>
@@ -516,6 +542,84 @@ test("a paired workspace claims a browser build once and reports through run-sco
 	expect(snapshot.lifecycle.activity.tasks[0].blocker).toBe("Choose the next tracer");
 	expect((await tool(context, claim.runToken, "read_implementation")).isError).toBe(true);
 	await Plan.close(context.plan);
+});
+
+test("Build proceeds while decisions are open and hands them to the builder as assumptions", async () => {
+	let context = await setup();
+	try {
+		let connection = await paired(context);
+		context.plan.records.set("deploy", decision("deploy"));
+		context.plan.records.set("again", decision("again", "reopened"));
+		let snapshot = await (await context.call(context.path)).json();
+		expect(snapshot).toMatchObject({ buildReady: true, blockers: [] });
+		let built = await (await context.call(context.path, {
+			planRevision: 0,
+			graphVersion: 1,
+			graphRevision: 1,
+		})).json();
+		expect(built.state).toBe("queued");
+		let claim = await tool(context, connection.token, "claim_implementation_build", {
+			id: built.id,
+		});
+		await tool(context, connection.token, "report_implementation_build", {
+			id: built.id,
+			state: "running",
+			session: "acp-session",
+		});
+		let read = await tool(context, claim.runToken, "read_implementation");
+		expect(read.unapprovedDecisions.instructions).toContain("best judgment");
+		expect(read.unapprovedDecisions.decisions).toEqual([
+			{
+				id: "deploy",
+				questionId: "deploy-question",
+				status: "open",
+				prompt: "How should we deploy?",
+				options: ["Canary", "Rolling"],
+			},
+			{
+				id: "again",
+				questionId: "again-question",
+				status: "reopened",
+				prompt: "How should we deploy?",
+				options: ["Canary", "Rolling"],
+			},
+		]);
+		// What the agent pastes into each pull request's body.
+		expect(read.unapprovedDecisions.pullRequestSection).toContain("## Assumed, not yet approved");
+		expect(read.unapprovedDecisions.pullRequestSection).toContain(
+			"- How should we deploy? (Canary, Rolling)",
+		);
+		// The decisions stay open and answerable; building closed none of them.
+		expect(context.plan.records.get("deploy")?.status).toBe("open");
+		expect(context.plan.records.get("again")?.status).toBe("reopened");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a document with no open decision tells the builder nothing to assume", async () => {
+	let context = await setup();
+	try {
+		let connection = await paired(context);
+		let built = await (await context.call(context.path, {
+			planRevision: 0,
+			graphVersion: 1,
+			graphRevision: 1,
+		})).json();
+		let claim = await tool(context, connection.token, "claim_implementation_build", {
+			id: built.id,
+		});
+		await tool(context, connection.token, "report_implementation_build", {
+			id: built.id,
+			state: "running",
+			session: "acp-session",
+		});
+		expect(await tool(context, claim.runToken, "read_implementation")).not.toHaveProperty(
+			"unapprovedDecisions",
+		);
+	} finally {
+		await Plan.close(context.plan);
+	}
 });
 
 test("a run's parallel lifecycle batch lands in order and refusals say what to do next", async () => {
@@ -2342,13 +2446,41 @@ test("without LIVE_BUILD a delivered build counts later edits and a person build
 		expect(snapshot.live).toMatchObject({ outOfSync: false, changes: 0 });
 		expect(snapshot.live.commits).toHaveLength(1);
 
-		// Like Build plan, a pressed Build waits for open decisions and accepted comments.
+		// A pressed Build still waits for accepted comments, but never for a decision.
 		expect((await edit(context.plan, "Another paragraph.")).ok).toBe(true);
-		context.plan.records.set("open-decision", { status: "open" } as never);
+		context.plan.threads.set(
+			"accepted",
+			{ id: "accepted", status: "accepted", notes: [] } as never,
+		);
 		let blocked = await context.call(rebuild, {});
 		expect(blocked.status).toBe(409);
-		expect((await blocked.json()).error).toBe("unanswered questionnaires");
-		context.plan.records.delete("open-decision");
+		expect((await blocked.json()).error).toBe("accepted comments awaiting plan changes");
+		context.plan.threads.delete("accepted");
+		context.plan.records.set("open-decision", decision("open-decision"));
+		context.plan.records.set("reopened-decision", decision("reopened-decision", "reopened"));
+		expect((await (await context.call(context.path)).json()).blockers).toEqual([]);
+		let again = await context.call(rebuild, {});
+		expect(again.status).toBe(200);
+		let next = context.plan.builds.at(-1)!.id;
+		expect(await tool(context, connection.token, "wait_for_work")).toEqual({
+			id: next,
+			kind: "implementation",
+		});
+		let rerun = await tool(context, connection.token, "claim_implementation_build", { id: next });
+		await tool(context, connection.token, "report_implementation_build", {
+			id: next,
+			state: "running",
+			session: "second-session",
+		});
+		// The builder reads every decision still open, and building answered none of them.
+		let changes = await tool(context, rerun.runToken, "read_rebuild");
+		expect(changes.unapprovedDecisions.decisions).toMatchObject([
+			{ id: "open-decision", status: "open", prompt: "How should we deploy?" },
+			{ id: "reopened-decision", status: "reopened", prompt: "How should we deploy?" },
+		]);
+		expect(changes.unapprovedDecisions.pullRequestSection).toContain("Assumed, not yet approved");
+		expect(context.plan.records.get("open-decision")?.status).toBe("open");
+		expect(context.plan.records.get("reopened-decision")?.status).toBe("reopened");
 	} finally {
 		await Plan.close(context.plan);
 	}
@@ -2555,6 +2687,754 @@ test("Build uses the machine the person chose for the document, never another", 
 		expect((await choose(null)).status).toBe(200);
 		let built = await (await context.call(context.path, review)).json();
 		expect(built.connectionId).toBe(first.connection.id);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+/**
+ * other shares a paired machine named desk with teammates, and the document's person (test) chose
+ * it. With `own`, test has a machine of their own too, which is not the one chosen.
+ */
+async function shared(
+	context: Awaited<ReturnType<typeof setup>>,
+	own = false,
+	/** Its owner also let Chopin start work on it by itself. */
+	autoRun = false,
+) {
+	let mine = own ? await paired(context) : undefined;
+	let theirs = await paired(context, context.otherCookie, autoRun);
+	let owner = (url: string, value: unknown) =>
+		context.call(url, value, undefined, undefined, context.otherCookie);
+	await owner(`/api/connector/machines/${theirs.machine}/label`, { label: "desk" });
+	await owner(`/api/connector/machines/${theirs.machine}/shared`, { shared: true });
+	let choose = (machine: string | null, cookie?: string) =>
+		context.call(
+			`/api/documents/${context.plan.id}/machine`,
+			{ machine },
+			undefined,
+			undefined,
+			cookie,
+		);
+	expect((await choose(theirs.machine)).status).toBe(200);
+	return { mine, theirs, choose, owner };
+}
+let review = { planRevision: 0, graphVersion: 1, graphRevision: 1 };
+
+test("Build goes to the teammate's shared machine the person chose, and runs there on their behalf", async () => {
+	let context = await setup();
+	try {
+		let { mine, theirs } = await shared(context, true);
+		let built = await (await context.call(context.path, review)).json();
+		// The person asked; the machine is its owner's.
+		expect(built).toMatchObject({
+			user: "U_test",
+			machineOwner: "U_other",
+			connectionId: theirs.connection.id,
+			machineId: theirs.machine,
+			state: "queued",
+		});
+		expect(context.experiments.connections.assigned(theirs.connection.id)).toBe(context.plan.id);
+		expect(context.experiments.connections.assigned(mine!.connection.id)).toBeUndefined();
+		// Only the machine it was queued on is offered it, and it claims it.
+		expect(await tool(context, theirs.token, "wait_for_work")).toEqual({
+			id: built.id,
+			kind: "implementation",
+		});
+		let claim = await tool(context, theirs.token, "claim_implementation_build", { id: built.id });
+		expect(claim.build).toMatchObject({
+			state: "starting",
+			user: "U_test",
+			machineOwner: "U_other",
+		});
+		expect(
+			(await tool(context, theirs.token, "report_implementation_build", {
+				id: built.id,
+				state: "running",
+				session: "acp-session",
+			})).isError,
+		).toBeUndefined();
+		// The run is recorded as the person's who asked, never the machine owner's.
+		expect(context.plan.execution?.user).toBe("U_test");
+		// The agent is told whose request it is, to say so in each pull request it opens.
+		let read = await tool(context, claim.runToken, "read_implementation");
+		expect(read.requestedBy.login).toBe("test");
+		expect(read.requestedBy.pullRequestNote).toContain("Requested by test in https://chopin.test/");
+		expect(read.requestedBy.pullRequestNote).toContain("other's shared machine");
+		expect(read.requestedBy.instructions).toContain("pullRequestNote");
+		// Everyone who sees the build is told whose machine it ran on.
+		let snapshot = await (await context.call(context.path)).json();
+		expect(snapshot.startedBy).toBe("test");
+		expect(snapshot.buildMachines[built.id]).toMatchObject({ label: "desk", owner: "other" });
+		expect(
+			(await tool(context, theirs.token, "renew_implementation_build", { id: built.id })).isError,
+		).toBeUndefined();
+		// The person who asked can stop it.
+		expect((await context.call(`${context.path}/stop`, { id: built.id })).status).toBe(200);
+		expect(context.plan.builds.at(-1)).toMatchObject({
+			state: "failed",
+			error: "Stopped in Chopin.",
+		});
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a build for a teammate is the same build for its owner's own machine: nobody's, in the owner's own document", async () => {
+	let context = await setup();
+	try {
+		let mine = await paired(context);
+		let built = await (await context.call(context.path, review)).json();
+		expect(built.machineOwner).toBeUndefined();
+		expect(built.connectionId).toBe(mine.connection.id);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("Build on a chosen shared machine counts the machine as the person's local agent", async () => {
+	let context = await setup();
+	try {
+		await shared(context);
+		let snapshot = await (await context.call(context.path)).json();
+		expect(snapshot.localAgent).toBe(true);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a machine that is not the one the build was queued on never claims or reports it", async () => {
+	let context = await setup();
+	try {
+		let { mine, theirs, owner } = await shared(context, true);
+		// A second machine of the owner's, shared too, but not the one the person chose.
+		let other = await paired(context, context.otherCookie);
+		await owner(`/api/connector/machines/${other.machine}/shared`, { shared: true });
+		let built = await (await context.call(context.path, review)).json();
+		expect(built.connectionId).toBe(theirs.connection.id);
+		expect(
+			context.experiments.connections.chosenShared("R_test", "U_test", context.plan.id).map(value =>
+				value.id
+			),
+		).toEqual([theirs.connection.id]);
+		for (let wrong of [mine!, other]) {
+			expect(
+				(await tool(context, wrong.token, "claim_implementation_build", { id: built.id })).isError,
+			)
+				.toBe(true);
+		}
+		expect(context.plan.builds.at(-1)?.state).toBe("queued");
+		let claim = await tool(context, theirs.token, "claim_implementation_build", { id: built.id });
+		expect(claim.build.state).toBe("starting");
+		for (let wrong of [mine!, other]) {
+			for (
+				let report of [
+					{ id: built.id, state: "running", session: "x" },
+					{ id: built.id, state: "failed", error: "gone" },
+				]
+			) {
+				expect((await tool(context, wrong.token, "report_implementation_build", report)).isError)
+					.toBe(true);
+			}
+			expect(
+				(await tool(context, wrong.token, "renew_implementation_build", { id: built.id })).isError,
+			)
+				.toBe(true);
+		}
+		expect(context.plan.builds.at(-1)?.state).toBe("starting");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a queued build is not taken by a machine whose owner stopped sharing it, and ends", async () => {
+	let context = await setup();
+	try {
+		let { theirs, owner } = await shared(context);
+		let built = await (await context.call(context.path, review)).json();
+		let connection = () => context.experiments.connections.get(theirs.connection.id)!;
+		expect(await context.implementations.waiting(connection())).toEqual({
+			id: built.id,
+			kind: "implementation",
+		});
+		expect(await owner(`/api/connector/machines/${theirs.machine}/shared`, { shared: false }))
+			.toMatchObject({ status: 200 });
+		// It is no longer offered the build, and claiming it is refused.
+		expect(await context.implementations.waiting(connection())).toBeUndefined();
+		expect(
+			(await tool(context, theirs.token, "claim_implementation_build", { id: built.id })).isError,
+		)
+			.toBe(true);
+		expect(context.plan.builds.at(-1)?.state).toBe("queued");
+		await context.implementations.sweep();
+		expect(context.plan.builds.at(-1)).toMatchObject({
+			state: "failed",
+			error: expect.stringContaining("no longer shared"),
+		});
+		expect(context.experiments.connections.assigned(theirs.connection.id)).toBeUndefined();
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a queued build is not taken by a machine the person no longer chose", async () => {
+	let context = await setup();
+	try {
+		let { mine, theirs, choose } = await shared(context, true);
+		let built = await (await context.call(context.path, review)).json();
+		expect((await choose(mine!.machine)).status).toBe(200);
+		expect(
+			(await tool(context, theirs.token, "claim_implementation_build", { id: built.id })).isError,
+		)
+			.toBe(true);
+		expect(context.plan.builds.at(-1)?.state).toBe("queued");
+		await context.implementations.sweep();
+		expect(context.plan.builds.at(-1)?.state).toBe("failed");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a build already running on a shared machine finishes when its owner stops sharing it", async () => {
+	let context = await setup();
+	try {
+		let { theirs, owner } = await shared(context);
+		let built = await (await context.call(context.path, review)).json();
+		await tool(context, theirs.token, "claim_implementation_build", { id: built.id });
+		expect(
+			(await tool(context, theirs.token, "report_implementation_build", {
+				id: built.id,
+				state: "running",
+				session: "acp-session",
+			})).isError,
+		).toBeUndefined();
+		await owner(`/api/connector/machines/${theirs.machine}/shared`, { shared: false });
+		await context.implementations.sweep();
+		expect(context.plan.builds.at(-1)?.state).toBe("running");
+		expect(
+			(await tool(context, theirs.token, "report_implementation_build", {
+				id: built.id,
+				state: "stopped",
+			})).isError,
+		).toBeUndefined();
+		expect(context.plan.builds.at(-1)?.state).toBe("stopped");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("Build is refused, naming the machine, while the shared machine chosen is offline or no longer takes the work", async () => {
+	let context = await setup();
+	try {
+		let { theirs } = await shared(context);
+		await tool(context, theirs.token, "disconnect_workspace");
+		let offline = await context.call(context.path, review);
+		expect(offline.status).toBe(409);
+		expect(await offline.json()).toEqual({
+			error: "machine-offline",
+			message: "desk is offline. Start chopin connect on it, or choose another machine.",
+		});
+		// Back online, but its owner can't push to the repository any more.
+		await reconnect(context, theirs.machineToken, context.otherCookie);
+		let github = context.auth.github;
+		let asked = github.repositoryAccess;
+		github.repositoryAccess = async (token, owner, name) =>
+			token === "other" ? undefined : asked(token, owner, name);
+		context.now.setTime(context.now.getTime() + 11 * 60_000);
+		let refused = await context.call(context.path, review);
+		expect(refused.status).toBe(409);
+		expect(await refused.json()).toEqual({
+			error: "machine-unavailable",
+			message:
+				"desk no longer takes this work: its owner stopped sharing it or can't push to this repository. Choose another machine.",
+		});
+		expect(context.plan.builds).toEqual([]);
+		expect(context.experiments.connections.assigned(theirs.connection.id)).toBeUndefined();
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a shared machine nobody chose never takes anyone's build", async () => {
+	let context = await setup();
+	try {
+		let { theirs, mine, choose } = await shared(context, true);
+		expect((await choose(mine!.machine)).status).toBe(200);
+		let built = await (await context.call(context.path, review)).json();
+		expect(built.connectionId).toBe(mine!.connection.id);
+		expect(built.machineOwner).toBeUndefined();
+		expect(
+			(await tool(context, theirs.token, "claim_implementation_build", { id: built.id })).isError,
+		)
+			.toBe(true);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a machine whose sharing is off takes no build even while a choice of it stands", async () => {
+	let context = await setup();
+	try {
+		let { theirs } = await shared(context);
+		let connections = context.experiments.connections;
+		let connection = () => connections.get(theirs.connection.id)!;
+		connections.share(theirs.machine, false);
+		expect(connections.chosenShared("R_test", "U_test", context.plan.id)).toEqual([]);
+		let refused = await context.call(context.path, review);
+		expect(refused.status).toBe(409);
+		expect((await refused.json()).error).toBe("machine-unavailable");
+		expect(context.plan.builds).toEqual([]);
+		// A build queued while it was shared is not taken while it is not, though the choice stands.
+		connections.share(theirs.machine, true);
+		let built = await (await context.call(context.path, review)).json();
+		connections.share(theirs.machine, false);
+		expect(await context.experiments.mayTake(connection(), "U_test", context.plan.id)).toBe(false);
+		expect(await context.implementations.waiting(connection())).toBeUndefined();
+		expect(
+			(await tool(context, theirs.token, "claim_implementation_build", { id: built.id })).isError,
+		).toBe(true);
+		connections.share(theirs.machine, true);
+		expect(await context.experiments.mayTake(connection(), "U_test", context.plan.id)).toBe(true);
+		expect(
+			(await tool(context, theirs.token, "claim_implementation_build", { id: built.id })).build
+				.state,
+		).toBe("starting");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a shared machine is not the person's until they choose it", async () => {
+	let context = await setup();
+	try {
+		let theirs = await paired(context, context.otherCookie);
+		await context.call(
+			`/api/connector/machines/${theirs.machine}/shared`,
+			{ shared: true },
+			undefined,
+			undefined,
+			context.otherCookie,
+		);
+		let connections = context.experiments.connections;
+		expect(connections.requested("R_test", "U_test", context.plan.id)).toEqual([]);
+		let refused = await context.call(context.path, review);
+		expect(refused.status).toBe(409);
+		expect((await refused.json()).error).toBe("no-workspace");
+		expect(context.plan.builds).toEqual([]);
+		expect(connections.assigned(theirs.connection.id)).toBeUndefined();
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a machine that is not shared can't be chosen, so no build goes to it", async () => {
+	let context = await setup();
+	try {
+		let theirs = await paired(context, context.otherCookie);
+		let refused = await context.call(
+			`/api/documents/${context.plan.id}/machine`,
+			{ machine: theirs.machine },
+		);
+		expect(refused.status).toBe(404);
+		// With nothing of their own, the person has nothing to build on.
+		let built = await context.call(context.path, review);
+		expect(built.status).toBe(409);
+		expect((await built.json()).error).toBe("no-workspace");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+/**
+ * other shares a paired machine named desk with teammates, and test makes it their favorite
+ * without choosing it for the document. With `own`, test has a machine of their own too.
+ */
+async function favored(context: Awaited<ReturnType<typeof setup>>, own = false) {
+	let mine = own ? await paired(context) : undefined;
+	let theirs = await paired(context, context.otherCookie);
+	let owner = (url: string, value: unknown) =>
+		context.call(url, value, undefined, undefined, context.otherCookie);
+	await owner(`/api/connector/machines/${theirs.machine}/shared`, { shared: true });
+	let favor = (machine: string, favorite = true) =>
+		context.call(`/api/connector/machines/${machine}/favorite`, { favorite });
+	expect((await favor(theirs.machine)).status).toBe(200);
+	return { mine, theirs, owner, favor };
+}
+
+test("Build on Automatic goes to the teammate's shared machine the person made their favorite, and runs there on their behalf", async () => {
+	let context = await setup();
+	try {
+		let { mine, theirs } = await favored(context, true);
+		let built = await (await context.call(context.path, review)).json();
+		expect(built).toMatchObject({
+			user: "U_test",
+			machineOwner: "U_other",
+			connectionId: theirs.connection.id,
+			machineId: theirs.machine,
+			state: "queued",
+		});
+		expect(context.experiments.connections.assigned(mine!.connection.id)).toBeUndefined();
+		expect(await tool(context, theirs.token, "wait_for_work")).toEqual({
+			id: built.id,
+			kind: "implementation",
+		});
+		let claim = await tool(context, theirs.token, "claim_implementation_build", { id: built.id });
+		expect(claim.build).toMatchObject({
+			state: "starting",
+			user: "U_test",
+			machineOwner: "U_other",
+		});
+		// The machine they didn't favor never takes it.
+		expect(
+			(await tool(context, mine!.token, "claim_implementation_build", { id: built.id })).isError,
+		).toBe(true);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("Build on a favorite shared machine counts the machine as the person's local agent", async () => {
+	let context = await setup();
+	try {
+		await favored(context);
+		let snapshot = await (await context.call(context.path)).json();
+		expect(snapshot.localAgent).toBe(true);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a person's choice for the document beats their favorite, and Build falls back to their own machine where the favorite doesn't take it", async () => {
+	let context = await setup();
+	try {
+		let { mine, theirs, owner } = await favored(context, true);
+		// Their own choice for the document comes first.
+		let choose = (machine: string | null) =>
+			context.call(`/api/documents/${context.plan.id}/machine`, { machine });
+		expect((await choose(mine!.machine)).status).toBe(200);
+		let chosen = await (await context.call(context.path, review)).json();
+		expect(chosen).toMatchObject({ connectionId: mine!.connection.id });
+		expect(chosen.machineOwner).toBeUndefined();
+		await context.call(`${context.path}/stop`, { id: chosen.id });
+		expect((await choose(null)).status).toBe(200);
+
+		// The favorite is offline: Automatic uses their own machine, as it does with no favorite.
+		await tool(context, theirs.token, "disconnect_workspace");
+		let offline = await (await context.call(context.path, review)).json();
+		expect(offline.connectionId).toBe(mine!.connection.id);
+		expect(offline.machineOwner).toBeUndefined();
+		await context.call(`${context.path}/stop`, { id: offline.id });
+		context.experiments.connections.release(mine!.connection.id, context.plan.id);
+
+		// Online again, but its owner stops sharing it: the favorite is gone with the sharing.
+		await reconnect(context, theirs.machineToken, context.otherCookie);
+		expect(await owner(`/api/connector/machines/${theirs.machine}/shared`, { shared: false }))
+			.toMatchObject({ status: 200 });
+		expect(context.experiments.connections.favorite("U_test")).toBeUndefined();
+		let unshared = await (await context.call(context.path, review)).json();
+		expect(unshared.connectionId).toBe(mine!.connection.id);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a favorite shared machine whose owner can't push to the repository takes nobody's build", async () => {
+	let context = await setup();
+	try {
+		let { mine, theirs } = await favored(context, true);
+		let github = context.auth.github;
+		let asked = github.repositoryAccess;
+		github.repositoryAccess = async (token, owner, name) =>
+			token === "other" ? undefined : asked(token, owner, name);
+		context.now.setTime(context.now.getTime() + 11 * 60_000);
+		let built = await (await context.call(context.path, review)).json();
+		expect(built.connectionId).toBe(mine!.connection.id);
+		expect(built.machineOwner).toBeUndefined();
+		expect(
+			(await tool(context, theirs.token, "claim_implementation_build", { id: built.id })).isError,
+		).toBe(true);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+/**
+ * A person's favorite request is held after it stored the favorite and before it published it,
+ * while `act` runs: the machine's owner stops sharing it, revokes it, or unpairs it. `act` either
+ * goes ahead of the request's publication or waits for it, and the person is left with no
+ * favorite, in storage or in memory, whichever it does.
+ */
+async function favoriteMeetsOwner(
+	context: Awaited<ReturnType<typeof setup>>,
+	act: (machine: { machine: string; machineToken: string }) => Promise<Response>,
+) {
+	let { theirs, favor } = await favored(context);
+	expect((await favor(theirs.machine, false)).status).toBe(200);
+	let machines = context.storage.machines;
+	let store = machines.favor.bind(machines);
+	let stored = Promise.withResolvers<void>();
+	let released = Promise.withResolvers<void>();
+	machines.favor = async (...args) => {
+		await store(...args);
+		stored.resolve();
+		await released.promise;
+	};
+	let request = favor(theirs.machine);
+	await stored.promise;
+	let acted = act(theirs);
+	// Where the owner's change waits for the request, it cannot end first: give it time to try.
+	await Promise.race([acted, Bun.sleep(100)]);
+	released.resolve();
+	expect((await request).status).toBe(200);
+	expect((await acted).status).toBe(200);
+	expect((await context.storage.machines.favorites()).some(value => value.userId === "U_test"))
+		.toBe(false);
+	expect(context.experiments.connections.favorite("U_test")).toBeUndefined();
+	return theirs;
+}
+
+test("a machine's owner stopping sharing it while a person's favorite is being saved leaves them no favorite, even when it is shared again", async () => {
+	let context = await setup();
+	try {
+		let owner = (url: string, value: unknown) =>
+			context.call(url, value, undefined, undefined, context.otherCookie);
+		let theirs = await favoriteMeetsOwner(
+			context,
+			machine => owner(`/api/connector/machines/${machine.machine}/shared`, { shared: false }),
+		);
+		expect(
+			(await owner(`/api/connector/machines/${theirs.machine}/shared`, { shared: true })).status,
+		).toBe(200);
+		expect(context.experiments.connections.favorite("U_test")).toBeUndefined();
+		let state = await (await context.call(`/api/documents/${context.plan.id}/machine`)).json();
+		expect(state.favorite).toBeNull();
+		expect(state.automatic?.id).not.toBe(theirs.machine);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a machine's owner revoking it while a person's favorite is being saved leaves them no favorite", async () => {
+	let context = await setup();
+	try {
+		await favoriteMeetsOwner(
+			context,
+			machine =>
+				context.call(
+					`/api/connector/machines/${machine.machine}/revoke`,
+					{},
+					undefined,
+					undefined,
+					context.otherCookie,
+				),
+		);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a machine unpairing itself while a person's favorite is being saved leaves them no favorite", async () => {
+	let context = await setup();
+	try {
+		await favoriteMeetsOwner(
+			context,
+			machine => context.call("/api/connector/machine/revoke", {}, machine.machineToken),
+		);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a person's rebuild goes to their favorite shared machine, and automatic work still never does", async () => {
+	let context = await setup();
+	context.plan.persistence.liveBuild = true;
+	try {
+		let { mine, theirs } = await favored(context, true);
+		let built = await (await context.call(context.path, review)).json();
+		expect(built.connectionId).toBe(theirs.connection.id);
+		let claim = await tool(context, theirs.token, "claim_implementation_build", { id: built.id });
+		await tool(context, theirs.token, "report_implementation_build", {
+			id: built.id,
+			state: "running",
+			session: "session",
+		});
+		for (
+			let [name, args] of [
+				["start_task", { taskId: "first", idempotencyKey: "start" }],
+				["report_pr", { taskId: "first", idempotencyKey: "pr", url: pullRequest, state: "open" }],
+				["complete_task", { taskId: "first", idempotencyKey: "done", summary: "Launched" }],
+			] as const
+		) expect((await tool(context, claim.runToken, name, args)).isError).toBeUndefined();
+		await tool(context, theirs.token, "report_implementation_build", {
+			id: built.id,
+			state: "stopped",
+		});
+		expect((await edit(context.plan, "A rebuilt paragraph.")).ok).toBe(true);
+		let connections = context.experiments.connections;
+		expect((await queueRebuild(context.plan, connections, { automatic: true })).kind)
+			.toBe("unavailable");
+		let rebuilt = await context.call(`${context.path}/rebuild`, {});
+		expect(rebuilt.status).toBe(200);
+		expect(await rebuilt.json()).toMatchObject({
+			kind: "rebuild",
+			user: "U_test",
+			machineOwner: "U_other",
+			connectionId: theirs.connection.id,
+		});
+		expect(connections.assigned(mine!.connection.id)).toBeUndefined();
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+/** A first build, claimed on the machine, reports its one task and stops, as a living document's does. */
+async function deliver(
+	context: Awaited<ReturnType<typeof setup>>,
+	machine: { token: string },
+	built: { id: string },
+) {
+	let claim = await tool(context, machine.token, "claim_implementation_build", { id: built.id });
+	await tool(context, machine.token, "report_implementation_build", {
+		id: built.id,
+		state: "running",
+		session: "session",
+	});
+	for (
+		let [name, args] of [
+			["start_task", { taskId: "first", idempotencyKey: "start" }],
+			["report_pr", { taskId: "first", idempotencyKey: "pr", url: pullRequest, state: "open" }],
+			["complete_task", { taskId: "first", idempotencyKey: "done", summary: "Launched" }],
+		] as const
+	) expect((await tool(context, claim.runToken, name, args)).isError).toBeUndefined();
+	await tool(context, machine.token, "report_implementation_build", {
+		id: built.id,
+		state: "stopped",
+	});
+}
+
+test("a person's rebuild goes to the shared machine they made their favorite after the first build ran on their own", async () => {
+	let context = await setup();
+	context.plan.persistence.liveBuild = true;
+	try {
+		let { mine, theirs, favor } = await favored(context, true);
+		// Their own machine was their favorite when the document was first built.
+		expect((await favor(mine!.machine)).status).toBe(200);
+		let built = await (await context.call(context.path, review)).json();
+		expect(built.connectionId).toBe(mine!.connection.id);
+		await deliver(context, mine!, built);
+		expect((await favor(theirs.machine)).status).toBe(200);
+		expect((await edit(context.plan, "A rebuilt paragraph.")).ok).toBe(true);
+		let rebuilt = await context.call(`${context.path}/rebuild`, {});
+		expect(rebuilt.status).toBe(200);
+		expect(await rebuilt.json()).toMatchObject({
+			kind: "rebuild",
+			user: "U_test",
+			machineOwner: "U_other",
+			connectionId: theirs.connection.id,
+			machineId: theirs.machine,
+		});
+		expect(context.experiments.connections.assigned(theirs.connection.id)).toBe(context.plan.id);
+		expect((await tool(context, theirs.token, "wait_for_work")).kind).toBe("implementation");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a person's rebuild stays where the first build ran while their shared favorite is offline, and goes to the machine they chose for the document before it", async () => {
+	let context = await setup();
+	context.plan.persistence.liveBuild = true;
+	try {
+		let { mine, theirs, favor } = await favored(context, true);
+		expect((await favor(mine!.machine)).status).toBe(200);
+		let built = await (await context.call(context.path, review)).json();
+		await deliver(context, mine!, built);
+		expect((await favor(theirs.machine)).status).toBe(200);
+		expect((await edit(context.plan, "A rebuilt paragraph.")).ok).toBe(true);
+		// The favorite is offline, so the rebuild goes where the first build ran.
+		await tool(context, theirs.token, "disconnect_workspace");
+		let offline = await (await context.call(`${context.path}/rebuild`, {})).json();
+		expect(offline).toMatchObject({ kind: "rebuild", connectionId: mine!.connection.id });
+		expect(offline.machineOwner).toBeUndefined();
+		await context.call(`${context.path}/stop`, { id: offline.id });
+		// Online again, a machine they chose for the document still comes before it.
+		await reconnect(context, theirs.machineToken, context.otherCookie);
+		let choose = (machine: string | null) =>
+			context.call(`/api/documents/${context.plan.id}/machine`, { machine });
+		expect((await choose(mine!.machine)).status).toBe(200);
+		let chosen = await (await context.call(`${context.path}/rebuild`, {})).json();
+		expect(chosen).toMatchObject({ kind: "rebuild", connectionId: mine!.connection.id });
+		expect(chosen.machineOwner).toBeUndefined();
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a person's rebuild goes to the shared machine they chose, and automatic work never does", async () => {
+	let context = await setup();
+	context.plan.persistence.liveBuild = true;
+	try {
+		// Its owner allowed automatic work on it, which is for their own documents' builders only.
+		let { theirs } = await shared(context, false, true);
+		let built = await (await context.call(context.path, review)).json();
+		let claim = await tool(context, theirs.token, "claim_implementation_build", { id: built.id });
+		expect(claim.live).toBe(true);
+		await tool(context, theirs.token, "report_implementation_build", {
+			id: built.id,
+			state: "running",
+			session: "session",
+		});
+		for (
+			let [name, args] of [
+				["start_task", { taskId: "first", idempotencyKey: "start" }],
+				["report_pr", { taskId: "first", idempotencyKey: "pr", url: pullRequest, state: "open" }],
+				["complete_task", { taskId: "first", idempotencyKey: "done", summary: "Launched" }],
+			] as const
+		) expect((await tool(context, claim.runToken, name, args)).isError).toBeUndefined();
+		await tool(context, theirs.token, "report_implementation_build", {
+			id: built.id,
+			state: "stopped",
+		});
+		expect(context.plan.live).toMatchObject({ user: "U_test" });
+		expect((await edit(context.plan, "A rebuilt paragraph.")).ok).toBe(true);
+		// Chopin's own rebuild runs only on its builder's own machines, whatever they chose.
+		let connections = context.experiments.connections;
+		expect((await queueRebuild(context.plan, connections, { automatic: true })).kind)
+			.toBe("unavailable");
+		expect(context.plan.builds.at(-1)?.id).toBe(built.id);
+		// Nor does a person's rebuild, while sharing is off or they chose another machine.
+		connections.share(theirs.machine, false);
+		expect((await queueRebuild(context.plan, connections, { by: "U_test" })).kind)
+			.toBe("unavailable");
+		connections.share(theirs.machine, true);
+		connections.choose(context.plan.id, "U_test", "another-machine");
+		expect((await queueRebuild(context.plan, connections, { by: "U_test" })).kind)
+			.toBe("unavailable");
+		connections.choose(context.plan.id, "U_test", theirs.machine);
+		expect(context.plan.builds.at(-1)?.id).toBe(built.id);
+		// Their press of Build runs it on the machine they chose.
+		let rebuilt = await context.call(`${context.path}/rebuild`, {});
+		expect(rebuilt.status).toBe(200);
+		expect(await rebuilt.json()).toMatchObject({
+			kind: "rebuild",
+			user: "U_test",
+			machineOwner: "U_other",
+			connectionId: theirs.connection.id,
+		});
+		expect(await tool(context, theirs.token, "wait_for_work")).toMatchObject({
+			kind: "implementation",
+		});
+		let rebuild = await tool(context, theirs.token, "claim_implementation_build", {
+			id: context.plan.builds.at(-1)!.id,
+		});
+		expect(rebuild.build).toMatchObject({ kind: "rebuild", state: "starting" });
+		await tool(context, theirs.token, "report_implementation_build", {
+			id: rebuild.build.id,
+			documentId: rebuild.documentId,
+			state: "running",
+			session: "rebuild-session",
+		});
+		let read = await tool(context, rebuild.runToken, "read_rebuild");
+		expect(read.requestedBy).toMatchObject({ login: "test" });
 	} finally {
 		await Plan.close(context.plan);
 	}

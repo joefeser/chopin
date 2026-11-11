@@ -6,13 +6,14 @@ import { ConnectorStopped, failureKind, redacted } from "./connection";
 import { errorCode } from "./machine";
 import { backoff, delay, forgottenMessage, RUN_GRACE_MS, runReports } from "./reconnect";
 import { bridgeCommand } from "./bridge";
-import { githubEnvironment, type GitHubToken, githubToken } from "./github-token";
+import { gitCredentials, githubEnvironment, type GitHubToken, githubToken } from "./github-token";
 import { runAgent } from "./acp";
 import type { AgentInfo } from "./acp";
 import { serveLocalBridge } from "./local-bridge";
 import { createOutput } from "./output";
 import type { Output } from "./output";
 import { ask, describePermission, permissionMemory } from "./permission";
+import type { Sandbox } from "./sandbox";
 import { stopProcessesIn } from "./processes";
 import {
 	discardWorkspace,
@@ -22,6 +23,7 @@ import {
 	prepareWorkspace,
 	runAttempt,
 	type StartFailures,
+	tokenFolder,
 } from "./workspace";
 import type { Checkouts } from "./checkouts";
 import { mkdir } from "node:fs/promises";
@@ -67,6 +69,8 @@ type Options = {
 	machine?: string;
 	/** Hears, once each time, why Chopin gave no GitHub token when its App can't push. */
 	githubRefused?: (message: string, repository: string) => void;
+	/** Where the agent starts: the machine's process sandbox, else plainly. */
+	sandbox?: Sandbox;
 };
 export const STOPPED = "Stopped from the connector terminal.";
 /** A run out of reach says it is still trying at most this often. */
@@ -219,18 +223,17 @@ export async function runWork(
 	 */
 	let issued: Promise<GitHubToken | undefined> | undefined;
 	let github: GitHubToken | undefined;
+	let tokens = tokenFolder(
+		join(options.directory, "runs", runAttempt(input.id, implementation ? 1 : claim.generation)),
+	);
 	let token = () =>
 		issued ??= options.machine
-			? mkdir(join(options.directory, "runs"), { recursive: true, mode: 0o700 }).then(() =>
+			? mkdir(tokens, { recursive: true, mode: 0o700 }).then(() =>
 				githubToken({
 					url: options.url,
 					machine: options.machine!,
 					repository: input.source.repository,
-					file: join(
-						options.directory,
-						"runs",
-						`${runAttempt(input.id, implementation ? 1 : claim.generation)}.github-token`,
-					),
+					file: join(tokens, "github"),
 					...(options.githubRefused ? { refused: options.githubRefused } : {}),
 				})
 			)
@@ -246,10 +249,23 @@ export async function runWork(
 			input,
 			implementation ? undefined : claim.generation,
 			undefined,
-			checkout.env,
+			// A registered checkout needs no token to be found, but fetching the run's commit into it
+			// takes one, as an agent's push does: the connector's git runs no credential helper of the
+			// person's, so a prototype's fetch gets the machine's token too, in this command's
+			// environment and no one else's.
+			Object.keys(checkout.env).length > 0
+				? checkout.env
+				: await token().then(value =>
+					value ? gitCredentials(value.file, input.source.repository) : {}
+				),
 		);
+		// A prototype never pushes and its agent is given no token, in its environment or on disk
+		// where it could read it: the one that fetched its commit is gone before the agent starts.
+		if (claim.spike) await issued?.then(value => value?.stop()).catch(() => {});
 		let path = prepared.path;
-		let worktrees = { root: path, extras: prepared.extras };
+		// A sandboxed agent can't add worktrees, which its prompt says (see `RunWorktrees`).
+		let confined = options.sandbox !== undefined && options.sandbox.report.engine !== "none";
+		let worktrees = { root: path, extras: prepared.extras, confined };
 		// A rebuild commits onto the existing pull request branches the agent checks out itself.
 		if (implementation && !rebuild) {
 			git(path, "checkout", "-b", `chopin/implement-${input.id.slice(0, 8)}`);
@@ -268,15 +284,20 @@ export async function runWork(
 				: (input as { brief: string }).brief,
 			path,
 		);
+		// A sandboxed agent can't reach this process's loopback bridge, and it may not honor the proxy
+		// it must use to reach Chopin, so it gets the stdio bridge, which does.
 		let stop = await runAgent({
 			...(options.onAgent ? { onInfo: options.onAgent } : {}),
+			...(options.sandbox
+				? { sandbox: options.sandbox, writable: [prepared.extras], own: [path, tokenFolder(path)] }
+				: {}),
 			command: options.command,
 			cwd: path,
 			env: {
 				...options.env,
 				// Where a build's agent adds any extra worktrees, as its prompt says.
 				...(implementation ? { CHOPIN_RUN_WORKTREES: prepared.extras } : {}),
-				...(github ? githubEnvironment(github) : {}),
+				...(github ? githubEnvironment(github, input.source.repository) : {}),
 				...(claim.spike ? noPushEnvironment() : {}),
 			},
 			onStart: failure =>
@@ -306,7 +327,8 @@ export async function runWork(
 					+ "Do not commit or push unless the authorized brief specifically requests it.",
 			// Investigations need the local upload_image_file, so their tools come from this process:
 			// a loopback HTTP bridge when the agent accepts HTTP servers, the stdio bridge otherwise.
-			mcpServers(http) {
+			mcpServers(accepted) {
+				let http = accepted && !confined;
 				let name = implementation ? "chopin-implementation" : "chopin-investigation";
 				if (http && !implementation) {
 					let tools: ReturnType<typeof relay> | undefined;

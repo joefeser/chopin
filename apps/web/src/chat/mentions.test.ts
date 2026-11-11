@@ -13,6 +13,7 @@ import {
 	mentionKeyAction,
 	mentionTrigger,
 	mentionTriggerKey,
+	pointerTrigger,
 } from "./mentions";
 
 import type { MentionCandidate } from "./mentions";
@@ -66,6 +67,39 @@ describe("mention trigger", () => {
 		let first = mentionTrigger("@a", 2)!;
 		expect(mentionTriggerKey(first)).not.toBe(mentionTriggerKey(mentionTrigger("@ab", 3)!));
 		expect(mentionTriggerKey(first)).not.toBe(mentionTriggerKey(mentionTrigger("x @a", 4)!));
+	});
+});
+
+describe("the trigger for a part of the document or a file", () => {
+	test("finds what mentionTrigger finds, with the same range and query", () => {
+		for (
+			let [text, caret] of [["@", 1], ["Ask @ch", 7], ["(@octo", 6], ["one\n@oct", 8], [
+				"@a-b",
+				4,
+			]] as const
+		) expect(pointerTrigger(text, caret)).toEqual(mentionTrigger(text, caret));
+	});
+
+	test("goes on past a space, a dot or a slash, for the words of a heading or a path", () => {
+		expect(pointerTrigger("Rewrite @Site 1: harbour", 24)).toEqual({
+			query: "Site 1: harbour",
+			start: 8,
+			end: 24,
+		});
+		expect(pointerTrigger("Look at @src/chat/a.ts", 22)?.query).toBe("src/chat/a.ts");
+		expect(pointerTrigger("@ch ", 4)).toEqual({ query: "ch ", start: 0, end: 4 });
+	});
+
+	test("never opens inside an address, over a line break, past the longest query, or inside a word", () => {
+		expect(pointerTrigger("mail a@b.com", 12)).toBeUndefined();
+		expect(pointerTrigger("hi@chopin", 9)).toBeUndefined();
+		expect(pointerTrigger("see a@b and @", 13)).toEqual({ query: "", start: 12, end: 13 });
+		expect(pointerTrigger("@one\ntwo", 8)).toBeUndefined();
+		expect(pointerTrigger(`@${"a ".repeat(32)}`, 65)?.query).toHaveLength(64);
+		expect(pointerTrigger(`@${"a ".repeat(33)}`, 67)).toBeUndefined();
+		expect(pointerTrigger("@chopin", 3)).toBeUndefined();
+		expect(pointerTrigger("@chopin", 1, 3)).toBeUndefined();
+		expect(pointerTrigger("no at sign", 5)).toBeUndefined();
 	});
 });
 
@@ -240,25 +274,77 @@ describe("mention picker markup", () => {
 		}),
 	);
 
-	test("is a listbox of options named by login with the active one selected", () => {
+	test("is a listbox of options with the active one selected", () => {
 		expect(html).toContain('role="listbox"');
+		expect(html).toContain('aria-label="Mentions"');
 		expect(html).toContain('id="mentions-option-0"');
-		expect(html).toContain('aria-label="chopin"');
-		expect(html).toContain('aria-label="octocat"');
+		expect(html).toContain('id="mentions-option-1"');
 		expect(html.match(/aria-selected="true"/g)).toHaveLength(1);
-		expect(html).toContain('id="mentions-option-1" role="option" tabindex="-1" type="button"');
+		// And the one selected is that active option.
+		expect(html.match(/<button[^>]*id="mentions-option-1"[^>]*>/)![0]).toContain(
+			'aria-selected="true"',
+		);
+		// A row is not a tab stop: the draft keeps focus and points at it.
+		expect(html.match(/<button[^>]*id="mentions-option-0"[^>]*>/)![0]).toContain('tabindex="-1"');
+	});
+
+	test("lists Chopin first as an agent, and the people as human", () => {
+		expect(html.indexOf(">Chopin<")).toBeLessThan(html.indexOf(">octocat<"));
+		expect(html).toMatch(/>Chopin<\/span><span class="[^"]*">agent</);
+		expect(html).toMatch(/>octocat<\/span><span class="[^"]*">human</);
 	});
 
 	test("draws a decorative avatar for people and the Planner mark for the Planner", () => {
 		expect(html).toContain('alt=""');
 		expect(html).toContain("https://github.com/octocat.png?size=40");
 		expect(html).not.toContain("github.com/chopin.png");
-		expect(html).toContain('aria-label="Chopin"');
+		// The badge is hidden from a screen reader, which reads the row's own words.
+		expect(html).toContain('<span aria-hidden="true"><span aria-hidden="true"');
+	});
+});
+
+describe("the @ menu with the document's parts", () => {
+	let groups = [{
+		label: "Sections",
+		options: [
+			{ id: "heading:a", kind: "heading" as const, anchor: "a", label: "Overview", meta: "H1" },
+			{ id: "decision:d", kind: "decision" as const, decisionId: "d", label: "Pick a store" },
+			{ id: "file:f", kind: "file" as const, path: "src/a.ts", label: "src/a.ts" },
+		],
+	}];
+	let render = (options: MentionCandidate[]) =>
+		renderToStaticMarkup(
+			createElement(MentionPicker, {
+				active: 0,
+				groups,
+				id: "mentions",
+				onActive: () => {},
+				onSelect: () => {},
+				onSelectPointer: () => {},
+				options,
+			}),
+		);
+
+	test("lists each kind of part after the people, tagged with its level or what it is", () => {
+		let html = render([{ kind: "planner", login: "chopin" }, { kind: "person", login: "octocat" }]);
+		expect(html.indexOf(">octocat<")).toBeLessThan(html.indexOf(">Overview<"));
+		expect(html).toMatch(/>Overview<\/span><span class="[^"]*">H1</);
+		expect(html).toMatch(/>Pick a store<\/span><span class="[^"]*">decision</);
+		expect(html).toMatch(/>src\/a.ts<\/span><span class="[^"]*">file</);
+		// No heading divides them: the tag says what a row is.
+		expect(html).not.toContain('role="group"');
 	});
 
-	test("shows nothing but the login in a row", () => {
-		let text = html.replace(/<span aria-hidden="true">[^<]*<\/span>/g, "").replace(/<[^>]*>/g, " ")
-			.replace(/\s+/g, " ").trim();
-		expect(text).toBe("chopin octocat");
+	test("numbers the rows after the people, so the keys and the pointer agree on which is active", () => {
+		let html = render([{ kind: "planner", login: "chopin" }, { kind: "person", login: "octocat" }]);
+		expect(html).toContain('id="mentions-option-2"');
+		expect(html.match(/<button[^>]*id="mentions-option-0"[^>]*>/)![0]).toContain(
+			'aria-selected="true"',
+		);
+		expect(html.match(/<button[^>]*id="mentions-option-2"[^>]*>/)![0]).toContain(
+			'aria-selected="false"',
+		);
+		expect(html).toContain("Overview");
+		expect(html).toContain(">H1<");
 	});
 });

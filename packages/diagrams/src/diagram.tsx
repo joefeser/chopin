@@ -34,6 +34,7 @@ import {
 	type Playback,
 	restart as restartPlayback,
 	running,
+	settle,
 	step as stepPlayback,
 } from "./playback";
 import { namespaceSvgIds } from "./viewer/namespace";
@@ -50,6 +51,12 @@ export type DiagramProps = {
 	 * given the column width it was laid out for.
 	 */
 	onExpand?: (opener: HTMLButtonElement, availableWidth: number) => void;
+	/**
+	 * Whether the host found the diagram within a screen of the reader when it mounted. One that is
+	 * not opens on its last step instead of playing its entrance to nobody; unset plays, as it does
+	 * wherever no host says. The host may say it after the first frame.
+	 */
+	near?: boolean;
 };
 
 type ReadyDiagram = Extract<DiagramResult, { ok: true }>;
@@ -93,6 +100,7 @@ function DiagramView({
 	description,
 	idPrefix,
 	onExpand,
+	near,
 	onWidth,
 }: Omit<DiagramProps, "spec"> & { result: ReadyDiagram; onWidth: (width: number) => void }) {
 	let expandable = onExpand !== undefined;
@@ -108,7 +116,7 @@ function DiagramView({
 	let [reduced, setReduced] = useState(prefersReducedMotion);
 	let motion = result.motion && result.motion !== "none" ? result.motion : null;
 	let maxStep = motion ? Math.max(0, result.steps ?? 0) : 0;
-	let [mode, setMode] = useState<Playback>(() => initialPlayback(maxStep, reduced));
+	let [mode, setMode] = useState<Playback>(() => initialPlayback(maxStep, reduced, near));
 	let [playback, setPlayback] = useState(0);
 	let [overflowing, setOverflowing] = useState(false);
 	let [available, setAvailable] = useState(0);
@@ -135,6 +143,11 @@ function DiagramView({
 		query.addEventListener("change", update);
 		return () => query.removeEventListener("change", update);
 	}, []);
+
+	// Found far from the reader after it mounted playing: hold the last step, not a step at a time.
+	useEffect(() => {
+		if (near === false) setMode((current) => settle(current, maxStep));
+	}, [near, maxStep]);
 
 	// Animated playback counts each step as its animation starts (onAnimationStart).
 	// Reduced motion has no animation to follow, so it shows one step per interval.
@@ -163,11 +176,19 @@ function DiagramView({
 		return () => clearTimeout(timer);
 	}, [reachedEnd, playback, maxStep, reduced]);
 
-	// Before paint, so the first frame already knows whether the controls are needed.
+	// Reading layout waits for the commit after the one that changed the drawing. Each diagram writes
+	// as it mounts (the step classes below), so a read in the same commit made the next diagram's read
+	// lay the page out again: fifty diagrams, fifty layouts. By the next commit every diagram that
+	// changed together has written what it will, and the reads of all of them share one layout.
+	let [settled, setSettled] = useState(0);
+	useLayoutEffect(() => setSettled(count => count + 1), [body, playback, zoom, expandable]);
+
+	// Before paint (the commit above is made before it too), so the first frame already knows whether
+	// the controls are needed.
 	useLayoutEffect(() => {
 		let stage = stageRef.current;
 		let svg = svgRef.current;
-		if (!stage || !svg) return;
+		if (!stage || !svg || settled === 0) return;
 		let measure = () => {
 			setOverflowing(stage.scrollWidth > stage.clientWidth + 1);
 			setAvailable(stage.clientWidth);
@@ -184,7 +205,7 @@ function DiagramView({
 		observer.observe(stage);
 		observer.observe(svg);
 		return () => observer.disconnect();
-	}, [body, playback, onWidth, zoom, expandable]);
+	}, [settled, onWidth]);
 
 	useEffect(() => {
 		let svg = svgRef.current;
@@ -559,6 +580,7 @@ export function Diagram({ spec, ...props }: DiagramProps) {
 			description={props.description}
 			idPrefix={props.idPrefix}
 			onExpand={props.onExpand}
+			near={props.near}
 		/>
 	);
 }

@@ -134,7 +134,7 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 				id: "build-blockers",
 				label: "Build blockers",
 				source: "apps/web/src/build-blocker-popover.tsx",
-				states: ["decisions", "investigations", "mixed", "hover", "keyboard"],
+				states: ["investigations", "hover", "keyboard"],
 			},
 			{
 				id: "interactive-document-actions",
@@ -164,13 +164,13 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 				id: "chat",
 				label: "Conversation",
 				source: "apps/web/src/chat/chat.tsx",
-				states: ["member", "planner", "tool", "busy", "error"],
+				states: ["member", "planner", "tool", "busy", "error", "planner-status"],
 			},
 			{
 				id: "workflow-runs",
 				label: "Workflow runs",
 				source: "apps/web/src/chat/run-card.tsx",
-				states: ["running", "concurrent", "ended"],
+				states: ["running", "concurrent", "disconnected", "ended"],
 			},
 			{
 				id: "identity",
@@ -202,6 +202,12 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 				label: "Errors",
 				source: "apps/web/src/terminal-alert.tsx",
 				states: ["inline", "terminal", "recoverable"],
+			},
+			{
+				id: "assistant-ui",
+				label: "assistant-ui elements",
+				source: "apps/web/src/components/assistant-ui/elements/model-selector.tsx",
+				states: ["outline", "ghost", "muted", "small", "large", "open"],
 			},
 		],
 	},

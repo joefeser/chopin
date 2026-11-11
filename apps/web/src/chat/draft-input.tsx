@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef } from "react";
 
 import { writeDraft } from "./draft-highlights";
-import { beforeInputSelection, reconcileReferenceDrafts } from "./references";
+import { beforeInputSelection, expandToChips, reconcileReferenceDrafts } from "./references";
 import type { HTMLAttributes } from "react";
 import type { ReferenceDraft } from "../chat/references";
 
@@ -45,6 +45,10 @@ export type DraftInputProps =
 		onSubmit: () => void;
 		onChange: (event: DraftEvent) => void;
 		onSelect: (event: DraftEvent) => void;
+		/** What is being dictated and not yet settled, drawn beside the caret and not part of the draft. */
+		interim?: { at: number; text: string };
+		/** Files pasted into the field: the image a screenshot copies, or files copied from a folder. */
+		onFiles?: (files: File[]) => void;
 	};
 
 function selectionOffsets(element: HTMLElement) {
@@ -94,6 +98,8 @@ export let DraftInput = forwardRef<DraftInputHandle, DraftInputProps>(function D
 		onSelect,
 		onKeyDown,
 		onBlur,
+		onFiles,
+		interim,
 		role,
 		"aria-label": label,
 		"aria-disabled": disabled,
@@ -241,6 +247,22 @@ export let DraftInput = forwardRef<DraftInputHandle, DraftInputProps>(function D
 				restoreHistory(input.inputType === "historyRedo");
 				return;
 			}
+			// A chip is one thing: deleting any of it deletes all of it, and typing never lands inside.
+			let before = event().currentTarget;
+			let whole = expandToChips(
+				references,
+				before.selectionStart,
+				before.selectionEnd,
+				input.inputType,
+			);
+			if (whole.start !== before.selectionStart || whole.end !== before.selectionEnd) {
+				setSelection(element.current!, whole.start, whole.end);
+				if (input.inputType.startsWith("delete")) {
+					input.preventDefault();
+					insert("");
+					return;
+				}
+			}
 			if (input.inputType === "insertParagraph" && !input.isComposing && !composing.current) {
 				input.preventDefault();
 				onSubmit();
@@ -335,9 +357,9 @@ export let DraftInput = forwardRef<DraftInputHandle, DraftInputProps>(function D
 			group.current = undefined;
 			remember(value, references, selected);
 		}
-		writeDraft(current, value, references, mentions);
+		writeDraft(current, value, references, mentions, interim);
 		if (focused) setSelection(current, selected.anchor, selected.focus);
-	}, [value, references, resetKey, mentionsKey, historyGroupKey]);
+	}, [value, references, resetKey, mentionsKey, historyGroupKey, interim?.at, interim?.text]);
 	return (
 		<div
 			role={role}
@@ -355,7 +377,8 @@ export let DraftInput = forwardRef<DraftInputHandle, DraftInputProps>(function D
 			suppressContentEditableWarning
 			aria-readonly={readOnly}
 			aria-multiline="true"
-			data-empty={!value || undefined}
+			// Words being said into an empty draft are drawn where the hint is, so the hint gives way to them.
+			data-empty={(!value && !interim?.text) || undefined}
 			data-placeholder={placeholder}
 			tabIndex={0}
 			onInput={change}
@@ -414,7 +437,13 @@ export let DraftInput = forwardRef<DraftInputHandle, DraftInputProps>(function D
 			}}
 			onPaste={paste => {
 				paste.preventDefault();
-				insert(paste.clipboardData.getData("text/plain").replace(/\r\n?/g, "\n"));
+				let files = onFiles ? [...paste.clipboardData.files] : [];
+				if (files.length) onFiles!(files);
+				let text = paste.clipboardData.getData("text/plain").replace(/\r\n?/g, "\n");
+				// A file copied from a folder brings its own name as text, which is not meant for the draft.
+				let names = new Set(files.map(file => file.name));
+				let named = text.split("\n").filter(Boolean).every(line => names.has(line.trim()));
+				if (text && !(files.length && named)) insert(text);
 			}}
 		/>
 	);

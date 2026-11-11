@@ -19,15 +19,15 @@ async function openPhoneChat(page: Page): Promise<void> {
 	await expect.poll(async () => (await chatPane(page).boundingBox())?.x).toBe(0);
 }
 
-/** From the top of the pill to the bottom of the composer, leaving out the status line above it. */
-function pillHeight(page: Page): Promise<number> {
+/** From the top of the box to the bottom of the composer, leaving out the status line above it. */
+function boxHeight(page: Page): Promise<number> {
 	return chatPane(page).locator(".chat-composer").evaluate(composer => {
 		let surface = composer.querySelector(".composer-surface")!.getBoundingClientRect();
 		return composer.getBoundingClientRect().bottom - surface.top;
 	});
 }
 
-test("a phone composer rests as one pill with a reference button, draft and send", async ({ join }) => {
+test("a phone composer is the message box: the draft above a row with the reference button, and a rounded-square send", async ({ join }) => {
 	let page = await join("ana", PHONE);
 	await openPhoneChat(page);
 	let chat = chatPane(page);
@@ -35,26 +35,30 @@ test("a phone composer rests as one pill with a reference button, draft and send
 	let send = chat.getByRole("button", { name: "Send message" });
 	let reference = chat.getByRole("button", { name: "Mention docs" });
 
-	expect(await pillHeight(page)).toBeLessThanOrEqual(64);
+	// The formatting toolbar gives way on a phone, and so does the button that turns it on.
+	await expect(chat.getByRole("toolbar", { name: "Formatting" })).toHaveCount(0);
+	await expect(chat.getByRole("button", { name: "Formatting", exact: true })).toBeHidden();
+	// One line of draft over one row of 28px controls.
+	expect(await boxHeight(page)).toBeLessThanOrEqual(112);
 	let [draftBox, sendBox, referenceBox] = await Promise.all([
 		draft.boundingBox(),
 		send.boundingBox(),
 		reference.boundingBox(),
 	]);
-	// One row: the reference button leads, the send button trails the draft.
-	expect(referenceBox!.x + referenceBox!.width).toBeLessThanOrEqual(draftBox!.x + 1);
-	expect(sendBox!.x).toBeGreaterThanOrEqual(draftBox!.x + draftBox!.width - 1);
-	expect(Math.abs(sendBox!.y + sendBox!.height - (draftBox!.y + draftBox!.height)))
+	// The row sits under the draft: the reference button leads, the send button trails.
+	expect(referenceBox!.y).toBeGreaterThanOrEqual(draftBox!.y + draftBox!.height - 1);
+	expect(sendBox!.y).toBeGreaterThanOrEqual(draftBox!.y + draftBox!.height - 1);
+	expect(referenceBox!.x).toBeLessThan(sendBox!.x);
+	expect(Math.abs(sendBox!.y + sendBox!.height / 2 - (referenceBox!.y + referenceBox!.height / 2)))
 		.toBeLessThanOrEqual(1);
-	expect(sendBox!.width).toBeCloseTo(36, 0);
-	expect(sendBox!.height).toBeCloseTo(36, 0);
-	// The status stays readable as one line above the pill.
-	let notice = chat.getByRole("status").filter({ hasText: "Chopin unavailable" });
+	// A 28px square whatever the pointer: only its target grows.
+	expect(sendBox!.width).toBeCloseTo(28, 0);
+	expect(sendBox!.height).toBeCloseTo(28, 0);
+	// The status stays readable as one line above the box.
+	let notice = chat.getByRole("status").filter({ hasText: "Replies are off on this server." });
 	await expect(notice).toBeVisible();
 	expect((await notice.boundingBox())!.height).toBeLessThanOrEqual(28);
-	// Disabled send is drawn solid rather than faded.
 	await expect(send).toBeDisabled();
-	expect(await send.evaluate(element => getComputedStyle(element).opacity)).toBe("1");
 
 	await draft.click();
 	await page.keyboard.type("One more line to send");
@@ -62,7 +66,7 @@ test("a phone composer rests as one pill with a reference button, draft and send
 	await expectNoHorizontalOverflow(page);
 });
 
-test("phone mention and reference pickers rest on the composer as a full-width list", async ({ join }) => {
+test("the phone's mention menu is assistant-ui's own, resting on the composer, and its reference picker is a full-width list", async ({ join }) => {
 	let page = await join("ana", PHONE);
 	await join("cy");
 	// The phone top bar carries no presence; the picker below waits for cy instead.
@@ -76,21 +80,20 @@ test("phone mention and reference pickers rest on the composer as a full-width l
 	let mentions = chat.locator("[data-chat-mention-picker]");
 	await expect(mentions.getByRole("option", { name: "cy" })).toBeVisible();
 	let pill = (await surface.boundingBox())!;
-	// The list scales in from the menu entrance; measure once it has settled.
-	await expect.poll(async () => Math.abs((await mentions.boundingBox())!.width - pill.width))
-		.toBeLessThanOrEqual(1);
+	// The menu scales in from its entrance; measure once it has settled. It keeps assistant-ui's own
+	// 288px (`w-72`), starts at the composer's edge and rests on it.
+	await expect.poll(async () => (await mentions.boundingBox())!.width).toBeCloseTo(288, 0);
 	let list = (await mentions.boundingBox())!;
-	expect(Math.abs(list.x - pill.x)).toBeLessThanOrEqual(1);
+	expect(Math.abs(list.x - pill.x)).toBeLessThanOrEqual(2);
+	expect(list.x + list.width).toBeLessThanOrEqual(pill.x + pill.width);
 	expect(list.y + list.height).toBeLessThanOrEqual(pill.y);
 	expect(pill.y - (list.y + list.height)).toBeLessThanOrEqual(8);
-	// Layout height: the entrance's scale can leave the drawn box a hair short.
+	// The list scrolls inside it without chaining to the transcript behind.
 	expect(
-		await mentions.getByRole("option", { name: "cy" }).evaluate(row =>
-			(row as HTMLElement).offsetHeight
+		await mentions.getByRole("listbox").evaluate(element =>
+			getComputedStyle(element).overscrollBehaviorY
 		),
 	)
-		.toBeGreaterThanOrEqual(44);
-	expect(await mentions.evaluate(element => getComputedStyle(element).overscrollBehaviorY))
 		.toBe("contain");
 
 	await page.keyboard.press("Backspace");
@@ -193,17 +196,20 @@ test("a phone transcript at the bottom stays pinned when a message arrives with 
 	}
 });
 
-test("the desktop composer keeps its labelled mode switch, footer and dropdown pickers", async ({ join }) => {
+test("the desktop composer keeps its Ask Chopin button, toolbar and dropdown menus", async ({ join }) => {
 	let page = await join("ana", { viewport: { width: 1440, height: 900 } });
+	// The Planner is off in this suite; the session says it is on, as the composer reads it.
+	await page.context().route("**/api/session", async route => {
+		let response = await route.fetch();
+		await route.fulfill({ response, json: { ...await response.json(), agent: true } });
+	});
+	await page.reload();
 	await join("cy");
 	let chat = chatPane(page);
 	let draft = chatInput(chat);
 	await expect(draft).toBeVisible();
-	await expect(chat.locator(".composer-mode-label")).toHaveText("Chat");
-	expect(
-		await chat.locator(".composer-surface").evaluate(element => getComputedStyle(element).display),
-	)
-		.not.toBe("flex");
+	await expect(chat.getByRole("button", { name: "Ask Chopin", exact: true })).toBeVisible();
+	await expect(chat.getByRole("button", { name: "Talk to Chopin" })).toHaveCount(0);
 	let [draftBox, sendBox] = await Promise.all([
 		draft.boundingBox(),
 		chat.getByRole("button", { name: "Send message" }).boundingBox(),
@@ -214,14 +220,13 @@ test("the desktop composer keeps its labelled mode switch, footer and dropdown p
 	await page.keyboard.type("@");
 	let mentions = chat.locator("[data-chat-mention-picker]");
 	await expect(mentions.getByRole("option", { name: "cy" })).toBeVisible();
-	let [list, pill] = await Promise.all([
-		mentions.boundingBox(),
-		chat.locator(".composer-surface").boundingBox(),
-	]);
-	expect(list!.width).toBeLessThan(pill!.width / 2);
+	// A dropdown at assistant-ui's own 288px once it has settled, not a list as wide as the box.
+	await expect.poll(async () => (await mentions.boundingBox())!.width).toBeCloseTo(288, 0);
+	let pill = await chat.locator(".composer-surface").boundingBox();
+	expect((await mentions.boundingBox())!.width).toBeLessThan(pill!.width);
 });
 
-test("a phone composer shows a removable Chopin chip while a message addresses Chopin", async ({ join }) => {
+test("a phone composer shows the removable Chopin chip while a message addresses Chopin", async ({ join }) => {
 	let page = await join("ana", PHONE);
 	// The Planner is off in this suite; the session says it is on, as the composer reads it.
 	await page.context().route("**/api/session", async route => {
@@ -233,24 +238,23 @@ test("a phone composer shows a removable Chopin chip while a message addresses C
 	let chat = chatPane(page);
 	let draft = chatInput(chat);
 	let chip = chat.getByRole("button", { name: "Remove Chopin", exact: true });
-	// Hidden while the chip shows, but its pressed state still says where the message goes.
-	let mode = chat.getByRole("button", { includeHidden: true, name: "Talk to Chopin", exact: true });
+	// The button that asks is spent while the chip shows.
+	let mode = chat.getByRole("button", { name: "Ask Chopin", exact: true });
 	await expect(chip).toHaveCount(0);
 
-	// A mention addresses Chopin; the chip says so above the draft, inside the pill.
+	// A mention addresses Chopin; the chip says so at the start of the draft, inside the pill.
 	await draft.click();
 	await page.keyboard.type("@chopin what is left? ");
 	await expect(chip).toBeVisible();
-	await expect(mode).toHaveAttribute("aria-pressed", "true");
-	// The chip stands in for the switch while it shows.
-	await expect(mode).toBeHidden();
+	await expect(mode).toBeDisabled();
 	let [chipBox, draftBox, pill] = await Promise.all([
 		chip.boundingBox(),
 		draft.boundingBox(),
 		chat.locator(".composer-surface").boundingBox(),
 	]);
-	expect(chipBox!.y + chipBox!.height).toBeLessThanOrEqual(draftBox!.y + 1);
+	expect(chipBox!.y).toBeGreaterThanOrEqual(draftBox!.y);
 	expect(chipBox!.y).toBeGreaterThanOrEqual(pill!.y);
+	expect(chipBox!.x + chipBox!.width).toBeLessThanOrEqual(pill!.x + pill!.width);
 	// Drawn small, but a full touch target.
 	let reach = await chip.evaluate(element => {
 		let box = element.getBoundingClientRect();
@@ -265,15 +269,15 @@ test("a phone composer shows a removable Chopin chip while a message addresses C
 	// Removing the chip removes the address, as switching to Chat does.
 	await chip.tap();
 	await expect(chip).toHaveCount(0);
-	await expect(mode).toHaveAttribute("aria-pressed", "false");
+	await expect(mode).toBeEnabled();
 	// No leading space is left where the mention was.
 	expect(await draft.textContent()).toBe("what is left? ");
 
-	// The switch turns it back on without a mention.
+	// The button turns it back on without a mention.
 	await expect(mode).toBeVisible();
 	await mode.tap();
 	await expect(chip).toBeVisible();
 	await chip.tap();
-	await expect(mode).toHaveAttribute("aria-pressed", "false");
+	await expect(mode).toBeEnabled();
 	await expectNoHorizontalOverflow(page);
 });

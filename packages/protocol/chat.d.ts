@@ -18,7 +18,11 @@ export declare namespace Chat {
 		| Request<PauseRun>
 		| Request<ResumeRun>
 		| Request<Unqueue>
+		| Request<Delete>
+		| Request<Retry>
+		| Request<Wake>
 		| Request<SetParticipation>
+		| Request<SetModel>
 		| Request<Typing>;
 
 	export type Outgoing =
@@ -29,7 +33,13 @@ export declare namespace Chat {
 		| State
 		| Queue
 		| Sent
-		| ParticipationState;
+		| Deleted
+		| Retried
+		| Woke
+		| Removed
+		| ParticipationState
+		| ModelState
+		| ModelUnreadable;
 
 	/** Who said something. The agent is not a member, so it is named apart. */
 	export type Author =
@@ -39,9 +49,55 @@ export declare namespace Chat {
 
 	export type ToolStatus = "running" | "done" | "failed";
 
+	/**
+	 * A file or image sent with a message, as the server keeps it. `kind` is what its bytes are:
+	 * `image` for a PNG, JPEG, WebP or GIF, `file` for text. `mimeType` is the type it is served
+	 * as, never the one the sender claimed, and `size` is in bytes.
+	 */
+	export type Attachment = {
+		id: string;
+		name: string;
+		kind: "image" | "file";
+		mimeType: string;
+		size: number;
+	};
+
 	export type ReferenceRequest =
 		| { kind: "document"; channelId: string; start: number; end: number }
-		| { kind: "research"; workspaceId: string; start: number; end: number };
+		| { kind: "research"; workspaceId: string; start: number; end: number }
+		| CommandRequest
+		| HeadingRequest
+		| DecisionRequest
+		| FileRequest;
+
+	/**
+	 * A mention of one of this document's own parts, by its identity and not its words: a heading
+	 * by its `anchor` (its text as a lowercase slug, `-1`, `-2` after a repeat, in document order),
+	 * a Decision by its id and a file of the document's repository by its path. The range holds
+	 * the `@` token the person saw.
+	 */
+	export type HeadingRequest = { kind: "heading"; anchor: string; start: number; end: number };
+	export type DecisionRequest = {
+		kind: "decision";
+		decisionId: string;
+		start: number;
+		end: number;
+	};
+	export type FileRequest = { kind: "file"; path: string; start: number; end: number };
+
+	/**
+	 * A command the composer's `/` list offered, run as the Planner's own: `commandKind` is the
+	 * `kind` the Planner reported for it, so a name two kinds share is never run as the other. The
+	 * server checks both against the commands the document's Planner reports now. The range holds
+	 * its `/name` token, which opens the message.
+	 */
+	export type CommandRequest = {
+		kind: "command";
+		name: string;
+		commandKind: string;
+		start: number;
+		end: number;
+	};
 
 	type ReferenceBase = {
 		id: string;
@@ -65,7 +121,44 @@ export declare namespace Chat {
 		workspaceId: string;
 	};
 
-	export type Reference = DocumentReference | ResearchReference;
+	/**
+	 * What a reference that names no other document carries: where its token sits and what it
+	 * reads. It has no address, repository or revision of its own.
+	 */
+	type PointerBase = { id: string; start: number; end: number; label: string };
+
+	/** A command, kept with the message that ran it; `label` is the `/name` token it opens with. */
+	export type CommandReference = PointerBase & {
+		kind: "command";
+		name: string;
+		commandKind: string;
+	};
+
+	/**
+	 * A heading of this document, as it read when the message was sent: `label` is `@` and its
+	 * text, `level` its depth (1 to 6) and `line` the line of the source it starts on. `anchor`
+	 * identifies it, as `HeadingRequest` describes.
+	 */
+	export type HeadingReference = PointerBase & {
+		kind: "heading";
+		anchor: string;
+		level: number;
+		line: number;
+	};
+
+	/** A Decision of this document: `label` is `@` and its header, `decisionId` the record's id. */
+	export type DecisionReference = PointerBase & { kind: "decision"; decisionId: string };
+
+	/** A file of this document's repository, by its path from the root; `label` is `@` and the path. */
+	export type FileReference = PointerBase & { kind: "file"; path: string };
+
+	export type Reference =
+		| DocumentReference
+		| ResearchReference
+		| CommandReference
+		| HeadingReference
+		| DecisionReference
+		| FileReference;
 
 	/** One tool call, as it appears beneath the message that made it. */
 	export type Activity = {
@@ -133,9 +226,54 @@ export declare namespace Chat {
 		streaming?: boolean;
 		tools?: Activity[];
 		references?: Reference[];
+		/**
+		 * Images and files the sender sent with the message, in the order they were added. Everyone
+		 * who can read the document reads them by `id` (see `attachmentPath`); a client that
+		 * predates them ignores the field.
+		 */
+		attachments?: Attachment[];
 		/** Present as `planner` on a member message sent to the Planner; the mention is stripped from `text`. */
 		to?: "planner";
+		/**
+		 * How far a member message to the Planner has got: `sent` is saved on the server and not
+		 * yet taken by the machine, `delivered` is taken by it, and `failed` can never be
+		 * delivered as sent, for `deliveryFailure`. Absent on any other entry and on one saved
+		 * before this existed, which reads as delivered.
+		 */
+		deliveryState?: DeliveryState;
+		/** Why a `failed` message could not be delivered. */
+		deliveryFailure?: DeliveryFailure;
+		/**
+		 * On a system notice that says a Planner turn ended without finishing its reply: why, so a
+		 * client can offer the way back. Absent on any other entry and on one saved before this
+		 * existed, which is only its `text`.
+		 */
+		turnFailure?: TurnFailure;
 	};
+
+	/**
+	 * Why a Planner turn ended. `error` is the model's or harness's own failure, `detail` its words
+	 * as reported; `refused` a tool the turn was not allowed to run, `tool` one it needed that is
+	 * not offered, `timed-out` a turn that took too long, `unreachable` an agent that could not be
+	 * reached, and `dropped` the machine's connection going while it replied (the connection's to
+	 * tell, not a failure to retry). `request` is the member message that began the turn, and
+	 * `focus` the child document that was open when it was sent, so a retry is the same turn.
+	 */
+	export type TurnFailure = {
+		kind: "error" | "refused" | "tool" | "timed-out" | "unreachable" | "dropped";
+		detail?: string;
+		request?: string;
+		focus?: string;
+	};
+
+	export type DeliveryState = "sent" | "delivered" | "failed";
+
+	/**
+	 * Why a message can never be delivered as it was sent: the machine was removed from the
+	 * document, the sender can no longer write to it, or the document or the child it was sent
+	 * from is gone.
+	 */
+	export type DeliveryFailure = "machine-removed" | "access-lost" | "document-unavailable";
 
 	/** Transient Planner turn state. */
 	export type Turn = {
@@ -188,6 +326,11 @@ export declare namespace Chat {
 		earlierStages?: number;
 		/** Decisions questions the run is waiting on. */
 		waiting: number;
+		/**
+		 * The Planner's connection dropped while this run was live: Chopin keeps the card as
+		 * last reported, and the run goes on when the Planner reconnects. Absent otherwise.
+		 */
+		disconnected?: true;
 	};
 
 	export type Runs = Run[];
@@ -196,6 +339,87 @@ export declare namespace Chat {
 	export type Participation = { enabled: boolean; paused: boolean };
 	export type ParticipationState = KIND<"chat:participation"> & Participation;
 	export type SetParticipation = KIND<"chat:participation"> & { paused: boolean };
+
+	/**
+	 * A model the document's agent can run, as its harness (or the client attached to the document)
+	 * reports it. `id` is the exact string a turn names; `thinkingLevels` are the levels the model
+	 * supports in the order to show them, absent or empty for a model with no reasoning control.
+	 */
+	export type ModelOption = {
+		id: string;
+		name: string;
+		provider?: { id: string; name?: string };
+		description?: string;
+		thinkingLevels?: string[];
+		/**
+		 * What the model reads, as its client reported it: `image` where it reads images, `text`
+		 * where it reads text. Absent when nothing was reported, which reads as text only: an
+		 * image is sent to a model only when it says it reads them.
+		 */
+		inputTypes?: string[];
+	};
+
+	/** What a document's agent offers: absent entirely where its harness offers no choice. */
+	export type ModelCatalog = {
+		models: ModelOption[];
+		/** The model, and thinking level, the agent uses until somebody chooses. */
+		default?: { model: string; thinkingLevel?: string };
+	};
+
+	/**
+	 * The model and thinking level somebody chose for the document's agent. A field left out means
+	 * the agent's own default; an empty choice is the default of both.
+	 */
+	export type ModelChoice = { model?: string; thinkingLevel?: string };
+
+	/**
+	 * The document's model choice and what it can be chosen from, shared by everyone in the room:
+	 * sent on join, to everyone when the choice or the catalog changes, and to the sender as the
+	 * answer to `SetModel`. `catalog` is absent when nothing can be chosen, and the composer then
+	 * offers no control. `choice` is the stored choice, which can name a model the catalog no longer
+	 * offers, or one offered by no catalog at all (a client withdrew its models, an older one took
+	 * its place); the agent then runs its default and says so in Chat, and the composer says so
+	 * too. `choice` is left out, though one is stored, while what the harness offers is unknown (a
+	 * remote Planner with no client attached, or one yet to report): it is neither gone nor honored.
+	 * A turn that falls back for want of a catalog its client offered and never reported ends that
+	 * for the client, and `choice` is then sent.
+	 */
+	export type ModelState = KIND<"chat:model"> & {
+		catalog?: ModelCatalog;
+		choice?: ModelChoice;
+		/** The chosen model's catalog name, kept when the model is no longer offered. */
+		modelName?: string;
+		/**
+		 * What `/` offers beyond Chopin's own commands: the commands the document's agent reports,
+		 * in the order, spelling and with the duplicates it reported them. Absent where it
+		 * reports none (an older client, or a harness with no commands), and the composer then
+		 * offers only Chopin's own.
+		 */
+		commands?: CommandOption[];
+	};
+
+	/**
+	 * One command the document's agent offers. `kind` says what it is, as the agent defines it:
+	 * `skill`, `prompt` (a prompt template) and `workflow` are the ones Chopin knows. A command
+	 * is run as `/name args`, except a workflow, which is asked for by name.
+	 */
+	export type CommandOption = { name: string; description?: string; kind: string };
+
+	/**
+	 * Sent to everyone in the room when a turn could not read the document's model choice, or the
+	 * catalog to check it against, and so ran the agent's default (`unreadable: true`), and again
+	 * when a later turn could read it (`false`). Only a change is sent; a person who joins while it
+	 * holds is sent it after `History`, which ends what an earlier connection was told. The composer
+	 * says so, in the words of `UNREADABLE_NOTICE`, until it ends.
+	 */
+	export type ModelUnreadable = KIND<"chat:model-unreadable"> & { unreadable: boolean };
+
+	/**
+	 * Choose the document's model and thinking level, from the next turn. Anyone who can write may.
+	 * The server checks the choice against the catalog it reports now, and refuses one the catalog
+	 * does not offer. Without a field the agent's own default applies.
+	 */
+	export type SetModel = KIND<"chat:model"> & ModelChoice;
 
 	/** Ephemeral composer activity, with no draft content. */
 	export type Typing = KIND<"chat:typing"> & { active: boolean };
@@ -250,6 +474,13 @@ export declare namespace Chat {
 		to: Destination;
 		references?: ReferenceRequest[];
 		/**
+		 * The images and files to send with the message, by the `id` the upload returned (at most
+		 * the server's per-message count). The server reads each from its own record, and refuses
+		 * one that is not the sender's, not from this document, already sent with another
+		 * message, or a kind the destination cannot take.
+		 */
+		attachments?: string[];
+		/**
 		 * The child document open beside this Chat, by channel id. Context for the
 		 * Planner only: the server resolves it against this root's children and
 		 * refuses one it cannot, and the Planner's child tools recheck it again.
@@ -277,4 +508,48 @@ export declare namespace Chat {
 
 	/** Withdraw a queued message. Only its author may. */
 	export type Unqueue = KIND<"chat:unqueue"> & { id: string };
+
+	/**
+	 * Delete a message the machine has not taken yet. Only its author may, and one that was
+	 * taken, or is already gone, is refused. The message leaves the Chat for everyone and is never
+	 * delivered.
+	 */
+	export type Delete = KIND<"chat:delete"> & { id: string };
+
+	/** The message is deleted. */
+	export type Deleted = KIND<"chat:delete"> & { id: string };
+
+	/** A message was deleted before it was delivered; sent to everyone with the Chat open. */
+	export type Removed = KIND<"chat:removed"> & { id: string };
+
+	/**
+	 * Send a `failed` message again, as it was. Only its author may. It is `sent` again, and
+	 * waits and is delivered like any other.
+	 */
+	export type Retry = KIND<"chat:retry"> & { id: string };
+
+	/** The message is waiting again. */
+	export type Retried = KIND<"chat:retry"> & { id: string };
+
+	/**
+	 * Ask a machine to start the document's Planner now, as sending it a message does, without
+	 * sending one. Authorized like `chat:send`: repository write access, and a document that is
+	 * not archived or deleted. It changes nothing about a Planner that is attached, or whose
+	 * connection dropped and whose work is kept for its return: the answer says so and the
+	 * machine's own client is what resumes. It never replays a turn. It is the root document's;
+	 * a child's Chat is its root's.
+	 */
+	export type Wake = KIND<"chat:wake">;
+
+	/**
+	 * `asked` is true when a machine that can run the Planner was asked to start it; its progress
+	 * arrives as `session:planner`. When false, `why` says so: `attached` (nothing to start),
+	 * `disconnected` (its machine's connection dropped; only that machine can resume it) or
+	 * `held` (another account holds it) leave it as it is; `no-machine` means no machine that can
+	 * run it is connected; `unavailable` means this server does not run Planners on machines.
+	 */
+	export type Woke = KIND<"chat:wake"> & {
+		asked: boolean;
+		why?: "attached" | "disconnected" | "held" | "no-machine" | "unavailable";
+	};
 }

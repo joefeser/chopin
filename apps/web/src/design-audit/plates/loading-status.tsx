@@ -4,6 +4,8 @@ import { useId } from "react";
 import { DecisionViewControl } from "../../decision-view-control";
 import { DocumentTitleBar } from "../../document-title-bar";
 import { LostEditsNotice, UndoRefusedNotice } from "../../document-status-notices";
+import { ConnectionBannerView } from "../../chat/connection-banner";
+import { connectionStep, INITIAL_MEMORY } from "../../chat/connection-phase";
 import { SurfaceToggle } from "../../workspace";
 import { AuditPlate, StateLabel } from "../frame";
 
@@ -14,7 +16,6 @@ let STATUS_SPECIMENS: { label: string; notice?: ReactNode; status: PlanStatusPro
 	{ label: "Connected", status: { connection: "connected", synced: true } },
 	{ label: "Loading", status: { synced: false } },
 	{ label: "Busy", status: { busy: true, synced: true } },
-	{ label: "Reconnect", status: { connection: "reconnecting", synced: true } },
 	{ label: "Error", status: { failed: "Permission denied", synced: false } },
 	{ label: "No access", status: { connection: "denied", synced: true } },
 	{
@@ -29,11 +30,16 @@ let STATUS_SPECIMENS: { label: string; notice?: ReactNode; status: PlanStatusPro
 	},
 ];
 
+let PAGE_NOTICES = [
+	{ label: "Reconnecting", failures: 1 },
+	{ label: "Dropped, after repeated failed reconnects", failures: 4 },
+];
+
 export function LoadingStatusPlate() {
 	let chat = useId();
 	return (
 		<AuditPlate
-			description="Document status sits at the end of the document title bar, silent while connected and idle."
+			description="Document status sits at the end of the document title bar, silent while connected and idle. A lost connection is one banner, at the Chat composer or, where Chat is not on screen, the top of the document's content, after a short grace period."
 			item="loading"
 			title="Loading and status"
 		>
@@ -70,6 +76,28 @@ export function LoadingStatusPlate() {
 									/>
 								}
 							/>
+						</div>
+					</div>
+				))}
+				{PAGE_NOTICES.map(({ label, failures }) => (
+					<div key={label}>
+						<StateLabel>{label}</StateLabel>
+						<div className="design-audit-page-notice">
+							<ConnectionBannerView
+								onRetry={failures >= 4 ? () => {} : undefined}
+								view={connectionStep(INITIAL_MEMORY, {
+									socket: "lost",
+									failures,
+									retrying: undefined,
+									synced: true,
+									current: true,
+									turn: undefined,
+									messages: 0,
+									planner: undefined,
+								}).view}
+							/>
+							<span className="design-audit-skeleton-line" />
+							<span className="design-audit-skeleton-line" />
 						</div>
 					</div>
 				))}

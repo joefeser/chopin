@@ -26,6 +26,104 @@ server process's user, on hosted instances as well as local ones.** No other fla
 turns this on or off. Operators who do not want it should use `copilot-sdk`. See [Self-hosting](self-hosting.md#choose-and-trust-a-harness) for
 `HARNESS`/`HARNESS_AUTH` selection and adapter trust.
 
+## Choosing the model and reasoning level
+
+A person with write access can choose the model and the level of reasoning (thinking) of a
+document's Planner from the Chat composer. The choice belongs to the document: everyone who opens
+it sees it, it survives a reload and a restart (`planner_model_choices`, see
+[Storage](storage.md)), and it applies from the next turn. Until somebody chooses, the harness
+runs what it always did, so nothing changes. Choosing a model records that model, the one marked
+_Default_ included, so the document keeps it if the harness's or the client's default later
+changes; the reasoning control's _Default_ returns the level to the model's own.
+
+The server owns what can be chosen, never the browser. It builds a catalog from the harness and
+sends it to the room in `chat:model` (with the stored choice) when somebody joins and when either
+changes:
+
+| Harness                     | Catalog                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Applied by                                                                                                                                                                                                                                                     |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `atomic`                    | The models of the Atomic model runtime the adapter builds: every chat model it has credentials for that `HARNESS_AUTH` would run, as `provider/model`, in the order the runtime reports them (the picker groups them by provider, in the order each first appears, and a model it reports twice is listed twice, a choice of that id being the first entry's), with each model's thinking levels as Atomic reads them (`xhigh` and `max` only where the model maps them) and its context size as the description. `MODEL` is the default. | The turn's `model` and `thinkingLevel`, set on the session; with no level chosen the model runs its own (the level saved for it in the operator's Atomic settings, else their default level, else `medium`), whichever model or level the session held before. |
+| `remote`                    | What the attached client reported in its [capability catalog](agent-connection.md#capability-catalog), with `MODEL` as the default when set. An older client, or one that reports no models, offers none.                                                                                                                                                                                                                                                                                                                                 | `model` and `thinkingLevel` in the `turn` message; the level only to a client that offered `capability-catalog`.                                                                                                                                               |
+| `copilot-sdk` and any other | None: the composer offers no control, because a choice nobody honors is not offered.                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Not applicable.                                                                                                                                                                                                                                                |
+
+The thinking level is a field of the turn the harness is given, beside `model` (`PlannerTurn` in
+`apps/server/src/harness/turn-level.ts`). `HarnessAgent` builds a turn from a fixed set of fields
+that has none for it, so the call that starts a Planner turn carries the level and the harness
+wrapper puts it on that turn; no turn can see another's, and a background job's turn has none.
+
+`chat:model` checks a choice against the catalog reported now, stores it under the writer lease
+and only then answers the sender and tells the room. It refuses a model or a level the catalog
+does not list (whatever its spelling or length: only the catalog decides, and what it lists is
+stored as written), a field that is not a string, a choice for a child document
+(which uses its root's), and every choice where no catalog is offered; choosing nothing goes back
+to the default. Every Planner turn a person started resolves the stored choice again. A model that
+has gone, or a level its model no longer lists, is not sent: the default runs, Chat says so once
+while the reason stands (and again if it changes, or comes back after the choice was honored), and
+the composer shows what will run. The stored choice is
+kept, so it returns to force if the model does. Background jobs never carry a choice.
+
+The composer says so even where nothing can be chosen any longer. When a client withdraws all its
+models, or an older client takes its place, there is no catalog and the picker is gone, but the
+stored choice is still sent in `chat:model` and the composer's notice says that the model is no longer
+available and the default runs until a turn records that fallback in Chat. It does not repeat the
+transcript line.
+A document nobody chose for says nothing. The choice is held back while what a remote Planner
+offers is unknown: with no client attached (a machine that is away, a server that has just restarted)
+or one that offered the catalog and has yet to report it. The choice is then neither gone nor
+honored, and the machine's own status speaks. It stops being unknown for a client that offered the
+catalog and never reports it once a turn has run for want of it and fallen back on the saved
+choice: that has happened, Chat says it, and the room is told the choice without repeating the
+same fallback above the composer. A report that comes later, or
+another client, starts again from what it reports. A person who can only read the document sees
+none of it.
+
+A turn that cannot read the choice at all (the catalog or the stored choice fails to load) never
+runs the default silently. It runs the default, Chat says once, while that holds, that the
+document's model choice couldn't be read, and the server tells the room with `chat:model-unreadable`
+(`true`, and `false` when a later turn can read it again; a person who joins meanwhile is sent
+`true` after the Chat history), so every open composer shows the same words in its notice until a
+turn can read the choice again. Nothing stored is changed. These words are the composer's own
+notice, a cause of their own beside the page's connection banner: drawn beneath the machine's
+banner when that is drawn, and giving way, as the composer's other notices do, to the room's
+own connection banner, a refused send and a failed reply, then returning with the connection
+([design guide](../apps/web/DESIGN.md)).
+
+### Commands the Planner offers
+
+The same `chat:model` carries `commands`: what `/` offers in Chat besides Chopin's own
+(`/research`), each with a `name`, a `kind` and a one-line `description`. Only the document's own
+Planner supplies them, read each time somebody joins or the state changes:
+
+| Harness                     | Commands                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `atomic`                    | What an Atomic session in the Planner's working directory finds: its prompt templates (`prompt`), its skills (`skill`, named `skill:name`, as Atomic invokes them) and the workflows registered for it (`workflow`). The session is built as a Planner's is, in the operator's agent directory and the checkout, and ended at once; nothing goes to a model. It is read once for 30 seconds per directory, however many people join. Atomic's own extension commands are not offered. |
+| `remote`                    | What the attached client reported in its [capability catalog](agent-connection.md#capability-catalog), as written, and nothing once that client has left. An older client, or one that reports none, offers none, and so does a machine that is away.                                                                                                                                                                                                                                 |
+| `copilot-sdk` and any other | None.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+
+The list is the document's Planner's alone. A remote Planner's commands are held with its attached
+link, so another person's machine, or an earlier client of the same document, never shows its own.
+A list that cannot be read leaves the field out and never fails the model state.
+
+Choosing a command in the composer inserts it as a chip at the start of the draft, and the send
+carries it as a `command` reference (`name` and `commandKind`, the `kind` the Planner reported, so a
+name two kinds share is never run as the other) over the range of its `/name` token. The server
+checks it against what the Planner reports at that moment and refuses what it does not offer, in
+words the composer shows under the draft it keeps: `/name is not one of the commands the Planner
+offers.`, `The Planner has not reported any commands, so /name cannot run.` (nothing attached, or
+a client that reports none), `A command has to open the message.` and `A message can run one
+command.` A command goes to the Planner; sent to the room it is refused. The reference is kept
+with the message (the same persisted shape as a document reference, so a queued or saved request
+keeps it across a restart) and the Planner's turn is built from it:
+
+| Kind                            | The turn's prompt                                                                                                                                                                                                         |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `skill`, `prompt` and any other | Atomic's own invocation, `/name args`, alone: the room's earlier words and the focused child's line wait for the next turn (a fresh session has them in its instructions), so the prompt opens with the `/`.              |
+| `workflow`                      | A request, in the person's turn as any message is, to start the registered workflow by name with the workflow tool's run action; the words after the chip are given as its input, said to be data and not an instruction. |
+
+Chopin's own commands (`/research`) keep their behaviour: they are never sent to the Planner, and
+the Planner's list never replaces them. A command in a queued message is not checked again when its
+turn starts: if the Planner has since lost it, Atomic reads `/name` as text.
+
 ## Coaching in an invoked turn
 
 The Planner is instructed to develop a small, provisional account of the problem
@@ -46,6 +144,12 @@ exploration can remain provisional without becoming a Build blocker.
 On every harness, Chat buffers each complete Planner text message and checks it
 with the deployment's decisions classifier before publication. Requests for input
 are withheld and the same session gets one continuation to create inline cards.
+A continuation that repeats cards an earlier turn already created, by their stable
+keys, counts as having created them only while those cards still hold their question:
+open, reopened or answered. A key repeated for a different question or passage is
+refused, and a card a person discarded, or that was cancelled or expired, counts for
+nothing and is never recreated, so the turn still reports that it could not move its
+questions.
 Completed tools and the original request are not replayed. Failed, missing,
 malformed or interrupted checks never publish unchecked prose; uncertain judgments
 also withhold it. Chat prose therefore arrives after validation rather than token
@@ -138,10 +242,11 @@ its Planner may send one, at most 10 an hour per document.
 Under `HARNESS=remote` only attaching claims ownership. An `@chopin` message or
 `invoke_planner` call for a document without an attached Planner is refused with
 `planner-not-attached`, and with one it runs as a turn on that Planner under its
-owner. Other Planner requests, such as sending a comment to the Planner or a
-Build draft, claim nothing either: with a client attached they run on it, and
-without one they fail as any request without a usable owner does, not with
-`planner-not-attached`. A research request claims no ownership either: its
+owner. (A person's request is no longer refused: it is [saved](#saved-requests) and
+starts once a Planner attaches, in hosted mode and under `AUTH_MODE=local` alike.) Other
+Planner requests, such as sending a comment to the Planner or a Build draft, claim nothing
+either: with a client attached they run on it, and without one they are saved the same way.
+A research request claims no ownership either: its
 workers run on the attached client as [isolated sessions](#remote-planner), and
 without one the request waits until a client attaches.
 
@@ -168,6 +273,12 @@ disposable session receives its owner's token when created and has no
 client-level service token or logged-in-user fallback. That detail is specific to
 the Copilot SDK adapter, not a property every harness in `HARNESS` shares.
 
+The CLI process does not inherit the server's environment. It receives the
+proxy variables (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, lowercase forms) and the
+certificate variables (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `SSL_CERT_DIR`) the
+server has set, so a server behind a proxy reaches GitHub through it, and nothing
+else; see [Self-hosting](self-hosting.md).
+
 The two pull-request tool names and input schemas are available when a Planner
 session opens. GitHub MCP discovery runs on the first pull-request tool call,
 using the owner's current credential. An unavailable server or missing required
@@ -187,7 +298,8 @@ Chopin's tools available to the Planner under every harness are:
   current plan-oriented tool names);
 - Chopin's child document tools (`list_children`, `read_child`, `edit_child`,
   `anchor_child`), bound to the root document's own children and rechecked on
-  every call (owner access, parentage, repository, and archive state). They are
+  every call (owner access, parentage, repository, and archive state); `read_child`
+  [pages like `read_plan`](#reading-a-large-document). They are
   never offered to background jobs, and unexpected storage errors reach the
   model only as a generic message;
 - bounded file and tree reads plus commit history using the session's default
@@ -281,9 +393,20 @@ confined to a repository. Operators who do not want that should use
 their usual [bind rules](self-hosting.md#choose-and-trust-a-harness).
 
 The Planner's own turns offer only read-only tools beside Chopin's document and
-repository tools: `read`, `find`, `search`, and `ast_grep` for the working
-directory, Atomic's web research tools, `ask_user_question`, `workflow`, and
-`intercom`. It cannot edit files, run commands, or start subagents itself, so it
+repository tools: `read`, `find` and `search` for the working directory,
+Atomic's web research tools, `ask_user_question`, `workflow`, and `intercom`,
+plus the read-only tools the operator names in `chopin.plannerTools` of the
+agent directory's `settings.json`, such as a code search tool a package
+registers:
+
+```json
+{ "chopin": { "plannerTools": ["my_code_search"] } }
+```
+
+Only the operator's file counts: a checkout's `.atomic/settings.json` can't add
+tools to a Planner, and a name that edits files, runs commands or starts agents
+(`bash`, `edit`, `write`, `kill`, `subagent`, `todo`) stops the Planner from
+starting. It cannot edit files, run commands, or start subagents itself, so it
 never implements the plan; a workflow it starts keeps the tools its stages
 declare. Atomic's workflows, MCP, web access, and Intercom run alongside
 Chopin's tools. The normal Atomic
@@ -367,9 +490,22 @@ extension dialogs, and workflow-stage input become ordinary shared Decisions:
   given in that batch. Late submissions cannot approve withdrawn input.
 - A request has no time limit. It waits until members answer it or it is
   withdrawn: the Planner stops, its run is cancelled, the document is archived
-  or deleted, or the asker's link closes. A document on **Default machine**
-  keeps its Planner running while that Planner waits on a question or a live or
-  paused workflow run, so nobody viewing the document does not withdraw it.
+  or deleted, or the asker's link closes for good, which includes its owner's
+  sign-in ending. A lost connection is never such an end. A link that dropped
+  unexpectedly and offered `resumable-sessions` keeps its open questions and live
+  runs for its account to [resume](agent-connection.md#resuming-after-a-dropped-link)
+  however long it stays away: no timer, including `PLANNER_ATTACH_GRACE_MS`, ends
+  them. While it is away Chat shows the runs with their last status, marked
+  disconnected rather than stopped, and adds no line about the connection (the machine
+  button and the cards carry it); the Decisions stay open and answerable, their answers kept
+  for the client. A Stop pressed meanwhile, or sent and still unanswered when the link
+  dropped, is held for the client's return (the line that records the Stop says so) rather
+  than lost; Stop on
+  a Planner that only waits on a question withdraws it, and Chat says that. A
+  document on **Default machine**
+  keeps its Planner running while that Planner is replying or waits on a question
+  or a live or paused workflow run, a disconnected Planner's kept work included, so
+  nobody viewing the document does not withdraw it or cut its work short.
 - Cards an earlier Chopin closed unanswered after a fixed time stay in the
   document and in Decisions, among the resolved cards, marked
   `status="expired"`; each reads "Nobody answered this question, so the Planner
@@ -443,7 +579,11 @@ Planner backend command it starts per document
 access is checked with the machine's own GitHub authorization, and it owns the
 document through a delegated login of the machine's owner that no browser holds
 (`apps/server/src/harness/remote/machine-planners.ts`), so no browser sign-in is
-needed and signing out does not release it. Revoking the machine, or GitHub
+needed and signing out does not release it. A machine its owner shares with
+teammates does the same for a teammate's document as its owner, where they chose it or made it their favorite; the same sharing
+is the owner's consent for that teammate's builds and runs to run on the machine
+too, as the owner (see
+[Share a machine with teammates](chopin-cli.md#share-a-machine-with-teammates)). Revoking the machine, or GitHub
 refusing its authorization, ends that login and closes its connections with
 `access-revoked`.
 
@@ -462,33 +602,143 @@ produce, is cleared under its generation and the document is claimed again.
 
 One client holds a document's Planner. While it is attached, every other
 `attach` for that document is refused with `planner-attached` (4409) and a
-message naming its GitHub login. A connection that detaches or drops keeps the
-ownership for `PLANNER_ATTACH_GRACE_MS` (2 minutes by default). A connection that
+message naming its GitHub login. A connection that detaches, or drops with no
+workflow run or open question to keep, keeps the ownership for
+`PLANNER_ATTACH_GRACE_MS` (2 minutes by default). A connection that
 answers none of the server's [protocol pings](agent-connection.md#pings) for
 `AGENT_CONNECTION_TIMEOUT_MS` (2 minutes by default) is closed as dropped, so a
 client whose network silently went away does not keep the document attached.
 Within the grace period the same account can attach again and keeps the same
-ownership generation, and anyone
-else is refused. When it ends, the ownership is cleared under its generation, so
-a newer owner is never released by an old timer. An attach, including a grace
+ownership generation; anyone else is refused. A link that offered
+`resumable-sessions` and dropped unexpectedly while it had runs or open questions
+instead keeps the ownership with no deadline, as the document's **disconnected**
+Planner: the same account takes back the sessions, runs and questions whenever its
+client returns, however long that takes, and nobody else can attach meanwhile.
+Nothing but an explicit act ends that hold: a sign-out or expiry of the owner's
+login, a Planner reset, revoking or unpairing the machine, the owner choosing
+another machine for the document, the document being archived, a Stop that
+withdraws the last thing it kept (which then runs the grace period as a detach
+does), or the same account attaching with a client that holds nothing to resume.
+A machine that only went quiet, or a Default machine idle period, never
+does. The grace period is an ownership lease on a connection that is no longer
+there, not a timeout on active work: it never runs while a client is attached or
+disconnected with work kept. When it ends, the ownership is cleared under its
+generation, so a newer owner is never released by an old timer. An attach, including a grace
 reattach, binds only if no sign-out, expiry, or Planner reset of its ownership
 landed while it was checking, including the eligibility checks of the sign-in
 it is about to claim with; otherwise it is refused like an attached connection would
-be closed. Attachments live in the server process; startup already clears
-every owner reference, which releases every attachment.
+be closed. Attachments live in the server process, so a restart does not keep a link,
+but it does keep what its client holds: at the cut, and when a link drops with work
+kept, the server writes each hold to `planner_link_holds` (see
+[Storage](storage.md#postgresql-schema)): the sessions the client holds, the questions
+it waits on, the answers it has not acknowledged and the Stops it has not heard. The next
+process rebuilds each as a suspended hold, so a client that returns and sends `resume`
+takes its sessions back. Startup's reset keeps the owner of a document whose hold names a
+browser sign-in that has stored credentials; a paired machine's hold names the machine
+and no login, which a restart cannot keep: the machine's backend attaches again with its
+credential, which is stored by digest and so accepted at once, and its new login takes over
+the hold.
+
+**The hand-over window.** A hold whose link the cut closed is given `HANDOVER_PLANNER_WINDOW_MS`
+from the release of the lease, the time its client is told it has. The cut cannot know when the
+release will be, so it writes the window's length with the hold (`handover_until` is the write
+plus that length) and the next process, which can take the lease only after the release, counts
+the window again from the moment it rebuilds the hold: no step between the write and the release,
+however slow, and no late takeover takes anything from it, and a client that comes back at any
+moment of the window it was told finds the machine attached. A process that rebuilds a hold more
+than an hour after the cut wrote it finds no window: no deploy takes so long, and such a row was
+left by a cut no process followed. Only the process that rebuilds the hold is given the window:
+it rewrites the row without it before it shows the hold (a write that fails is logged, and the
+window is still given), so a process that starts after that one crashed, inside the window or
+after it, finds the hold of a link that had already dropped, disconnected. Until the window ends, `session:planner`, the owner's own views and
+Planner comments treat it as attached, with its login, so no member sees it disconnected or
+reconnecting; a request to it is saved as a row and starts when it resumes, and workflow
+runs Chat stored come back live, not stopped. A `resume` inside the window before the owner's
+browser sign-in is back (it comes back with the browser's cookie) is not refused: it waits, with
+the link kept and the machine shown attached, and the sessions are handed back the moment the
+sign-in is. One still without it when the window is over is refused with `unavailable` and
+`retry`, which a client retries; it is never `sign-in-required`, which would end the link. A
+`resume` inside the window ends it. When it ends with no resume the hold is disconnected,
+as a dropped link is today, announced, with run cards marked disconnected, and the miss is
+logged with its cause: the owner's sign-in or the client was not back. A hold that was already
+disconnected keeps its state and gets no window, and one in its grace period is not kept.
+A question a client waited on is not waited on again: nothing in the new process can
+answer it, so `resumed` does not list it, the client settles it as cancelled, and its
+Decision stays open and answerable; an answer starts a Planner turn once one is attached. An
+answer given while the link was down, which was owed, is delivered once as before.
+A graceful shutdown still tells every link it is going down first, so none withdraws a
+question on the way out, and posts no Chat line about the links or the runs. `AUTH_MODE=local` is never handed over, and keeps today's behaviour: holds stay in memory.
 
 **Who is attached.** Each room socket hears `session:planner` after
 `session:hello`, and the whole room hears it again whenever an attachment
-changes: an attach, a detach into the grace period with the time it ends, the
-grace period ending, a sign-out, a Planner reset, or the server closing a connection
+changes: an attach, a detach into the grace period with the time it ends, a drop
+that keeps work (`disconnected`, with no deadline), the grace period ending, a sign-out, a Planner reset, or the server closing a connection
 whose ownership was released. It names only the holder's GitHub login and
-state, never a machine, checkout, or token. Chat shows it as one line under the
-composer. Other harnesses never send it, and Chat then shows nothing.
+state, never a machine, checkout, or token. A healthy, attached Planner shows
+nothing. Otherwise the document's machine button carries it (a thin spinner while
+the machine is connecting, a warning dot where it cannot connect, a muted grey dot
+while the Planner is away, and no dot at all where no machine is connected, the same
+bare icon as a button with no machine, never the machine's own green) with its words in
+the button's name and at the top of its menu, and as the connection banner at the Chat
+composer's top edge, once, as it changes: _reconnecting_ while a machine is being connected to,
+_dropped_ for a machine that cannot be connected to (with the reason exactly as the machine
+reported it, the attempts and _How to fix_, and a button that asks the machine to try again
+through `chat:wake`), that is offline or that has stepped away (no button: only that machine
+can come back), and, for a person with no machine button, _No machine is connected._ The
+page cannot hear the machine while the room's own connection is lost, so the banner then
+tells that connection alone and tells the machine again, with the state then known, once
+the connection is back. `plannerForBanner` and `connectionStep` decide this, so the button
+and the banner cannot disagree. A screen reader hears each phase once as it begins, from
+one live region of the page, and nothing when it clears; the region remembers the machine
+state it last said, so one that carried on through a loss is not said again when the
+connection returns, and a different one is said once. Other harnesses never send it, and
+Chat then shows nothing.
+
+These words are plain and name none of Chopin's own terms: _Connecting to studio_,
+_Can't connect to studio_, _studio is offline. Last seen 10:31 AM._ for a machine that is away (_Your work is kept._ where no time is known), _studio stepped away.
+Your work is kept until 10:31 AM._ for a detached holder with its deadline, and _No machine is
+connected._ where none is attached, naming the machine only when it is the one the
+document's button names (the person's choice, else the one Default machine uses now), and
+otherwise only its owner's login (_@mona's machine_).
+_Connecting_ and _No machine is connected_ are said only once they have lasted the 1.5 s a lost connection waits before the page speaks of it, the last state staying until then, so a restart's passing states are never shown; every state clearing goes at once. Through a lost connection the page keeps the last state it knew, however long the machine takes to return: a server that has just started tells `none` to everyone who connects until a machine returns, so the first `none` after the connection comes back is its placeholder, not news of the machine, and nothing is said until another state arrives. A `none` told after any other state, a machine removed while the page is connected, is still said, and so is the first state of a page that has known nothing else. It never names another machine of the list: while the person's machines are loading, while the
+list names a machine the document does not run on, a teammate's or another of the person's own,
+for a Planner their own account is starting or has lost, while it describes another account's Planner than the page's connection does, or while it was read before the connection's last word, which describes the Planner as it was (the page reads it again on every word, and a read that began after the word is the one that may name a machine), nothing is named
+until it agrees. Meanwhile the status says nothing of the machine, however long that takes (a read that fails or a hidden tab leaves it empty, never stale), and what it said of an older word does not stay. The state it last showed and said is remembered through that gap, with the live region silent meanwhile, but only so that the same state naming the same machine, such as a word that repeats it with one more attempt, is neither made to wait out its grace again nor announced twice. Any other state that arrives after the gap is drawn by its own rules, never in place of what was shown before the gap: a state that waits (_Connecting_, _No machine is connected_) draws nothing until it has lasted its grace, so a document moved from one machine to another does not read the first machine's _offline_ before it says it is connecting to the second, and a state with no grace is drawn at once. With no gap, in an ordinary transition, the last state still stays through the grace of the next, so a reconnect does not flicker. A `disconnected` Planner's work is
+kept with no deadline. Its live
+run cards carry `disconnected` beside the status they last reported: each reads
+**disconnected**, not running or stopped, with a still ring instead of the pulse and
+its clock held at the last report; an open card says what it last reported and what
+happens when the Planner returns. A card offers Pause, named as waiting for the Planner
+to reconnect, because Chopin holds it, and no Resume, which it cannot hold. While the
+page's connection banner shows, the cards say nothing of the machine: no **disconnected**, no
+note, and a plain Pause, with the status as last reported, a still neutral ring and the
+clock held; the words come back with the connection, as the state then is. Decisions
+stay where they were and stay answerable. **Build plan** says to reconnect the machine
+(_Reconnect the machine to build_), and a new comment is not sent to Chopin by default, until
+it does. With no machine connected at all it says _Connect a machine to this document to
+build_ and offers how to connect one.
+
+While a paired machine is starting the Planner, the state is `starting`. Its
+connector reports each launch of the backend that exits before staying up to
+`POST /api/connector/planner/failure`: how many in a row, how it ended and the
+last stderr line that says why (colors and credentials removed, the home
+directory shown as `~`, at most 300 characters). From the second in a row, the
+`starting` state also carries `failure` with the count, the reason and when
+the last launch exited, so everyone in the document reads why it cannot connect to
+the machine; the time is the server's own, not the connector's clock. The report
+counts only for a document Chopin asked that machine to run, and is forgotten
+when the Planner attaches, when the connector says a launch stayed up, when the
+machine is no longer asked for the document, and with a restart. It is a new
+route, not a new connector protocol: a connector that does not report is
+unaffected, and a server without the route answers a reporting connector 404,
+which it takes to mean no.
 
 **Unattached documents.** Members, MCP callers, and research requests never claim
 ownership under `HARNESS=remote`. An `@chopin` message or `invoke_planner` call
-for a document with no attached client, including one within its grace period,
-is refused with `planner-not-attached` before anything is posted or queued.
+for a document with no attached client, including one within its grace period or
+disconnected with its work kept (the message says its machine is offline and that the work
+is kept and picks up when it is back), is saved and waits for a Planner to attach, as
+[saved requests](#saved-requests) describe.
 Before accepting either, the server rechecks an attached connection as its periodic
 recheck would: if the owner's browser sign-in has ended or storage no longer
 assigns that owner, it closes the connection, releases the ownership, and refuses the
@@ -575,6 +825,92 @@ A harness session is bound to one credential revision. Before an eight-hour
 GitHub App token refresh, Chopin aborts and discards every Planner session
 using that revision. The next turn creates a fresh session with the new token.
 
+## Files in Chat
+
+A message can carry images and text files: the `+` in the composer, a drop on it and a paste
+add them, and each shows as a chip, with its picture for an image, its name and its size until the
+message is sent.
+The server keeps them in the document's storage (the `chat_attachments` table and the memory
+adapter's equivalent; see [Storage](storage.md)), not in the sidecar, and a sent message shows them
+to everyone in the room.
+
+**Upload.** The browser sends each file's bytes to `POST /api/channels/:channelId/attachments`, with
+its name and declared type in the query (`name`, `type`), and sees progress as the bytes go. The
+route needs a session, the app's own origin, and repository write access to a document that is not
+archived. It answers `201` with the file as the server kept it (`id`, `name`, `kind`, `mimeType`,
+`size`), or a refusal with a `reason` (`too-large` 413, `empty`, `unsupported` and `image-type` 422,
+`too-many` and `too-much` 429, `not-allowed` 403). A file is its uploader's alone until a message is
+sent with it: `DELETE` on the same path with the file's `id` takes back one that has not been sent,
+and an upload nobody sent within a day is forgotten. One person may leave unsent at most four times
+what a message may carry.
+
+**What a file is.** The server reads the bytes and decides, whatever the name or declared type say
+(`packages/protocol/attachment.ts`, which the browser runs too, before the upload): a PNG, JPEG,
+WebP or GIF is an image; UTF-8 text with no stray control character is a text file; anything else
+is refused. A file whose name or declared type says it is an image must be one of those four rasters
+by its bytes, so an SVG, a HEIC or a page named `.png` is refused rather than stored under a type
+it is not. The file is stored under the type its bytes have, and a text file, whatever it is called,
+as `text/plain`.
+
+**Limits.** Three settings, each also told to the browser when it joins: `CHAT_ATTACHMENT_MAX_BYTES`
+for one file (1 MiB by default), `CHAT_ATTACHMENT_MAX_COUNT` for a message (5; `0` turns files off)
+and `CHAT_ATTACHMENT_MAX_TOTAL_BYTES` for all of a message's (4 MiB). See
+[Self-hosting](self-hosting.md). Under `HARNESS=remote` the per-file and total caps are never more
+than 1 MiB.
+
+**To the Planner.** A file sent with a message to the Planner reaches its turn as the message's own
+parts: a text file as a file part (`text/plain`) and an image as an image part, and only where the
+model the turn would run reads images, by its catalog entry's `inputTypes`. A model that does not
+say so reads as text only, and so does a harness that reports no catalog (`copilot-sdk`), so the
+`+` explains why images are unavailable there and the server refuses an image sent to the
+Planner all the same ("This model can't read images"); the same image can go to the room. Atomic is
+given images as its own prompt images and each text file written into the prompt under its name;
+the Copilot SDK likewise, with images as blob attachments; a remote Planner's client is sent them
+in the turn's `attachments` if it asked for that feature, and otherwise as words (see [Images and files in a turn](agent-connection.md#images-and-files-in-a-turn)). If the model has stopped
+reading images by the time the turn starts, the prompt says which images were sent and not shown.
+A repair attempt of a turn is given the prompt alone.
+
+**Reading.** `GET /api/channels/:channelId/attachments/:id` answers a person who can read the
+document, and only once a message has been sent with the file (before that only its uploader may). A
+person who cannot, a missing file and another document's file are the same `404`. A raster image is
+served inline under its own type; a text file is a download of `text/plain; charset=utf-8`; every
+answer carries `X-Content-Type-Options: nosniff` and `Content-Security-Policy: default-src 'none';
+sandbox`, so a stored file is never rendered as HTML or SVG.
+
+## Dictating a message
+
+The composer has a microphone button where speech can be turned into words, and nowhere else. It
+never records until a person presses it (the browser asks for the microphone then and not before),
+and it stops on a second press, on Escape, when the message is sent, when the page is hidden, when
+the person leaves the document and when the document stops taking messages. Nothing runs in the
+background, and what a recognizer reports after a stop is ignored.
+
+**Where speech becomes words.** First the browser's own speech recognition (`SpeechRecognition`,
+prefixed or not), and only if the browser says it runs on the device (`processLocally`): a browser
+that cannot say so is treated as having none, because without it a browser may send the audio to a
+speech service. A device with no model for the person's language is asked to fetch one before the
+microphone opens, and is told plainly if it cannot. Otherwise, where `TRANSCRIPTION_MODEL` is set
+(off by default; see [Self-hosting](self-hosting.md)), the composer records on the device and, when
+the person stops, sends the recording to `POST /api/channels/:channelId/transcriptions` for a person
+who can write to the document, from the app's own origin. The server reads the bytes (a recording
+a browser makes, a WAV or an MP3, up to `TRANSCRIPTION_MAX_BYTES`), sends nothing else to the
+provider, and gives back `{ "text" }`; the route answers 404 where no model is set. The
+`session:hello` frame names the provider (`transcription.provider`) only where it is set, and the
+button's tooltip then says the recording goes to it.
+
+**What it does to the draft.** Words the recognizer is sure of are written into the draft at the
+caret the person had when they pressed the button, spaced as typing would, one result after another;
+words it is still working on are shown beside that place in a quieter ink and replaced by the next
+result, and are never part of the draft's text, selection or history. The draft stays ordinary
+text the person can edit at any time: typing or moving the caret takes dictation with them. A
+message sent while speaking is sent as the person saw it. A blocked microphone, no microphone, a
+language the device cannot recognize and a lost connection each stop it with a plain message.
+
+**Accessibility.** The button is "Dictate", pressed while listening, with the chord (Alt+Shift+M, ⌥⇧M on
+a Mac) in its tooltip and in the keyboard shortcuts sheet; a polite live region says when it starts,
+when it stops and why not; and the dot beside it, with the time so far, holds still where the person
+prefers reduced motion.
+
 ## Chat context
 
 [Automatic participation](conversation-initiative.md) is enabled with the Planner and lets
@@ -595,37 +931,294 @@ every turn.
   descriptions and legacy summaries under durable `document-summary@1` are
   separate and are not bootstrap context.
 - The Planner reads the current document through the plan-named `read_plan` tool
-  instead of receiving a stale embedded copy. That result, and every structured
-  `edit_plan` result (success, or a locked, stale, or invalid refusal), carry
-  `document: { id, url }`: the room's own document id and the canonical URL MCP
-  `read_document` returns for it, nested under the parent for a child document. A
-  renamed top-level document adds `earlier_urls`, the links it had before, which
-  still open it, so the Planner can tell its current link from an old one by data.
-  Argument and storage errors return plain error text without it. Code running
-  inside the session, such as an Atomic extension, can use either to address
-  that document over MCP.
+  instead of receiving a stale embedded copy. The tool's own result is still that
+  structured view as JSON, and the model is shown it as
+  [text it can page through](#reading-a-large-document). A short header names the
+  `document` id, the canonical `url` MCP `read_document` returns for it (nested
+  under the parent for a child document), the `revision` and the size. A renamed
+  top-level document adds `earlier urls`, the links it had before, which still
+  open it, so the Planner can tell its current link from an old one by data.
+  Every structured `edit_plan` result (success, or a locked, stale, or invalid
+  refusal) still carries `document: { id, url }`, and `earlier_urls` after a
+  rename. Argument and storage errors return plain error text without it. Code
+  running inside the session, such as an Atomic extension, can use either to
+  address that document over MCP.
 
 After an `ask` questionnaire has a saved answer, its result may include
 `current_plan` with the same document, revision, source, block outline, comments,
-and question records as `read_plan`. The Planner can edit from that revision and
+and question records as the structured view `read_plan` is built from. The
+Planner can edit from that revision and
 still uses `anchor_plan` to relate the answer to prose. The optional snapshot
 has a 50 ms budget for document lookup, owner revalidation, and room access;
 if it cannot finish, the saved answer returns without waiting and the Planner
 can call `read_plan`. When none of a batch's questions were answered, or lookup
-or revalidation fails, the result contains only the outcomes.
+or revalidation fails, the result contains only the outcomes. `open_decisions`
+returns `current_plan` the same way. Once that view, as JSON, would take more
+than half of one read's 16,000 bytes (8,000 bytes), `current_plan` keeps
+`document`, `revision`, and the newest `questions` and `comments` that fit, with
+`questions_omitted` and `comments_omitted` counting any left out, and replaces
+`source` and `blocks` with `source_omitted`, which gives the source's size, the
+block count and the call that reads them. A result that carries the plan stays
+within one read's bytes. Edit from that revision only after `read_plan` has
+returned the blocks.
 
 Chat references are typed server-side resources, not URLs the model can
 follow. `#` selects another ordinary document in the current repository.
 References persist with their message, but `read_reference` accepts only the
 bounded set retained by the active Planner session. A document reference reads
-latest canonical source and reports whether it changed since selection. New
-messages no longer offer `%` research references; persisted references from the
-removed Research Workspace interface still return a bounded compatibility
-projection. Both forms are untrusted evidence, and neither changes the
-room-fixed target of `read_plan` or editing tools.
+latest canonical source and reports whether it changed since selection. Typing `%`
+no longer opens anything; a research card of this document is chosen from `@` (below),
+and persisted references from the removed Research Workspace interface still return a
+bounded compatibility projection. Both forms are untrusted evidence, and neither changes
+the room-fixed target of `read_plan` or editing tools.
+
+`@` also points at the document's own parts and at its repository, as references the
+Planner receives as identities and not as words. A request names the part and never
+its text; the server resolves it against the document as it stands when the message
+is sent, writes the label the person saw from it, and refuses one that has gone, in
+words the composer shows (`That heading is no longer in the document.`,
+`That Decision is no longer in the document.`, `That file is not in the repository.`,
+`This repository's files cannot be listed right now, so a file cannot be mentioned.`,
+`That path is too long to mention.`):
+
+| Kind       | Request       | What the Planner is told beside the words                                                                                                                                                                   |
+| ---------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `heading`  | `anchor`      | `[heading anchor "overview", level 1, line 1 of this document]`. The anchor is the heading's text as GitHub slugs it, `-1`, `-2` after a repeat, in document order, over the document's top-level headings. |
+| `decision` | `decisionId`  | `[Decision id "<id>" of this document]`. The label is the Decision's header (its prompt where it has none).                                                                                                 |
+| `file`     | `path`        | `[file path "src/index.ts" in the repository]`. A plain path from the root: no `..`, `.`, empty part, backslash or control character.                                                                       |
+| `research` | `workspaceId` | As before: a reference read by id with `read_reference`, drawn `%Title`. Only a workspace of this document is accepted.                                                                                     |
+
+The composer asks for what it can offer with `GET /api/channels/:channelId/mentions?query=&limit=`
+(`limit`, 1 to 20 of each kind, is 6 by default; a query is at most 64 characters). A person who
+can read the document gets its headings (`anchor`, `text`, `level`), its Decisions (`id`,
+`title`), its research cards (`workspaceId`, `title`: the workspaces the document holds a card
+for) and its repository's files (`files`, paths), each narrowed by the query (a title or name
+that starts with it first, then a word, then any part) and read from the same source a message's
+mentions are resolved against. Anybody else is told the document does not exist. Files are those
+of the Planner's checkout where the document has one (`HARNESS=atomic`, what `git` tracks and has
+not ignored, kept 10 seconds) and else what GitHub lists for the default branch, read with the
+asking person's own session and kept a minute per repository, up to 50,000 paths; with neither,
+`files` is left out and a file mention is refused.
+
+None but a document or a research reference can be read by id: a heading, a Decision and a file
+are places the prompt already says how to find (`read_plan` shows the document with its Decisions,
+the repository tools read a file), and are quoted so a name with a quote or a line break stays one
+value. Each is kept with its message, in the same persisted shape, strictly checked on restore.
 
 Messages from people retain their GitHub handles so disagreement is not merged
 into one anonymous user voice.
+
+### Reading a large document
+
+A host tool result reaches the model as one string, and a harness may keep only
+the head and tail of a long one: Atomic's MCP adapter keeps the first and last
+10 KiB of a result over 20 KiB of UTF-8 and drops the middle without a word.
+`read_plan`, `read_child` and MCP `read_document` therefore return Markdown with
+real newlines, and one result never carries more than **16,000 UTF-8 bytes in
+all** (`READ_BYTES` in `apps/server/src/document-reading.ts`). The budget covers
+the header, the outline, the lists, the block listing, the source and the lines
+that say how to continue; nothing sits outside it. It is well under the 20 KiB
+Atomic keeps and the 50,000 characters a harness reads at once.
+
+`read_plan` and `read_child` still return their structured view as JSON, so a
+caller that runs the tool itself, or reads the result of a tool-run in the
+server, sees the whole document unchanged. The Copilot SDK, Atomic and the
+attached client show their model whatever a host tool returned, and the agent
+harness applies a tool's `toModelOutput` only to the messages it returns when a
+turn ends. `withModelOutput` (`apps/server/src/harness/model-output.ts`) wraps
+each real harness, so the result it hands the runtime for these two tools is the
+text below, made from the same view. The harness the end-to-end suite fakes, and
+`HARNESS` values added later, see the JSON until they are wrapped. The `remote`
+harness sends the attached client the same text as `host-tool-result.output`.
+
+```text
+document: <id>
+url: /documents/<owner>/<repository>/<slug>
+revision: 7
+size: 168421 characters, 5566 lines, 2214 blocks
+lines: 1-120 of 5566
+next: read_plan {"offset":121}
+This document is larger than one result holds (16000 bytes), so this is its outline and first part. ...
+
+Outline (line, heading):
+L1 # Quarterly field notes
+L3 ## Site 1: harbour survey
+
+Decisions (their text, options and answers are in the source):
+- <id>: open: Which quay?
+
+Blocks starting on lines 1-120 (index type lines digest):
+0 heading L1-1 sha256:...
+
+--- source lines 1-120 of 5566 ---
+# Quarterly field notes
+...
+```
+
+- The source is last, after a `--- source lines A-B of N ---` line, and is
+  verbatim: the source sections of the results `next:` leads through, joined,
+  are the document exactly, with its final newline, CRLF and blank lines. Lines
+  are separated by `\n`; a final newline does not start another line, so `lines`
+  is the count of lines, not of newlines.
+- Without arguments, a document whose whole text fits in 16,000 bytes is
+  returned whole (`lines: all N`). A larger one returns its outline (shallow
+  headings first, with the line each starts on, in at most 2,500 bytes and with
+  a count of any left out) and its first part, and says `next:` with the exact
+  call that continues. That is the threshold: `read_document` returns a document of
+  up to about 15,000 characters whole, and `read_plan`, whose block listing takes
+  about 90 bytes a block, about 6,000 characters of short blocks or more of long
+  ones.
+- `offset` (a 1-based line) and `limit` (lines) return that slice and the total
+  line count. Where the slice fits in the budget it is exact. **`limit` is a
+  maximum:** a result that would pass 16,000 bytes stops sooner, and its header
+  says so (`limit: asked for 4000 lines from line 1, but one result holds at
+  most 16000 bytes, so this one stops at line 521`) with a `next:` for the rest.
+  The cap is what keeps a harness from silently cutting the middle of a result,
+  so it wins over an exact slice. An `offset` outside the document is an error
+  that names the line count.
+- A line too long for one result is read in pieces. `column` is a 1-based
+  position in line `offset`, counted in Unicode code points (a line's characters
+  and then its newline, if it has one), so a piece never splits an emoji or a CJK
+  character. A result that ends inside a line says `ends mid-line: line 3 after
+  character 30703 of 50001` and its `next:` names `offset` and `column`; the
+  result that continues says `starts mid-line`. A `column` needs its `offset`
+  and must lie inside that line. Following `next:` covers every character
+  exactly once.
+- Lists that come with the first part are trimmed to their own budgets, and the
+  last line of each says what was left out: the decisions (1,500 bytes; every
+  decision, with its options and answers, is in the source), the accepted
+  comments (1,500 bytes) and, for MCP, the brief (2,000 bytes; the whole brief is
+  in `structuredContent.brief`). A header value is one line of at most 300
+  characters.
+- A part lists the top-level blocks that start on its lines, with their index,
+  type, line range and digest, so a Planner can aim `edit_plan` and `anchor_plan`
+  at a block it has read. `read_plan` on a small document lists every block.
+- `read_child` has the same text, with `child` and `title` in the header, the
+  same `offset`, `limit` and `column`, and a `next:` that names the child. MCP
+  `read_document` has the same shape with the document's `id`, `title` and `url`,
+  and no blocks. Its `structuredContent` is the whole document as before,
+  whatever slice the text carries.
+
+## Saved requests
+
+A request to the Planner that cannot start at once is kept, not dropped and not refused. It is
+acknowledged only after it is saved, as a row in `planner_deferred_turns`, in the same commit as
+the transcript entry that shows it. Five kinds are kept: a Chat message to the Planner, a member
+message from an MCP `invoke_planner` call, an automatic follow-up (`invoke_planner` with
+`as: "system"`), a comment note sent to Chopin in a document or in one of its children, and a task
+draft from Build. Every one is saved first, even when nothing is running and a machine is there: a
+turn begins from its row, once a session is open on the machine, so a session that cannot be
+opened leaves the request waiting and a stop before the turn starts loses nothing. A request waits
+when a turn is running, when no turn may start because the process is stopping, when a saved
+request is already waiting ahead of it, and, under `HARNESS=remote`, whenever no Planner is
+attached, however long that lasts. Behind a running turn the queue holds
+20 requests; past that the server answers `planner-queue-full` before anything is saved, which is
+not a refusal of the message: the sender's browser keeps it and sends it again, in its turn and
+with the same request ID, every few seconds until there is room, and shows it as waiting to send
+meanwhile. A machine that is away has no such bound. As a chat app keeps a message for someone
+who is offline, every request a person sends it is saved, in order, and kept until the machine is
+back and takes it or the sender deletes it; none is refused or dropped for how many wait or how
+long the machine has been away, and nothing is said in Chat about it. Nor is one turned away for
+how many are being saved at the same moment, which is limited to 20 only for a machine that is
+there (past which a send is answered `temporarily-unavailable` and sent again, below): a Chat
+message, an MCP call and a task draft for a machine that is away are each saved, in the order they
+came, however many arrive together and however slowly Chopin finds out that the machine is away.
+What remains is a limit on a message's size. A send whose commit
+went through but whose answer was lost is answered `temporarily-unavailable` like any passing
+trouble, and its row is not forgotten: it is put back in the queue ahead of what was accepted
+after it, and in the transcript, when the sender sends the same request again, when the queue next
+starts and when the document opens again, so it is delivered once and in order whether or not its
+sender asks again, unless it was deleted, which stays deleted. A machine that comes
+back with a long backlog takes it one request at a time, in order; while twenty or more still
+wait, a new message is held by its sender's browser as for any busy machine. So is any other refusal of a send for a passing reason (the message could
+not be saved, the room is changing, authorization is briefly unavailable, too many sends are being
+handled, a reference or the open child could not be looked up for storage's sake, or anything the
+send itself threw): it carries `temporarily-unavailable`. Only a reference the server finds at
+fault (malformed, outside the repository, no longer there) is final. A refusal without either code says the message is at
+fault, and is the only one that marks it Couldn't send. Server-authored turns (answers to open
+decisions, relinking after a build, settling a prototyped passage) and background jobs are not
+kept this way and wait as before. `AUTH_MODE=local` is never handed over. It keeps requests as
+rows only where the Planner runs on a machine that can be away (`HARNESS=remote`), so a message to
+it waits for the machine as anywhere else; with a Planner on the same computer nothing is away and
+the queue stays in memory.
+
+A row is `waiting`, `started`, `ended`, `interrupted` or `cancelled`. Only `waiting` can move to
+`started` or `cancelled`, and only `started` to `ended` or `interrupted`; any other move changes
+nothing and is logged. Every move is written in one commit with the entry or notice it explains
+and published after it commits.
+
+**When a request starts.** In the order they were accepted, once the process is ready, and only
+through a check that claims nothing until a login is known to be live. Under `HARNESS=remote` that
+is an attached Planner. Otherwise the document's owner must have a live login, or, with no owner,
+the login of someone whose request is waiting must be live, and it claims the document. A login is
+live again when its browser sends its cookie. The check is tried when the process is ready, when
+a login comes back, when a new request is accepted, when a Planner attaches and when a turn ends.
+A request whose sender can no longer write is cancelled as failed; one whose focused child
+document is gone is cancelled as failed; a comment whose thread was resolved is cancelled without
+a notice, because the resolution is what members see. Only one turn is begun at a time: Chopin's
+own background jobs (such as keeping a title) wait beside saved requests, run after those ahead of
+them, and do not count against the 20 places a person's messages may fill.
+
+**What a person sees.** A message appears in Chat at once, as theirs, with `deliveryState`: `sent`
+while the row waits, `delivered` once its prompt is on its way to the machine, and `failed`, with `deliveryFailure`
+(`machine-removed`, `access-lost` or `document-unavailable`), when it can never be delivered as
+sent. The reason is kept on the cancelled row, so a document that was closed when its request was
+cancelled still says why when it opens again. An entry saved before this existed has no state and
+reads as delivered. `chat:delete` removes
+a message that has not been delivered, for everyone, and cancels its row in the same commit; one
+already taken, or someone else's, is refused with the code `message-not-deletable`, and deleting twice
+leaves it deleted. That code is the server's last word; a delete refused for any other reason (storage
+busy, the message being taken by the machine at that moment) says nothing final. `chat:retry`
+sends a `failed` message again as it was. A message that is waiting is not listed in `chat:queue`,
+which lists only requests with no entry of their own. Chat says nothing about why a queue waits,
+however long it does: the message's own mark is the only sign, and the machine's state is shown on
+the machine button alone, as everywhere else. (The design asked for one Chat line after a delay,
+saying what the queue waits for; the rule that machine state is not said anywhere else replaces
+it, so there is no such line and no `DEFERRED_NOTICE_DELAY_MS`.)
+
+The sender's own message carries one quiet mark, in plain words and readable by a screen reader:
+**Waiting to send** (a clock) while only the browser has it, in an outbox that sends it by itself, in
+order and once, when the page's connection is back; **Sent** (one tick) once the server has it and
+the machine has not taken it, whether the machine is away, still starting, or between processes
+during a deploy; **Delivered** (two ticks) once the machine took it. A message not yet delivered
+has a menu with **Delete**, even one the browser has already put on the wire, whatever the server
+last answered it (an earlier attempt of a message it turned down for a passing reason may have
+been kept, its answer lost): the server is told to drop it as soon as there is a connection,
+cancels its saved row if it had one, and remembers that it was taken back so that a send still on
+its way from a lost connection cannot bring it back. A message
+taken back while the page is offline, or whose delete the server has not answered, leaves the Chat
+at once and stays gone across a reload: the browser keeps the ids in the tab's session storage, as
+it keeps the outbox, and asks again until the server answers, so the message is never delivered and
+never comes back. The outbox remembers which messages were put on the wire, across a reload too, so
+that a message whose answer was lost, taken back after the page was reloaded offline, is still told
+to the server; only a message that provably never left the page is just dropped. Only the server's
+last word (`message-not-deletable`) ends the asking, and shows the message again with its mark; a
+refusal for a passing reason keeps the message hidden and is asked again after a few seconds, as a
+lost connection is asked again on the next one. A message that can
+never be delivered as sent, or that the server turned down for good, says **Couldn't send** on
+itself, with the reason and **Try again** and **Delete**, and never in a strip above the composer. While the
+page's connection banner shows, that line gives way to it and returns with the connection.
+A full queue is not that: the message stays marked as waiting to send. The outbox is used only
+with a server that acknowledges sends (`chatSendAcks`), and only for messages to the machine.
+
+**Delivered is true.** A request kept as a row is handed to its machine only once a session is
+open there: the row moves from `waiting` to `started`, and its message to `delivered`, in the
+commit that follows a successful open, immediately before the prompt is sent. If the machine
+cannot open a session, which is what a link that dropped as the request was starting does, the
+row stays `waiting` and the message stays **Sent**, at the head of the queue and in order. It is
+tried again when something says the machine may be there (a request accepted, the machine back, a
+login restored), once each time, never in a loop, and without a failure notice or any line in
+Chat. A message that starts at once is marked **Sent** until the same point and **Delivered** then. What is not
+claimed: the prompt is handed over, not confirmed read, and a connection that drops between the
+commit and the send ends the turn with its usual notice and is not run again, as any started
+turn.
+
+**Restarts.** When a document opens, rows `started` under an older fencing token are marked
+`interrupted`, each with one Chat notice, and are never run again, because their turn may already
+have changed the document. A turn cut off at `HANDOVER_TURN_WAIT_MS` ends its row the same way. The
+rows still `waiting` rejoin the queue, a comment's prompt is built again from its thread as it
+reads now, and a task draft is the document's live draft again, so a second press of Build returns
+it. A retried `chat:send` with a request ID the process no longer holds is answered from its row.
 
 ## Session lifecycle
 
@@ -677,7 +1270,16 @@ when the server stopped comes back stopped. A stored run's stages go when its
 card does. Ended rows stay until the next workflow starts in the
 document. When a run ends, Chat also records a line saying how it ended and how
 long it took. The session is let go when its runs finish, when its owner
-binding ends, or when the document closes; run state is durable in Atomic's
+binding ends, or when the document closes. A session that waits on a question
+it asked, such as an `ask_user_question` with no reported run, is kept the same way
+until a member answers it or it is withdrawn. A turn whose Chat reply could not
+be verified, or moved into inline decisions, fails without letting go a session
+that still owns runs or waits on a question, so that failure ends no run and
+withdraws no question. An explicit Stop still lets go a session that only waits on
+a question, but changes nothing for one whose workflows are paused: they and the
+question they hold open wait for Resume. The
+"was stopped after N min" line records how long the run had lasted when its
+session was let go, not a limit; run state is durable in Atomic's
 workflow journal, so runs interrupted that way can be resumed from a later
 session. Before disposing the session, the adapter waits, for at most 10
 seconds, on Atomic's `session.workflows.waitForSettled()` for each run that

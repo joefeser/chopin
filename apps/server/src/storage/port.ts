@@ -32,21 +32,32 @@ import type {
 	CreateResearchWorkspaceResult,
 	CreateWebSession,
 	DecisionAnswer,
+	DeferredTurn,
+	DeferredTurnOutcome,
+	DeferredTurnState,
+	DeferredTurnTransition,
 	DocumentVersion,
 	EnqueueBackgroundJob,
 	FailBackgroundJob,
 	Lease,
+	LeasePeek,
 	LinkResearchTurnJob,
 	LinkResearchTurnJobResult,
 	MachineChoice,
 	MachineCredentials,
 	MachineFavorite,
 	MachineRepository,
+	McpSession,
+	NewDeferredTurn,
 	PauseBackgroundJob,
+	PlannerCredential,
+	PlannerLinkHold,
+	PlannerModelChoice,
 	PublishChannelDescription,
 	PublishChannelDescriptionResult,
 	PublishInitialResearchReport,
 	PublishInitialResearchReportResult,
+	PutChatAttachment,
 	PutImage,
 	PutRunStages,
 	PutUser,
@@ -71,12 +82,15 @@ import type {
 	SaveDecisionAnswer,
 	SessionCredentials,
 	SettleBackgroundJob,
+	StagedChatAttachments,
 	StartResearchWorkspace,
 	StartResearchWorkspaceResult,
 	StoredChannel,
+	StoredChatAttachment,
 	StoredDocumentVersion,
 	StoredImage,
 	StoredMachine,
+	StoredPlannerLinkHold,
 	StoredWebSession,
 	SummarizeDocumentVersion,
 	SupersedeBackgroundJob,
@@ -91,6 +105,12 @@ import type { ExperimentStore } from "./experiments";
 export interface UserStore {
 	put(user: PutUser): Promise<UserRecord>;
 	get(id: string): Promise<UserRecord | undefined>;
+	/**
+	 * The user each login names, in one read, compared case-insensitively as GitHub's logins are;
+	 * a login nobody signed in under is left out. A login a person has given up stays on their row
+	 * until they sign in again, so where two rows carry it the one saved last owns it.
+	 */
+	byLogins(logins: readonly string[]): Promise<UserRecord[]>;
 }
 
 export interface SessionStore {
@@ -99,7 +119,10 @@ export interface SessionStore {
 	rotate(id: string, expectedRevision: number, credentials: SessionCredentials): Promise<boolean>;
 	delete(id: string): Promise<boolean>;
 	deleteExpired(now: Date): Promise<number>;
-	/** Release all Planner owners; retain only unexpired sessions with encrypted credentials. */
+	/**
+	 * Release all Planner owners; retain only unexpired sessions with encrypted credentials. A
+	 * document whose persisted Planner hold names a retained session keeps that owner.
+	 */
 	reset(
 		now: Date,
 		lease: Lease,
@@ -115,6 +138,8 @@ export interface MachineStore {
 	byToken(tokenHash: Uint8Array): Promise<StoredMachine | undefined>;
 	/** An owner's unrevoked machines, most recently paired first. */
 	list(userId: string): Promise<StoredMachine[]>;
+	/** Every unrevoked machine its owner shares with teammates, most recently paired first. */
+	shared(): Promise<StoredMachine[]>;
 	seen(id: string, now: Date): Promise<void>;
 	rotate(id: string, expectedRevision: number, credentials: MachineCredentials): Promise<boolean>;
 	/** Drop credentials GitHub refused at `expectedRevision`; the owner must pair again. */
@@ -134,9 +159,15 @@ export interface MachineStore {
 		choice: Omit<MachineChoice, "machineId"> & { machineId?: string },
 		now: Date,
 	): Promise<void>;
-	/** Every person's favorite unrevoked machine. Revoking a machine forgets it as a favorite. */
+	/**
+	 * Every person's favorite unrevoked machine. Revoking a machine forgets it as a favorite, and
+	 * its owner no longer sharing it forgets teammates' (not its owner's own).
+	 */
 	favorites(): Promise<MachineFavorite[]>;
-	/** Set a person's favorite to one of their own machines, or without `machineId` clear it. */
+	/**
+	 * Set a person's favorite to one of their own machines or a teammate's that its owner shares,
+	 * or without `machineId` clear it.
+	 */
 	favor(
 		favorite: Omit<MachineFavorite, "machineId"> & { machineId?: string },
 		now: Date,
@@ -149,6 +180,31 @@ export interface ImageStore {
 	get(channelId: string, sha256: string): Promise<StoredImage | undefined>;
 	/** Every document these bytes were uploaded to, oldest upload first. */
 	channels(sha256: string): Promise<string[]>;
+}
+
+/** The images and text files people send with Chat messages, kept with the document. */
+export interface ChatAttachmentStore {
+	/** Keeps an upload as its uploader's own. Refuses a document or user that does not exist. */
+	put(attachment: PutChatAttachment): Promise<void>;
+	get(channelId: string, id: string): Promise<StoredChatAttachment | undefined>;
+	/** What `userId` has uploaded to the document and not sent, to bound what one person can keep. */
+	staged(channelId: string, userId: string): Promise<StagedChatAttachments>;
+	/**
+	 * Sends the uploads with the message `entryId`, in this order, all or none: it holds only when
+	 * every id is an upload of `userId` to this document that is still unsent, or already sent
+	 * with this same message (so a retried send binds again). Anything else binds nothing.
+	 */
+	bind(
+		input: { channelId: string; userId: string; ids: string[]; entryId: string },
+	): Promise<boolean>;
+	/** The files of one message in the order they were sent, bytes included. */
+	forEntry(channelId: string, entryId: string): Promise<StoredChatAttachment[]>;
+	/** Takes back an upload its uploader has not sent. False when it is not theirs or was sent. */
+	discard(channelId: string, id: string, userId: string): Promise<boolean>;
+	/** Forgets what a deleted message carried. */
+	discardEntry(channelId: string, entryId: string): Promise<number>;
+	/** Forgets uploads nobody sent that are older than `before`; how many it forgot. */
+	prune(before: Date): Promise<number>;
 }
 
 /**
@@ -299,6 +355,11 @@ export interface CollaborationStore {
 }
 
 export interface LeaseStore {
+	/**
+	 * Reads a lease with a plain query: it takes no lock, so it never waits for the holder's writes
+	 * or delays them. Undefined when the lease was never taken.
+	 */
+	peek(name: string): Promise<LeasePeek | undefined>;
 	acquire(name: string, owner: string, ttlMs: number): Promise<Lease | undefined>;
 	renew(lease: Lease, ttlMs: number): Promise<Lease | undefined>;
 	release(lease: Lease): Promise<boolean>;
@@ -378,6 +439,87 @@ export interface ResearchWorkspaceStore {
 	findTurnByJob(channelId: string, jobId: string): Promise<ResearchTurn | undefined>;
 }
 
+/**
+ * Each document's remote Planner as its link left it, one row per document, so the process that
+ * takes over can rebuild it. Writes are fenced by the writer lease. A hold goes with its owner's
+ * login session and with its document; everything else that ends one deletes it.
+ */
+export interface PlannerLinkHoldStore {
+	/** Replaces the document's hold, recording the lease's fencing token. */
+	put(lease: Lease, hold: PlannerLinkHold): Promise<void>;
+	/** True only for the call that removed a hold. */
+	delete(lease: Lease, channelId: string): Promise<boolean>;
+	get(channelId: string): Promise<StoredPlannerLinkHold | undefined>;
+	/** Every hold, by document id. */
+	list(): Promise<StoredPlannerLinkHold[]>;
+}
+
+/**
+ * The model and thinking level chosen for each document's Planner. Writes are fenced by the writer
+ * lease; a row goes with its document.
+ */
+export interface PlannerModelChoiceStore {
+	/** Replaces the document's choice whole. A choice with neither field removes the row. */
+	put(lease: Lease, choice: PlannerModelChoice): Promise<void>;
+	get(channelId: string): Promise<PlannerModelChoice | undefined>;
+}
+
+/**
+ * Credentials a paired machine hands to a Planner backend, by digest. A row is written before
+ * its credential is handed out, so a process that starts later accepts it while it lasts.
+ */
+export interface PlannerCredentialStore {
+	/** Throws a conflict for a digest already stored. */
+	put(credential: PlannerCredential): Promise<void>;
+	/** The credential for this digest while it has not expired at `now`. */
+	find(digest: Uint8Array, now: Date): Promise<PlannerCredential | undefined>;
+	delete(digest: Uint8Array): Promise<boolean>;
+	/** One machine's credentials, for one document or for every document; returns how many. */
+	deleteForMachine(machineId: string, channelId?: string): Promise<number>;
+	deleteExpired(now: Date): Promise<number>;
+}
+
+/** MCP sessions, which a restart no longer ends. Idle ones are swept. */
+export interface McpSessionStore {
+	/** Idempotent: an id already stored keeps its first record. */
+	create(session: McpSession): Promise<void>;
+	find(id: string): Promise<McpSession | undefined>;
+	/** Records activity; false for an unknown session. Never moves `lastSeenAt` back. */
+	touch(id: string, now: Date): Promise<boolean>;
+	/** Forgets sessions not seen since `before`; returns how many. */
+	deleteIdle(before: Date): Promise<number>;
+}
+
+/**
+ * Acknowledged Planner requests whose turn has not started, one row each. Every write is fenced
+ * by the writer lease and conditional on the row's state; a write that does not apply changes
+ * nothing and says why. The same changes can ride a `collaboration.commit`, which is how a row
+ * is made durable no later than the entry that acknowledges it.
+ */
+export interface DeferredTurnStore {
+	/**
+	 * Adds a `waiting` row. A request id the document already has returns that row, and a comment
+	 * thread that already has a waiting row returns it, writing nothing.
+	 */
+	insert(lease: Lease, turn: NewDeferredTurn): Promise<DeferredTurnOutcome>;
+	/**
+	 * Moves a row from the state it is expected to be in, recording the lease's fencing token and,
+	 * for a final state, `at`. A turn ends only under the lease it started under.
+	 */
+	transition(lease: Lease, change: DeferredTurnTransition): Promise<DeferredTurnOutcome>;
+	/**
+	 * Marks every `started` row written under an older fencing token interrupted, in a document or
+	 * in all, and returns them in the order they were accepted. Fencing tokens compare only within
+	 * one lease: the deployment's writer lease, which every row is written under.
+	 */
+	interruptStale(lease: Lease, at: Date, documentId?: string): Promise<DeferredTurn[]>;
+	get(documentId: string, requestId: string): Promise<DeferredTurn | undefined>;
+	/** A document's rows in the order they were accepted, optionally only in these states. */
+	list(documentId: string, states?: DeferredTurnState[]): Promise<DeferredTurn[]>;
+	/** Documents with a row in any of these states, by id. */
+	documents(states: DeferredTurnState[]): Promise<string[]>;
+}
+
 /** The complete durable boundary. No provider-specific primitive crosses it. */
 export interface StorageAdapter {
 	readonly experiments: ExperimentStore;
@@ -391,10 +533,16 @@ export interface StorageAdapter {
 	readonly jobs: BackgroundJobStore;
 	readonly research: ResearchWorkspaceStore;
 	readonly images: ImageStore;
+	readonly chatAttachments: ChatAttachmentStore;
 	readonly runStages: RunStageStore;
 	readonly decisionAnswers: DecisionAnswerStore;
 	readonly versions: DocumentVersionStore;
 	readonly machines: MachineStore;
+	readonly plannerHolds: PlannerLinkHoldStore;
+	readonly plannerModelChoices: PlannerModelChoiceStore;
+	readonly plannerCredentials: PlannerCredentialStore;
+	readonly mcpSessions: McpSessionStore;
+	readonly deferredTurns: DeferredTurnStore;
 
 	migrate(): Promise<void>;
 	health(): Promise<void>;

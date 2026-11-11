@@ -16,6 +16,7 @@
 @source "../../../packages/editor/src/**/*.{ts,tsx}";
 @source "../../../packages/icons/src/**/*.{ts,tsx}";
 @source "../../../packages/question/src/**/*.{ts,tsx}";
+@source not "./components";
 
 @utility ring-hairline {
 	outline: var(--edge-width) solid var(--color-edge);
@@ -1160,12 +1161,6 @@ body {
 	--activity-badge-ring: var(--color-gray-300);
 }
 
-/* On the ground a white composer is the brightest thing in the column. */
-.workspace-root .chat-composer .field {
-	background: var(--color-inset);
-	box-shadow: none;
-}
-
 .workspace-root[data-workspace-mode="split"] .workspace-chat-panel .chat-composer {
 	padding-inline: var(--spacing);
 	padding-bottom: env(safe-area-inset-bottom);
@@ -1478,28 +1473,17 @@ body {
 	}
 }
 
-.chat-composer .field {
-	border-color: var(--color-edge);
-	border-radius: var(--radius-lg);
-	box-shadow: var(--shadow-resting);
-}
-
 /*
  * The ring answers keyboard arrival. A clicked composer is already found, so it
  * keeps only the quieter brand edge from `.composer-surface:focus-within`.
  */
-:root:not([data-focus-origin="pointer"]) .chat-composer .field:focus-within {
+:root:not([data-focus-origin="pointer"]) .chat-composer .composer-surface:focus-within {
 	outline: 2px solid var(--color-brand);
 	outline-offset: 2px;
 }
 
 .chat-composer textarea:focus {
 	outline: none;
-}
-
-.chat-composer .send-action:disabled {
-	background-color: var(--color-brand);
-	color: var(--color-page);
 }
 
 @media (min-width: 640px) {
@@ -1539,7 +1523,7 @@ body {
 }
 
 :root[data-plan-coarse-pointer] .room-header :where(button, summary),
-:root[data-plan-coarse-pointer] .chat-composer button,
+:root[data-plan-coarse-pointer] .document-banner button,
 :root[data-plan-coarse-pointer] .hosted-header button,
 :root[data-plan-coarse-pointer] .channel-create-input,
 :root[data-plan-coarse-pointer] [data-hosted] .btn,
@@ -1580,12 +1564,14 @@ body {
 /* In the components layer so utilities such as `absolute` still win. */
 @layer components {
 	:root[data-plan-coarse-pointer]
-		:where(.btn-icon, .btn-sm, .project-sidebar-action, .project-sidebar-document-action) {
+		:where(.btn-icon, .btn-sm, .project-sidebar-action, .project-sidebar-document-action, .chat-composer
+			button) {
 		position: relative;
 	}
 
 	:root[data-plan-coarse-pointer]
-		:where(.btn-icon, .btn-sm, .project-sidebar-action, .project-sidebar-document-action)::after {
+		:where(.btn-icon, .btn-sm, .project-sidebar-action, .project-sidebar-document-action, .chat-composer
+			button)::after {
 		content: "";
 		position: absolute;
 		top: 50%;

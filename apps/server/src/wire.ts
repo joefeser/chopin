@@ -22,6 +22,8 @@ export type Identity = {
 	client: string;
 	/** Validated demo actor bound at admission; `handle` is then the roster ID. */
 	actor?: DemoActor;
+	/** The picture the user table stores for the login; never set for a demo actor. */
+	avatarUrl?: string;
 };
 
 export type AuthorizationResult = "allowed" | "denied" | "unavailable";
@@ -83,6 +85,12 @@ function stamp<T extends Outgoing>(frame: T, extra?: Partial<Frame>): string {
 export function reply<T extends Outgoing>(ws: Sender, rid: string, frame: T): void {
 	ws.send(stamp(frame, { rid }));
 }
+
+/**
+ * The code of a refusal for a passing reason: the request is fine, and its client sends it again,
+ * with the same request id, in a moment. Every refusal of a send that is not final says it.
+ */
+export const PASSING: Session.Failure["code"] = "temporarily-unavailable";
 
 /** Refuse one request, on the socket that made it. */
 export function fail(

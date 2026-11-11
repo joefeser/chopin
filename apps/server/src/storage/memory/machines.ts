@@ -38,6 +38,9 @@ export class MemoryMachineStore implements MachineStore {
 		this.#machines.set(input.id, stored);
 		this.#tokens.set(hex(input.tokenHash), input.id);
 	}
+	has(id: string): boolean {
+		return this.#machines.has(id);
+	}
 	async get(id: string) {
 		let found = this.#machines.get(id);
 		return found && copy(found);
@@ -49,6 +52,12 @@ export class MemoryMachineStore implements MachineStore {
 	async list(userId: string) {
 		return [...this.#machines.values()]
 			.filter(value => value.userId === userId && !value.revokedAt)
+			.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+			.map(copy);
+	}
+	async shared() {
+		return [...this.#machines.values()]
+			.filter(value => value.shared && !value.revokedAt)
 			.sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
 			.map(copy);
 	}
@@ -86,7 +95,10 @@ export class MemoryMachineStore implements MachineStore {
 		let found = this.#machines.get(id);
 		if (!found || found.userId !== userId || found.revokedAt) return false;
 		if (shared) found.shared = true;
-		else delete found.shared;
+		else {
+			delete found.shared;
+			this.#unfavor(id, userId);
+		}
 		return true;
 	}
 	async revoke(id: string, userId: string, now: Date) {
@@ -95,8 +107,14 @@ export class MemoryMachineStore implements MachineStore {
 		delete found.credentials;
 		found.revokedAt = new Date(now);
 		for (let [key, choice] of this.#choices) if (choice.machineId === id) this.#choices.delete(key);
-		if (this.#favorites.get(userId) === id) this.#favorites.delete(userId);
+		this.#unfavor(id);
 		return true;
+	}
+	/** Forget everyone's favorite of a machine, except `keep`'s: its owner's own stays. */
+	#unfavor(machineId: string, keep?: string) {
+		for (let [userId, favorite] of this.#favorites) {
+			if (favorite === machineId && userId !== keep) this.#favorites.delete(userId);
+		}
 	}
 	async serve(id: string, repository: MachineRepository) {
 		let found = this.#machines.get(id);
@@ -116,7 +134,7 @@ export class MemoryMachineStore implements MachineStore {
 			return;
 		}
 		let found = this.#machines.get(choice.machineId);
-		if (!found || found.revokedAt || found.userId !== choice.userId) {
+		if (!found || found.revokedAt || found.userId !== choice.userId && !found.shared) {
 			throw missing(`machine ${choice.machineId} is not the person's`);
 		}
 		if (!this.channelExists(choice.channelId)) {
@@ -137,7 +155,7 @@ export class MemoryMachineStore implements MachineStore {
 			return;
 		}
 		let found = this.#machines.get(favorite.machineId);
-		if (!found || found.revokedAt || found.userId !== favorite.userId) {
+		if (!found || found.revokedAt || found.userId !== favorite.userId && !found.shared) {
 			throw missing(`machine ${favorite.machineId} is not the person's`);
 		}
 		this.#favorites.set(favorite.userId, favorite.machineId);

@@ -58,7 +58,7 @@ const DONE_STAGES = RUN_STAGES.map(stage => ({
 export function WorkflowRunsPlate() {
 	return (
 		<AuditPlate
-			description="Planner-launched workflows: one live run, a concurrent stack ordered by who needs attention, and ended runs kept until the next run starts."
+			description="Workflows Chopin launched: one live run, a concurrent stack ordered by who needs attention, ended runs kept until the next run starts, and the runs of a machine whose connection dropped."
 			item="workflow-runs"
 			title="Workflow runs"
 		>
@@ -84,6 +84,30 @@ export function WorkflowRunsPlate() {
 						run("blocked", DONE_STAGES, { name: "spec-check", started: 400 }),
 					]}
 				/>
+				<StateLabel>Disconnected</StateLabel>
+				<div className="chat-composer">
+					<RunStack
+						onPause={() => {}}
+						onShowDecisions={() => {}}
+						runs={[
+							{ ...run("running", RUN_STAGES, { started: 1_400 }), disconnected: true },
+							{
+								...run("waiting", [
+									...RUN_STAGES.slice(0, 3),
+									{ id: "r:draft-2", name: "draft-2", status: "awaiting_input", started: 1_620 },
+								], { name: "review-b", started: 1_100, waiting: 2 }),
+								disconnected: true,
+							},
+							{
+								...run("paused", [
+									...RUN_STAGES.slice(0, 3),
+									{ id: "r:draft-2", name: "draft-2", status: "paused", started: 1_620 },
+								], { name: "api-audit", started: 1_200 }),
+								disconnected: true,
+							},
+						]}
+					/>
+				</div>
 				<StateLabel>Ended</StateLabel>
 				<RunStack
 					runs={[

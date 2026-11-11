@@ -1,6 +1,15 @@
 /** Three panes on one ground, with the document as the only raised surface. */
 
-import { useEffect, useId, useLayoutEffect, useReducer, useRef, useState } from "react";
+import {
+	useEffect,
+	useId,
+	useLayoutEffect,
+	useReducer,
+	useRef,
+	useState,
+	useSyncExternalStore,
+} from "react";
+import { flushSync } from "react-dom";
 import { ContentSwapLayer } from "@chopin/editor/content-swap";
 import { useTransitionPresence } from "@chopin/editor/transition-presence";
 import { ArrowLeftIcon, ChevronIcon, ExpandIcon, MessageIcon } from "@chopin/icons";
@@ -9,6 +18,7 @@ import { usePhone } from "@chopin/editor/pointer";
 import {
 	CHAT_CHOICE_STORAGE_KEY,
 	initialWorkspaceState,
+	pageNoticePlace,
 	presentWorkspace,
 	storedDesktopChat,
 	transitionWorkspace,
@@ -17,7 +27,7 @@ import {
 	workspaceProfile,
 } from "./workspace-model";
 import { clampPane, ResizeHandle, usePaneWidth } from "./resizable-pane";
-import { workspaceSizing } from "./workspace-sizing";
+import { createWorkspaceSpace, workspaceSizing } from "./workspace-sizing";
 import "./workspace-sizing.css";
 import { motionContract } from "./motion-contract";
 import { motionImmediately } from "./motion-input";
@@ -30,6 +40,7 @@ import { DocumentTitleBar } from "./document-title-bar";
 import { destinationLabel, WorkspaceViewNavigation } from "./workspace-navigation";
 
 import type { CSSProperties, Dispatch, ReactNode, RefObject } from "react";
+import type { WorkspaceSpace } from "./workspace-sizing";
 import type { DocumentActivity } from "./document-activity";
 import type {
 	WorkspaceDestination,
@@ -70,12 +81,21 @@ export function useWorkspaceIds(): WorkspaceIds {
 
 export function useWorkspaceLayout() {
 	let frame = useRef<HTMLDivElement>(null);
-	let [available, setAvailable] = useState(() => Math.max(0, window.innerWidth - 24));
+	let [space] = useState(() => createWorkspaceSpace(Math.max(0, window.innerWidth - 24)));
+	// The room renders when the layout mode changes. The width itself goes to `space`, which only
+	// the workspace reads, so a drag that changes it on every frame does not render the room.
+	let [narrow, setNarrow] = useState(() => workspaceSizing(space.get(), 500).mode === "compact");
+	// The first measure replaces the guess made before the frame existed, before the first paint.
+	let [, measured] = useReducer(() => true, false);
 	useLayoutEffect(() => {
 		let element = frame.current;
 		if (!element) return;
 		let measure = () => {
-			if (!sidebarMoving()) setAvailable(element.clientWidth);
+			if (sidebarMoving()) return;
+			let width = element.clientWidth;
+			space.set(width);
+			setNarrow(workspaceSizing(width, 500).mode === "compact");
+			measured();
 		};
 		measure();
 		let observer = new ResizeObserver(measure);
@@ -87,14 +107,14 @@ export function useWorkspaceLayout() {
 			document.removeEventListener("transitionend", measure);
 			document.removeEventListener("transitioncancel", measure);
 		};
-	}, []);
+	}, [space]);
 	// A phone keeps one destination at a time even when landscape gives it a wide window.
 	let phone = usePhone();
 	return {
-		available,
 		frame,
-		mode: phone ? "compact" as const : workspaceSizing(available, 500).mode,
+		mode: phone || narrow ? "compact" as const : "split" as const,
 		phone,
+		space,
 	};
 }
 
@@ -128,7 +148,10 @@ export type WorkspaceProps = {
 	header: ReactNode;
 	/** The document's own title, path and actions, at the start of the sheet's title bar. */
 	title?: ReactNode;
+	/** The width to share between Chat and the document, when it is not read from `space`. */
 	available?: number;
+	/** The room's live measure of that width, which the workspace follows without the room rendering. */
+	space?: WorkspaceSpace;
 	frame?: RefObject<HTMLDivElement | null>;
 	chat?: ReactNode;
 	plan: ReactNode;
@@ -147,8 +170,15 @@ export type WorkspaceProps = {
 	/** A phone tapped Build while it cannot open. */
 	onBuildUnavailable?: () => void;
 	controls: ReactNode;
-	/** Connection and document status, right-aligned in the document title bar. */
+	/** Document status, right-aligned in the document title bar. */
 	status?: ReactNode;
+	/**
+	 * A notice for the whole page, such as a lost connection, in flow at the top of the document's
+	 * content. Where Chat and the document take turns it stands above both panes, as one element
+	 * that neither switching nor a phone's tabs remount, so it reads as top of Chat where Chat is
+	 * all that shows; a phone's floats just under its top bar (see `document-banner.css`).
+	 */
+	notice?: ReactNode;
 	/** People present in the room, at the end of the document title bar. */
 	presence?: ReactNode;
 	ids: WorkspaceIds;
@@ -182,7 +212,7 @@ export function SurfaceToggle(
 	},
 ) {
 	let status = activity.busy
-		? "Planner working"
+		? "Chopin working"
 		: activity.unread > 0
 		? `${activity.unread} unread`
 		: undefined;
@@ -222,9 +252,18 @@ export function SurfaceToggle(
 	);
 }
 
+let ignore = () => () => {};
+
+/** The width the workspace shares: the room's live measure when it has one, else the given one. */
+function useWorkspaceSpace(space: WorkspaceSpace | undefined, given: number): number {
+	let snapshot = () => space ? space.get() : given;
+	return useSyncExternalStore(space ? space.subscribe : ignore, snapshot, snapshot);
+}
+
 export function Workspace(
 	{
 		available = 950,
+		space,
 		build,
 		buildEnabled = true,
 		buildGlyph,
@@ -242,6 +281,7 @@ export function Workspace(
 		header,
 		identity,
 		mode,
+		notice,
 		onBuildHover,
 		onChatOpen,
 		onDesktopChatOpen,
@@ -260,17 +300,27 @@ export function Workspace(
 	}: WorkspaceProps,
 ) {
 	let profile = workspaceProfile(workspacePresentation);
-	let [preferredWidth, resizePreferred] = usePaneWidth({
+	let [preferredWidth, resizePreferred, setPreferred] = usePaneWidth({
 		active: mode === "split",
 		...CHAT_PANE,
 		storageKey: profile.persistPaneSize ? CHAT_PANE.storageKey : undefined,
 	});
-	let { chat: chatWidth, maximum } = workspaceSizing(available, preferredWidth);
+	let shared = useWorkspaceSpace(space, available);
+	let { chat: chatWidth, maximum } = workspaceSizing(shared, preferredWidth);
 	let resizeChat = (delta: number) => {
 		let next = clampPane(chatWidth + delta, CHAT_PANE.min, maximum);
 		resizePreferred(next - preferredWidth);
 	};
 	let root = useRef<HTMLDivElement>(null);
+	let chatPanel = useRef<HTMLElement>(null);
+	let chatBody = useRef<HTMLDivElement>(null);
+	// Split Chat's width is `--chat-width` on the pane (`.is-open`) and on its body, in theme.css.
+	let showChatWidth = (width: number | undefined) => {
+		for (let element of [chatPanel.current, chatBody.current]) {
+			if (width === undefined) element?.style.removeProperty("width");
+			else element?.style.setProperty("width", `${width}px`);
+		}
+	};
 	let presentation = presentWorkspace(state, mode, view);
 	let nested = workspacePresentation.type === "parent-with-child"
 		? workspacePresentation
@@ -444,6 +494,7 @@ export function Workspace(
 				/>
 			)}
 
+			{pageNoticePlace(mode) === "above-panes" && notice}
 			<div
 				ref={frame}
 				className={`workspace-frame relative flex min-h-0 flex-1 ${
@@ -586,6 +637,7 @@ export function Workspace(
 									{status}
 								</div>
 							)}
+							{pageNoticePlace(mode) === "document" && notice}
 							<div
 								className="workspace-document-swap content-swap-stack relative min-h-0 flex-1"
 								data-workspace-document-swap
@@ -673,18 +725,26 @@ export function Workspace(
 							}
 						}}
 						onTransitionEnd={chatTrack.onTransitionEnd}
+						ref={chatPanel}
 						style={mode === "split" ? undefined : { width: "100%" }}
 					>
 						<h2 className="sr-only" id={ids.heading.chat} tabIndex={-1}>
 							Chat
 						</h2>
-						<div className="workspace-chat-body relative min-h-0 flex-1">
+						<div className="workspace-chat-body relative min-h-0 flex-1" ref={chatBody}>
 							{presentation.separatorVisible && (
 								<ResizeHandle
 									label="Resize chat"
 									max={maximum}
 									min={CHAT_PANE.min}
+									// The width is in state before the pane stops carrying it itself, so the two never differ.
+									onCommit={width => flushSync(() => setPreferred(width))}
+									onRelease={() => showChatWidth(undefined)}
 									onResize={resizeChat}
+									// A drag sets the widths the variable gives, on the two elements that take it, and
+									// renders nothing until it ends. Moving the variable itself would restyle every
+									// element under it on each step: the whole page on the root, the Chat on the pane.
+									onShow={showChatWidth}
 									side="right"
 									width={chatWidth}
 								/>

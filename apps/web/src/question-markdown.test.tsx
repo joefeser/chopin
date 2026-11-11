@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import { RepositoryLinksProvider } from "@chopin/editor";
 import { QuestionView } from "@chopin/question/react";
 
 import { documentImageUrl, QuestionMarkdownProvider } from "./question-markdown";
@@ -60,10 +61,10 @@ test("a question body renders a Markdown list with Chat's renderer under its hea
 	);
 	expect(heading(markup)).toContain(">Confirm the earlier answers</span></h4>");
 	expect(markup).toContain(
-		'<div class="question-body" data-question-markdown=""><ul>\n<li>Storage: <strong>PostgreSQL</strong></li>\n<li>Rollout: <code>pilot</code></li>\n</ul>',
+		'<div data-status="complete" data-question-markdown="" class="question-body aui-md"><ul class="aui-md-ul">\n<li class="aui-md-li">Storage: <strong class="aui-md-strong">PostgreSQL</strong></li>\n<li class="aui-md-li">Rollout: <code class="aui-md-inline-code">pilot</code></li>\n</ul>',
 	);
 	expect(markup).toContain(
-		'<a href="https://example.com/notes" rel="noopener noreferrer" target="_blank">the notes</a>',
+		'<a class="aui-md-a" href="https://example.com/notes" rel="noopener noreferrer" target="_blank">the notes</a>',
 	);
 });
 
@@ -71,7 +72,7 @@ test("the heading carries inline Markdown, but never a block", () => {
 	let markup = heading(card("Use `pg` with *pooling* or [a proxy](https://example.com)?"));
 	expect(markup).toContain('<code class="inline-code">pg</code>');
 	expect(markup).toContain("<em>pooling</em>");
-	expect(markup).toContain('<a href="https://example.com"');
+	expect(markup).toContain('<a class="aui-md-a" href="https://example.com"');
 	// Linked to its prose, the heading is a button, which cannot hold a link.
 	let linked = heading(card("Read [the notes](https://example.com)?", { places: { q: 1 } }));
 	expect(linked).not.toContain("<a ");
@@ -118,7 +119,9 @@ test("a mermaid fence becomes a lazily drawn diagram; any other fence stays code
 	);
 	expect(markup).toContain('data-question-diagram="pending"');
 	expect(markup).not.toContain("flowchart LR");
-	expect(markup).toContain('<pre><code class="language-ts">let a = 1;\n</code></pre>');
+	expect(markup).toContain(
+		'<pre class="aui-md-pre"><code class="language-ts">let a = 1;\n</code></pre>',
+	);
 });
 
 test("descriptions and option text render through the same renderer", () => {
@@ -130,13 +133,17 @@ test("descriptions and option text render through the same renderer", () => {
 		],
 	});
 	expect(markup).toContain(
-		'<div class="question-hint" data-question-markdown=""><p>Both keep:</p>',
+		'<div data-status="complete" data-question-markdown="" class="question-hint aui-md"><p class="aui-md-p">Both keep:</p>',
 	);
-	expect(markup).toContain("<ol>");
-	expect(markup).toContain('<span class="question-label">Use <strong>Postgres</strong></span>');
-	expect(markup).toContain('<span class="question-desc">Managed, <em>familiar</em></span>');
+	expect(markup).toContain('<ol class="aui-md-ol">');
 	expect(markup).toContain(
-		'<div class="question-desc" data-question-markdown=""><p>Trade-offs:</p>',
+		'<span class="question-label">Use <strong class="aui-md-strong">Postgres</strong></span>',
+	);
+	expect(markup).toContain(
+		'<span class="question-desc">Managed, <em>familiar</em></span>',
+	);
+	expect(markup).toContain(
+		'<div data-status="complete" data-question-markdown="" class="question-desc aui-md"><p class="aui-md-p">Trade-offs:</p>',
 	);
 });
 
@@ -146,6 +153,39 @@ test("an answered card keeps its rendered body", () => {
 		status: "answered",
 		answers: [{ question, optionIds: ["a"], choices: ["Keep them"] }],
 	});
-	expect(markup).toContain("<li>Storage: PostgreSQL</li>");
+	expect(markup).toContain('<li class="aui-md-li">Storage: PostgreSQL</li>');
 	expect(heading(markup)).not.toContain("Storage");
+});
+
+test("a repository path in a decision card opens the file on GitHub", () => {
+	let blob = "https://github.com/octo-org/score/blob/main";
+	let markup = renderToStaticMarkup(
+		<RepositoryLinksProvider value={{ owner: "octo-org", name: "score", ref: "main" }}>
+			<QuestionMarkdownProvider document={DOCUMENT}>
+				<QuestionView
+					definition={{
+						questions: [{
+							id: "q",
+							header: "Check",
+							question:
+								"Which?\n\nRead [the review](docs/review.md#L10-L20) and [the site](https://example.com).",
+							multiple: false,
+							options: [{
+								id: "a",
+								label: "Keep",
+								description: "As in [the config](./config/app.toml)",
+							}],
+						}],
+					}}
+					drafts={{}}
+				/>
+			</QuestionMarkdownProvider>
+		</RepositoryLinksProvider>,
+	);
+	expect(markup).toContain(`<a class="aui-md-a" href="${blob}/docs/review.md#L10-L20"`);
+	expect(markup).toContain(`<a class="aui-md-a" href="${blob}/config/app.toml"`);
+	expect(markup).toContain('<a class="aui-md-a" href="https://example.com"');
+	expect(card("Read [the review](docs/review.md)")).toContain(
+		'<a class="aui-md-a" href="docs/review.md"',
+	);
 });

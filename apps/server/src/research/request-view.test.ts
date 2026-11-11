@@ -8,7 +8,19 @@ test.each([
 		"attempts-exhausted:web-search-authorization-timeout",
 		"Authorization for public web search timed out.",
 	],
-	["web-search-unavailable", "The public web-search service was unavailable."],
+	[
+		"web-search-unavailable",
+		"The public web-search service was unavailable. The server log has the details.",
+	],
+	[
+		"attempts-exhausted:web-search-credential-rejected",
+		"GitHub refused this sign-in's GitHub App user access token for public web search. "
+		+ "The server log has the details.",
+	],
+	[
+		"attempts-exhausted:web-search-not-offered",
+		"GitHub did not offer public web search to this sign-in. The server log has the details.",
+	],
 ])("maps the research failure %s to a safe explanation", (reason, expected) => {
 	expect(researchFailureMessage(reason)).toBe(expected);
 });

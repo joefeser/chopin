@@ -75,7 +75,7 @@ import type { Root, RootContent } from "mdast";
 import type { Decision, Questionnaire, Registry } from "@chopin/dialect";
 import type { Plan } from "@chopin/protocol";
 
-type Anchor = Plan.Anchor;
+export type Anchor = Plan.Anchor;
 type Passage = Plan.Passage;
 
 /** Awareness is relayed, never interpreted here, so a no-op provider suffices. */
@@ -931,11 +931,26 @@ export function digest(source: string): string {
 	return `sha256:${createHash("sha256").update(source).digest("hex")}`;
 }
 
-/** Canonical hash of each top-level block, in order. */
+/** What `digests` found for each state of an editor, which no longer changes once committed. */
+const digested = new WeakMap<object, string[]>();
+
+/**
+ * Canonical hash of each top-level block, in order.
+ *
+ * Every thread's passage and every decision's anchors are brought forward by hashing the whole
+ * document, and a commit does that for each of them, so the cost of a commit grew with the number
+ * of open threads. A committed editor state never changes, so what was found for it is kept for
+ * as long as it is the current one.
+ */
 export function digests(target: Document): string[] {
-	return parse(project(target)).children.map(node =>
+	let state = target.editor.getEditorState();
+	let known = digested.get(state);
+	if (known) return [...known];
+	let found = parse(project(target)).children.map(node =>
 		digest(serialize({ type: "root", children: [node] }))
 	);
+	digested.set(state, found);
+	return [...found];
 }
 
 function bodyBlocks(target: Document) {
@@ -1004,6 +1019,34 @@ export function anchorAt(target: Document, index: number, hash: string): Anchor 
 		key = addressable()[index]?.getKey();
 	});
 	return anchorForKey(target, key, hash);
+}
+
+/** An anchor for every addressable block, in order, with none where a block has no collaborative identity. */
+export function anchorsOfBlocks(target: Document): Array<Anchor | undefined> {
+	let hashes = digests(target);
+	let keys: string[] = [];
+	target.editor.getEditorState().read(() => {
+		keys = addressable().map(node => node.getKey());
+	});
+	return hashes.map((hash, index) => {
+		try {
+			return anchorForKey(target, keys[index], hash);
+		} catch {
+			return undefined;
+		}
+	});
+}
+
+/** The index of the block an anchor still names, whatever that block now says. */
+export function blockNamedBy(target: Document, anchor: Anchor): number | undefined {
+	let key = resolveAnchor(target, anchor);
+	if (!key) return undefined;
+	let keys: string[] = [];
+	target.editor.getEditorState().read(() => {
+		keys = addressable().map(node => node.getKey());
+	});
+	let index = keys.indexOf(key);
+	return index < 0 ? undefined : index;
 }
 
 /** A questionnaire's index in the canonical block address space. */
@@ -1086,8 +1129,16 @@ export function matchesAnchor(target: Document, anchor: Anchor, index: number): 
  * identical paragraphs give no way to tell which was meant. The rest are kept
  * and marked orphaned rather than guessed at: a relationship pointing at the
  * wrong passage is worse than one admitting it is lost.
+ *
+ * A match by digest alone may be an identical copy of the block the anchor was
+ * made for, and re-expressing it as a position hides that. With `marking`, such
+ * an anchor says so with `byDigest`, and an anchor already saying so keeps it.
  */
-export function rebase(target: Document, anchors: Anchor[]): Anchor[] {
+export function rebase(
+	target: Document,
+	anchors: Anchor[],
+	options: { marking?: boolean } = {},
+): Anchor[] {
 	let hashes = digests(target);
 	let keys: string[] = [];
 	target.editor.getEditorState().read(() => {
@@ -1108,12 +1159,20 @@ export function rebase(target: Document, anchors: Anchor[]): Anchor[] {
 		if (key) {
 			let index = keys.indexOf(key);
 			let hash = hashes[index];
-			if (hash) return anchorForKey(target, key, hash);
+			if (hash) {
+				return {
+					...anchorForKey(target, key, hash),
+					...(options.marking && anchor.byDigest ? { byDigest: true as const } : {}),
+				};
+			}
 		}
 
 		let matches = byDigest.get(anchor.digest) ?? [];
 		return matches.length === 1
-			? anchorForKey(target, matches[0], anchor.digest)
+			? {
+				...anchorForKey(target, matches[0], anchor.digest),
+				...(options.marking ? { byDigest: true as const } : {}),
+			}
 			: { ...anchor, epoch: target.epoch, orphaned: true as const };
 	});
 }
@@ -1439,6 +1498,16 @@ export function resolveBlock(
 	let hashes = digests(target);
 	if (hashes[at.index] === at.digest) return at.index;
 	let matches = hashes.flatMap((hash, index) => hash === at.digest ? [index] : []);
+	return matches.length === 1 ? matches[0] : undefined;
+}
+
+/**
+ * The block carrying `at.digest` when exactly one does, wherever it now stands. Unlike
+ * `resolveBlock`, a repeated digest never resolves, even where the addressed index still
+ * matches: identical paragraphs give no way to tell which one was meant.
+ */
+export function uniqueBlock(target: Document, at: { digest: string }): number | undefined {
+	let matches = digests(target).flatMap((hash, index) => hash === at.digest ? [index] : []);
 	return matches.length === 1 ? matches[0] : undefined;
 }
 

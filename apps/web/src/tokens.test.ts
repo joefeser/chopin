@@ -10,6 +10,8 @@ import { describe, expect, it } from "bun:test";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 
+import { recordedSources } from "./recorded-sources.test-fixtures";
+
 type Oklch = { l: number; c: number; h: number };
 
 const ROOT = join(import.meta.dir, "../../..");
@@ -85,10 +87,14 @@ function contrast(foreground: string, background: string): number {
 	return (lighter + 0.05) / (darker + 0.05);
 }
 
+/** Copied registry source keeps its own classes; these scans are for Chopin's own code. */
+const COPIED = recordedSources(ROOT);
+
 function sources(dir: string, found: string[] = []): string[] {
 	for (let entry of readdirSync(dir)) {
 		if (entry === "node_modules" || entry === "dist" || entry.startsWith(".")) continue;
 		let path = join(dir, entry);
+		if (COPIED.has(path)) continue;
 		if (statSync(path).isDirectory()) sources(path, found);
 		else if (entry.endsWith(".tsx") || entry.endsWith(".css")) found.push(path);
 	}
@@ -633,13 +639,6 @@ describe("migration", () => {
 	it("puts each listed standard control on its shared utility", () => {
 		let controls: StandardControl[] = [
 			{
-				file: "apps/web/src/chat/composer.tsx",
-				marker: 'className="composer-surface field"',
-				name: "chat composer",
-				tag: "div",
-				utility: "field",
-			},
-			{
 				file: "packages/editor/src/comments.tsx",
 				marker: 'className="plan-comment-composer field"',
 				name: "comment composer",
@@ -767,16 +766,10 @@ describe("migration", () => {
 				tiers: ["btn-ghost"],
 			}],
 			["apps/web/src/chat/composer.tsx", {
-				action: "Stop Chopin",
-				marker: 'aria-label="Stop Chopin"',
-				size: "btn-icon",
-				tiers: ["btn-secondary"],
-			}],
-			["apps/web/src/chat/composer.tsx", {
 				action: "Resume Planner",
 				marker: 'aria-label="Resume Chopin"',
 				size: "btn-icon",
-				tiers: ["btn-secondary"],
+				tiers: ["btn-ghost"],
 			}],
 			["packages/editor/src/send-action.tsx", {
 				action: "shared send action",

@@ -4,7 +4,14 @@ export { CardMetaStore, useCardMeta } from "./card-meta";
 export { ChopinMark } from "./chopin-mark";
 export { collaborationPlugin } from "./collaboration";
 export type { CollaborationOptions } from "./collaboration";
-export { CONNECTION_GRACE, CONNECTION_STALL, useConnectionNotice } from "./connection-notice";
+export {
+	CONNECTION_GRACE,
+	CONNECTION_STALL,
+	connectionGrace,
+	isOffline,
+	RETRY_AFTER_FAILURES,
+	useConnectionNotice,
+} from "./connection-notice";
 export type { ConnectionNotice } from "./connection-notice";
 export { ContentSwapLayer } from "./content-swap";
 export type { ContentSwapLayerProps, ContentSwapMotion } from "./content-swap";
@@ -38,6 +45,7 @@ export { AgentFace, Face } from "./face";
 export type { FaceProps } from "./face";
 export { GitHubReferencesProvider } from "./github-references";
 export type { Refusal } from "./history";
+export { usePendingWork } from "./pending-work";
 export { isDemoHandle, personName, setFaceProfiles } from "./people";
 export type { FaceProfile } from "./people";
 export { PlanEditor } from "./plan-editor";
@@ -54,6 +62,8 @@ export {
 	useQuestionnaires,
 } from "./questionnaires";
 export type { PlanQuestionnaireState, QuestionnaireEntry } from "./questionnaires";
+export { RepositoryLinksProvider, useLinkHref } from "./repository-links";
+export type { LinkRepository } from "./repository-links";
 export { MAX_RESEARCH_BRIEF, ResearchLauncher } from "./research-launcher";
 export type { ResearchLaunchBlock, ResearchLaunchResult } from "./research-launcher";
 export { ResolvedComment } from "./resolved-comment";

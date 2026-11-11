@@ -50,7 +50,9 @@ test(
 			.toBeVisible();
 		let status = questionPage(ana).locator("[data-question-page-status]");
 		await expect(status.getByText("Waiting for", { exact: true })).toBeVisible();
-		await expect(status.getByText("ben", { exact: true })).toBeVisible();
+		// Not an exact match: until GitHub's photograph of ben arrives, or for good if it never does,
+		// his face holds his initial inside the same element, so that element reads "bben".
+		await expect(status).toContainText("ben");
 		let bar = ana.locator("[data-question-page-actions]");
 		await expect(bar.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
 		await expect(questionPage(ana).getByRole("heading", { name: "Takes" })).toBeVisible();
@@ -104,6 +106,32 @@ test(
 	},
 );
 
+test(
+	"a decision's page shows the record's question once: the document's own title and empty-document hint stay out of it",
+	async ({ join, seed }) => {
+		let decision = writtenSeed(QUESTION);
+		await seed(decision.source, decision.state);
+		let ana = await join("ana");
+		await decisions(ana);
+		await card(ana).getByRole("button", { name: "Expand decision" }).click();
+		await expect(questionPage(ana).getByRole("heading", { level: 1, name: QUESTION }))
+			.toBeVisible();
+		// The scroller that holds the page is the page document's, not its parent's.
+		let scroller = ana.locator("[data-plan-scroll]").filter({ has: questionPage(ana) });
+		let own = scroller.locator(".plan-content > h1:first-child");
+		await expect(own).toHaveCount(1);
+		await expect(own).toHaveCSS("display", "none");
+		await expect(scroller.locator(".plan-content").first()).toHaveCSS("padding-block-start", "0px");
+		// The Notes area of an empty page says where to write, and the editor's own hint is gone.
+		await expect.poll(() =>
+			scroller.locator(".plan-content > h1:first-child + p").first().evaluate(paragraph =>
+				getComputedStyle(paragraph, "::before").content
+			)
+		).toBe('"Add a note"');
+		await expect(scroller.locator(".plan-body-placeholder")).toHaveCSS("display", "none");
+	},
+);
+
 const LAYOUTS = [
 	["a phone", { hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } }],
 	["a compact layout", { viewport: { width: 640, height: 900 } }],
@@ -111,8 +139,7 @@ const LAYOUTS = [
 
 for (let [name, options] of LAYOUTS) {
 	test(`on ${name} a decision's page keeps Copy link and Discard decision`, async ({ join, seed }) => {
-		let fresh = crypto.randomUUID().replaceAll("-", "").slice(0, 4).toUpperCase();
-		let decision = writtenSeed(QUESTION, undefined, `01K0N4TR8K7JGM4R1J7PW4${fresh}`);
+		let decision = writtenSeed(QUESTION);
 		await seed(decision.source, decision.state);
 		let page = await join("ana", options);
 		await decisions(page);

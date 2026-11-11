@@ -4,7 +4,14 @@ import type { DesignOptions } from "./fixture";
 
 export default defineConfig<DesignOptions>({
 	...visual,
-	testMatch: ["interactions.e2e.ts", "responsive.e2e.ts", "build-blockers.e2e.ts"],
+	testMatch: [
+		"interactions.e2e.ts",
+		"responsive.e2e.ts",
+		"build-blockers.e2e.ts",
+		"assistant-ui-geometry.e2e.ts",
+		"assistant-ui-theme.e2e.ts",
+		"touch-targets.e2e.ts",
+	],
 	workers: 2,
 	outputDir: "../test-results/design-behavior",
 	reporter: [

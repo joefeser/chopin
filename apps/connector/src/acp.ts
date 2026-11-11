@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { ClientApp, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import type {
@@ -7,6 +6,7 @@ import type {
 	SessionNotification,
 } from "@agentclientprotocol/sdk";
 import { PROCESSES, stopBackend } from "./planner";
+import { type Sandbox, spawnIn } from "./sandbox";
 import { VERSION } from "./version";
 
 /** How long a stopped agent's process group has to exit before it is killed. */
@@ -31,6 +31,11 @@ export type AgentOptions = {
 	onStart?: (failure?: AgentFailure) => void;
 	/** Called with the agent's name and version once it has answered initialize with them. */
 	onInfo?: (info: AgentInfo) => void;
+	/** Where the agent starts: the machine's process sandbox, else plainly. */
+	sandbox?: Sandbox;
+	/** What it may write beside its worktree, and its own files in the connector's state directory. */
+	writable?: string[];
+	own?: string[];
 };
 
 /** A coding agent as it names itself in its ACP initialize answer. */
@@ -59,12 +64,15 @@ function startAgent(
 	cwd: string,
 	env: NodeJS.ProcessEnv | undefined,
 	stderr?: (chunk: string) => void,
+	where: Pick<AgentOptions, "sandbox" | "writable" | "own"> = {},
 ) {
-	let child = spawn(command[0]!, command.slice(1), {
+	let child = spawnIn(where.sandbox, {
+		command,
 		cwd,
-		...(env ? { env } : {}),
-		stdio: ["pipe", "pipe", "pipe"],
-		detached: process.platform !== "win32",
+		env: env ?? process.env,
+		stdin: "pipe",
+		...(where.writable ? { writable: where.writable } : {}),
+		...(where.own ? { own: where.own } : {}),
 	});
 	let kill = (signal: NodeJS.Signals = "SIGTERM") => {
 		try {
@@ -85,8 +93,13 @@ function startAgent(
 			(code, signal) => resolve(ended ??= signal ? `signal ${signal}` : `exit ${code}`),
 		);
 	});
+	// "exit" can come before the last of its stderr is read; "close" follows once that stream ends.
+	let closed = new Promise(resolve => {
+		child.once("error", resolve);
+		child.once("close", resolve);
+	});
 	let connection = app.connect(ndJsonStream(
-		Writable.toWeb(child.stdin),
+		Writable.toWeb(child.stdin!),
 		Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>,
 	));
 	child.once("error", error => connection.close(error));
@@ -95,8 +108,12 @@ function startAgent(
 		connection,
 		kill,
 		async failure(error: unknown): Promise<AgentFailure> {
-			// Its exit, and the rest of its stderr, may come just after the failure they caused.
-			await Promise.race([exited, new Promise(resolve => setTimeout(resolve, 1000))]);
+			// Its exit, and the rest of its stderr, may come just after the failure they caused. A
+			// process it left holding stderr open is not waited on past a second.
+			await Promise.race([
+				exited.then(() => closed),
+				new Promise(resolve => setTimeout(resolve, 1000)),
+			]);
 			let line = head.split("\n").map(text => text.trim()).find(Boolean);
 			return {
 				how: ended ?? (error instanceof Error ? error.message : String(error)),
@@ -129,7 +146,9 @@ function initialize(connection: ReturnType<ClientApp["connect"]>) {
 /**
  * Start the agent with `env` as its whole environment and ask it to initialize, then stop it.
  * Undefined once it answers within `timeoutMs`; otherwise how it failed. `onInfo` hears the name
- * and version it answered with.
+ * and version it answered with. It starts in `sandbox` when given one. The two start checks that
+ * come before any run, `chopin service install`'s and a connect's before the machine is paired,
+ * give none: they are not runs, and nothing from Chopin reaches the agent.
  */
 export async function checkAgent(
 	command: string[],
@@ -140,10 +159,23 @@ export async function checkAgent(
 		onInfo?: (info: AgentInfo) => void;
 		/** Stops the agent at once, as a failure. */
 		signal?: AbortSignal;
+		sandbox?: Sandbox;
 	},
 ): Promise<AgentFailure | undefined> {
 	let timeoutMs = options.timeoutMs ?? 10_000;
-	let agent = startAgent(new ClientApp(), command, options.cwd, options.env);
+	let agent: ReturnType<typeof startAgent>;
+	try {
+		agent = startAgent(
+			new ClientApp(),
+			command,
+			options.cwd,
+			options.env,
+			undefined,
+			options.sandbox ? { sandbox: options.sandbox } : {},
+		);
+	} catch (error) {
+		return { how: error instanceof Error ? error.message : String(error) };
+	}
 	let deadline = setTimeout(
 		() =>
 			agent.connection.close(
@@ -189,6 +221,11 @@ export async function runAgent(options: AgentOptions): Promise<string> {
 		options.cwd,
 		options.env ? { ...process.env, ...options.env } : undefined,
 		options.stderr,
+		{
+			...(options.sandbox ? { sandbox: options.sandbox } : {}),
+			...(options.writable ? { writable: options.writable } : {}),
+			...(options.own ? { own: options.own } : {}),
+		},
 	);
 	let { connection } = agent;
 	let deadline = setTimeout(

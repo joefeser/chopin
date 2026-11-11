@@ -1,12 +1,20 @@
 import { researchWorkspace } from "./research-inline-contract-fixtures";
 import { childChannelContract } from "./child-channel-contract";
 import { experimentContract } from "./experiment-contract";
+import { chatAttachmentContract } from "./chat-attachment-contract";
 import { imageContract } from "./image-contract";
 import { runStageContract } from "./run-stage-contract";
 import { decisionAnswerContract } from "./decision-answer-contract";
 import { versionContract } from "./version-contract";
 import { machineContract } from "./machine-contract";
 import { plannerAttachmentContract } from "./planner-attachment-contract";
+import { plannerHoldContract } from "./planner-hold-contract";
+import { plannerModelChoiceContract } from "./planner-model-choice-contract";
+import { plannerCredentialContract } from "./planner-credential-contract";
+import { deferredTurnContract } from "./deferred-turn-contract";
+import { mcpSessionContract } from "./mcp-session-contract";
+import { leasePeekContract } from "./lease-peek-contract";
+import { userContract } from "./user-contract";
 import { researchInlineContract } from "./research-inline-contract";
 import { describe, expect, it } from "bun:test";
 
@@ -41,12 +49,20 @@ function attempt<T>(action: () => Promise<T>): Promise<T> {
 export function storageContract(name: string, factory: Factory): void {
 	experimentContract(name, factory);
 	imageContract(name, factory);
+	chatAttachmentContract(name, factory);
 	runStageContract(name, factory);
 	decisionAnswerContract(name, factory);
 	versionContract(name, factory);
 	machineContract(name, factory);
 	childChannelContract(name, factory);
 	plannerAttachmentContract(name, factory);
+	plannerHoldContract(name, factory);
+	plannerModelChoiceContract(name, factory);
+	plannerCredentialContract(name, factory);
+	deferredTurnContract(name, factory);
+	mcpSessionContract(name, factory);
+	leasePeekContract(name, factory);
+	userContract(name, factory);
 	describe(`${name} storage`, () => {
 		it("supports expiring metadata-only sessions for local authentication", async () => {
 			let storage = await opened(factory);

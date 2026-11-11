@@ -41,7 +41,8 @@ On any open line of the document, type `/` and choose **Investigate**, next to
 `<Investigation id="…" />` card where the caret was, marked **Ready to run**. The
 document holds only that id; the investigation record owns the brief, state and
 result. Select **Run**:
-the work runs on your own local agent, never on another person's. Chopin
+the work runs on your own local agent, or on a teammate's shared machine if you
+chose one for the document, never on another machine by itself. Chopin
 prefers the connection that last ran work for this document, then your most
 recently active one that is not busy. When all of yours are busy, the work
 queues behind one of them and starts when it is free. Without any, the card shows the connector command to start, and you select
@@ -90,8 +91,17 @@ The connector refuses paths outside that worktree, including symlinks. The agent
 returned hosted paths as Markdown images in the submitted report. The run-scoped server tool
 is `upload_investigation_image`; the connector handles reading and encoding the local file.
 
-Local execution uses the agent's ordinary OS permissions, skills and configured
-services. A worktree organizes edits; it is not a sandbox. Standard ACP permission
+Local execution uses the agent's skills and configured services. Where the machine has
+one, the connector starts the agent in the operating system's process sandbox (macOS
+Seatbelt, Linux bubblewrap or Windows ProcessContainer, through MXC): it writes only
+its worktree, the places in its repository's git directory where commits and refs go and
+its own worktree's entry there (not the configuration, hooks or any other worktree's, and
+no new file in the directory that git reads) and its own state, can't read your SSH, cloud
+and GitHub credentials, and
+reaches only an allow-list of hosts. `chopin status` says whether this machine has one,
+and [Sandbox](chopin-cli.md#sandbox) describes it. Without one the agent has your
+account's ordinary permissions, and a worktree organizes edits; it is not a sandbox.
+Standard ACP permission
 requests appear in the connector terminal with the tool kind and the command,
 paths or input involved, and are declined when no interactive terminal is
 available. Choosing an "always allow" option skips later prompts for that tool

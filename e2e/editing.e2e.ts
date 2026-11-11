@@ -9,6 +9,14 @@
  * reload.
  */
 
+import {
+	connectionBanner,
+	heardWords,
+	phaseVoice,
+	RESUMED_WAIT,
+	watchBanners,
+	wordsOutsideBanner,
+} from "./banner";
 import { content, expect, ready, test, written } from "./room";
 import { chatInput } from "./chat-input";
 
@@ -76,7 +84,9 @@ test("losing the connection locks the plan, and getting it back unlocks it", asy
 	// loses it.
 	await expect(content(page)).toHaveAttribute("contenteditable", "false");
 	await expect(page.locator(".plan[data-plan-offline]")).toHaveCount(1);
-	await expect(page.locator(".plan-status")).toHaveAttribute("data-level", /^(notice|alert)$/);
+	// The loss is said once, by the connection banner, not in the header beside the title.
+	await expect(page.locator("[data-connection-banner]")).toBeVisible();
+	await expect(page.locator(".plan-status")).toHaveAttribute("data-level", "hidden");
 
 	// The client retries on its own; nothing here reconnects it. Opening is
 	// driven by the connection rather than by the mount, and a socket that
@@ -214,7 +224,7 @@ test("Tab over a selection from a list into a paragraph leaves it alone", async 
 	await written(page, room, /^- one\n- two\n\nafter$/m);
 });
 
-test("a lost connection is said in the document header and the composer", async ({ join, page }) => {
+test("a lost connection is said once, at the top of the document, with Retry only after repeated failures", async ({ join, page }) => {
 	let sockets: WebSocketRoute[] = [];
 	let offline = false;
 	let refused = 0;
@@ -227,52 +237,61 @@ test("a lost connection is said in the document header and the composer", async 
 		sockets.push(route);
 	});
 
+	await watchBanners(page);
 	await join("ana");
 	let chat = page.getByRole("complementary", { name: "Chat", exact: true });
 	let status = page.locator("[data-document-title-bar] .plan-status");
-	let spoken = status.getByRole("status");
+	let notice = connectionBanner(page);
+	let spoken = phaseVoice(page);
 	await expect(status).toHaveAttribute("data-level", "hidden");
 	// Opening a document is not news.
 	await expect(spoken).toHaveText("");
+	await expect(notice).toHaveCount(0);
 
 	offline = true;
 	await sockets.at(-1)!.close();
 
-	await expect(status).toHaveAttribute("data-level", "notice");
-	await expect(status).toContainText("Reconnecting…");
-	await expect(spoken).toHaveText("Reconnecting…");
+	// Past the grace period the banner says it is reconnecting, and a screen reader hears that as
+	// it appears, from the page's one polite live region.
+	await expect(notice).toContainText("Reconnecting. Your changes are kept.");
+	await expect(spoken).toHaveText("Reconnecting. Your changes are kept.");
 	await expect(page.locator(".plan[data-plan-offline]")).toHaveCount(1);
-	// Chat says the same thing in its footer, and keeps the draft editable.
-	await expect(chat.locator(".composer-connection")).toHaveText("Reconnecting…");
+	// Nothing else says it: the header stays quiet and Chat keeps its draft editable.
+	await expect(status).toHaveAttribute("data-level", "hidden");
+	await expect(status.getByRole("status")).toHaveText("");
+	expect(await wordsOutsideBanner(chat, /Offline|Reconnecting/)).toEqual([]);
 	await expect(chatInput(chat)).toHaveAttribute("contenteditable", "true");
 	await expect(page.getByRole("button", { name: "Send message" })).toBeDisabled();
 
-	// Lost for long enough, it stops promising and offers a way out.
-	await expect(status).toHaveAttribute("data-level", "alert", { timeout: 10_000 });
-	await expect(spoken).toHaveText("Offline");
-	await expect(chat.locator(".composer-connection")).toHaveText("Offline");
-	// Reconnecting in place keeps a Chat draft a reload would lose. Only after
-	// it keeps failing does the page offer to reload.
-	let reconnect = status.getByRole("button", { name: "Reconnect", exact: true });
-	await expect(reconnect).toBeVisible();
-	await expect(reconnect).toHaveAccessibleDescription(/Editing resumes once connected/);
-	await expect(status.getByRole("button", { name: "Reload" })).toHaveCount(0);
-	for (let attempt = 0; attempt < 3; attempt++) {
-		let before = refused;
-		await status.getByRole("button", { name: "Reconnect", exact: true }).click();
-		await expect.poll(() => refused).toBeGreaterThan(before);
-	}
-	await expect(status.getByRole("button", { name: "Reload" })).toBeVisible();
-	await expect(status.getByRole("button", { name: "Reconnect", exact: true })).toHaveCount(0);
+	// Automatic reconnects run on their own; Reconnect joins the banner only once they have failed
+	// repeatedly, and asking restarts the backoff.
+	let retry = notice.getByRole("button", { name: "Reconnect", exact: true });
+	await expect(retry).toHaveCount(0);
+	await expect(retry).toBeVisible({ timeout: 25_000 });
+	await expect(notice).toContainText(
+		"You're offline. Your changes are kept and will sync when you reconnect.",
+	);
+	let before = refused;
+	await retry.click();
+	await expect.poll(() => refused).toBeGreaterThan(before);
+	await expect(retry).toBeVisible();
 
-	// No online event here: the wire's own retry has to bring it back, and
-	// asking to reconnect restarted the backoff rather than adding to it.
+	// No online event here: the wire's own retry has to bring it back.
 	offline = false;
 	await ready(page);
+	await expect(notice).toHaveAttribute("data-phase", "resumed");
+	await expect(spoken).toHaveText("Back online. Your changes are synced");
+	await expect(notice).toHaveCount(0, RESUMED_WAIT);
+	// A screen reader heard each phase as it began, and never the same words twice running.
+	let said = await heardWords(page);
+	expect(said.slice(0, 2)).toEqual([
+		"Reconnecting. Your changes are kept.",
+		"You're offline. Your changes are kept and will sync when you reconnect.",
+	]);
+	expect(said.at(-1)).toBe("Back online. Your changes are synced");
+	expect(said.filter((words, index) => words === said[index - 1])).toEqual([]);
 	await expect(status).toHaveAttribute("data-level", "hidden");
-	await expect(spoken).toHaveText("Reconnected");
 	await expect(page.locator(".plan[data-plan-offline]")).toHaveCount(0);
-	await expect(chat.locator(".composer-connection")).toBeEmpty();
 });
 
 const PASSAGES = Array.from({ length: 40 }, (_, index) => `Passage ${index + 1}.`).join("\n\n")

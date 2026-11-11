@@ -1,6 +1,10 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
+import { $createParagraphNode, $createTextNode, $getRoot } from "lexical";
+import * as Y from "yjs";
 import { ULID } from "@chopin/dialect";
 import * as Question from "@chopin/question";
+import { applyBlockEdit } from "../agent/document-ops";
+import * as Edit from "../plan/edit";
 import * as Room from "../plan/room";
 import * as Plan from "../plan/service";
 import { openPlan } from "../testing/plan";
@@ -8,6 +12,8 @@ import * as Capture from "./service-capture";
 import * as Questions from "./service";
 import * as Store from "./store";
 import { member } from "./text-response.test-fixtures";
+
+import type { DocumentRoom } from "../agent/tools";
 
 let contexts: Awaited<ReturnType<typeof openPlan>>[] = [];
 afterEach(async () => {
@@ -22,6 +28,7 @@ async function setup(source = "# Draft\n\nProvisional onboarding.\n\nProvisional
 }
 
 function question(plan: Plan.Plan, key: string, index = 1, written = true) {
+	Edit.outline(plan);
 	return {
 		key,
 		header: "Onboarding",
@@ -124,7 +131,7 @@ test("capture replay survives Save and restart without rebinding the saved card"
 	expect(context.plan.records.get(id)!.followUp).toEqual(captured);
 });
 
-test("mixed replay and new capture requires the current revision and reuses a paragraph scope", async () => {
+test("mixed replay and new capture after the document moved on rebases and reuses a paragraph scope", async () => {
 	let context = await setup();
 	let firstQuestion = question(context.plan, "decision-one");
 	let first = await Capture.captureDecisions(context.plan, context.server, context.plan.id, {
@@ -135,17 +142,94 @@ test("mixed replay and new capture requires the current revision and reuses a pa
 		revision: 0,
 		questions: [firstQuestion, question(context.plan, "decision-two")],
 	};
-	await expect(Capture.captureDecisions(context.plan, context.server, context.plan.id, input))
-		.rejects.toThrow(/changed/);
-	expect(context.plan.records.size).toBe(1);
-	let result = await Capture.captureDecisions(context.plan, context.server, context.plan.id, {
-		...input,
-		revision: first.revision,
-	});
+	expect(first.revision).toBeGreaterThan(input.revision);
+	let result = await Capture.captureDecisions(context.plan, context.server, context.plan.id, input);
 	expect(result.decisions[0]!.id).toBe(first.decisions[0]!.id);
 	expect(context.plan.records.size).toBe(2);
 	let scopes = result.decisions.map(item => context.plan.records.get(item.id)!.followUp!.scope);
 	expect(scopes[0]).toBe(scopes[1]);
+});
+
+async function rewrite(context: Awaited<ReturnType<typeof setup>>, source: string) {
+	let outcome = Edit.apply(context.plan, context.plan.revision, [{ op: "replace_root", source }]);
+	if (!outcome.ok) throw new Error("fixture edit failed");
+	if (outcome.mutation) {
+		await Plan.publish(context.plan, context.server, context.plan.id, outcome.mutation);
+	}
+}
+
+async function edited(
+	context: Awaited<ReturnType<typeof setup>>,
+	operations: Edit.Operation[],
+) {
+	let outcome = Edit.apply(context.plan, context.plan.revision, operations);
+	if (!outcome.ok) throw new Error("fixture edit failed");
+	if (outcome.mutation) {
+		await Plan.publish(context.plan, context.server, context.plan.id, outcome.mutation);
+	}
+}
+
+test("a capture read before an unrelated edit still lands beside its paragraph, once, however often it is retried", async () => {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one")] };
+	await edited(context, [{ op: "insert_root", source: "A late note." }]);
+	expect(context.plan.revision).toBeGreaterThan(input.revision);
+	let first = await Capture.captureDecisions(context.plan, context.server, context.plan.id, input);
+	let id = first.decisions[0]!.id;
+	expect(first.revision).toBe(context.plan.revision);
+	expect(
+		Room.matchesAnchor(
+			context.plan.document,
+			context.plan.records.get(id)!.followUp!.target[0]!,
+			1,
+		),
+	)
+		.toBe(true);
+	expect(Room.questionnaireIndex(context.plan.document, id)).toBe(2);
+	let again = await Capture.captureDecisions(context.plan, context.server, context.plan.id, input);
+	expect(again.decisions).toEqual(first.decisions);
+	expect(context.plan.records.size).toBe(1);
+	expect(context.plan.questions.open.size).toBe(1);
+});
+
+test("a capture read before a paragraph moved follows the paragraph by its digest", async () => {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one")] };
+	await edited(context, [{ op: "insert", index: 0, source: "A new introduction." }]);
+	let result = await Capture.captureDecisions(context.plan, context.server, context.plan.id, input);
+	let id = result.decisions[0]!.id;
+	expect(
+		Room.matchesAnchor(
+			context.plan.document,
+			context.plan.records.get(id)!.followUp!.target[0]!,
+			2,
+		),
+	)
+		.toBe(true);
+	expect(Room.questionnaireIndex(context.plan.document, id)).toBe(3);
+});
+
+test("a capture whose paragraph changed since it was read is refused and creates nothing", async () => {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one")] };
+	await rewrite(
+		context,
+		"# Draft\n\nProvisional onboarding, rewritten.\n\nProvisional collaboration.",
+	);
+	let frames = context.broadcasts.length;
+	await expect(Capture.captureDecisions(context.plan, context.server, context.plan.id, input))
+		.rejects.toThrow("The document changed; read it again before opening a decision");
+	expect(context.plan.records.size).toBe(0);
+	expect(context.plan.questions.open.size).toBe(0);
+	expect(context.broadcasts).toHaveLength(frames);
+	let fresh = {
+		...input,
+		revision: context.plan.revision,
+		questions: [question(context.plan, "decision-one")],
+	};
+	let result = await Capture.captureDecisions(context.plan, context.server, context.plan.id, fresh);
+	expect(result.decisions).toHaveLength(1);
+	expect(context.plan.records.size).toBe(1);
 });
 
 test.each(["empty", "heading", "stale-block", "duplicate-key", "too-many", "nontext-key"])(
@@ -287,4 +371,535 @@ test("blocking ask retains its own wait and cancellation lifecycle without follo
 	expect(context.plan.questions.open.size).toBe(1);
 	controller.abort();
 	expect((await pending)[0]!.status).toBe("cancelled");
+});
+
+const SAME_KEY = "already holds a different decision";
+
+test.each([
+	["question", true, { question: "What should collaboration teach?" }],
+	["description", true, { description: "Think about the first hour." }],
+	["response kind", true, {
+		response: undefined,
+		options: [{ label: "First task", description: "Begin with a useful action" }],
+	}],
+	["choices", false, { options: [{ label: "Tour", description: "Walk through" }] }],
+])(
+	"a repeated key with a different %s is refused and the first card is untouched",
+	async (_, written, change) => {
+		let context = await setup();
+		let first = await Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+			revision: 0,
+			questions: [question(context.plan, "decision-one", 1, written)],
+		});
+		let id = first.decisions[0]!.id;
+		let before = structuredClone(context.plan.records.get(id)!.definition);
+		let source = Room.project(context.plan.document);
+		let frames = context.broadcasts.length;
+		let { response: _response, ...base } = question(context.plan, "decision-one", 1, written);
+		let changed = { ...base, ...(written ? { response: "text" as const } : {}), ...change };
+		if ("response" in change) delete (changed as { response?: unknown }).response;
+		await expect(Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+			revision: context.plan.revision,
+			questions: [changed],
+		})).rejects.toThrow(SAME_KEY);
+		expect(context.plan.records.size).toBe(1);
+		expect(context.plan.records.get(id)!.definition).toEqual(before);
+		expect(context.plan.questions.open.size).toBe(1);
+		expect(Room.project(context.plan.document)).toBe(source);
+		expect(context.broadcasts).toHaveLength(frames);
+	},
+);
+
+test("a repeated key naming another paragraph is refused instead of keeping the card beside the first", async () => {
+	let context = await setup();
+	let first = await Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+		revision: 0,
+		questions: [question(context.plan, "decision-one", 1)],
+	});
+	let moved = question(context.plan, "decision-one", 2);
+	await expect(Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+		revision: context.plan.revision,
+		questions: [moved],
+	})).rejects.toThrow(SAME_KEY);
+	await expect(Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+		revision: context.plan.revision,
+		questions: [question(context.plan, "decision-one", 3)],
+	})).rejects.toThrow(SAME_KEY);
+	expect(context.plan.records.size).toBe(1);
+	expect(first.decisions).toHaveLength(1);
+	expect(
+		Room.matchesAnchor(
+			context.plan.document,
+			context.plan.records.get(first.decisions[0]!.id)!.followUp!.target[0]!,
+			1,
+		),
+	)
+		.toBe(true);
+});
+
+test("one mismatched key refuses the whole batch, so no replay is repeated and no new card is made", async () => {
+	let context = await setup();
+	let one = question(context.plan, "decision-one", 1);
+	let two = question(context.plan, "decision-two", 2);
+	await Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+		revision: 0,
+		questions: [one, two],
+	});
+	let source = Room.project(context.plan.document);
+	let frames = context.broadcasts.length;
+	await expect(Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+		revision: 0,
+		questions: [
+			one,
+			{ ...two, question: "What else should collaboration teach?" },
+			question(context.plan, "decision-three", 1),
+		],
+	})).rejects.toThrow(SAME_KEY);
+	expect(context.plan.records.size).toBe(2);
+	expect(context.plan.questions.open.size).toBe(2);
+	expect(Room.project(context.plan.document)).toBe(source);
+	expect(context.broadcasts).toHaveLength(frames);
+});
+
+test("an identical replay stays idempotent after a person added an option to the open card", async () => {
+	let context = await setup();
+	let choices = question(context.plan, "decision-one", 1, false);
+	let first = await Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+		revision: 0,
+		questions: [choices],
+	});
+	let id = first.decisions[0]!.id;
+	let actor = member();
+	await Questions.addOption(context.plan, context.server, context.plan.id, actor.ws, {
+		kind: "question:option",
+		ts: 0,
+		rid: "add",
+		id,
+		question: context.plan.records.get(id)!.definition.questions[0]!.id,
+		key: "added-option",
+		label: "Shadow a teammate",
+	});
+	expect(context.plan.records.get(id)!.definition.questions[0]!.options).toHaveLength(3);
+	let again = await Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+		revision: 0,
+		questions: [choices],
+	});
+	expect(again.decisions).toEqual(first.decisions);
+	expect(context.plan.records.get(id)!.definition.questions[0]!.options).toHaveLength(3);
+	expect(context.plan.records.size).toBe(1);
+});
+
+test("a capture read before an identical paragraph appeared is refused as ambiguous and creates nothing", async () => {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one")] };
+	await edited(context, [{ op: "insert", index: 0, source: "Provisional onboarding." }]);
+	let source = Room.project(context.plan.document);
+	let frames = context.broadcasts.length;
+	await expect(Capture.captureDecisions(context.plan, context.server, context.plan.id, input))
+		.rejects.toThrow("The document changed; read it again before opening a decision");
+	expect(context.plan.records.size).toBe(0);
+	expect(context.plan.questions.open.size).toBe(0);
+	expect(Room.project(context.plan.document)).toBe(source);
+	expect(context.broadcasts).toHaveLength(frames);
+	// Read again, the Planner names the very block it means and the card goes there.
+	let fresh = {
+		revision: context.plan.revision,
+		questions: [question(context.plan, "decision-one", 2)],
+	};
+	let result = await Capture.captureDecisions(context.plan, context.server, context.plan.id, fresh);
+	let id = result.decisions[0]!.id;
+	expect(
+		Room.matchesAnchor(
+			context.plan.document,
+			context.plan.records.get(id)!.followUp!.target[0]!,
+			2,
+		),
+	)
+		.toBe(true);
+});
+
+const REFUSED = "The document changed; read it again before opening a decision";
+
+async function expectNothingCreated(
+	context: Awaited<ReturnType<typeof setup>>,
+	input: Parameters<typeof Capture.captureDecisions>[3],
+	cards = 0,
+	cause?: string,
+) {
+	let source = Room.project(context.plan.document);
+	let frames = context.broadcasts.length;
+	let refusal = await Capture.captureDecisions(context.plan, context.server, context.plan.id, input)
+		.then(() => undefined, (error: unknown) => error as Error);
+	if (!refusal) throw new Error("the batch was accepted as captured, not refused");
+	expect(refusal.message).toContain(REFUSED);
+	if (cause) expect(refusal.message).toContain(cause);
+	expect(refusal.message).not.toContain("different decision");
+	expect(refusal.message).not.toContain("new key");
+	expect(context.plan.records.size).toBe(cards);
+	expect(context.plan.questions.open.size).toBe(cards);
+	expect(Room.project(context.plan.document)).toBe(source);
+	expect(context.broadcasts).toHaveLength(frames);
+}
+
+test("a capture whose paragraph was rewritten beside an identical copy is refused, not moved onto the copy", async () => {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one")] };
+	await edited(context, [{
+		op: "replace",
+		index: 1,
+		source: "Provisional onboarding, rewritten.",
+	}]);
+	await edited(context, [{ op: "insert_root", source: "Provisional onboarding." }]);
+	await expectNothingCreated(context, input, 0, "has been rewritten, removed or moved since");
+	let fresh = {
+		revision: context.plan.revision,
+		questions: [question(context.plan, "decision-one", 3)],
+	};
+	let result = await Capture.captureDecisions(context.plan, context.server, context.plan.id, fresh);
+	expect(context.plan.records.get(result.decisions[0]!.id)).toBeDefined();
+});
+
+test("a capture whose paragraph was already repeated when it was read is refused once one copy is rewritten", async () => {
+	let context = await setup(
+		"# Draft\n\nProvisional onboarding.\n\nProvisional onboarding.\n\nProvisional collaboration.",
+	);
+	let input = { revision: 0, questions: [question(context.plan, "decision-one", 1)] };
+	await edited(context, [{
+		op: "replace",
+		index: 1,
+		source: "Provisional onboarding, rewritten.",
+	}]);
+	await expectNothingCreated(context, input, 0, "appeared more than once when you read it");
+});
+
+test("a capture of the second of two identical paragraphs is refused once that copy is removed, not moved onto the first", async () => {
+	let context = await setup(
+		"# Draft\n\nProvisional onboarding.\n\nProvisional onboarding.\n\nProvisional collaboration.",
+	);
+	let input = { revision: 0, questions: [question(context.plan, "decision-one", 2)] };
+	await rewrite(context, "# Draft\n\nProvisional onboarding.\n\nProvisional collaboration.");
+	await expectNothingCreated(context, input, 0, "appeared more than once when you read it");
+});
+
+test("a capture read at a revision that is no longer retained is refused instead of guessed", async () => {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one")] };
+	await rewrite(
+		context,
+		"# Draft\n\nProvisional onboarding.\n\nProvisional collaboration.\n\nA late note.",
+	);
+	context.plan.outlines.clear();
+	await expectNothingCreated(context, input, 0, "the server no longer has that read");
+});
+
+test("a repeated key whose paragraph was rewritten since is refused as a changed document, not as a different decision", async () => {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one")] };
+	await Capture.captureDecisions(context.plan, context.server, context.plan.id, input);
+	await edited(context, [{
+		op: "replace",
+		index: 1,
+		source: "Provisional onboarding, rewritten.",
+	}]);
+	await expectNothingCreated(context, input, 1);
+});
+
+test("a repeated key whose paragraph was rewritten beside an identical copy is refused, not replayed onto the copy", async () => {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one")] };
+	await Capture.captureDecisions(context.plan, context.server, context.plan.id, input);
+	await edited(context, [{
+		op: "replace",
+		index: 1,
+		source: "Provisional onboarding, rewritten.",
+	}]);
+	await edited(context, [{ op: "insert_root", source: "Provisional onboarding." }]);
+	await expectNothingCreated(context, input, 1);
+});
+
+test("a repeated key naming another intact paragraph is still a different decision when the document has moved on", async () => {
+	let context = await setup();
+	let first = question(context.plan, "decision-one", 1);
+	let other = question(context.plan, "decision-one", 2);
+	await Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+		revision: 0,
+		questions: [first],
+	});
+	await edited(context, [{ op: "insert_root", source: "A late note." }]);
+	await expect(Capture.captureDecisions(context.plan, context.server, context.plan.id, {
+		revision: 0,
+		questions: [other],
+	})).rejects.toThrow(SAME_KEY);
+	expect(context.plan.records.size).toBe(1);
+});
+
+test("a repeated key whose read was evicted is refused when its card no longer stands beside the paragraph", async () => {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one")] };
+	await Capture.captureDecisions(context.plan, context.server, context.plan.id, input);
+	await edited(context, [{
+		op: "replace",
+		index: 1,
+		source: "Provisional onboarding, rewritten.",
+	}]);
+	await edited(context, [{ op: "insert_root", source: "Provisional onboarding." }]);
+	for (let note = 0; note < 9; note++) {
+		await edited(context, [{ op: "insert_root", source: `Note ${note}.` }]);
+		Edit.outline(context.plan);
+	}
+	expect(Edit.read(context.plan, 0)).toBeUndefined();
+	await expectNothingCreated(context, input, 1, "the server no longer has that read");
+});
+
+test("a stale address whose index disagrees with its digest is refused as the fresh one is", async () => {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one", 1)] };
+	input.questions[0]!.blocks[0]!.digest = Room.digests(context.plan.document)[2]!;
+	await edited(context, [{ op: "insert_root", source: "A late note." }]);
+	await expectNothingCreated(context, input, 0, "does not match the block you read");
+});
+
+test("a repeated key whose read was evicted is refused when a later passage was rewritten beside an identical copy", async () => {
+	let context = await setup(
+		"# Draft\n\nProvisional onboarding.\n\nProvisional collaboration.\n\nProvisional pricing.",
+	);
+	let single = question(context.plan, "decision-one", 1);
+	let digests = Room.digests(context.plan.document);
+	let input = {
+		revision: 0,
+		questions: [{ ...single, blocks: [1, 2].map(index => ({ index, digest: digests[index]! })) }],
+	};
+	await Capture.captureDecisions(context.plan, context.server, context.plan.id, input);
+	await edited(context, [{
+		op: "replace",
+		index: 3,
+		source: "Provisional collaboration, rewritten.",
+	}]);
+	await edited(context, [{ op: "insert_root", source: "Provisional collaboration." }]);
+	for (let note = 0; note < 9; note++) {
+		await edited(context, [{ op: "insert_root", source: `Note ${note}.` }]);
+		Edit.outline(context.plan);
+	}
+	expect(Edit.read(context.plan, 0)).toBeUndefined();
+	await expectNothingCreated(context, input, 1, "the server no longer has that read");
+});
+
+/**
+ * The Planner's `edit_plan` path: the structural batch, the rebase of every decision's anchors
+ * that follows it, then the commit. `edited` above commits without that rebase.
+ */
+async function planned(context: Awaited<ReturnType<typeof setup>>, operations: Edit.Operation[]) {
+	let target = {
+		id: context.plan.id,
+		plan: context.plan,
+		server: context.server,
+		publish: (mutation: { update: Uint8Array; source: string }) =>
+			Plan.publish(context.plan, context.server, context.plan.id, mutation, { agent: true }),
+		persist: () => Plan.persist(context.plan),
+		exclusive: <T>(action: () => Promise<T>) => Plan.exclusive(context.plan, action),
+		anchors() {},
+		changes() {},
+		visualAdmission: async () => [],
+	} as unknown as DocumentRoom;
+	let outcome = await target.exclusive(() =>
+		applyBlockEdit(target, { revision: context.plan.revision, operations })
+	);
+	if (!outcome.ok) throw new Error("fixture edit failed");
+}
+
+/** A person's browser edit: a Yjs update over the socket, then the rebase that follows it. */
+async function typed(context: Awaited<ReturnType<typeof setup>>, change: () => void) {
+	let peer = await Room.restore(
+		context.plan.document.epoch,
+		Y.encodeStateAsUpdate(context.plan.document.doc),
+		Room.project(context.plan.document),
+		[],
+	);
+	try {
+		let vector = Y.encodeStateVector(peer.doc);
+		peer.editor.update(change, { discrete: true });
+		await Room.settle();
+		let replies: Array<Record<string, unknown>> = [];
+		let socket = {
+			data: { canEdit: true, room: context.plan.id, handle: "ana", client: "client-ana" },
+			send: (raw: string) => replies.push(JSON.parse(raw) as Record<string, unknown>),
+			publish() {},
+			close() {},
+		} as unknown as Parameters<typeof Plan.submit>[1];
+		Plan.submit(context.plan, socket, {
+			kind: "plan:update",
+			ts: 0,
+			rid: "typed",
+			id: "typed",
+			epoch: context.plan.document.epoch,
+			update: Buffer.from(Y.encodeStateAsUpdate(peer.doc, vector)).toString("base64"),
+		});
+		await Plan.drain(context.plan);
+		expect(replies.map(reply => reply.kind)).toContain("plan:ack");
+	} finally {
+		peer.doc.destroy();
+	}
+}
+
+/** The edit of the issue: the paragraph rewritten, an identical copy of its old text left after it. */
+function rewriteLeavingCopy() {
+	let original = $getRoot().getChildren()[1]!;
+	let rewritten = $createParagraphNode().append(
+		$createTextNode("Provisional onboarding, rewritten."),
+	);
+	original.replace(rewritten);
+	rewritten.insertAfter($createParagraphNode().append($createTextNode("Provisional onboarding.")));
+}
+
+async function evictRead(context: Awaited<ReturnType<typeof setup>>) {
+	for (let note = 0; note < 9; note++) {
+		await planned(context, [{ op: "insert_root", source: `Note ${note}.` }]);
+	}
+	expect(Edit.read(context.plan, 0)).toBeUndefined();
+}
+
+async function reopen(context: Awaited<ReturnType<typeof setup>>) {
+	await Plan.close(context.plan);
+	context.plan = await Plan.open(context.plan.id, context.backend, context.server);
+	expect(Edit.read(context.plan, 0)).toBeUndefined();
+}
+
+/** Where the card's widget stands: right after the copy, which is the block before it. */
+function expectCardAfterCopy(context: Awaited<ReturnType<typeof setup>>) {
+	expect(Room.questionnaireIndex(context.plan.document, [...context.plan.records.keys()][0]!))
+		.toBe(3);
+}
+
+async function opened() {
+	let context = await setup();
+	let input = { revision: 0, questions: [question(context.plan, "decision-one")] };
+	await Capture.captureDecisions(context.plan, context.server, context.plan.id, input);
+	return { context, input };
+}
+
+const NO_READ = "the server no longer has that read";
+const COPY = `${NO_READ}, and the card's paragraph can only be found again by its text`;
+
+test("a replay is refused while its read is retained when the Planner rewrote the paragraph and left a copy before the card", async () => {
+	let { context, input } = await opened();
+	await planned(context, [{
+		op: "replace",
+		index: 1,
+		source: "Provisional onboarding, rewritten.\n\nProvisional onboarding.",
+	}]);
+	expectCardAfterCopy(context);
+	expect(Edit.read(context.plan, 0)).toBeDefined();
+	await expectNothingCreated(context, input, 1, "has been rewritten, removed or moved since");
+});
+
+test("a replay without its read is refused when the Planner rewrote the paragraph and left a copy before the card", async () => {
+	let { context, input } = await opened();
+	await planned(context, [{
+		op: "replace",
+		index: 1,
+		source: "Provisional onboarding, rewritten.\n\nProvisional onboarding.",
+	}]);
+	expectCardAfterCopy(context);
+	await evictRead(context);
+	await expectNothingCreated(context, input, 1, COPY);
+});
+
+test("a replay without its read is refused when a person's edit rewrote the paragraph and left a copy before the card", async () => {
+	let { context, input } = await opened();
+	await typed(context, rewriteLeavingCopy);
+	expectCardAfterCopy(context);
+	await evictRead(context);
+	await expectNothingCreated(context, input, 1, COPY);
+});
+
+test("a replay is refused after a restart that lost its read when the paragraph was rewritten with a copy left before the card", async () => {
+	let { context, input } = await opened();
+	await planned(context, [{
+		op: "replace",
+		index: 1,
+		source: "Provisional onboarding, rewritten.\n\nProvisional onboarding.",
+	}]);
+	expectCardAfterCopy(context);
+	await reopen(context);
+	expectCardAfterCopy(context);
+	await expectNothingCreated(context, input, 1, COPY);
+});
+
+test("a replay is still refused after a restart that follows a person's rewrite, later edits and another restart", async () => {
+	let { context, input } = await opened();
+	await typed(context, rewriteLeavingCopy);
+	await planned(context, [{ op: "insert", index: 0, source: "A new opening." }]);
+	await reopen(context);
+	await planned(context, [{ op: "insert_root", source: "A closing note." }]);
+	await reopen(context);
+	await expectNothingCreated(context, input, 1, COPY);
+});
+
+test("a replay of a card beside an unchanged paragraph is accepted once, with its read retained, evicted or lost to a restart", async () => {
+	let { context, input } = await opened();
+	let id = [...context.plan.records.keys()][0]!;
+	await planned(context, [{ op: "insert", index: 0, source: "A new opening." }]);
+	expect(Room.questionnaireIndex(context.plan.document, id)).toBe(3);
+	let replay = async () => {
+		let again = await Capture.captureDecisions(
+			context.plan,
+			context.server,
+			context.plan.id,
+			input,
+		);
+		expect(again.decisions).toEqual([{ key: "decision-one", id, status: "open" }]);
+		expect(context.plan.records.size).toBe(1);
+		expect(context.plan.questions.open.size).toBe(1);
+	};
+	expect(Edit.read(context.plan, 0)).toBeDefined();
+	await replay();
+	await evictRead(context);
+	await replay();
+	await reopen(context);
+	await replay();
+});
+
+test("a replay of a card whose paragraph keeps its place is accepted without its read after other paragraphs were inserted, edited or deleted around it", async () => {
+	let { context, input } = await opened();
+	let id = [...context.plan.records.keys()][0]!;
+	await planned(context, [{ op: "insert", index: 0, source: "A new opening." }]);
+	await planned(context, [{
+		op: "replace",
+		index: 4,
+		source: "Provisional collaboration, rewritten.",
+	}]);
+	await typed(context, () => {
+		let tail = $getRoot().getLastChild()!;
+		tail.insertAfter($createParagraphNode().append($createTextNode("A browser note.")));
+	});
+	await planned(context, [{ op: "delete", index: 0 }]);
+	expect(Room.questionnaireIndex(context.plan.document, id)).toBe(2);
+	await evictRead(context);
+	let again = await Capture.captureDecisions(context.plan, context.server, context.plan.id, input);
+	expect(again.decisions).toEqual([{ key: "decision-one", id, status: "open" }]);
+	expect(context.plan.records.size).toBe(1);
+	await reopen(context);
+	let restarted = await Capture.captureDecisions(
+		context.plan,
+		context.server,
+		context.plan.id,
+		input,
+	);
+	expect(restarted.decisions).toEqual([{ key: "decision-one", id, status: "open" }]);
+});
+
+test("a replay is refused without its read when no rebase has yet recorded that the anchor lost its position", async () => {
+	let { context, input } = await opened();
+	await edited(context, [{
+		op: "replace",
+		index: 1,
+		source: "Provisional onboarding, rewritten.\n\nProvisional onboarding.",
+	}]);
+	expectCardAfterCopy(context);
+	for (let note = 0; note < 9; note++) {
+		await edited(context, [{ op: "insert_root", source: `Note ${note}.` }]);
+		Edit.outline(context.plan);
+	}
+	expect(Edit.read(context.plan, 0)).toBeUndefined();
+	await expectNothingCreated(context, input, 1, COPY);
 });

@@ -17,10 +17,15 @@ import * as Plan from "../plan/service";
 import * as Rooms from "../rooms";
 import { claimImplementation, reportImplementationLifecycle } from "../tasks/plan-graphs";
 import { coordinationSnapshot } from "../tasks/coordination-snapshot";
-import { answerExternal } from "../questions/service";
+import {
+	answerExternal,
+	type Record as QuestionRecord,
+	type StoredOpen,
+} from "../questions/service";
 import { approveExternal } from "../coordination/approve";
 import { StorageError } from "../storage/errors";
 import { implementationLifecycle } from "../tasks/lifecycle";
+import { unapprovedContext } from "../tasks/open-decisions";
 import { imagePath } from "../images/format";
 
 import type { Server } from "bun";
@@ -132,6 +137,10 @@ type ExposedState = {
 	graph?: Graph;
 	execution?: Run;
 	lifecycle?: Lifecycle;
+	/** Decision records, for the unapproved-context surface beside the graph. */
+	records?: QuestionRecord[];
+	/** Open questionnaires with their shared-draft revisions, as persisted. */
+	openQuestions?: StoredOpen[];
 };
 
 function exposed(
@@ -174,6 +183,7 @@ function exposed(
 			: { state: "idle" },
 		activity: lifecycle?.activity,
 		history: lifecycle?.history ?? [],
+		...unapprovedContext(state.records ?? []),
 	};
 }
 
@@ -263,6 +273,12 @@ export type HostedCoordination = {
 	/** GitHub logins, lowercased, that may answer through the coordination tools. */
 	approvers: readonly string[];
 };
+
+const MAX_MCP_SESSION_ID = 128;
+/** A session seen this recently is not written again. */
+const MCP_SESSION_TOUCH_MS = 60_000;
+/** An MCP session nobody used for this long is forgotten with the expired login sessions. */
+export const MCP_SESSION_IDLE_MS = 30 * 24 * 60 * 60_000;
 
 /** Bind the backend-neutral MCP surface to hosted GitHub authentication. */
 export function hosted(
@@ -379,6 +395,29 @@ export function hosted(
 	}
 
 	return {
+		sessions: {
+			async create(caller, id, client) {
+				let now = auth.clock();
+				await auth.storage.mcpSessions.create({
+					id,
+					userId: caller.user.id,
+					clientName: client.name,
+					clientVersion: client.version,
+					createdAt: now,
+					lastSeenAt: now,
+				});
+			},
+			async find(id) {
+				if (id.length > MAX_MCP_SESSION_ID) return undefined;
+				let found = await auth.storage.mcpSessions.find(id);
+				if (!found) return undefined;
+				let now = auth.clock();
+				if (now.getTime() - found.lastSeenAt.getTime() >= MCP_SESSION_TOUCH_MS) {
+					await auth.storage.mcpSessions.touch(id, now);
+				}
+				return { name: found.clientName, version: found.clientVersion };
+			},
+		},
 		invoke: callbacks.invokePlanner
 			? {
 				async invoke(caller, input) {
@@ -987,6 +1026,7 @@ export function hosted(
 								exposed(channel, {
 									source: Plan.source(live),
 									revision: live.revision,
+									records: [...live.records.values()],
 									...(live.creation ? { creation: live.creation } : {}),
 									...(live.graph ? { graph: live.graph } : {}),
 									...(live.execution ? { execution: live.execution } : {}),

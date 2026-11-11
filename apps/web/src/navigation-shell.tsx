@@ -13,6 +13,7 @@ import {
 	useState,
 	useSyncExternalStore,
 } from "react";
+import type { Dispatch, SetStateAction } from "react";
 import { usePhone } from "@chopin/editor/pointer";
 import { useTransitionPresence } from "@chopin/editor/transition-presence";
 import { documentPath } from "@chopin/protocol/document-url";
@@ -47,6 +48,8 @@ import {
 } from "./project-sidebar-chrome";
 import { clearRepositoryCache } from "./repository-cache";
 import { NavigationError } from "./navigation-error";
+import { unreached } from "./navigation-failure";
+import type { NavigationFailure } from "./navigation-failure";
 import { useProjectDocuments } from "./use-project-documents";
 import { useDocumentCreation } from "./use-document-creation";
 import { requestTitleEdit } from "./title-edit";
@@ -142,8 +145,6 @@ let KeyboardShortcutsDialog = lazy(() =>
 	}))
 );
 
-type NavigationFailure = { reason: unknown; retry?: "refresh" | "visit" };
-
 let NavigationDocument = createContext<{
 	navigationRevision: number;
 	channel?: Api.Channel;
@@ -156,6 +157,8 @@ let NavigationDocument = createContext<{
 	onDocumentLoaded: (channel: Api.Channel, routeKey: DocumentRouteIdentity) => Promise<void>;
 	onDocumentRouteSettled: (routeKey: DocumentRouteIdentity) => void;
 	onProjectReveal: (repositoryId: string) => void;
+	/** Counts the connection banners telling a lost connection (see `connection-speaking.ts`). */
+	setBanners?: Dispatch<SetStateAction<number>>;
 	onRepositoryAccessChanged: () => void;
 	onResearchChildOpen: (
 		parentId: string,
@@ -215,7 +218,11 @@ function useSidebarWidth() {
 	});
 
 	useEffect(() => localStorage.setItem(SIDEBAR_STORAGE_KEY, String(width)), [width]);
-	return [width, (delta: number) => setWidth(current => clamp(current + delta))] as const;
+	return [
+		width,
+		(delta: number) => setWidth(current => clamp(current + delta)),
+		(value: number) => setWidth(clamp(value)),
+	] as const;
 }
 
 export function NavigationShell(
@@ -250,6 +257,8 @@ export function NavigationShell(
 	let latestVisitedDocument = useRef<string | undefined>(undefined);
 	let catalogueRefreshes = useRef(new Map<string, number>([["navigation", Date.now()]]));
 	let [error, setError] = useState<NavigationFailure>();
+	// A connection banner in a room tells a lost connection; the same loss is not told again here.
+	let [banners, setBanners] = useState(0);
 	let [resolvedDocument, setResolvedDocument] = useState<{
 		channel: Api.Channel;
 		routeKey: DocumentRouteIdentity;
@@ -283,7 +292,8 @@ export function NavigationShell(
 	let [focusProjectId, setFocusProjectId] = useState<string>();
 	let [notice, showNotice] = useState<NoticeOptions>();
 	let [reveal, setReveal] = useState<{ id: string; nonce: number }>();
-	let [width, resize] = useSidebarWidth();
+	let [width, resize, setSidebarWidth] = useSidebarWidth();
+	let sidebarFrame = useRef<HTMLDivElement>(null);
 	let mode = useNavigationMode();
 	let phone = usePhone();
 	// Phones navigate from a bottom sheet; it stays mounted once loaded so it can animate out.
@@ -771,6 +781,7 @@ export function NavigationShell(
 		onDocumentLoaded: documentLoaded,
 		onDocumentRouteSettled: documentRouteSettled,
 		onProjectReveal: projectReveal,
+		setBanners,
 		onRepositoryAccessChanged: repositoryAccessChanged,
 		onResearchChildOpen: researchChildOpen,
 		onResearchChildPublished: researchChildPublished,
@@ -816,14 +827,22 @@ export function NavigationShell(
 	};
 
 	let retryError = () => {
-		if (!error) return;
-		if (error.retry === "visit" && currentChannelRef.current && isDocumentWorkspaceRoute(route)) {
+		if (error?.retry === "visit" && currentChannelRef.current && isDocumentWorkspaceRoute(route)) {
 			void documentLoaded(currentChannelRef.current, documentRouteIdentity(route));
 		} else void refresh();
 	};
+	// The connection is back: what failed while it was out is asked for again, so the notice goes
+	// when the server answers, and stays only if it still does not.
+	let lost = error && unreached(error);
+	let shownError = banners && lost ? undefined : error;
+	useEffect(() => {
+		if (!banners && lost && error?.retry) retryError();
+	}, [banners]);
+	let focusDrawerOpener = () =>
+		requestAnimationFrame(() => drawerOpener.current?.focus({ preventScroll: true }));
 	let dismissDrawer = () => {
 		setDrawerOpen(false);
-		requestAnimationFrame(() => drawerOpener.current?.focus({ preventScroll: true }));
+		focusDrawerOpener();
 	};
 	let dismissDialog = () => setDialog(undefined);
 	let [sidebarShortcut, setSidebarShortcut] = useState<string>();
@@ -843,7 +862,7 @@ export function NavigationShell(
 			if (collapsed) return showSidebar();
 			let inside = document.activeElement?.closest(".project-sidebar-frame");
 			setCollapsed(true);
-			if (inside) requestAnimationFrame(() => drawerOpener.current?.focus({ preventScroll: true }));
+			if (inside) focusDrawerOpener();
 		},
 	};
 	// The listener and its registry load after first paint; the shell only names its actions.
@@ -972,12 +991,12 @@ export function NavigationShell(
 					onRetry={retryProject ? () => void createDocument(retryProject) : undefined}
 				/>
 			)}
-			{error !== undefined && (
+			{shownError !== undefined && (
 				<NavigationError
-					message={error.reason instanceof Error
-						? error.reason.message
+					message={shownError.reason instanceof Error
+						? shownError.reason.message
 						: "Could not update navigation."}
-					onRetry={error.retry ? retryError : undefined}
+					onRetry={shownError.retry ? retryError : undefined}
 				/>
 			)}
 			<div className="navigation-body">
@@ -1039,11 +1058,22 @@ export function NavigationShell(
 							aria-hidden={sidebarPresence.phase === "closing" ? "true" : undefined}
 							className={`project-sidebar-frame ${sidebarMotion.className} ${sidebarPresence.className}`}
 							inert={sidebarPresence.phase === "closing"}
+							ref={sidebarFrame}
 							style={{ "--project-sidebar-width": `${width}px` } as CSSProperties}
 						>
 							<div className="project-sidebar-motion-content">{sidebar}</div>
 							<SidebarFeatureBoundary>
-								<SidebarResizeHandle onResize={resize} width={width} />
+								<SidebarResizeHandle
+									onCommit={setSidebarWidth}
+									onResize={resize}
+									// A drag moves the sidebar through its CSS variable and renders nothing until it ends.
+									onShow={value =>
+										sidebarFrame.current?.style.setProperty(
+											"--project-sidebar-width",
+											`${value}px`,
+										)}
+									width={width}
+								/>
 							</SidebarFeatureBoundary>
 						</div>
 					)}

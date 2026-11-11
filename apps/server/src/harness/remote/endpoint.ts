@@ -69,6 +69,8 @@ export type AgentHooks = {
 	unavailable?: (channelId: string) => boolean;
 	/** Observes attached links. */
 	register?: LinkOptions["register"];
+	/** A document's attached client reported what it offers, which may be nothing now. */
+	catalogChanged?: (channelId: string) => void;
 	timeoutMs?: number;
 	revalidateEveryMs?: number;
 	/** How often the link is sent a protocol ping. */
@@ -229,7 +231,7 @@ export function agentLink(
 			return {
 				ok: false,
 				code: "repository-forbidden",
-				message: "This Planner credential was issued for another document.",
+				message: "This credential was issued for another document.",
 			};
 		}
 		if (channel.archivedAt) {
@@ -250,11 +252,33 @@ export function agentLink(
 				: {}),
 		}, link);
 		if (!granted.ok) return granted;
+		let document = { id: channel.id, title: channel.title, repository: fullName, url };
+		if (granted.takeover) {
+			let { takeover } = granted;
+			return {
+				ok: true,
+				document,
+				takeover: async names => {
+					let taken = await takeover(names);
+					if (!taken.ok) return taken;
+					channelId = channel.id;
+					return {
+						ok: true,
+						document,
+						detach: taken.detach,
+						claim: taken.claim,
+						lapse: taken.lapse,
+					};
+				},
+			};
+		}
 		channelId = channel.id;
 		return {
 			ok: true,
-			document: { id: channel.id, title: channel.title, repository: fullName, url },
+			document,
 			detach: granted.detach,
+			claim: granted.claim,
+			lapse: granted.lapse,
 		};
 	}
 	async function revalidate(): Promise<boolean> {
@@ -279,6 +303,9 @@ export function agentLink(
 		timeoutMs: hooks.timeoutMs,
 		revalidateEveryMs: hooks.revalidateEveryMs,
 		features,
+		catalogChanged: () => {
+			if (channelId) hooks.catalogChanged?.(channelId);
+		},
 	});
 	return link;
 }

@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
-import { checkPlannerReply, publishPlannerReplies } from "./reply-policy";
+import { expectPlain } from "../testing/plain-words";
+import { ToolBoundaryError } from "../harness/remote/link";
+import { checkPlannerReply, PlannerReplyError, publishPlannerReplies } from "./reply-policy";
 
 import type { Decide } from "../conversation-plan/decisions";
 import type { TextStreamPart, ToolSet } from "ai";
@@ -41,6 +43,7 @@ function fixture(turns: Part[][], decide: Decide | undefined = verdict(0)) {
 		signal: controller.signal,
 		decide: decide as Decide | undefined,
 		capturedDecisions: undefined as (() => number) | undefined,
+		keptDecisions: undefined as (() => number) | undefined,
 		publish: (part: Part) => published.push(part),
 	};
 	return { options, published, prompts, controller, run: () => publishPlannerReplies(options) };
@@ -85,12 +88,21 @@ test.each([0.11, 0.5, 1])(
 	"repeated input requests or uncertainty (%s) get only one repair",
 	async p => {
 		let f = fixture([text("Tell me your preferred scope."), text("Which scope?")], verdict(p));
-		await expect(f.run()).rejects.toThrow("could not move its questions into inline decisions");
+		expect(await rejection(f.run())).toContain(
+			"could not move its questions into inline decisions",
+		);
 		expect(f.published).toEqual([]);
 		expect(f.prompts).toHaveLength(2);
 		expect(f.prompts[1]).toContain("do not repeat completed operations");
 	},
 );
+
+/** What a failed reply says in Chat, which a person reads. */
+async function rejection(run: Promise<unknown>): Promise<string> {
+	let message = await run.then(() => "", error => (error as Error).message);
+	expectPlain(message, "a failed reply");
+	return message;
+}
 
 test("saved inline decisions get a factual server summary when both generated replies are withheld", async () => {
 	let f = fixture([
@@ -100,14 +112,36 @@ test("saved inline decisions get a factual server summary when both generated re
 	f.options.capturedDecisions = () => 4;
 	await f.run();
 	expect(f.prompts).toHaveLength(2);
-	expect(f.published.filter(part => part.type === "text-delta").map(part => part.text))
-		.toEqual(["Added 4 inline decisions to the document."]);
+	let said = f.published.filter(part => part.type === "text-delta").map(part => part.text);
+	expect(said).toEqual(["Added 4 inline decisions to the document."]);
+	for (let line of said) expectPlain(line, "a summary Chat shows");
 });
+
+test("decisions the Planner repeated give a factual summary without claiming they were added", async () => {
+	let f = fixture([text("The cards are open."), text("Please answer them.")], verdict(0.19));
+	f.options.keptDecisions = () => 2;
+	await f.run();
+	let said = f.published.filter(part => part.type === "text-delta").map(part => part.text);
+	expect(said).toEqual(["2 inline decisions are already in the document."]);
+	for (let line of said) expectPlain(line, "a summary Chat shows");
+});
+
+test.each([0, -1, NaN, 1.5])(
+	"a repeated-decision count of %s cannot mask a rejected turn, and the failure keeps the session",
+	async count => {
+		let f = fixture([text("Which scope?"), text("Tell me the scope.")], verdict(1));
+		f.options.keptDecisions = () => count;
+		let failure = await f.run().catch(error => error);
+		expect(failure).toBeInstanceOf(PlannerReplyError);
+		expect(failure.message).toContain("could not move its questions");
+		expect(f.published).toEqual([]);
+	},
+);
 
 test.each([0, -1, NaN, 1.5])("a capture count of %s cannot mask a rejected turn", async count => {
 	let f = fixture([text("Which scope?"), text("Tell me the scope.")], verdict(1));
 	f.options.capturedDecisions = () => count;
-	await expect(f.run()).rejects.toThrow("could not move its questions");
+	expect(await rejection(f.run())).toContain("could not move its questions");
 	expect(f.published).toEqual([]);
 });
 
@@ -116,14 +150,14 @@ test("a classifier failure still fails even after inline decisions were captured
 		throw new Error("provider unavailable");
 	});
 	f.options.capturedDecisions = () => 4;
-	await expect(f.run()).rejects.toThrow("could not verify");
+	expect(await rejection(f.run())).toContain("could not verify");
 	expect(f.published).toEqual([]);
 });
 
 test("a stream failure after capture cannot become a success summary", async () => {
 	let f = fixture([[{ type: "error", error: new Error("Provider failed") }]]);
 	f.options.capturedDecisions = () => 4;
-	await expect(f.run()).rejects.toThrow("Planner stream failed");
+	expect(await rejection(f.run())).toContain("Provider failed");
 	expect(f.published).toEqual([]);
 });
 
@@ -141,7 +175,7 @@ test.each([NaN, -1, 1.1])(
 	"invalid classifier probability %s never publishes or retries",
 	async p => {
 		let f = fixture([text("Done.")], verdict(p));
-		await expect(f.run()).rejects.toThrow("could not verify");
+		expect(await rejection(f.run())).toContain("could not verify");
 		expect(f.published).toEqual([]);
 		expect(f.prompts).toHaveLength(1);
 	},
@@ -155,7 +189,7 @@ test("missing or failed classifier cannot publish unchecked text", async () => {
 	) {
 		let f = fixture([text("What should happen next?")]);
 		f.options.decide = decide;
-		await expect(f.run()).rejects.toThrow("could not verify");
+		expect(await rejection(f.run())).toContain("could not verify");
 		expect(f.published).toEqual([]);
 		expect(f.prompts).toHaveLength(1);
 	}
@@ -181,7 +215,7 @@ test("a stop during verification discards the verdict and never repairs", async 
 test("oversized text is refused rather than checking a truncated prefix", async () => {
 	for (let candidate of ["x".repeat(24_001), '"'.repeat(12_001)]) {
 		let f = fixture([text(candidate)]);
-		await expect(f.run()).rejects.toThrow("could not verify");
+		expect(await rejection(f.run())).toContain("could not verify");
 		expect(f.published).toEqual([]);
 	}
 });
@@ -195,7 +229,7 @@ test("an unterminated message is still checked before publication", async () => 
 test("a stream error discards partial text without starting a repair", async () => {
 	let failure: Part = { type: "error", error: new Error("Provider failed") };
 	let f = fixture([[{ type: "text-delta", id: "message", text: "Which" }, failure]], verdict(1));
-	await expect(f.run()).rejects.toThrow("Planner stream failed");
+	expect(await rejection(f.run())).toContain("Provider failed");
 	expect(f.published).toEqual([]);
 	expect(f.prompts).toHaveLength(1);
 });
@@ -297,3 +331,15 @@ test.each(["classifier", "oversize"])(
 		expect(f.published).toEqual([]);
 	},
 );
+
+test("a stream error from the tool boundary ends the turn as that error, so it is told as a tool failure and not a failed reply", async () => {
+	let boundary = new ToolBoundaryError("Chopin's tool boundary failure: bash");
+	let f = fixture([[{ type: "text-delta", id: "message", text: "Which" }, {
+		type: "error",
+		error: boundary,
+	}]], verdict(1));
+	let failure = await f.run().then(() => undefined, error => error);
+	expect(failure).toBe(boundary);
+	expect(f.published).toEqual([]);
+	expect(f.prompts).toHaveLength(1);
+});

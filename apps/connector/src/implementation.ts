@@ -76,15 +76,54 @@ export async function relay(
 	};
 }
 
-/** Where a run's agent works: its own worktree, and the one folder for any extra worktrees. */
-export type RunWorktrees = { root: string; extras: string };
+/**
+ * Where a run's agent works: its own worktree, and the one folder for any extra worktrees. In the
+ * machine's process sandbox it can't add one: that needs the repository's list of worktrees written,
+ * which would let it alter every worktree of the person's.
+ */
+export type RunWorktrees = { root: string; extras: string; confined?: boolean };
 
-function worktreeLines({ root, extras }: RunWorktrees) {
+function worktreeLines({ root, extras, confined }: RunWorktrees) {
 	return [
 		`Your worktree is ${root}.`,
-		`For extra worktrees, as for concurrent PRs, create them only inside ${extras} (also in `
-		+ "$CHOPIN_RUN_WORKTREES) with `git worktree add`, never beside the checkout.",
-		"They are removed when this run ends, uncommitted changes included, so push what you keep.",
+		...confined
+			? [
+				"This sandbox lets git write your worktree and not add another (`git worktree add` fails):"
+				+ " for concurrent PRs, make each one from its own branch in your worktree, one after another.",
+			]
+			: [
+				`For extra worktrees, as for concurrent PRs, create them only inside ${extras} (also in `
+				+ "$CHOPIN_RUN_WORKTREES) with `git worktree add`, never beside the checkout.",
+				"They are removed when this run ends, uncommitted changes included, so push what you keep.",
+			],
+	];
+}
+
+/**
+ * Decisions nobody has answered never hold a build back. The server lists them in what the run
+ * reads; the agent builds on its best judgment and says in each pull request what it assumed.
+ */
+function openDecisionLines(read: "read_implementation" | "read_rebuild") {
+	return [
+		`If ${read} returns unapprovedDecisions, those decisions are still open. Never wait for one,`
+		+ " block a task on one, or answer or close one: use your best judgment.",
+		read === "read_rebuild"
+			? "Make every pull request you push to or open end with its pullRequestSection, unchanged,"
+				+ " in its body (`gh pr edit`), replacing an earlier copy of it."
+			: "Put its pullRequestSection, unchanged, at the end of the body of every pull request you open,"
+				+ " then add a few words after each item on what you assumed.",
+	];
+}
+
+/**
+ * A build asked for by a teammate runs on this machine with its owner's GitHub account, so its pull
+ * requests come from the owner. The server says whose request it was; the agent passes that on.
+ */
+function requestedByLines(read: "read_implementation" | "read_rebuild") {
+	return [
+		`If ${read} returns requestedBy, a teammate asked for this build: put its pullRequestNote,`
+		+ " unchanged, at the end of the body of every pull request you open or update, so the"
+		+ " pull request says whose request it was.",
 	];
 }
 
@@ -99,6 +138,8 @@ export function implementationPrompt(worktrees: RunWorktrees) {
 		"The connector already claimed this exact graph. Never claim another run or change the approved plan.",
 		"Open small reviewable draft pull requests (`gh pr create --draft`), linking the document URL",
 		"and its #task-ID anchors. Never merge PRs.",
+		...openDecisionLines("read_implementation"),
+		...requestedByLines("read_implementation"),
 		"If a task needs no code change, open no pull request: call complete_task with noChange, giving",
 		"the reason and Markdown evidence of what you checked. Its dependents build on the same base.",
 		"If a new human decision is needed, block the affected task with its question and stop that work.",
@@ -120,6 +161,8 @@ export function liveImplementationPrompt(worktrees: RunWorktrees) {
 		"The connector already claimed this exact graph. Never claim another run or change the approved plan.",
 		"Open small reviewable draft pull requests (`gh pr create --draft`), linking the document URL",
 		"and its #task-ID anchors. Never merge PRs.",
+		...openDecisionLines("read_implementation"),
+		...requestedByLines("read_implementation"),
 		"If a task needs no code change, open no pull request: call complete_task with noChange, giving",
 		"the reason and Markdown evidence of what you checked. Its dependents build on the same base.",
 		"If a new human decision is needed, block the affected task with its question and stop that work.",
@@ -144,6 +187,8 @@ export function rebuildPrompt(worktrees: RunWorktrees) {
 		"request, or open one draft pull request (`gh pr create --draft`) only for an outstanding task",
 		"that has none.",
 		"Never open any other pull request. Never merge.",
+		...openDecisionLines("read_rebuild"),
+		...requestedByLines("read_rebuild"),
 		"Code that fits no existing pull request goes on the most closely related one.",
 		"If the change needs no code and nothing is outstanding, make no commits.",
 		"Finally call report_rebuild with a summary, every commit you pushed, and one task per new change.",

@@ -1,9 +1,11 @@
 import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { RepositoryLinksProvider } from "@chopin/editor";
 
 import { inlineText } from "./inline-text";
-import { InlineMarkdown, MessageMarkdown } from "./markdown";
+import { MarkdownText } from "../markdown-text/markdown-text";
+import { InlineMarkdown, MessageMarkdown, sameMessageMarkdown } from "./markdown";
 import { referenceRenderModel } from "./references";
 
 import type { Chat } from "@chopin/protocol";
@@ -31,6 +33,9 @@ let PARTICIPANT_MESSAGE = [
 	'<img src="https://example.invalid/raw.png" alt="raw">',
 ].join("\n");
 
+/** An h1 start tag with or without attributes: MarkdownText's elements carry an aui-md class. */
+const H1 = /<h1(?:\s|>)/;
+
 function reference(source: string, token: string, id = "reference-one"): Chat.Reference {
 	let start = source.indexOf(token);
 	return {
@@ -54,28 +59,76 @@ function markdown(source: string, references?: Chat.Reference[]): string {
 test("Chat Markdown admits formatting without document features", () => {
 	let markup = markdown(PARTICIPANT_MESSAGE);
 
-	expect(markup).toContain("<strong>Bold</strong>");
+	expect(markup).toContain('<strong class="aui-md-strong">Bold</strong>');
 	expect(markup).toContain("<em>italic</em>");
-	expect(markup).toContain("<ul>");
-	expect(markup).toContain("<li>first</li>");
-	expect(markup).toContain("<ol>");
-	expect(markup).toContain("<li>one</li>");
-	expect(markup).toContain("<blockquote>");
+	expect(markup).toContain('<ul class="aui-md-ul">');
+	expect(markup).toContain('<li class="aui-md-li">first</li>');
+	expect(markup).toContain('<ol class="aui-md-ol">');
+	expect(markup).toContain('<li class="aui-md-li">one</li>');
+	expect(markup).toContain('<blockquote class="aui-md-blockquote">');
 	expect(markup).toContain("quoted");
 	expect(markup).toContain('href="https://example.com"');
 	expect(markup).toContain('target="_blank"');
-	expect(markup).toContain("<p>Use <code>bun test</code>.</p>");
+	expect(markup).toContain(
+		'<p class="aui-md-p">Use <code class="aui-md-inline-code">bun test</code>.</p>',
+	);
 	expect(markup).toContain('<code class="language-ts">let answer = 42;');
 	expect(markup).toContain("Ordinary message text");
-	expect(markup).not.toContain("<h1>");
+	expect(markup).not.toMatch(H1);
 	expect(markup).not.toContain("<img");
 
-	expect(markdown("Planner wrote **strongly**.")).toContain("<strong>strongly</strong>");
+	expect(markdown("Planner wrote **strongly**.")).toContain(
+		'<strong class="aui-md-strong">strongly</strong>',
+	);
+});
+
+test("the check that Chat draws no h1 recognises an h1 that carries a class", () => {
+	let drawn = renderToStaticMarkup(createElement(MarkdownText, { text: "# Title" }));
+	// MarkdownText draws a heading as an h1 with its class, which "<h1>" alone would never match.
+	expect(drawn).toContain('<h1 class="aui-md-h1">Title</h1>');
+	expect(drawn).not.toContain("<h1>");
+	expect(drawn).toMatch(H1);
+	expect(H1.test("<h1>")).toBe(true);
+	// Chat's message draws the same source as a line of text.
+	expect(markdown("# Title")).not.toMatch(H1);
+	expect(markdown("# Title")).toContain('<p class="aui-md-p">Title</p>');
+});
+
+test("Chat reads GitHub's tables, strikethrough and task lists, and only those", () => {
+	let markup = markdown(
+		"| A | B |\n| - | - |\n| 1 | 2 |\n\n~~gone~~ and ~one~ and about ~5 minutes, ~10 at most\n\n- [x] done\n- [ ] open",
+	);
+	expect(markup).toContain('<table class="aui-md-table">');
+	expect(markup).toContain("<del>gone</del>");
+	// One tilde is not strikethrough: it is the text a person typed.
+	expect(markup).toContain("~one~ and about ~5 minutes, ~10 at most");
+	expect(markup.match(/<input [^>]*type="checkbox"/g)).toHaveLength(2);
+	// A box is named, so a reader of the screen hears what it is before the item's words.
+	expect(markup.match(/<input aria-label="Task"/g)).toHaveLength(2);
+	expect(markup).toContain('<li class="aui-md-li task-list-item">');
+});
+
+test("a footnote, a bare address and a www link stay the plain text they were in Chat", () => {
+	let markup = markdown(
+		"Claim[^1] and see https://example.com/page, www.example.com or ana@example.com.\n\n[^1]: The note.",
+	);
+	expect(markup).not.toContain("<a");
+	expect(markup).not.toContain("<sup");
+	expect(markup).not.toContain("<section");
+	expect(markup).not.toContain("footnote");
+	expect(markup).toContain(
+		"Claim[^1] and see https://example.com/page, www.example.com or ana@example.com.",
+	);
+	expect(markup).toContain("[^1]: The note.");
+	// A link someone wrote is still a link.
+	expect(markdown("[the page](https://example.com/page)")).toContain(
+		'href="https://example.com/page"',
+	);
 });
 
 test("indentation keeps nested lists and code blocks intact", () => {
 	let nested =
-		/<li>parent\s*<ul>\s*<li>child<\/li>\s*<li>sibling<\/li>\s*<\/ul>\s*<\/li>\s*<li>next<\/li>/;
+		/<li class="aui-md-li">parent\s*<ul class="aui-md-ul">\s*<li class="aui-md-li">child<\/li>\s*<li class="aui-md-li">sibling<\/li>\s*<\/ul>\s*<\/li>\s*<li class="aui-md-li">next<\/li>/;
 
 	expect(markdown("- parent\n  - child\n  - sibling\n- next")).toMatch(nested);
 	expect(markdown("- parent\n    - child\n    - sibling\n- next")).toMatch(nested);
@@ -100,17 +153,17 @@ test("a numbered list that continues after a lead-in line still renders as a lis
 	].join("\n");
 	let markup = markdown(source);
 
-	expect(markup).toContain("<p>Needs task 1 first:</p>");
+	expect(markup).toContain('<p class="aui-md-p">Needs task 1 first:</p>');
 	expect(markup).toContain(
-		'<ol start="3">\n<li><code>rewire-handler</code>: rewire it.</li>\n</ol>',
+		'<ol class="aui-md-ol" start="3">\n<li class="aui-md-li"><code class="aui-md-inline-code">rewire-handler</code>: rewire it.</li>\n</ol>',
 	);
-	expect(markup).toContain("<p>Need task 3 first:</p>");
+	expect(markup).toContain('<p class="aui-md-p">Need task 3 first:</p>');
 	expect(markup).toMatch(
-		/<ol start="4">\s*<li><code>table-tests<\/code>: check tables\s+and statuses\.<\/li>\s*<li><code>secret-test<\/code>: check the secret\.<\/li>\s*<\/ol>/,
+		/<ol class="aui-md-ol" start="4">\s*<li class="aui-md-li"><code class="aui-md-inline-code">table-tests<\/code>: check tables\s+and statuses\.<\/li>\s*<li class="aui-md-li"><code class="aui-md-inline-code">secret-test<\/code>: check the secret\.<\/li>\s*<\/ol>/,
 	);
 	// An escaped marker, a number inside a sentence, and code stay as written.
 	expect(markdown("Released in\n2024\\. Then more")).toContain(
-		"<p>Released in\n2024. Then more</p>",
+		'<p class="aui-md-p">Released in\n2024. Then more</p>',
 	);
 	expect(markdown("Step\n`3. code`")).not.toContain("<ol");
 });
@@ -121,7 +174,7 @@ test("authoritative ranges render internal chips inside ordinary Markdown", () =
 
 	expect(markup).not.toContain("@chopin");
 	expect(markup).toContain(
-		'<strong><a class="chat-reference" data-chat-reference="document" href="/documents/octo-org/score/reference-one">#Release: v2 (API)</a></strong>',
+		'<strong class="aui-md-strong"><a class="chat-reference" data-chat-reference="document" href="/documents/octo-org/score/reference-one">#Release: v2 (API)</a></strong>',
 	);
 	expect(markup).toContain('href="https://example.com"');
 	expect(markup).toContain('rel="noopener noreferrer"');
@@ -155,6 +208,26 @@ test("chips preserve the server label and href rather than reparsing token text"
 
 	expect(markup).toContain(">#Release plan (captured)</a>");
 	expect(markup).toContain('href="/documents/octo-org/score/release-at-send-time"');
+});
+
+test("a command that opened a message is a chip, not a link, and the words after it are its own", () => {
+	let source = "/skill:release-notes for **v2**";
+	let command: Chat.CommandReference = {
+		id: "command-reference",
+		kind: "command",
+		start: 0,
+		end: "/skill:release-notes".length,
+		label: "/skill:release-notes",
+		name: "skill:release-notes",
+		commandKind: "skill",
+	};
+	let markup = markdown(source, [command]);
+
+	expect(markup).toContain(
+		'<span class="chat-reference" data-chat-reference="command">/skill:release-notes</span>',
+	);
+	expect(markup).toContain('<strong class="aui-md-strong">v2</strong>');
+	expect(markup).not.toContain("<a");
 });
 
 test("historical research references remain readable without composer discovery", () => {
@@ -221,7 +294,7 @@ test("ranges inside code, link labels, and link destinations remain ordinary tex
 	let markup = markdown(source, references);
 
 	expect(markup.match(/class="chat-reference"/g)).toHaveLength(1);
-	expect(markup).toContain("<code>#Code</code>");
+	expect(markup).toContain('<code class="aui-md-inline-code">#Code</code>');
 	expect(markup).toContain(">#Label</a>");
 	expect(markup).toContain('href="#Target"');
 	expect(markup).toContain(">#Plan</a>");
@@ -253,7 +326,7 @@ function inline(source: string, links?: boolean): string {
 
 test("inline Markdown formats code, emphasis and links without blocks", () => {
 	expect(inline("Rewire `login` to **call** _three_ [helpers](https://example.com)")).toBe(
-		'Rewire <code>login</code> to <strong>call</strong> <em>three</em> <a href="https://example.com" rel="noopener noreferrer" target="_blank">helpers</a>',
+		'Rewire <code class="aui-md-inline-code">login</code> to <strong class="aui-md-strong">call</strong> <em>three</em> <a class="aui-md-a" href="https://example.com" rel="noopener noreferrer" target="_blank">helpers</a>',
 	);
 	// A task title sits inside a button, so its links read as text.
 	expect(inline("See [the docs](https://example.com)", false)).toBe("See the docs");
@@ -262,7 +335,9 @@ test("inline Markdown formats code, emphasis and links without blocks", () => {
 	expect(inline("- item")).toBe("- item");
 	expect(inline("# Heading")).toBe("# Heading");
 	expect(inline("> quote")).toBe("&gt; quote");
-	expect(inline("    indented `code`")).toBe("indented <code>code</code>");
+	expect(inline("    indented `code`")).toBe(
+		'indented <code class="aui-md-inline-code">code</code>',
+	);
 	expect(inline("<b>raw</b> ![image](https://example.invalid/i.png)")).toBe("raw ");
 	expect(inline("one\n\ntwo")).toBe("one two");
 });
@@ -283,4 +358,100 @@ test("the plain text of inline Markdown is the text it shows, with single spaces
 	}
 	expect(inlineText("Deploy on `main`")).toBe("Deploy on main");
 	expect(inlineText("<b>raw</b> ![image](https://example.invalid/i.png)")).toBe("raw");
+});
+
+const REPOSITORY = { owner: "octo-org", name: "score", ref: "main" };
+const BLOB = "https://github.com/octo-org/score/blob/main";
+
+function inRepository(element: ReturnType<typeof createElement>): string {
+	return renderToStaticMarkup(
+		createElement(RepositoryLinksProvider, { value: REPOSITORY }, element),
+	);
+}
+
+test("a repository path in Chat opens the file on GitHub, as it does in the document", () => {
+	let source = "See [the review](docs/review.md#L10-L20) and [the app](./src/app.ts).";
+	let markup = inRepository(createElement(MessageMarkdown, { source }));
+
+	expect(markup).toContain(
+		`<a class="aui-md-a" href="${BLOB}/docs/review.md#L10-L20" rel="noopener noreferrer" target="_blank">the review</a>`,
+	);
+	expect(markup).toContain(`<a class="aui-md-a" href="${BLOB}/src/app.ts"`);
+	expect(
+		inRepository(createElement(InlineMarkdown, { source: "Edit [the app](src/app.ts)" })),
+	).toContain(`<a class="aui-md-a" href="${BLOB}/src/app.ts"`);
+});
+
+test("every other link in Chat is as written, with or without a repository", () => {
+	let source =
+		"[web](https://example.com/a) [mail](mailto:ana@example.com) [here](#here) [out](../secrets.md) [gone](//evil.example/a)";
+	let elsewhere = markdown(source);
+	let inside = inRepository(createElement(MessageMarkdown, { source }));
+
+	for (let href of ["https://example.com/a", "mailto:ana@example.com", "#here", "../secrets.md"]) {
+		expect(inside).toContain(`href="${href}"`);
+		expect(elsewhere).toContain(`href="${href}"`);
+	}
+	expect(inside).not.toContain("github.com");
+	// Without a repository to resolve against, a path stays the path it was.
+	expect(markdown("See [the review](docs/review.md)")).toContain('href="docs/review.md"');
+});
+
+test("a message's Markdown is drawn again only when what it says changes", () => {
+	let reference = {
+		kind: "document" as const,
+		id: "ref-1",
+		start: 4,
+		end: 9,
+		label: "The plan",
+		href: "/documents/octo-org/score/plan",
+		repositoryId: "R_1",
+		observedRevision: 3,
+		channelId: "c1",
+		observedSourceHash: "abc",
+	};
+	let props = { className: "body", mention: "@chopin", references: [reference], source: "See it" };
+	// A message to the Planner hands over its references as a new list on every render.
+	expect(sameMessageMarkdown(props, { ...props, references: [{ ...reference }] })).toBe(true);
+	expect(sameMessageMarkdown({ source: "Same" }, { source: "Same" })).toBe(true);
+
+	expect(sameMessageMarkdown(props, { ...props, source: "See it again" })).toBe(false);
+	expect(sameMessageMarkdown(props, { ...props, mention: undefined })).toBe(false);
+	expect(sameMessageMarkdown(props, { ...props, className: "other" })).toBe(false);
+	expect(sameMessageMarkdown(props, { ...props, references: [{ ...reference, end: 10 }] })).toBe(
+		false,
+	);
+	expect(sameMessageMarkdown(props, { ...props, references: undefined })).toBe(false);
+	expect(sameMessageMarkdown(props, { ...props, references: [] })).toBe(false);
+});
+
+test("a message is drawn again when it starts or stops streaming, and not when its flag is only absent", () => {
+	let base = { source: "Same" };
+	expect(sameMessageMarkdown({ ...base, streaming: true }, { ...base, streaming: false })).toBe(
+		false,
+	);
+	expect(sameMessageMarkdown({ ...base, streaming: false }, { ...base, streaming: true })).toBe(
+		false,
+	);
+	expect(sameMessageMarkdown({ ...base, streaming: undefined }, { ...base, streaming: true })).toBe(
+		false,
+	);
+	expect(sameMessageMarkdown({ ...base, streaming: true }, { ...base, streaming: undefined })).toBe(
+		false,
+	);
+	// Absent and false both mean the message is settled.
+	expect(sameMessageMarkdown({ ...base, streaming: undefined }, { ...base, streaming: false }))
+		.toBe(true);
+	expect(sameMessageMarkdown({ ...base, streaming: false }, base)).toBe(true);
+	expect(sameMessageMarkdown({ ...base, streaming: true }, { ...base, streaming: true })).toBe(
+		true,
+	);
+	// Streaming shows as the root's status.
+	expect(renderToStaticMarkup(createElement(MessageMarkdown, { ...base, streaming: true })))
+		.toContain(
+			'data-status="running"',
+		);
+	expect(renderToStaticMarkup(createElement(MessageMarkdown, base))).toContain(
+		'data-status="complete"',
+	);
 });

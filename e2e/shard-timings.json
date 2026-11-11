@@ -147,6 +147,10 @@
 		"ms": 7507,
 		"tests": 3
 	},
+	"handover.e2e.ts": {
+		"ms": 75000,
+		"tests": 6
+	},
 	"harness-children.e2e.ts": {
 		"ms": 15351,
 		"tests": 3
@@ -222,6 +226,10 @@
 	"mcp-update.e2e.ts": {
 		"ms": 3675,
 		"tests": 2
+	},
+	"message-delivery.e2e.ts": {
+		"ms": 31000,
+		"tests": 6
 	},
 	"navigation-focus-recovery.e2e.ts": {
 		"ms": 3234,

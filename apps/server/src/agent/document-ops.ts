@@ -15,7 +15,9 @@ import * as Questions from "../questions/service";
 import * as QuestionStore from "../questions/store";
 import { reanchorScopes } from "../questions/decision-followup-reanchor";
 import { documentIdentity, implementationActive, publishStaged } from "../plan/service";
+import { characters, checkRange, READ_BYTES, ReadRangeError, size } from "../document-reading";
 
+import type { ReadRange } from "../document-reading";
 import type { Plan } from "../plan/service";
 import type { DocumentRoom } from "./tools";
 
@@ -74,6 +76,67 @@ export async function documentView(plan: Plan): Promise<Record<string, unknown>>
 	return documentSnapshot(plan, await documentIdentity(plan));
 }
 
+/** `documentView`, once `range` is known to name a position in its source. */
+export async function readableView(
+	plan: Plan,
+	range: ReadRange,
+): Promise<Record<string, unknown>> {
+	let view = await documentView(plan);
+	try {
+		checkRange(view.source as string, range);
+	} catch (err) {
+		if (err instanceof ReadRangeError) throw new Arguments.ArgumentError(err.message);
+		throw err;
+	}
+	return view;
+}
+
+/** A view inline in another tool's result may take this much of one read's bytes. */
+const CURRENT_PLAN_BYTES = READ_BYTES / 2;
+const LISTED_QUESTION_BYTES = 3_000;
+const LISTED_COMMENT_BYTES = 2_000;
+
+/** The last of `items` that fit `bytes` as JSON, and how many came before them. */
+function newest<T>(items: T[], bytes: number): { kept: T[]; omitted: number } {
+	let used = 2;
+	let kept: T[] = [];
+	for (let item of items.toReversed()) {
+		used += size(JSON.stringify(item)) + 1;
+		if (used > bytes) break;
+		kept.unshift(item);
+	}
+	return { kept, omitted: items.length - kept.length };
+}
+
+/**
+ * A tool result that already carries the document keeps the view's shape while it is small.
+ * Once the view would take more than half of one read's bytes it keeps the revision, identity,
+ * and the newest decisions and comments that fit, and points at the read for the source.
+ */
+export function currentPlan(view: Record<string, unknown>, read: string): Record<string, unknown> {
+	if (size(JSON.stringify(view)) <= CURRENT_PLAN_BYTES) return view;
+	let { source, blocks, questions, comments, ...rest } = view as {
+		source: string;
+		blocks: unknown[];
+		questions: unknown[];
+		comments: unknown[];
+	} & Record<string, unknown>;
+	let listed = newest(questions, LISTED_QUESTION_BYTES);
+	let commented = newest(comments, LISTED_COMMENT_BYTES);
+	return {
+		...rest,
+		comments: commented.kept,
+		...commented.omitted ? { comments_omitted: commented.omitted } : {},
+		questions: listed.kept,
+		...listed.omitted ? { questions_omitted: listed.omitted } : {},
+		source_omitted: {
+			characters: characters(source),
+			blocks: blocks.length,
+			read: `${read} reads the source and the blocks you can address, in parts.`,
+		},
+	};
+}
+
 /** Capture the read_plan fields without awaiting storage while the room queue is held. */
 export function documentSnapshot(
 	plan: Plan,
@@ -84,7 +147,7 @@ export function documentSnapshot(
 		document,
 		revision: plan.revision,
 		source,
-		blocks: edit.outline(plan, source),
+		blocks: edit.outline(plan),
 		/*
 		 * Accepted threads only, which only the earlier lifecycle made.
 		 *
@@ -159,6 +222,18 @@ export async function applyBlockEdit(
 	target: DocumentRoom,
 	args: { revision: number; operations: Parameters<typeof edit.apply>[2] },
 	options: { acting?: string; applied?: () => void; signal?: AbortSignal } = {},
+) {
+	let result = await applyBlocks(target, args, options);
+	// The revision the edit hands back is the one the Planner works from next, so what it holds is
+	// remembered as read, for a later write that finds the document has moved on again.
+	if (result.ok && result.revision === target.plan.revision) edit.outline(target.plan);
+	return result;
+}
+
+async function applyBlocks(
+	target: DocumentRoom,
+	args: { revision: number; operations: Parameters<typeof edit.apply>[2] },
+	options: { acting?: string; applied?: () => void; signal?: AbortSignal },
 ) {
 	if (options.signal?.aborted) return { ok: false as const, reason: "cancelled" };
 	if (implementationActive(target.plan)) return { ok: false as const, reason: "locked" };

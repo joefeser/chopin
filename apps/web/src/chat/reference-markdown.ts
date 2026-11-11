@@ -32,7 +32,8 @@ function text(value: string): MarkdownNode {
 function referenceNode(reference: Chat.Reference, index: number): MarkdownNode {
 	return {
 		type: "link",
-		url: reference.href,
+		// Only a document is a link. Every other kind is a chip with no address of its own.
+		url: reference.kind === "document" || reference.kind === "research" ? reference.href : "",
 		children: [text(reference.label)],
 		data: {
 			hProperties: {

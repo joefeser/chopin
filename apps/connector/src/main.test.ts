@@ -1,6 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
@@ -354,6 +354,86 @@ test("connect --keep-runs saves how many finished runs to keep, and removes olde
 		git(root, "worktree", "list", "--porcelain").split("\n")
 			.filter(line => line.startsWith("worktree ")),
 	).toHaveLength(2);
+});
+
+test.skipIf(process.platform === "win32")(
+	"the start check that names the agent once connected runs in an empty folder of its own where no checkout is registered, not the home directory, and in the checkout where one is",
+	async () => {
+		let record = join(scratch, "check-cwd");
+		await writeFile(
+			join(programs, "probe-cwd"),
+			'#!/bin/sh\npwd > "$PROBE_CWD"\nls -A >> "$PROBE_CWD"\n',
+			{ mode: 0o755 },
+		);
+		let asked = async (args: string[]) => {
+			await rm(record, { force: true });
+			let result = await connect("nothing", args, undefined, { PROBE_CWD: record });
+			expect(result.code).toBe(0);
+			for (let wait = 0; wait < 100 && !(await Bun.file(record).exists()); wait++) {
+				await Bun.sleep(50);
+			}
+			let [where = "", ...names] = (await readFile(record, "utf8")).trim().split("\n");
+			return { where, names };
+		};
+		let alone = await asked(["--no-sandbox", "--", "probe-cwd"]);
+		expect(alone.where).not.toBe(homedir());
+		expect(await realpath(dirname(alone.where))).toBe(await realpath(tmpdir()));
+		// Nothing in it to read, and it is gone with the connector.
+		expect(alone.names).toEqual([]);
+		await expect(stat(alone.where)).rejects.toThrow();
+		let root = await checkout();
+		let registered = await asked([root, "--no-sandbox", "--", "probe-cwd"]);
+		expect(registered.where).toBe(await realpath(root));
+	},
+);
+
+test("connect saves the sandbox options for service install, says what the sandbox is, and refuses nonsense before it pairs", async () => {
+	let root = await checkout();
+	let write = join(scratch, "extra-writable");
+	let started = await connect("nothing", [
+		root,
+		"--require-sandbox",
+		"--sandbox-host",
+		"store.example.com:8443",
+		"--sandbox-host=*.corp.test",
+		"--sandbox-write",
+		write,
+		"--",
+		"agent",
+	]);
+	expect(started.code).toBe(0);
+	// Where this machine has no sandbox it says so, and that runs are refused.
+	expect(started.stdout).toMatch(
+		/Sandboxed \((macOS Seatbelt|Linux bubblewrap|Windows ProcessContainer)\)|Not sandboxed: .* Runs are refused \(--require-sandbox is on\)\./,
+	);
+	expect(JSON.parse(await readFile(join(started.directory, "config.json"), "utf8")).connect.sandbox)
+		.toEqual({
+			require: true,
+			hosts: ["store.example.com:8443", "*.corp.test"],
+			writable: [write],
+		});
+	let off = await connect("nothing", [root, "--no-sandbox", "--", "agent"]);
+	expect(off.code).toBe(0);
+	expect(off.stdout).toContain(
+		"Not sandboxed: It is turned off with --no-sandbox. Runs go on without it.",
+	);
+	expect(JSON.parse(await readFile(join(off.directory, "config.json"), "utf8")).connect.sandbox)
+		.toEqual({ off: true });
+	for (
+		let [args, message] of [
+			[
+				["--require-sandbox", "--no-sandbox"],
+				"--require-sandbox and --no-sandbox can't be used together.",
+			],
+			[["--sandbox-host", "https://example.com"], "--sandbox-host takes a host like example.com"],
+			[["--sandbox-host", "*"], "--sandbox-host takes a host like example.com"],
+		] as const
+	) {
+		let refused = await connect("pairing", [root, ...args, "--", "agent"]);
+		expect(refused.code).toBe(1);
+		expect(refused.stderr).toContain(message);
+		expect(refused.requests).toEqual([]);
+	}
 });
 
 test("connect refuses a --keep-runs that isn't a whole number, before it pairs", async () => {

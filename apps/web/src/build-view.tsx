@@ -1,3 +1,4 @@
+import { usePendingWork } from "@chopin/editor";
 import { Face } from "@chopin/editor/face";
 import {
 	CheckIcon,
@@ -75,7 +76,11 @@ function MachineLabel({ machine }: { machine: BuildMachine }) {
 	return (
 		<span
 			className="build-card-machine"
-			title={machine.connected === false ? `${machine.label} is offline` : undefined}
+			title={machine.connected === false
+				? `${machine.label} is offline`
+				: machine.owner
+				? `${machine.label}, ${machine.owner}'s machine`
+				: undefined}
 		>
 			{machine.connected === undefined
 				? (
@@ -108,10 +113,8 @@ export function BuildView(
 		build,
 		canEdit,
 		comments,
-		onShowDecisions,
 		onShowDocument,
 		room,
-		unanswered,
 		userId,
 	}: {
 		active: boolean;
@@ -119,10 +122,8 @@ export function BuildView(
 		canEdit: boolean;
 		/** Accepted comments the document has not yet taken in. */
 		comments: number;
-		onShowDecisions: () => void;
 		onShowDocument: () => void;
 		room: string;
-		unanswered: number;
 		userId: string;
 	},
 ) {
@@ -132,6 +133,7 @@ export function BuildView(
 	let [stopping, setStopping] = useState(false);
 	let [returning, setReturning] = useState(false);
 	let [reason, setReason] = useState("");
+	usePendingWork(returning && reason.trim() !== "");
 	let [open, setOpen] = useState<Record<string, boolean>>({});
 	let [linked, setLinked] = useState<string>();
 	let [now, setNow] = useState(() => Date.now());
@@ -222,25 +224,16 @@ export function BuildView(
 				return {
 					title: "Waiting to build",
 					glyph: <span aria-hidden="true" className="build-glyph-dot" data-tone="warning" />,
-					detail: phase.decisions || phase.comments
+					detail: phase.comments
 						? (
 							<span className="build-blockers">
-								{phase.decisions && (
-									<button className="build-link link" onClick={onShowDecisions} type="button">
-										{unanswered > 0
-											? `Answer ${plural(unanswered, "decision", "decisions")} first`
-											: "Answer the open decisions first"}
-									</button>
-								)}
-								{phase.comments && (
-									<button className="build-link link" onClick={onShowDocument} type="button">
-										{comments > 0
-											? `Update the document for ${
-												plural(comments, "accepted comment", "accepted comments")
-											} first`
-											: "Update the document for accepted comments first"}
-									</button>
-								)}
+								<button className="build-link link" onClick={onShowDocument} type="button">
+									{comments > 0
+										? `Update the document for ${
+											plural(comments, "accepted comment", "accepted comments")
+										} first`
+										: "Update the document for accepted comments first"}
+								</button>
 							</span>
 						)
 						: "This document can’t be built yet.",

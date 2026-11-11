@@ -78,11 +78,11 @@
 				1
 			]
 		],
-		"sourceHash": "668907a52cf8e3bc0827158a8d22542652b627b9f848dd12d0f4dc148a93a6e0",
+		"sourceHash": "591e5b1e7633d7ad3440a2b02d05bef5263eeffee021f6276ea8fbe0b37c7cf6",
 		"producers": [
 			{
 				"file": "apps/web/src/design-audit/foundations.tsx",
-				"sourceHash": "668907a52cf8e3bc0827158a8d22542652b627b9f848dd12d0f4dc148a93a6e0"
+				"sourceHash": "591e5b1e7633d7ad3440a2b02d05bef5263eeffee021f6276ea8fbe0b37c7cf6"
 			}
 		]
 	},
@@ -272,7 +272,7 @@
 				1
 			]
 		],
-		"sourceHash": "9584bed3b159e5846bc3c7b4476698b6c711a3abdf973155176578b5f1005bbf"
+		"sourceHash": "7cb35269080441b053e05152af96bc86f66be9e35a854fff0caac9d5a4225c1c"
 	},
 	{
 		"file": "packages/editor/src/callout.css",
@@ -371,19 +371,6 @@
 				"animation",
 				"plan-research-swap-out 240ms var(--ease-out) both",
 				"CSS > .plan-research-swap > span[data-leaving]",
-				1
-			]
-		]
-	},
-	{
-		"file": "apps/web/src/chat/composer.css",
-		"reason": "User-approved Chopin mode halo uses 10px spread at 0.4 opacity on a separate outer layer. This addressing indicator keeps the input white and does not change shared elevation tiers.",
-		"cases": [
-			[
-				"shadow",
-				"box-shadow",
-				"0 0 var(--composer-glow-spread) var(--color-brand)",
-				"CSS > .chat-composer .composer-surface::before",
 				1
 			]
 		]

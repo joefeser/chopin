@@ -1,10 +1,32 @@
-import { MENU_ROW, MENU_ROW_OFF, MENU_ROW_ON, MENU_SURFACE } from "@chopin/editor";
-
+import { COMMAND_KINDS } from "@chopin/protocol/commands";
+import { GlobeIcon, PlayIcon, SparklesIcon, TerminalIcon, WrenchIcon } from "lucide-react";
+import { useEffect } from "react";
+import { ComposerCommandItem } from "@/components/assistant-ui/elements/composer";
+import { ComposerPopover } from "./assistant-ui/composer-popover";
 import { referenceOptionId } from "./reference-picker";
 
 import type { ChatCommand } from "./commands";
 
-/** The document's `/` menu, anchored above the Chat composer. */
+/** The row's icon is the kind the command is: Chat's own, a skill, a prompt template, a workflow. */
+function icon(command: ChatCommand) {
+	if (command.source === "chat") return GlobeIcon;
+	switch (command.commandKind) {
+		case COMMAND_KINDS.skill:
+			return SparklesIcon;
+		case COMMAND_KINDS.prompt:
+			return TerminalIcon;
+		case COMMAND_KINDS.workflow:
+			return PlayIcon;
+		default:
+			return WrenchIcon;
+	}
+}
+
+/**
+ * The `/` menu over the Chat composer, assistant-ui's Slash commands: the icon of what each is,
+ * `/name`, one line of its description, and a `↵` on the row that Enter runs. Chat's own command
+ * comes first, then the ones the document's agent reports, in the order it reported them.
+ */
 export function CommandPicker(
 	{
 		active,
@@ -20,31 +42,33 @@ export function CommandPicker(
 		options: readonly ChatCommand[];
 	},
 ) {
+	useEffect(() => {
+		let frame = requestAnimationFrame(() => {
+			document.getElementById(referenceOptionId(id, active))?.scrollIntoView({ block: "nearest" });
+		});
+		return () => cancelAnimationFrame(frame);
+	}, [active, id]);
+
 	return (
-		<div
-			className={`absolute bottom-full left-2.5 z-30 mb-1 w-56 max-w-[calc(100%-1.25rem)] ${MENU_SURFACE}`}
-			data-chat-command-picker=""
-			data-focus-boundary=""
-		>
-			<div aria-label="Commands" id={id} role="listbox">
-				{options.map((option, index) => (
-					<button
-						aria-selected={index === active}
-						className={`${MENU_ROW} ${index === active ? MENU_ROW_ON : MENU_ROW_OFF}`}
-						data-press="wide"
-						id={referenceOptionId(id, index)}
-						key={option.id}
-						onClick={() => onSelect(option)}
-						onMouseDown={event => event.preventDefault()}
-						onMouseEnter={() => onActive(index)}
-						role="option"
-						tabIndex={-1}
-						type="button"
-					>
-						{option.label}
-					</button>
-				))}
-			</div>
-		</div>
+		<ComposerPopover id={id} kind="commands" label="Commands">
+			{options.map((command, index) => (
+				<ComposerCommandItem
+					active={index === active}
+					aria-selected={index === active}
+					command={{
+						name: command.name,
+						description: command.description ?? "",
+						icon: icon(command),
+					}}
+					id={referenceOptionId(id, index)}
+					key={command.id}
+					onClick={() => onSelect(command)}
+					onMouseDown={event => event.preventDefault()}
+					onMouseEnter={() => onActive(index)}
+					role="option"
+					tabIndex={-1}
+				/>
+			))}
+		</ComposerPopover>
 	);
 }

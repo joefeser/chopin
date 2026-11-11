@@ -1,0 +1,135 @@
+{
+	"schemaVersion": 1,
+	"files": [
+		{
+			"file": "apps/web/src/components/assistant-ui/elements/composer.tsx",
+			"registry": "@assistant-ui",
+			"item": "elements-composer",
+			"version": "assistant-ui/assistant-ui@d25a97a22f00",
+			"sha256": "397fb48354d73ae3eb2e51fc4872601eb8cc863e981520a4a7de65865db65308",
+			"patch": "apps/web/src/components/assistant-ui/elements/composer.tsx.patch",
+			"patchSha256": "0218b24a9992b131a5be6f1d5e99fecfcc323b5112dda272ac9de1c66028a347"
+		},
+		{
+			"file": "apps/web/src/components/assistant-ui/elements/directive-text.tsx",
+			"registry": "@assistant-ui",
+			"item": "elements-directive-text",
+			"version": "assistant-ui/assistant-ui@2c298dfa8392",
+			"sha256": "7865b18353476c4963a1f59cd6c0d72a994899ee2acf27eeb849e7942bf0b3d4",
+			"patch": "apps/web/src/components/assistant-ui/elements/directive-text.tsx.patch",
+			"patchSha256": "ddf4a3b22762db4c6d1bba03b26009f138ee1cea8a253b6151e545ad5a0e61b7"
+		},
+		{
+			"file": "apps/web/src/components/assistant-ui/elements/message-attachment.tsx",
+			"registry": "@assistant-ui",
+			"item": "elements-message-attachment",
+			"version": "assistant-ui/assistant-ui@ec601b37f6b6",
+			"sha256": "d577a91802b3caa44e4f1e9d2e2948893b5761c53b4654ef5d94ea66f9f1f30c"
+		},
+		{
+			"file": "apps/web/src/components/assistant-ui/elements/model-selector.tsx",
+			"registry": "@assistant-ui",
+			"item": "elements-model-selector",
+			"version": "assistant-ui/assistant-ui@d25a97a22f00",
+			"sha256": "b8cf3a7ebf2c9ae778c2e65680bbb834aa140dc8acd38811e23b1b1f149f809b"
+		},
+		{
+			"file": "apps/web/src/components/assistant-ui/elements/surfaces.tsx",
+			"registry": "@assistant-ui",
+			"item": "elements-surfaces",
+			"version": "assistant-ui/assistant-ui@ec601b37f6b6",
+			"sha256": "5d81fbb669e67ae20026cd30ed57efc51a5e3ee0f4f5d265e1723de75359b8fa"
+		},
+		{
+			"file": "apps/web/src/components/assistant-ui/utils/model-selection.ts",
+			"registry": "@assistant-ui",
+			"item": "elements-model-selection",
+			"version": "assistant-ui/assistant-ui@d25a97a22f00",
+			"sha256": "019d3dca2d33724de16b9eb54757344cd05bd5c89f2fc3cb2885cdcc2590f4d9"
+		},
+		{
+			"file": "apps/web/src/components/assistant-ui/utils/range.ts",
+			"registry": "@assistant-ui",
+			"item": "elements-range",
+			"version": "assistant-ui/assistant-ui@d25a97a22f00",
+			"sha256": "555d880ea1ac3a2b8f0cdbe76bece147e72f6748a07a643dbe404957c64d451d"
+		},
+		{
+			"file": "apps/web/src/components/assistant-ui/utils/useIsomorphicLayoutEffect.ts",
+			"registry": "@assistant-ui",
+			"item": "elements-surfaces",
+			"version": "assistant-ui/assistant-ui@ec601b37f6b6",
+			"sha256": "8db117d730e640655e5099e086af4e00d545c283839d9ef5885ca93419d51893"
+		},
+		{
+			"file": "apps/web/src/components/geometry.css",
+			"registry": "tailwindcss",
+			"item": "theme.css",
+			"version": "tailwindcss@4.3.0",
+			"sha256": "b9fbc0e484bc84330463cf8e53c6f9a298f865dd80cf794321810a735cfad13a"
+		},
+		{
+			"file": "apps/web/src/components/ui/badge.tsx",
+			"registry": "@assistant-ui",
+			"item": "badge",
+			"version": "assistant-ui/assistant-ui@2c298dfa8392",
+			"sha256": "610c24620259c690cacbb8a79fe3278aad6eaacb66e78e365de6337cdd73920c"
+		},
+		{
+			"file": "apps/web/src/components/ui/button.tsx",
+			"registry": "@shadcn",
+			"item": "button",
+			"version": "shadcn-ui/ui@8ab27715521c",
+			"sha256": "313353436d0fcc8e44ab470adb614b9fd013d28626f624328ea0d66d41a6c81b"
+		},
+		{
+			"file": "apps/web/src/components/ui/command.tsx",
+			"registry": "@shadcn",
+			"item": "command",
+			"version": "shadcn-ui/ui@8ab27715521c",
+			"sha256": "35de96d755a49978e2e8bc2282d968eddbf4bdb8e9a54d39ede8c57910f921c1"
+		},
+		{
+			"file": "apps/web/src/components/ui/dialog.tsx",
+			"registry": "@shadcn",
+			"item": "dialog",
+			"version": "shadcn-ui/ui@8ab27715521c",
+			"sha256": "e1a331d1617ef6381511f537c5652b13e1f9a4d627a25d80853d6171b7e8b8a5"
+		},
+		{
+			"file": "apps/web/src/components/ui/input-group.tsx",
+			"registry": "@shadcn",
+			"item": "input-group",
+			"version": "shadcn-ui/ui@8ab27715521c",
+			"sha256": "7e768d41f247b1a4a3b0d214453dbeb1c2150aba500f5c0037b0285dfbe6a899"
+		},
+		{
+			"file": "apps/web/src/components/ui/input.tsx",
+			"registry": "@shadcn",
+			"item": "input",
+			"version": "shadcn-ui/ui@8ab27715521c",
+			"sha256": "dab990dfefa0ba78854ab6602ad074270dba9d7d1262184d9bfbb62bd990903b"
+		},
+		{
+			"file": "apps/web/src/components/ui/popover.tsx",
+			"registry": "@shadcn",
+			"item": "popover",
+			"version": "shadcn-ui/ui@8ab27715521c",
+			"sha256": "5fecff622f4eecc06e8be32bface11c59d529be5c0a1484c78c9e40530b2b7d0"
+		},
+		{
+			"file": "apps/web/src/components/ui/textarea.tsx",
+			"registry": "@shadcn",
+			"item": "textarea",
+			"version": "shadcn-ui/ui@8ab27715521c",
+			"sha256": "82601c91ffc6c727d924162c78d7cb853114bcced4e2eb922a68ca12d4239c0f"
+		},
+		{
+			"file": "apps/web/src/lib/utils.ts",
+			"registry": "@assistant-ui",
+			"item": "utils",
+			"version": "assistant-ui/assistant-ui@d25a97a22f00",
+			"sha256": "55bbdc94cef3e0c8a8bba386e94f97228dd2c967fe61466fc565378890550c08"
+		}
+	]
+}

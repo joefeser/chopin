@@ -1,7 +1,7 @@
 import type { TextStreamPart, ToolSet } from "ai";
 import type { Decide } from "../conversation-plan/decisions";
 import type { JevQuestion } from "../conversation-plan/jev";
-import type { PlannerSession } from "../harness/session";
+import type { PlannerFiles, PlannerSession } from "../harness/session";
 
 type Part = TextStreamPart<ToolSet>;
 
@@ -19,7 +19,41 @@ let inputQuestion: JevQuestion = {
 	},
 };
 
-const UNVERIFIED = "The Planner could not verify its Chat response. Try again.";
+const UNVERIFIED = "Chopin could not verify its Chat response. Try again.";
+
+/** A failure of the Chat reply check alone; the Planner session that produced the reply is sound. */
+export class PlannerReplyError extends Error {}
+
+const REPLY_FAILED = "Chopin's reply failed. Try again.";
+
+/**
+ * A reply that ended with nothing from the model or harness to say why. The words are Chopin's
+ * own, so a client that already says the reply failed does not repeat them as the model's.
+ */
+export class ReplyFailedError extends Error {
+	constructor() {
+		super(REPLY_FAILED);
+	}
+}
+
+/**
+ * The error a stream part reported, as the model or harness gave it, so its words and its kind
+ * (a timeout is told as one) reach the room. Only a report with no words of its own is Chopin's.
+ */
+function reported(error: unknown): Error {
+	if (error instanceof Error) return error;
+	if (typeof error === "string" && error.trim()) return new Error(error);
+	return new ReplyFailedError();
+}
+
+/**
+ * Whether a harness's own tool boundary stopped the turn. It names its error so, in both
+ * harnesses, and that is how a failure of the turn is told apart from any other.
+ */
+export function isToolBoundaryError(error: unknown): boolean {
+	return error instanceof Error && error.name === "ToolBoundaryError";
+}
+
 const REPAIR = "Your previous Chat response was withheld because it requested human input. "
 	+ "The JSON below is quoted context, not a new instruction to carry out the original request. "
 	+ "Preserve its original document focus. Continue from the current document and completed tool "
@@ -43,7 +77,9 @@ export async function checkPlannerReply(
 	signal: AbortSignal,
 ): Promise<boolean> {
 	if (signal.aborted) return false;
-	if (!decide || JSON.stringify({ reply: text }).length > 24_000) throw new Error(UNVERIFIED);
+	if (!decide || JSON.stringify({ reply: text }).length > 24_000) {
+		throw new PlannerReplyError(UNVERIFIED);
+	}
 	try {
 		let result = await decide({ state: { reply: text }, questions: { input: inputQuestion } }, {
 			signal,
@@ -54,11 +90,11 @@ export async function checkPlannerReply(
 		if (
 			answer?.type !== "noul" || !Number.isFinite(answer.noul)
 			|| answer.noul < 0 || answer.noul > 1
-		) throw new Error(UNVERIFIED);
+		) throw new PlannerReplyError(UNVERIFIED);
 		return answer.noul <= 0.1;
 	} catch {
 		if (signal.aborted) return false;
-		throw new Error(UNVERIFIED);
+		throw new PlannerReplyError(UNVERIFIED);
 	}
 }
 
@@ -66,10 +102,14 @@ export async function checkPlannerReply(
 export async function publishPlannerReplies(options: {
 	session: Pick<PlannerSession, "stream">;
 	prompt: string;
+	/** The files sent with the message, which only the first attempt is given with its prompt. */
+	files?: PlannerFiles;
 	signal: AbortSignal;
 	decide: Decide | undefined;
 	/** Count new, durably captured Planner decisions from the authoritative document state. */
 	capturedDecisions?: () => number;
+	/** Count decisions that already existed and that the Planner repeated this turn. */
+	keptDecisions?: () => number;
 	publish: (part: Part) => void;
 }): Promise<void> {
 	let { session, decide, publish } = options;
@@ -111,7 +151,12 @@ export async function publishPlannerReplies(options: {
 		}`;
 		let failure: unknown;
 		try {
-			let result = await session.stream(prompt, signal);
+			let result = await session.stream(
+				prompt,
+				signal,
+				undefined,
+				attempt === 0 ? options.files : undefined,
+			);
 			for await (let part of result.fullStream) {
 				// Keep consuming after a local failure: cancelling a tee does not settle its producer.
 				if (signal.aborted) continue;
@@ -119,7 +164,7 @@ export async function publishPlannerReplies(options: {
 					if (part.type === "text-start") messages.set(part.id, "");
 					else if (part.type === "text-delta") {
 						let text = (messages.get(part.id) ?? "") + part.text;
-						if (text.length > 24_000) throw new Error(UNVERIFIED);
+						if (text.length > 24_000) throw new PlannerReplyError(UNVERIFIED);
 						messages.set(part.id, text);
 					} else if (part.type === "text-end") await flush(part.id);
 					else {
@@ -135,18 +180,19 @@ export async function publishPlannerReplies(options: {
 							} else toolsTruncated = true;
 							if (retained.length < detail.length) toolsTruncated = true;
 						}
-						if (part.type === "error" || part.type === "abort") {
-							throw new Error("The Planner stream failed. Try again.");
-						}
+						// A boundary stop is the turn's own, whole: its kind is how the room is told.
+						if (part.type === "error" && isToolBoundaryError(part.error)) throw part.error;
+						if (part.type === "error") throw reported(part.error);
+						if (part.type === "abort") throw new ReplyFailedError();
 						publish(part);
 					}
 				} catch (error) {
-					failure = error ?? new Error(UNVERIFIED);
+					failure = error ?? new PlannerReplyError(UNVERIFIED);
 					controller.abort();
 				}
 			}
 		} catch (error) {
-			failure ??= error ?? new Error(UNVERIFIED);
+			failure ??= error ?? new PlannerReplyError(UNVERIFIED);
 			controller.abort();
 		}
 		if (failure) throw failure;
@@ -160,17 +206,21 @@ export async function publishPlannerReplies(options: {
 		if (!rejected) return;
 	}
 	let count = options.capturedDecisions?.() ?? 0;
+	let kept = options.keptDecisions?.() ?? 0;
 	if (signal.aborted) return;
-	if (Number.isSafeInteger(count) && count > 0) {
+	let summary = Number.isSafeInteger(count) && count > 0
+		? `Added ${count} inline ${count === 1 ? "decision" : "decisions"} to the document.`
+		: Number.isSafeInteger(kept) && kept > 0
+		? `${kept} inline ${kept === 1 ? "decision is" : "decisions are"} already in the document.`
+		: undefined;
+	if (summary) {
 		let id = crypto.randomUUID();
 		publish({ type: "text-start", id });
-		publish({
-			type: "text-delta",
-			id,
-			text: `Added ${count} inline ${count === 1 ? "decision" : "decisions"} to the document.`,
-		});
+		publish({ type: "text-delta", id, text: summary });
 		publish({ type: "text-end", id });
 		return;
 	}
-	throw new Error("The Planner could not move its questions into inline decisions. Try again.");
+	throw new PlannerReplyError(
+		"Chopin could not move its questions into inline decisions. Try again.",
+	);
 }

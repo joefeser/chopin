@@ -18,18 +18,27 @@ requests appear in its terminal with the command or paths involved, and are
 declined when no interactive terminal is available. The agent retains its
 normal tools, project instructions and configured services.
 
-## Build a settled plan
+## Build a plan
 
-1. Resolve planning questions and accepted comments awaiting document updates.
-   Until then **Build plan** in the document header is inert and its tooltip
-   says what is left.
+1. Update the document for accepted comments, and finish any required
+   investigation. Until then **Build plan** in the document header is inert and
+   its tooltip says what is left. Open decisions do not wait: the agent builds
+   on its best judgment, is told which decisions are unanswered, and lists them
+   as assumed in each pull request. See
+   [open decisions never block a build](implementation-lifecycle.md#open-decisions-never-block-a-build).
 2. Select **Build plan**. When the tasks are missing or older than the
    document, it asks the hosted Planner to draft them without posting a Chat
    message, then starts them without a separate review. See
    [drafting tasks from Build plan](implementation-lifecycle.md#drafting-tasks-from-build-plan).
-3. The build runs on your own local agent: the server picks your idle
-   connection for the repository, preferring the one that last ran work for this
-   document, and derives the checkout from it. Without one, the header reads
+3. The build runs on the machine you chose for the document: the server picks
+   your idle connection for the repository, preferring the one that last ran work
+   for this document, and derives the checkout from it. If you chose a
+   teammate's shared machine, or made one your default and chose none, it runs
+   there instead, as that machine's owner (see
+   [Share a machine with teammates](chopin-cli.md#share-a-machine-with-teammates)):
+   the connection it queues on belongs to the owner, the build records you as
+   the person who asked, and only that connection claims and reports it, while
+   the machine is shared and its owner can push to the repository. Without one, the header reads
    **Build stopped**, and Build says your local agent isn't connected and shows
    the connector command to run in your project folder; **Retry** tries again
    once connected. Approval persists the document and graph

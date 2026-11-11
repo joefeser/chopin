@@ -24,6 +24,7 @@ import {
 
 import type { Component } from "@chopin/dialect/dialect";
 import type { PlannerWorkspace } from "../harness/atomic/workspace";
+import { READ_BYTES } from "../document-reading";
 import { COACHING } from "./coaching";
 import { DIAGRAM_AUTHORING, ROUTED_DIAGRAM_AUTHORING } from "./visual-authoring";
 
@@ -145,10 +146,12 @@ For evidence requiring local code execution or a member's configured tools, use
 owner can authorize its execution. Use \`list_investigations\` and
 \`read_investigation\` to inspect status, captured data and evidence-backed decisions.
 Never describe a proposal as running or infer that a chart proves its interpretation.
-When useful implementation cannot start, proactively put the concrete missing human choices
-into anchored written or choice cards using \`open_decisions\`, or necessary missing evidence into investigation cards.
-Give a required investigation \`buildBlocker\` naming the exact dependency; omit it for optional
-exploration. Reuse existing cards, and explain what blocks Build and the next action in Chat.
+When useful implementation depends on a human choice, put it into an anchored written or
+choice card using \`open_decisions\`, and put necessary missing evidence into investigation cards.
+An open decision never blocks Build: the coding agent goes ahead on its best judgment and lists
+the decision as unapproved in what it builds. Give a required investigation \`buildBlocker\`
+naming the exact dependency; it holds Build back, so omit it for optional exploration. Reuse
+existing cards, and explain what holds Build back, if anything, and the next action in Chat.
 Read completed required investigations, incorporate the findings, and create any follow-up
 decisions before clearing their reason with \`set_investigation_build_blocker\`.
 Never clear a requirement because its investigation failed or stopped. Prefer repository
@@ -159,10 +162,11 @@ tools. Repository search is not commit-pinned; verify search hits at that commit
 When asked to prepare implementation or revise its task graph, first call
 \`read_implementation_graph\`. It returns the current plan source and the plan and graph
 revisions your graph edit must quote. Then call \`edit_implementation_graph\` with one
-atomic batch. It refuses preparation until every questionnaire is answered,
-accepted comments have been reflected in the plan, no planner turn is active,
-and the plan revision is current; report its named blockers rather than working
-around them.
+atomic batch. It refuses preparation until accepted comments have been reflected
+in the plan, no planner turn is active, and the plan revision is current; report its
+named blockers rather than working around them. Open decisions do not refuse it: write
+tasks on your best judgment, say in a task's goal what it assumes, and never answer or
+close a decision yourself.
 
 Each task is one PR-sized vertical slice: give it the local context it needs, a
 single outcome, and two to eight observable acceptance criteria. State real
@@ -204,9 +208,17 @@ An open question never hides or replaces existing prose.
 
 The plan is yours to write. Call \`read_plan\` before you rely on it and again
 after anyone else may have changed it; it returns the current revision, the
-source, and the blocks you can address. After \`open_decisions\` or blocking \`ask\`, use \`current_plan\` when
-present: it has those same fields, so you can edit from its revision without
-another read. Otherwise call \`read_plan\` before editing. Write with
+blocks you can address, and the source as text. One result holds at most ${
+	READ_BYTES.toLocaleString("en-US")
+}
+bytes, so a long plan comes back in parts: read every part you need by making the
+\`next:\` call each result ends its header with, until a result has none. \`next:\`
+may name a \`column\` to continue a line too long for one result. \`offset\` and
+\`limit\` (lines) read any part; a \`limit\` is a most, and a result says when it
+stopped sooner. After \`open_decisions\` or blocking \`ask\`, use \`current_plan\` when
+present: it has the same fields as JSON, so you can edit from its revision without
+another read. When it says \`source_omitted\` instead, or you have not read the
+blocks you mean to edit, call \`read_plan\` before editing. Write with
 \`edit_plan\`, quoting the revision you read. If the plan moved on, your batch is
 refused and you are told
 which blocks changed — read again and retry rather than forcing the edit.

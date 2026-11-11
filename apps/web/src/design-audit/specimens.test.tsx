@@ -274,12 +274,59 @@ describe("design audit specimens", () => {
 		expect(empty).toContain('<p class="project-sidebar-empty">No archived documents</p>');
 		expect(empty).toContain("No matching documents");
 		expect(markup).toContain('data-chat-entry="true"');
-		let chat = plate(markup, "chat");
+		// The apostrophe React escapes in text, written back, so copy reads as typed.
+		let chat = plate(markup, "chat").replaceAll("&#x27;", "'");
 		expect(chat).toContain('class="workspace-root');
-		expect(chat).toContain('class="composer-surface field"');
+		expect(chat).toContain('class="composer-surface"');
+		expect(chat).toContain('role="toolbar"');
 		expect(chat).toContain('class="composer-notice motion-feedback"');
-		expect(chat).toContain("Reconnect");
-		expect(chat).toContain('aria-label="Stop Chopin"');
+		// The connection and the Planner's states: the one banner on the composer's edge in each phase,
+		// and the machine button's dot and note.
+		// The banner announces nothing itself: the page's one live region does.
+		expect(chat).toMatch(
+			/class="composer-notice" data-banner="" data-connection-banner=""[^>]*data-warning="true"/,
+		);
+		expect(chat).not.toMatch(/data-connection-banner=""[^>]*role="(alert|status)"/);
+		expect(chat).toContain('data-phase="reconnecting"');
+		expect(chat).toContain('data-phase="dropped"');
+		expect(chat).toContain('data-phase="resumed"');
+		expect(chat).toContain(">attempt 3</span>");
+		expect(chat).toContain("Back. The reply kept going.");
+		expect(chat).toContain("Couldn't finish the reply.");
+		expect(chat).toContain("429 Too Many Requests");
+		expect(chat).toContain("Retrying");
+		expect(chat).toContain('data-error-banner=""');
+		expect(chat).toContain("Can't connect to @mona's machine.");
+		expect(chat).toContain("Can't connect to Build box");
+		expect(chat).toContain("How to fix");
+		// With no machine button the strip carries each state, and draws the reason as given.
+		expect(chat).toContain(
+			'<span class="composer-notice-line">The checkout\'s git config sets a credential helper</span>',
+		);
+		expect(chat).toContain("Can't connect to @mona's machine.");
+		expect(chat).toContain("Connecting to @mona's machine");
+		expect(chat).toContain("@mona's machine is offline. Your work is kept.");
+		expect(chat).toContain("@mona's machine stepped away. Your work is kept until ");
+		expect(chat).toContain("No machine is connected.");
+		expect(chat).toContain("Connecting to Build box");
+		expect(chat).toContain("Build box is offline. Your work is kept.");
+		expect(chat).toContain('data-planner="starting"');
+		expect(chat).toContain('data-planner="failing"');
+		expect(chat).toContain('data-planner="away"');
+		expect(chat).toContain(">Reconnect</button>");
+		expect(chat).toContain(">Try again</button>");
+		// The machine button's dots beside each state: only a healthy one keeps the machine's green,
+		// and no machine connected has no dot at all.
+		let cells = chat.split('class="design-audit-planner-presence"')[1]!.split(
+			'<div class="design-audit-planner-glyph">',
+		).slice(1);
+		expect(cells).toHaveLength(6);
+		expect(cells[0]).toContain('data-state="connected"');
+		for (let cell of cells.slice(1)) expect(cell).not.toContain('data-state="connected"');
+		let none = cells.at(-1)!;
+		expect(none).toContain("No machine is connected.");
+		expect(none).not.toContain("status-dot");
+		expect(chat).toContain('aria-label="Stop generating"');
 		expect(chat).toContain("Read-only access");
 		expect(chat).toContain("Document archived");
 		expect(chat).not.toContain("<textarea");

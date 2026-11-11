@@ -57,7 +57,14 @@ Every adapter must provide:
 - paired machines found by token hash, with revision-checked credential rotation,
   re-authorization and owner-only revocation that discards credentials;
 - revision-checked credential rotation that cannot recreate a deleted session;
-- startup removal of expired and metadata-only sessions and every Planner owner reference;
+- startup removal of expired and metadata-only sessions and every Planner owner
+  reference, except that of a document whose persisted Planner hold names a session the
+  reset keeps;
+- plain, lock-free reads of a lease (`leases.peek`), so a process waiting for the writer
+  lease never queues behind its holder;
+- Planner holds, Planner credential digests, MCP sessions and deferred Planner turns
+  that outlive a process; holds and deferred turns are written under the writer lease,
+  and a deferred turn changes only from the state the write expects;
 - startup clearing of child channel conversations, fenced by the writer lease
   and idempotent;
 - renewable leases whose fencing token protects commits, epoch replacements,
@@ -111,10 +118,16 @@ The migration runner owns `chopin_migrations`, including a checksum for each
 applied migration. The application schema contains:
 
 | `machine_choices` | Each person's chosen machine for one document; no row is automatic. Revoking the machine or deleting the document removes it. |
-| `machine_favorites` | Each person's one favorite machine, which Automatic prefers; no row is none. Revoking the machine removes it. |
+| `machine_favorites` | Each person's one favorite machine, their own or a teammate's shared one, which Automatic prefers; no row is none. Revoking the machine removes it; its owner no longer sharing it removes teammates' (not its owner's). |
 | `document_versions` | Activity history: one row per editing session with its author (absent for Chopin), the canonical MDX it left, revision, hash, and start and end times. |
 | `workflow_run_stages` | Every stage of each workflow run a document's Chat shows, keyed by document, run ID and stage ID, with its order, status, name, kind, parent stage IDs and start and end seconds. Bounded per stage, not per run. A run's rows go when Chat stops showing its card, or with the document. |
+| `planner_link_holds` | One row per document whose remote Planner link left work or a hand-over window for the next process: the owner's browser login session (the row goes with it) or the paired machine (and no login, which a restart cannot keep), user, generation, its held sessions (waiting request IDs, with the kind and decisions of each question so its answer can be given again, unacknowledged answers, held stops), when it was suspended, `handover_until` (the length of its hand-over window after the write, which the next process counts again from its own start and then rewrites the row without, so no process after it is given the window), and the fencing token it was written under. Written when a link drops with work kept and at the cut, removed while a live link backs the hold and by everything that ends one, and with the document. Holds no secret. |
+| `planner_model_choices` | One row per document whose people chose a model or a thinking level for its Planner: either or both (a row with neither is removed), who chose last and when, and the fencing token it was written under. Written under the writer lease before the choice is answered or shown to the room, replaced whole by the next choice, and removed with the document. The strings are not checked here: the server resolves them against the catalog the harness or attached client reports at the turn that uses them, so a model that has gone stays stored, and returns to force if it comes back. Holds no secret. |
+| `planner_credentials` | The SHA-256 digest, machine, document and expiry of each credential a paired machine handed to a Planner backend, written before the credential is handed out. Rows go when they expire, with the machine's end or withdrawal, and with the document. No token is stored. |
+| `planner_deferred_turns` | One row per acknowledged Planner request whose turn had not started (`composer`, `invoke_planner`, `invoke_system`, `comment` or `draft`): what its turn and a retried request need, its state (`waiting`, `started`, `ended`, `interrupted`, `cancelled`), the fencing token of its latest transition, when it was resolved and, for a request Chopin cancelled, why (`agent`, `access` or `unavailable`). A request ID is unique within a document, and a comment thread has at most one `waiting` row. Rows go with the document. |
+| `mcp_sessions` | MCP sessions: ID, user, client name and version, creation and last-seen times. Idle sessions are swept. |
 | `decision_answers` | Saved answers to decisions the Planner left open, one row per document and decision: the saved generation, when it was saved, the Planner turn claimed to carry it and when that turn was delivered. A newer generation replaces the row and waits again; a delivered row stays marked so it never runs twice. Rows go with the document. |
+| `chat_attachments` | The images and text files sent with Chat messages, one row per file: its bytes, its sniffed type (a PNG, JPEG, WebP or GIF image, or plain text, held by a check, never HTML or SVG), its name and size, who uploaded it and when. A row has no message until one is sent with it (then the message's request ID and the file's place in it); until then only its uploader reads it, and one nobody sent within a day is forgotten. Deleting the message or the document removes it. |
 
 `channel_state.unanswered_decisions` is maintained in JavaScript rather than a
 generated column. Sidecar text may contain an escaped NUL or an unpaired UTF-16
@@ -139,6 +152,20 @@ display title and slug in the same fenced collaboration transaction.
 A rename promotes a new collision-suffixed slug but retains all former slugs as
 aliases that cannot be assigned to another channel while it exists. Archived
 channels continue to reserve their aliases.
+
+Files sent with a Chat message (see [Files in Chat](hosted-agent.md#files-in-chat)) are rows of
+`chat_attachments`, kept with the document and never in the sidecar: the sidecar's transcript entry
+carries only their names, kinds, types and sizes. The same rows are the memory adapter's, and the
+storage contract holds both to the same rules.
+
+A transcript entry keeps what the composer's `@` and `/` point at (a command, a heading of the
+document, a Decision, a file of the repository) under `pointers`, and only references to other
+documents and to research cards under `references`. A server from before pointers restores
+`references` strictly and refuses a sidecar with any other kind in it, so a pointer in that list
+would leave a rolled-back server unable to open the document; under a key it does not know, it reads
+the message as the words it was written in. A server that knows pointers merges them back by where
+each begins in the text, which restores the list that was stored, exactly
+(`apps/server/src/chat/stored-pointers.ts`, held by `rollback.test.ts` against the real older reader).
 
 ## Archival and deletion
 
@@ -268,6 +295,16 @@ runtime does not advance the summary or cursor, and startup forces status to
 `unavailable`. A later owner creates a fresh Copilot SDK session from bounded
 transcript context and the current document.
 
+The reset keeps one owner reference: a document whose `planner_link_holds` row names
+the session that owns it, when that session has credentials and has not expired. A hold
+is the persisted state of a remote Planner whose link was live when a process released
+the lease, and the next process rebuilds it, so clearing its owner would end the
+Planner it is meant to hand over. A session the reset deletes takes its holds with it
+and its documents' owners are cleared as before. A paired machine's hold names the
+machine, not a login: its delegated login is a metadata-only session the reset deletes, the
+document's owner is cleared with it, and the machine's backend claims the document again
+when it attaches.
+
 A child document has no Chat of its own. Next, still under the writer lease and
 before any room opens, `CollaborationStore.dropChildConversations` empties each
 child's transcript and removes its workflow runs, conversation analysis, card
@@ -285,7 +322,8 @@ identity, progress, and history remain durable across application restart.
 ## Writer lease
 
 One database-wide `chopin:writer` lease permits one active application process.
-A second process refuses startup. The holder renews the lease every 10 seconds
+A second process refuses startup, unless it was started with `HANDOVER=wait`: it then
+waits for the holder's release. The holder renews the lease every 10 seconds
 on its own connection, outside the shared pool. A renewal attempt that takes
 more than about five seconds fails and is retried until the safety deadline,
 25 seconds after the last successful renewal was sent. A renewal that gets no
@@ -306,9 +344,22 @@ behind a takeover cannot extend a lease that expired meanwhile. Once the holder
 starts shutting down, a renewal still in flight neither re-arms the safety
 deadline nor schedules a retry.
 
-This lease is why the current deployment model cannot perform a rolling
-application replacement against one database. See
-[Self-hosting](self-hosting.md) for upgrade and backup guidance.
+`leases.peek(name)` reads the lease row with a plain query. It takes no lock, so it
+neither waits for a holder's writes nor delays them, and reports whether the lease is
+free (released or expired) on the database's own clock. A process that waits for the
+lease polls it and calls `acquire` only once the lease is free.
+
+Deferred Planner turns are fenced by the same lease. A change to one rides a
+`collaboration.commit` through `deferredTurns`, in the commit's transaction, so a request
+is durable no later than the entry that acknowledges it and is not kept when the commit
+is refused. Fencing tokens compare only within one lease, and every row is written
+under the writer lease. The Chat service writes and reads these rows; see
+[Saved requests](hosted-agent.md#saved-requests).
+
+This lease is why only one process serves at a time, and the hand-over between two is
+the holder's release followed by the waiting process's acquisition; see
+[Deploys nobody can see](zero-downtime-deploys.md). Several processes serving at once
+is not supported. See [Self-hosting](self-hosting.md) for upgrade and backup guidance.
 
 ## Migrations
 

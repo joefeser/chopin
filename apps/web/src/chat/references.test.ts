@@ -2,25 +2,37 @@ import { describe, expect, test } from "bun:test";
 
 import {
 	acknowledgeDraft,
+	addressedOutsideReferences,
 	addressesPlanner,
 	beforeInputSelection,
 	boundedChatError,
 	chatSendPayload,
 	contiguousReplacement,
 	destinationCue,
+	expandToChips,
+	insertCommand,
+	insertPointer,
 	insertReference,
 	MAX_REFERENCE_QUERY,
 	MAX_REFERENCES,
 	prepareDraftSubmission,
 	reconcileReferenceDrafts,
+	referenceMarker,
+	referenceRequest,
 	referenceTrigger,
+	REPLIES_OFF,
+	repliesOffNotice,
 	restoreDraftSubmission,
 	reviseComposerDraft,
+	runsCommand,
 	selectedReplacement,
+	sendFailure,
+	shownSendFailure,
 	withNoticesAfter,
 } from "./references";
-import { WireRefusal } from "../wire";
+import { WireLost, WireRefusal } from "../wire";
 
+import type { Chat } from "@chopin/protocol";
 import type { ReferenceDraft, ReferenceTarget } from "./references";
 
 let REQUEST_ID = "123e4567-e89b-42d3-a456-426614174000";
@@ -35,6 +47,150 @@ function select(text: string, target: ReferenceTarget, references: ReferenceDraf
 	if (!trigger) throw new Error("expected a reference trigger");
 	return insertReference(text, references, trigger, target);
 }
+
+describe("choosing a part of the document or a file with @", () => {
+	let heading = { kind: "heading" as const, anchor: "site-1", label: "Site 1: harbour" };
+
+	test("puts its own words in the draft as one chip with a space after it, and the caret after that", () => {
+		let text = "Rewrite @sit";
+		let result = insertPointer(text, [], { query: "sit", start: 8, end: 12 }, heading);
+		expect(result.text).toBe("Rewrite @Site 1: harbour ");
+		expect(result.caret).toBe(result.text.length);
+		expect(result.references).toEqual([
+			{ kind: "heading", anchor: "site-1", start: 8, end: 24, token: "@Site 1: harbour" },
+		]);
+	});
+
+	test("opens a research card with a % and takes the space already there", () => {
+		let result = insertPointer("See @re later", [], { query: "re", start: 4, end: 7 }, {
+			kind: "research",
+			workspaceId: "w1",
+			label: "Release",
+		});
+		expect(result.text).toBe("See %Release later");
+		expect(result.references[0]).toMatchObject({
+			kind: "research",
+			workspaceId: "w1",
+			start: 4,
+			end: 12,
+			token: "%Release",
+		});
+		expect(result.caret).toBe(13);
+	});
+
+	test("moves a part already in the draft to its new place, and keeps others where their words are", () => {
+		let first = insertPointer("@a", [], { query: "a", start: 0, end: 2 }, heading);
+		let second = insertPointer(`${first.text}and @f`, first.references, {
+			query: "f",
+			start: first.text.length + 4,
+			end: first.text.length + 6,
+		}, { kind: "file", path: "src/a.ts", label: "src/a.ts" });
+		expect(second.references.map(reference => reference.kind)).toEqual(["heading", "file"]);
+		let again = insertPointer(`${second.text}see @s`, second.references, {
+			query: "s",
+			start: second.text.length + 4,
+			end: second.text.length + 6,
+		}, heading);
+		expect(again.references.map(reference => reference.kind)).toEqual(["file", "heading"]);
+		expect(again.references.at(-1)!.start).toBe(second.text.length + 4);
+	});
+
+	test("leaves the draft as it was when its range is not the typed query, or ten references are held", () => {
+		expect(insertPointer("@x", [], { query: "y", start: 0, end: 2 }, heading).text).toBe("@x");
+		let full: ReferenceDraft[] = Array.from({ length: 10 }, (_, index) => ({
+			kind: "file",
+			path: `f${index}`,
+			start: index * 4,
+			end: index * 4 + 3,
+			token: `@f${index}`,
+		}));
+		let text = "@f0 @f1 @f2 @f3 @f4 @f5 @f6 @f7 @f8 @f9 @q";
+		let result = insertPointer(
+			text,
+			full,
+			{ query: "q", start: text.length - 2, end: text.length },
+			heading,
+		);
+		expect(result.references).toBe(full);
+	});
+});
+
+describe("choosing a command with /", () => {
+	test("opens the draft with the command as a chip and a space for its words", () => {
+		let result = insertCommand("/rev", [], { end: 4 }, { name: "review", commandKind: "prompt" });
+		expect(result.text).toBe("/review ");
+		expect(result.caret).toBe(8);
+		expect(result.references).toEqual([
+			{
+				kind: "command",
+				name: "review",
+				commandKind: "prompt",
+				start: 0,
+				end: 7,
+				token: "/review",
+			},
+		]);
+		expect(runsCommand(result.references)).toBe(true);
+		expect(runsCommand([])).toBe(false);
+	});
+
+	test("is sent to the Planner with no @chopin, with its kind and range, and only the first token as the command", () => {
+		let drafted = insertCommand("/skill:notes", [], { end: 12 }, {
+			name: "skill:notes",
+			commandKind: "skill",
+		});
+		let text = `${drafted.text}for today`;
+		expect(addressedOutsideReferences(text, drafted.references)).toBe(true);
+		let payload = chatSendPayload(text, drafted.references, true, "request", true);
+		expect(payload).toEqual({
+			requestId: "request",
+			text: "/skill:notes for today",
+			to: "planner",
+			references: [{
+				kind: "command",
+				name: "skill:notes",
+				commandKind: "skill",
+				start: 0,
+				end: 12,
+			}],
+		});
+		// Without a Planner there is nobody to run it: the message is the room's.
+		expect(chatSendPayload(text, drafted.references, false, "request", true)?.to).toBe("room");
+		// The chip's @chopin is not put in front of it.
+		let prepared = prepareDraftSubmission(
+			{ text, references: drafted.references },
+			() => "request",
+			{ planner: true, asking: true, referencesEnabled: true },
+		);
+		expect(prepared?.submission.text).toBe("/skill:notes for today");
+	});
+});
+
+describe("a sent reference asked for again", () => {
+	let base = { id: "r", start: 2, end: 9, label: "@x" };
+	test("is the request that made it, whatever its kind, with the same range", () => {
+		let sent: Chat.Reference[] = [
+			{ ...base, kind: "heading", anchor: "overview", level: 2, line: 3 },
+			{ ...base, kind: "decision", decisionId: "d1" },
+			{ ...base, kind: "file", path: "src/a.ts" },
+			{ ...base, kind: "command", name: "review", commandKind: "prompt" },
+		];
+		expect(sent.map(referenceRequest)).toEqual([
+			{ kind: "heading", anchor: "overview", start: 2, end: 9 },
+			{ kind: "decision", decisionId: "d1", start: 2, end: 9 },
+			{ kind: "file", path: "src/a.ts", start: 2, end: 9 },
+			{ kind: "command", name: "review", commandKind: "prompt", start: 2, end: 9 },
+		]);
+	});
+
+	test("opens its token with the character of its kind", () => {
+		expect(
+			(["document", "research", "command", "heading", "decision", "file"] as const).map(
+				referenceMarker,
+			),
+		).toEqual(["#", "%", "/", "@", "@", "@"]);
+	});
+});
 
 describe("typed reference triggers", () => {
 	test("finds bare and queried tokens only at a whitespace boundary", () => {
@@ -108,7 +264,7 @@ describe("reference draft tokens", () => {
 		expect(duplicate.references).toHaveLength(1);
 		expect(duplicate.references[0]!.start).toBe(first.text.length + 1);
 		expect(
-			sameTitle.references.map(reference => reference.channelId),
+			sameTitle.references.map(reference => reference.kind === "document" && reference.channelId),
 		).toEqual(["channel-one", "channel-two"]);
 	});
 
@@ -199,15 +355,23 @@ describe("textarea replacement reconciliation", () => {
 	});
 });
 
+describe("the strip for a server whose agent is off", () => {
+	test("says so plainly while the page is online, and nothing while the page's connection banner is up", () => {
+		expect(repliesOffNotice(false)).toEqual({ tone: "info", text: REPLIES_OFF });
+		expect(REPLIES_OFF).toBe("Replies are off on this server.");
+		expect(repliesOffNotice(true)).toBeUndefined();
+	});
+});
+
 describe("composer destination cue", () => {
 	test("says a message without @chopin stays in the room, and one with it goes to the Planner", () => {
 		expect(destinationCue("should we ask about auth first?", [], true)).toEqual({
 			to: "room",
-			text: "Room only. Add @chopin to ask the Planner",
+			text: "Sent to people here. Type @ to ask Chopin",
 		});
 		expect(destinationCue("@chopin draft the auth section", [], true)).toEqual({
 			to: "planner",
-			text: "Sends to the Planner, which will reply",
+			text: "Sends to Chopin, which will reply",
 		});
 	});
 
@@ -330,10 +494,10 @@ describe("chat send payloads", () => {
 });
 
 describe("acknowledged composer drafts", () => {
-	test("keeps the complete Planner-mode payload and reference projection after reload", () => {
+	test("keeps the complete payload of a message to Chopin and reference projection after reload", () => {
 		let draft = { text: "Compare #Plan", references: [documentDraft("Compare #Plan", "#Plan")] };
 		let first = prepareDraftSubmission(draft, () => REQUEST_ID, {
-			mode: true,
+			asking: true,
 			planner: true,
 			focus: "40cfa671-750b-4ca8-a1d7-024457de5a2a",
 		})!;
@@ -343,7 +507,7 @@ describe("acknowledged composer drafts", () => {
 			restored.submission,
 		);
 		let retry = prepareDraftSubmission(restored, () => crypto.randomUUID(), {
-			mode: false,
+			asking: false,
 			planner: true,
 		})!;
 		expect(retry.submission).toEqual({
@@ -461,10 +625,59 @@ describe("acknowledged composer drafts", () => {
 		expect(boundedChatError(new Error("connection lost"))).toContain("Check the connection");
 	});
 
-	test("shows a missing remote Planner's instructions whole, however long", () => {
-		let message = `No Planner is attached to this document. ${
-			"Connect a Planner client. ".repeat(20)
-		}`.trim();
+	test("knows a send the connection cut off from a refusal, and says the same of it", () => {
+		let cut = [
+			new WireLost("connection lost"),
+			new WireLost("disposed"),
+			new Error("not connected"),
+		];
+		for (let error of cut) {
+			expect(sendFailure(error)).toEqual({ text: boundedChatError(error), lost: true });
+			expect(sendFailure(error).text).toContain("Check the connection");
+		}
+		let refused = [
+			new WireRefusal("Unavailable"),
+			new WireRefusal("x".repeat(500)),
+			new WireRefusal(
+				"Still connecting to @mona's machine. Try again in a moment.",
+				"planner-not-attached",
+			),
+			new WireLost("document deleted"),
+		];
+		for (let error of refused) {
+			expect(sendFailure(error)).toEqual({ text: boundedChatError(error), lost: false });
+		}
+	});
+
+	test("tells a send the connection cut off only while the connection is up, and no failure at all while the page's connection banner shows", () => {
+		let cut = sendFailure(new WireLost("connection lost"));
+		let refused = sendFailure(new WireRefusal("Unavailable"));
+		let machine = sendFailure(
+			new WireRefusal(
+				"Still connecting to @mona's machine. Try again in a moment.",
+				"planner-not-attached",
+			),
+		);
+		// The page's connection banner speaks for a lost connection, so a blip and an outage alike
+		// leave nothing about the connection beside the composer.
+		expect(shownSendFailure(cut, false, false)).toBeUndefined();
+		expect(shownSendFailure(cut, false, true)).toBeUndefined();
+		expect(shownSendFailure(cut, true, false)).toBe(cut);
+		// Nor does a refusal sit beside that notice: two alerts would say two things were wrong.
+		// It is told before the notice shows and as soon as the connection is back, as it was.
+		for (let failure of [refused, machine]) {
+			expect(shownSendFailure(failure, true, false)).toBe(failure);
+			expect(shownSendFailure(failure, false, false)).toBe(failure);
+			expect(shownSendFailure(failure, false, true)).toBeUndefined();
+			expect(shownSendFailure(failure, true, true)).toBeUndefined();
+		}
+		expect(shownSendFailure(undefined, false, false)).toBeUndefined();
+		expect(shownSendFailure(undefined, true, true)).toBeUndefined();
+	});
+
+	test("shows the instructions for a missing machine whole, however long", () => {
+		let message = `Connect a machine to get a reply. ${"Connect an agent client. ".repeat(20)}`
+			.trim();
 		expect(boundedChatError(new WireRefusal(message, "planner-not-attached"))).toBe(message);
 		expect(boundedChatError(new WireRefusal(message))).toEndWith("...");
 	});
@@ -488,5 +701,32 @@ describe("focus", () => {
 		});
 		expect(chatSendPayload("@chopin tighten it", [], false, REQUEST_ID, true, CHILD)?.focus)
 			.toBeUndefined();
+	});
+});
+
+describe("a chip is edited whole", () => {
+	let chips = [{ start: 4, end: 11 }, { start: 12, end: 16 }];
+
+	test("deleting at its edge, or inside it, takes all of it, and only in the direction it is deleted", () => {
+		expect(expandToChips(chips, 11, 11, "deleteContentBackward")).toEqual({ start: 4, end: 11 });
+		expect(expandToChips(chips, 8, 8, "deleteContentBackward")).toEqual({ start: 4, end: 11 });
+		expect(expandToChips(chips, 4, 4, "deleteContentForward")).toEqual({ start: 4, end: 11 });
+		expect(expandToChips(chips, 4, 4, "deleteContentBackward")).toEqual({ start: 4, end: 4 });
+		expect(expandToChips(chips, 11, 11, "deleteContentForward")).toEqual({ start: 11, end: 11 });
+		expect(expandToChips(chips, 12, 12, "deleteWordForward")).toEqual({ start: 12, end: 16 });
+	});
+
+	test("a selection that reaches into one takes the whole of it, as far as the next", () => {
+		expect(expandToChips(chips, 8, 14, "deleteContentBackward")).toEqual({ start: 4, end: 16 });
+		expect(expandToChips(chips, 0, 5, "insertText")).toEqual({ start: 0, end: 11 });
+		expect(expandToChips(chips, 0, 3, "insertText")).toEqual({ start: 0, end: 3 });
+		expect(expandToChips(chips, 11, 12, "deleteContentBackward")).toEqual({ start: 11, end: 12 });
+	});
+
+	test("typing with the caret inside one goes after it, and typing at its edges is untouched", () => {
+		expect(expandToChips(chips, 6, 6, "insertText")).toEqual({ start: 11, end: 11 });
+		expect(expandToChips(chips, 11, 11, "insertText")).toEqual({ start: 11, end: 11 });
+		expect(expandToChips(chips, 4, 4, "insertText")).toEqual({ start: 4, end: 4 });
+		expect(expandToChips([], 3, 3, "deleteContentBackward")).toEqual({ start: 3, end: 3 });
 	});
 });

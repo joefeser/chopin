@@ -28,7 +28,35 @@ Planner first writes provisional prose, then supplies the current document revis
 key and related block addresses for each card. Written responses use `response: "text"`,
 `options: []`, and `multiple: false`; choices retain their existing form. Cards appear beside
 their primary passage and the tool returns immediately. Retrying a key reuses the same card,
-including after it has been saved or discarded. Stop Planner does not withdraw committed cards.
+including after it has been saved or discarded, but only when the retry describes that card: its
+question, response kind and choices (apart from options a person added since) and its passages
+must match. A key that already holds a different decision refuses the whole batch with a message
+naming the key, so a new question is never answered with an unrelated card; nothing is created
+or replaced. A discarded card is never recreated by its key. When the document changed after
+the Planner read it, each related block is matched against the revision the Planner read, not the
+document as it stands: the digest must have named exactly one block then, and that same block
+must still carry it, now alone, wherever it stands. A paragraph rewritten since, one an identical
+copy now repeats, one that was already repeated when it was read, and a read the server no longer
+retains each refuse the batch with a message saying the document changed and to read it again,
+rather than anchoring a card beside a twin. Nothing is created for a refused batch.
+Replaying a key whose card exists is judged against the same read. Where the server no longer
+holds it (after a restart, or once more than eight revisions have been read since), a replay is
+accepted only for a card standing beside the single passage it was opened on, and only if that
+card's anchor has never had to be found again by its digest. A card with several passages is
+refused until the Planner reads again, since a later passage cannot then be told from an
+identical copy. So is a card whose position in its paragraph was lost: after every edit the
+server re-expresses an anchor as a position, and when an edit removes it (the paragraph was
+rewritten or replaced, another block was moved across it, or the document was rebuilt under a
+new epoch) the anchor is matched to the one block carrying its digest. That block may be an
+identical copy of the paragraph, for instance one an edit left between the rewritten paragraph
+and the card, so the match is recorded on the anchor in the stored decision, survives later
+edits and restarts, and ends only when the Planner anchors the card again. The refusal says
+the card's paragraph can only be found again by its text; reading the document again gives the
+replay a read to be judged against. A card whose paragraph kept its place through insertions,
+deletions, edits and typing elsewhere is still accepted, with or without the read. A card
+recorded before the mark existed has none, and is judged by where it stands unless an edit
+since has taken its position.
+Stop Planner does not withdraw committed cards.
 
 Each Save queues an update to the related prose. Decisions sharing a passage share its write
 scope, so later answers preserve earlier saved answers. Source, updated anchors and receipts
@@ -39,7 +67,9 @@ write-up. Child-focused Planner turns cannot create decisions in the root docume
 
 Saving a decision the Planner left open, whether captured with `open_decisions` or
 `open_decision` or asked with `ask` by a turn that has since ended, also hands the saved answer to
-a Planner turn, so the Planner acts on it: an answer that chose "start a new run" starts one.
+a Planner turn, so the Planner acts on it (a question a client asked as a dialog counts once nothing
+waits on it any more, as after a crash, or when its client never resumed after a restart and so
+cannot be given the answer; the turn names the option chosen): an answer that chose "start a new run" starts one.
 Answers saved to one document close together share one turn that lists each question, answer,
 chosen option and who saved it. The turn starts once nobody has saved another answer for five
 seconds, or 30 seconds after the first, and never while a Planner turn runs or waits in that

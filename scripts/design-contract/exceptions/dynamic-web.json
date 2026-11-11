@@ -1,46 +1,5 @@
 [
 	{
-		"file": "apps/web/src/chat/command-picker.tsx",
-		"reason": "Chat reuses the editor slash-menu class recipes; the imported constants are static token-based utilities in the reviewed editor producer.",
-		"cases": [
-			[
-				"dynamic",
-				"class",
-				"MENU_SURFACE",
-				"class > CommandPicker > <div>",
-				1
-			],
-			[
-				"dynamic",
-				"class",
-				"MENU_ROW",
-				"class > CommandPicker > <button>",
-				1
-			],
-			[
-				"dynamic",
-				"class",
-				"MENU_ROW_ON",
-				"class > CommandPicker > <button>",
-				1
-			],
-			[
-				"dynamic",
-				"class",
-				"MENU_ROW_OFF",
-				"class > CommandPicker > <button>",
-				1
-			]
-		],
-		"sourceHash": "9418b1cafede24f85820d9f2893e0f416412445dad0fcfc321e52bee4b9fea80",
-		"producers": [
-			{
-				"file": "packages/editor/src/toolbar/surface.ts",
-				"sourceHash": "ad3d483335b4dda9238fbcf529b79ad86320987accf3175d581a33d90f1c331b"
-			}
-		]
-	},
-	{
 		"file": "apps/web/src/document-workspace-host.tsx",
 		"reason": "Workspace assembly supplies document/session callbacks and data, not design values; scanner does not execute the workspaceProps function. Its returned keys contain no className or style; the parent presentation carries the child layer node, a finite \"open\" | \"closing\" state, a finite \"lift\" | \"zoom\" motion that Workspace renders only as a data attribute, path labels, a close callback, the open child's channel id that Chat sends as its focus, a child-open callback, and the child request key retained across canonical changes and used only to reveal a newly requested Document view; a document presentation carries only that child-open callback.",
 		"cases": [
@@ -59,7 +18,7 @@
 				1
 			]
 		],
-		"sourceHash": "201e83e15db914171abbbeac5030abb0c2bb5b8671466bcb7126b060702d506e"
+		"sourceHash": "9770422f8676e5c2064982e343388ce35ce5952acddedd21713e28ad49d54210"
 	},
 	{
 		"file": "apps/web/src/document-rename.tsx",
@@ -73,21 +32,7 @@
 				1
 			]
 		],
-		"sourceHash": "7116df5ad4fc3d55f905cdc426c4eb8de3a7c9fb9903f75a1bf4657b351704ac"
-	},
-	{
-		"file": "apps/web/src/chat/markdown.tsx",
-		"reason": "Component forwards or combines caller class names; static call-site classes are scanned. Runtime/cross-module values require review at this exact component boundary.",
-		"cases": [
-			[
-				"dynamic",
-				"class",
-				"className",
-				"class > MessageMarkdown > <div>",
-				1
-			]
-		],
-		"sourceHash": "3d5a0587ed77dda3810f37f0a6d969fd8d6452ed00b6bff05e069ec44c6c98a4"
+		"sourceHash": "63213489ee99add048d63095e34c02e5342e9e1bb8c9714cc3746f97404d6eee"
 	},
 	{
 		"file": "apps/web/src/project-sidebar.tsx",
@@ -101,7 +46,7 @@
 				1
 			]
 		],
-		"sourceHash": "6ec43a59cdb8231f0f33b2f57dc8e39c5a4fbed9121dab21c2cae61f1430e9c4"
+		"sourceHash": "0e7edd9b75e5ced538efd81678f79591f4efd884c50c5f9801a315fff2ba5a85"
 	},
 	{
 		"file": "apps/web/src/account-menu.tsx",
@@ -129,7 +74,7 @@
 				1
 			]
 		],
-		"sourceHash": "20323e990ce66f93fdb5669370a4026349c21c235b8980ea2f50c9bd52d177ac"
+		"sourceHash": "b3500f6c31710b46b8b954ee42ac6bdb746cfc0a327f4ca54c6d420b2fbefdb2"
 	},
 	{
 		"file": "apps/web/src/design-audit/controls.tsx",
@@ -143,7 +88,7 @@
 				1
 			]
 		],
-		"sourceHash": "67417dc4f0e93a10f76583d07b30b2a4980e9018cbdb72d4627ae6b0f37170e7"
+		"sourceHash": "b1eac2a759867ebff7afc1082c41a10101ec8a747891361f2849447599ac5e10"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -195,6 +140,20 @@
 		"sourceHash": "0a11fe298d25f70f899ec376a04f2e128b8de45e763d36c377d15f55aa8e2f8b"
 	},
 	{
+		"file": "apps/web/src/chat/message-delivery.tsx",
+		"reason": "The message menu is placed from its button's measured rectangle, above or below as there is room, as the document actions menu is: measured popup coordinates and visibility, not design token values.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"position",
+				"unresolved style > MessageMenu > <div>",
+				1
+			]
+		],
+		"sourceHash": "efb8748486bb9224d9e51bfc18b5298365ca9eebad95ee8b7a0c727c98f5a7cb"
+	},
+	{
 		"file": "apps/web/src/terminal-alert.tsx",
 		"reason": "Component forwards or combines caller class names; static call-site classes are scanned. Runtime/cross-module values require review at this exact component boundary.",
 		"cases": [
@@ -227,7 +186,7 @@
 				1
 			]
 		],
-		"sourceHash": "1159e1e1ac0de083c4d278fbd86d872847522533172dcdc18cc22eef2a551527"
+		"sourceHash": "fc9cfa9c5d8ca9222b9cfc507af3b2ce94f4e580f6d17cfd251f38409a4835a9"
 	},
 	{
 		"file": "apps/web/src/navigation-drawer.tsx",
@@ -276,7 +235,7 @@
 				1
 			]
 		],
-		"sourceHash": "2e3c08c1ffa3e5e6c04e4a7a64331836157d6f37f80d62cea953e5b923413a79"
+		"sourceHash": "262e2b1e5c5dc9aaf0c14bd5c853051fda90e6b7c340dbe8186f124a7e50ec55"
 	},
 	{
 		"file": "apps/web/src/navigation-dialog.tsx",
@@ -311,7 +270,7 @@
 				1
 			]
 		],
-		"sourceHash": "25d5641ba4757668917be319cb5452999354e3f730264d3b1ec8cde48f3c3f44"
+		"sourceHash": "ef95f80b0d05b634dfbc54c1cf26cf950bbae85a1052b2980054499a8065e351"
 	},
 	{
 		"file": "apps/web/src/machine-button.tsx",
@@ -325,7 +284,7 @@
 				1
 			]
 		],
-		"sourceHash": "dc900a88bb31f1481af9ea0482e3c0e6d1eeecd85d8199c94275ac8ddb51809b"
+		"sourceHash": "e663ed6d64c26bc0251dc0ff3f6866654f471a968ee58ea1b868dd079a1c7a52"
 	},
 	{
 		"file": "apps/web/src/experiments/machine-setup.tsx",
@@ -353,6 +312,265 @@
 				1
 			]
 		],
-		"sourceHash": "b1854427e2ab3bb30ea96ed20e9ba8c97e97e4bc42e1f9530e5b0100f3b4d37a"
+		"sourceHash": "28471a91af2b9315664313e20fdca8f5c675ed4c03cce97166509c9f3313928b"
+	},
+	{
+		"file": "apps/web/src/chat/composer.tsx",
+		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. Review the producer when changing this boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"MOTION.className",
+				"class > ChatComposer > <div>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"strip.className",
+				"class > ChatComposer > <div>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"MOTION.contentClassName",
+				"class > ChatComposer > <div>",
+				1
+			]
+		],
+		"sourceHash": "4a274a795c3cc65ad14b7bc3c60483bfa62243d60f6c40fe5195142a85289123"
+	},
+	{
+		"file": "apps/web/src/markdown-text/markdown-text.tsx",
+		"reason": "MarkdownText draws its root with the class and attributes its surface passes (Chat's message root, a decision card's body); each caller's static classes are scanned at its own call site. Reviewed at this exact component boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"codeOverrides",
+				"unresolved JSX props > MarkdownCodeOverride: FC<ComponentProps<CodeComponent>> > <CodeOverride>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > MarkdownCodeOverride: FC<ComponentProps<CodeComponent>> > <CodeOverride>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > MarkdownPreOverride: FC<ComponentProps<PreComponent>> > <PreOverride>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"options",
+				"unresolved JSX props > MarkdownRenderer: FC<MarkdownRendererProps> > <ReactMarkdown>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"options",
+				"unresolved JSX props > DeferredMarkdownRenderer: FC<MarkdownRendererProps> > <MarkdownRenderer>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"stableRest",
+				"unresolved JSX props > MarkdownTextInner: FC<MarkdownTextInnerProps> > <Renderer>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"attributes",
+				"unresolved JSX props > MarkdownTextImpl: FC<MarkdownTextProps> > <Container>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"rest",
+				"unresolved JSX props > MarkdownTextImpl: FC<MarkdownTextProps> > <MarkdownTextInner>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"[className, \"aui-md\", containerClassName].filter(Boolean)",
+				"class > MarkdownTextImpl: FC<MarkdownTextProps> > <Container>",
+				1
+			]
+		],
+		"sourceHash": "2cd6a8312b5856503115cda33d51b76879fb400811935e1b38ec0aadf1dc1de2"
+	},
+	{
+		"file": "apps/web/src/markdown-text/memoization.tsx",
+		"reason": "The memoizing wrapper forwards the properties react-markdown computed to the component it wraps, unchanged. Reviewed at this exact component boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > withoutNode > <Component>",
+				1
+			]
+		],
+		"sourceHash": "a9cceda09bc6905e37be11e647def47a8aa0d6e900510f7e912f4b26b44ce0c4"
+	},
+	{
+		"file": "apps/web/src/markdown-text/default-components.tsx",
+		"reason": "MarkdownText's elements forward the properties react-markdown computed from the parsed message (a link's href, a table cell's alignment, a list's task-list class, a code block's language class) onto the element and join the class they are given to their fixed aui-md-* class; the values are parsed message data, never authored styles. Reviewed at this exact component boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > element > <Tag>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > defaultComponents > <table>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > defaultComponents > Code > <code>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"own",
+				"class > element > <Tag>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"className",
+				"class > element > <Tag>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"className",
+				"class > defaultComponents > <table>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"className",
+				"class > defaultComponents > Code > <code>",
+				1
+			]
+		],
+		"sourceHash": "2e8add35b4eb5bc4b88422c4b8796757798861dd9141d0d66ee40aa211336002"
+	},
+	{
+		"file": "apps/web/src/markdown-text/code-blocks.tsx",
+		"reason": "The fenced-code override re-emits the pre and code properties react-markdown computed from the parsed message (a block's language class) onto the pre and code it draws; nothing is authored here. Reviewed at this exact component boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"rest",
+				"unresolved JSX props > DefaultPre: PreComponent > <pre>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"rest",
+				"unresolved JSX props > DefaultCode: CodeComponent > <code>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"rest",
+				"unresolved JSX props > PreOverrideImpl > <FallbackPre>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"withDefaultProps<any>(preProps)(props)",
+				"unresolved JSX props > WrappedPre > <Pre>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"withDefaultProps<any>(codeProps)(props)",
+				"unresolved JSX props > WrappedCode > <Code>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > CodeOverrideImpl: FC<CodeOverrideProps> > <components.Code>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > CodeOverrideImpl: FC<CodeOverrideProps> > <CodeBlockOverride>",
+				1
+			]
+		],
+		"sourceHash": "536278deba1ca3bd121443588f57e37f7ecb4df845d6d106d5b3f0fd3abf99d9"
+	},
+	{
+		"file": "apps/web/src/question-markdown.tsx",
+		"reason": "The decision card's Markdown root takes the class its place gives it from the question package (one of five fixed roots); static classes there are scanned. Reviewed at this exact component boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"root.className",
+				"class > questionMarkdown > <MarkdownText>",
+				1
+			]
+		],
+		"sourceHash": "8f8433e53e188bfb21813716660a6b9c8369dc8b814cc0e7a19fdde9e9f23401"
+	},
+	{
+		"file": "apps/web/src/chat/markdown.tsx",
+		"reason": "Component forwards or combines caller class names; static call-site classes are scanned. Runtime/cross-module values require review at this exact component boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"[\"aui-md-a\", className].filter(Boolean)",
+				"class > ChatLink > <a>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"[\"chat-markdown\", className].filter(Boolean)",
+				"class > MessageMarkdown > MessageMarkdown > <MarkdownText>",
+				1
+			]
+		],
+		"sourceHash": "25c7c40d5688c6dc6bbf7782b701bcddcac518dfa043f1278bda32afca2c3798"
 	}
 ]

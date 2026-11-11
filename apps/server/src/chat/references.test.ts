@@ -12,6 +12,7 @@ import type { DocumentTarget } from "../plan/service";
 import type { ResearchWorkspaceService, ResearchWorkspaceView } from "../research/service";
 
 let NOW = new Date("2026-08-23T12:00:00.000Z");
+let ULID_SHAPE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 
 function researchReferencePath(
 	owner: string,
@@ -436,6 +437,248 @@ describe("chat reference requests", () => {
 	});
 });
 
+async function yes() {
+	return true;
+}
+
+function request(name: string, commandKind: string, start: number, end: number) {
+	return { kind: "command", name, commandKind, start, end };
+}
+
+describe("chat command requests", () => {
+	let commands: Wire.CommandOption[] = [
+		{ name: "skill:notes", kind: "skill", description: "Take notes" },
+		{ name: "review", kind: "prompt" },
+		{ name: "review", kind: "workflow" },
+	];
+	let run = async (
+		text: string,
+		requests: unknown[],
+		reported: Wire.CommandOption[] | null = commands,
+		destination: Wire.Destination = "planner",
+	) => {
+		let { service, parent } = await setup();
+		return service.resolve({
+			channelId: parent.id,
+			repositoryId: parent.repositoryId,
+			text,
+			destination,
+			requests: requests as Wire.ReferenceRequest[],
+			...(reported ? { commands: reported } : {}),
+		});
+	};
+	it("keeps the command's token as the opening of the message, with its name and kind", async () => {
+		let result = await run("@chopin /skill:notes for today", [
+			request("skill:notes", "skill", 8, 20),
+		]);
+		expect(result.text).toBe("/skill:notes for today");
+		expect(result.references).toEqual([{
+			kind: "command",
+			id: expect.stringMatching(ULID_SHAPE),
+			start: 0,
+			end: 12,
+			label: "/skill:notes",
+			name: "skill:notes",
+			commandKind: "skill",
+		}]);
+	});
+
+	it("tells two commands that share a name apart by their kind", async () => {
+		let prompt = await run("/review the diff", [request("review", "prompt", 0, 7)]);
+		let workflow = await run("/review the diff", [request("review", "workflow", 0, 7)]);
+		expect(prompt.references?.[0]).toMatchObject({ name: "review", commandKind: "prompt" });
+		expect(workflow.references?.[0]).toMatchObject({ name: "review", commandKind: "workflow" });
+		await expect(run("/review", [request("review", "skill", 0, 7)])).rejects.toThrow(
+			"/review is not one of the commands the Planner offers",
+		);
+	});
+
+	it("refuses a command the Planner does not report, in words a person can read", async () => {
+		await expect(run("/ship it", [request("ship", "workflow", 0, 5)])).rejects.toMatchObject({
+			name: "ChatCommandError",
+			message: "/ship is not one of the commands the Planner offers.",
+		});
+		await expect(run("/Review", [request("Review", "prompt", 0, 7)])).rejects.toThrow(
+			"/Review is not one of the commands the Planner offers",
+		);
+	});
+
+	it("refuses every command while the Planner has reported none, and says so", async () => {
+		let said = "The Planner has not reported any commands, so /review cannot run.";
+		await expect(run("/review", [request("review", "prompt", 0, 7)], null)).rejects
+			.toMatchObject({ name: "ChatCommandError", message: said });
+		await expect(run("/review", [request("review", "prompt", 0, 7)], [])).rejects
+			.toMatchObject({ message: said });
+	});
+
+	it("takes a command only at the start of a message to the Planner, once", async () => {
+		await expect(run("please /review", [request("review", "prompt", 7, 14)])).rejects.toThrow(
+			"A command has to open the message.",
+		);
+		await expect(run("/review the diff", [request("review", "prompt", 0, 7)], commands, "room"))
+			.rejects.toThrow("A command runs in the Planner's turn");
+		await expect(run("/review /skill:notes", [
+			request("review", "prompt", 0, 7),
+			request("skill:notes", "skill", 8, 20),
+		])).rejects.toThrow("A message can run one command.");
+	});
+
+	it("keeps the command's chip when other references follow it", async () => {
+		let { service, parent, target } = await setup();
+		let result = await service.resolve({
+			channelId: parent.id,
+			repositoryId: parent.repositoryId,
+			text: "/review #notes",
+			destination: "planner",
+			requests: [
+				request("review", "prompt", 0, 7),
+				documentRequest(target.id, 8, 14),
+			] as Wire.ReferenceRequest[],
+			commands,
+		});
+		expect(result.text).toBe("/review #Release Notes");
+		expect(result.references?.map(reference => reference.kind)).toEqual(["command", "document"]);
+	});
+});
+
+const MENTION_SOURCE = [
+	"# Overview",
+	"",
+	"## Site 1: harbour survey",
+	"",
+	'<Questionnaire id="01HQ0000000000000000000000">',
+	'<Question id="q1" header="Rollout" prompt="How should we deploy?" multiple="false">',
+	'<Option id="o1" label="Canary" />',
+	"</Question>",
+	"</Questionnaire>",
+	"",
+	'<Research id="workspace-1" />',
+	"",
+].join("\n");
+
+describe("chat mention requests", () => {
+	async function mentioned(
+		text: string,
+		requests: unknown[],
+		files?: (path: string) => Promise<boolean | undefined>,
+		destination: Wire.Destination = "planner",
+	) {
+		let { service, parent, current } = await setup();
+		current.set(parent.id, {
+			channelId: parent.id,
+			revision: 5,
+			source: MENTION_SOURCE,
+			sourceHash: sourceHash(MENTION_SOURCE),
+		});
+		return service.resolve({
+			channelId: parent.id,
+			repositoryId: parent.repositoryId,
+			text,
+			destination,
+			requests: requests as Wire.ReferenceRequest[],
+			...(files ? { fileExists: files } : {}),
+		});
+	}
+
+	it("points at a heading by its anchor, and shows its words as the document has them now", async () => {
+		let result = await mentioned("Rewrite @site first", [
+			{ kind: "heading", anchor: "site-1-harbour-survey", start: 8, end: 13 },
+		]);
+		expect(result.text).toBe("Rewrite @Site 1: harbour survey first");
+		expect(result.references).toEqual([{
+			kind: "heading",
+			id: expect.stringMatching(ULID_SHAPE),
+			start: 8,
+			end: 31,
+			label: "@Site 1: harbour survey",
+			anchor: "site-1-harbour-survey",
+			level: 2,
+			line: 3,
+		}]);
+	});
+
+	it("points at a Decision by its id, shown by its header", async () => {
+		let result = await mentioned("What about @roll", [
+			{ kind: "decision", decisionId: "01HQ0000000000000000000000", start: 11, end: 16 },
+		]);
+		expect(result.text).toBe("What about @Rollout");
+		expect(result.references?.[0]).toMatchObject({
+			kind: "decision",
+			decisionId: "01HQ0000000000000000000000",
+			label: "@Rollout",
+		});
+	});
+
+	it("points at a research card of this document by its workspace, as a research reference", async () => {
+		let result = await mentioned("See %rel", [
+			{ kind: "research", workspaceId: "workspace-1", start: 4, end: 8 },
+		]);
+		expect(result.text).toBe("See %Release Research");
+		expect(result.references?.[0]).toMatchObject({ kind: "research", workspaceId: "workspace-1" });
+	});
+
+	it("points at a file by its path, where the repository's files can say it is there", async () => {
+		let result = await mentioned("Look at @index", [
+			{ kind: "file", path: "src/index.ts", start: 8, end: 14 },
+		], async path => path === "src/index.ts");
+		expect(result.text).toBe("Look at @src/index.ts");
+		expect(result.references?.[0]).toMatchObject({
+			kind: "file",
+			path: "src/index.ts",
+			label: "@src/index.ts",
+		});
+	});
+
+	it("refuses a part the document no longer has, in words a person can read", async () => {
+		await expect(mentioned("@gone", [{ kind: "heading", anchor: "gone", start: 0, end: 5 }]))
+			.rejects.toMatchObject({
+				name: "ChatMentionError",
+				message: "That heading is no longer in the document.",
+			});
+		await expect(mentioned("@gone", [{ kind: "decision", decisionId: "nope", start: 0, end: 5 }]))
+			.rejects.toMatchObject({ message: "That Decision is no longer in the document." });
+		await expect(
+			mentioned("@a.ts", [{ kind: "file", path: "a.ts", start: 0, end: 5 }], async () => false),
+		).rejects.toMatchObject({ message: "That file is not in the repository." });
+		await expect(
+			mentioned("@a.ts", [{ kind: "file", path: "a.ts", start: 0, end: 5 }], async () => undefined),
+		).rejects.toMatchObject({
+			message: "This repository's files cannot be listed right now, so a file cannot be mentioned.",
+		});
+		await expect(mentioned("@a.ts", [{ kind: "file", path: "a.ts", start: 0, end: 5 }]))
+			.rejects.toMatchObject({ name: "ChatMentionError" });
+	});
+
+	it("takes a path only as a plain relative one from the repository's root", async () => {
+		for (let path of ["../secret", "/etc/passwd", "a//b", "a\\b", "a/./b", "", "x/..", "a\nb"]) {
+			await expect(
+				mentioned("@x", [{ kind: "file", path, start: 0, end: 2 }], yes),
+			).rejects.toThrow();
+		}
+		await expect(
+			mentioned("@x", [{ kind: "file", path: "x".repeat(200), start: 0, end: 2 }], yes),
+		).rejects.toMatchObject({ message: "That path is too long to mention." });
+	});
+
+	it("mixes every kind in one message and keeps each range, a part once", async () => {
+		let result = await mentioned("@a and @b and @c", [
+			{ kind: "heading", anchor: "overview", start: 0, end: 2 },
+			{ kind: "decision", decisionId: "01HQ0000000000000000000000", start: 7, end: 9 },
+			{ kind: "file", path: "README.md", start: 14, end: 16 },
+		], async () => true);
+		expect(result.text).toBe("@Overview and @Rollout and @README.md");
+		expect(result.references?.map(reference => reference.kind)).toEqual([
+			"heading",
+			"decision",
+			"file",
+		]);
+		await expect(mentioned("@a @b", [
+			{ kind: "heading", anchor: "overview", start: 0, end: 2 },
+			{ kind: "heading", anchor: "overview", start: 3, end: 5 },
+		])).rejects.toThrow("unique");
+	});
+});
+
 describe("reading cached reference targets", () => {
 	it("uses latest document metadata and reports source drift without retargeting", async () => {
 		let { current, service, storage, parent, target } = await setup();
@@ -579,6 +822,81 @@ describe("reading cached reference targets", () => {
 			repositoryId: target.repositoryId,
 			reference,
 		})).rejects.toThrow("moved");
+	});
+});
+
+describe("stored mentions", () => {
+	let id = ulid();
+	let heading: Wire.HeadingReference = {
+		kind: "heading",
+		id,
+		start: 0,
+		end: 9,
+		label: "@Overview",
+		anchor: "overview",
+		level: 1,
+		line: 1,
+	};
+	let decision: Wire.DecisionReference = {
+		kind: "decision",
+		id: ulid(),
+		start: 10,
+		end: 18,
+		label: "@Rollout",
+		decisionId: "01HQ0000000000000000000000",
+	};
+	let file: Wire.FileReference = {
+		kind: "file",
+		id: ulid(),
+		start: 19,
+		end: 32,
+		label: "@src/index.ts",
+		path: "src/index.ts",
+	};
+	let command: Wire.CommandReference = {
+		kind: "command",
+		id: ulid(),
+		start: 33,
+		end: 40,
+		label: "/review",
+		name: "review",
+		commandKind: "prompt",
+	};
+	let text = "@Overview @Rollout @src/index.ts /review";
+
+	it("are restored exactly as kept, for every kind in one message", () => {
+		let all = [heading, decision, file, command];
+		expect(restoreReferences(all, text)).toEqual(all);
+	});
+
+	it("are refused when their shape, range, label or identity drifts", () => {
+		for (
+			let invalid of [
+				{ ...heading, extra: true },
+				{ ...heading, level: 7 },
+				{ ...heading, line: 0 },
+				{ ...heading, anchor: 3 },
+				{ ...heading, label: "Overview" },
+				{ ...decision, decisionId: undefined },
+				{ ...file, label: "@src/other.ts" },
+				{ ...file, id: "not-a-server-id" },
+				{ ...command, label: "/other" },
+				{ ...heading, end: 8 },
+			]
+		) expect(() => restoreReferences([invalid], text)).toThrow();
+		expect(() => restoreReferences([heading, { ...heading, id: ulid(), start: 0, end: 9 }], text))
+			.toThrow();
+	});
+
+	it("name no address, so none is read by id", async () => {
+		let { service, parent } = await setup();
+		for (let reference of [heading, decision, file, command]) {
+			await expect(service.read({
+				channelId: parent.id,
+				repositoryId: parent.repositoryId,
+				reference,
+			})).rejects.toThrow("not read by id");
+		}
 	});
 });
 

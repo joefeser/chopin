@@ -11,6 +11,7 @@ import * as Room from "../plan/room";
 import * as Service from "../plan/service";
 import * as Rooms from "../rooms";
 import { MemoryStorage } from "../storage/memory/adapter";
+import { storedQuestion } from "../testing/plan";
 import { implementationGraphs } from "../tasks/plan-graphs";
 import { hosted } from "./hosted";
 import { deterministicChannelId } from "../channels/id";
@@ -26,6 +27,7 @@ import type {
 	RepositoryPage,
 } from "../github/client";
 import type { CreateDocumentInput } from "../mcp";
+import type { JsonValue } from "../storage/model";
 import type { Socket, SocketData } from "../wire";
 import type { PlannerInvocation } from "./hosted";
 
@@ -181,6 +183,23 @@ function request(authorization?: string | Headers): Request {
 		? new Headers({ authorization })
 		: undefined;
 	return new Request("https://chopin.test/mcp", { headers });
+}
+
+function call(mcp: (request: Request) => Promise<Response>, body: unknown, session?: string) {
+	return mcp(
+		new Request("https://chopin.test/mcp", {
+			method: "POST",
+			headers: {
+				authorization: "Bearer allowed",
+				...(session ? { "mcp-session-id": session } : {}),
+			},
+			body: JSON.stringify(body),
+		}),
+	);
+}
+
+async function code(response: Response): Promise<string> {
+	return (await response.json()).result.structuredContent.code;
 }
 
 async function plan(context: ReturnType<typeof setup>) {
@@ -372,11 +391,9 @@ describe("the hosted MCP adapter", () => {
 			).toEqual({
 				kind: "refused",
 				code: "planner-not-attached",
-				message:
-					"No Planner is attached to this document. To attach one, connect a Planner client to "
+				message: "Connect a machine to get a reply. Connect an agent client to "
 					+ "https://chopin.test/documents/octo-org/score/release-readiness over the agent "
-					+ "connection from a session in a checkout of octo-org/score; that session becomes this "
-					+ "document's Planner.",
+					+ "connection from a session in a checkout of octo-org/score.",
 			});
 		} finally {
 			await Service.close(opened.plan);
@@ -1278,6 +1295,106 @@ describe("the hosted MCP adapter", () => {
 		}
 	});
 
+	it("lists the decisions still open to a coding agent that reads an approved graph", async () => {
+		let context = setup();
+		let opened = await plan(context);
+		opened.plan.creation = {
+			brief: creation.brief,
+			origin: {
+				idempotencyKey: creation.idempotencyKey,
+				fingerprint: creation.fingerprint,
+				repository: creation.repository,
+				baseBranch: creation.baseBranch,
+				baseCommit: creation.baseCommit,
+				title: "Created",
+			},
+		};
+		expect(
+			(await implementationGraphs().revise(opened.plan, {
+				planRevision: 0,
+				graphRevision: 0,
+				operations: [{ op: "add", task: claimTask }],
+			})).ok,
+		).toBe(true);
+		expect((await implementationGraphs().approve(opened.plan)).ok).toBe(true);
+		let definition = {
+			questions: [{
+				id: "rollout",
+				header: "Rollout",
+				question: "How should we deploy?",
+				multiple: false,
+				options: [{ id: "canary", label: "Canary", description: "" }],
+			}],
+		};
+		let decision = {
+			id: "deploy",
+			status: "open" as const,
+			origin: "planner" as const,
+			definition,
+			history: [],
+			optionOrigins: {},
+			editors: [],
+		};
+		let adapter = hosted(context.auth, { lease: () => opened.lease });
+		let caller = await adapter.caller(request("Bearer allowed"));
+		if (!caller || !adapter.implementations) throw new Error("implementation adapter unavailable");
+		let listed = {
+			unapprovedDecisions: {
+				decisions: [{
+					id: "deploy",
+					questionId: "rollout",
+					status: "open",
+					prompt: "How should we deploy?",
+					options: ["Canary"],
+				}],
+			},
+		};
+
+		// With no open decision the agent has nothing to assume.
+		let live = Rooms.join(
+			{ data: { room: opened.channel.id, client: "mcp-test" } } as unknown as Socket,
+		);
+		live.plan = opened.plan;
+		try {
+			expect(await adapter.implementations.readImplementation(caller, opened.channel.id))
+				.not.toHaveProperty("unapprovedDecisions");
+			opened.plan.records.set("deploy", decision);
+			expect(await adapter.implementations.readImplementation(caller, opened.channel.id))
+				.toMatchObject(listed);
+			opened.plan.records.clear();
+		} finally {
+			Rooms.forget(live);
+		}
+
+		// A closed document answers from its stored sidecar.
+		await Service.close(opened.plan);
+		let stored = await context.storage.collaboration.load(opened.channel.id, context.now);
+		if (!stored?.snapshot) throw new Error("test channel has no checkpoint");
+		let sidecar = stored.sidecar as { [key: string]: JsonValue };
+		await context.storage.collaboration.commit({
+			channelId: opened.channel.id,
+			lease: opened.lease,
+			expectedRevision: stored.channel.revision,
+			operationId: crypto.randomUUID(),
+			epoch: stored.snapshot.epoch,
+			sidecar: {
+				...sidecar,
+				revision: Number(sidecar.revision) + 1,
+				questions: [decision],
+				openQuestions: [{
+					id: "deploy",
+					definition,
+					model: storedQuestion(definition),
+					revision: 0,
+				}],
+			},
+			events: [],
+			now: context.now,
+		});
+		expect(await adapter.implementations.readImplementation(caller, opened.channel.id))
+			.toMatchObject(listed);
+	});
+
 	it("atomically stores one implementation claim for a closed hosted plan", async () => {
 		let context = setup();
 		context.github.repositoryValue = {
@@ -1940,5 +2057,61 @@ describe("the hosted MCP adapter", () => {
 			Rooms.forget(live);
 			await Service.close(opened.plan);
 		}
+	});
+	it("keeps an MCP session across a restart, records its use, and answers an unknown one as before", async () => {
+		let context = setup();
+		context.github.repositoryValue.permissions.push = true;
+		let start = {
+			jsonrpc: "2.0",
+			id: 2,
+			method: "tools/call",
+			params: {
+				name: "start_implementation",
+				arguments: {
+					id: crypto.randomUUID(),
+					planRevision: 1,
+					graphVersion: 1,
+					graphRevision: 1,
+					repository: "octo-org/score",
+					branch: "feature",
+					commit: "0123456789abcdef0123456789abcdef01234567",
+				},
+			},
+		};
+		let lease = (await context.storage.leases.acquire("writer", "mcp-test", 60_000))!;
+		let persistence = { lease: () => lease };
+		let first = handler(hosted(context.auth, persistence));
+		let initialized = await call(first, {
+			jsonrpc: "2.0",
+			id: 1,
+			method: "initialize",
+			params: { clientInfo: { name: "Codex", version: "1.2.3" } },
+		});
+		let session = initialized.headers.get("mcp-session-id")!;
+		expect(await context.storage.mcpSessions.find(session)).toMatchObject({
+			userId: "U_allowed",
+			clientName: "Codex",
+			clientVersion: "1.2.3",
+		});
+
+		// A new process over the same database knows the session the old one issued.
+		let restarted = handler(hosted(context.auth, persistence));
+		expect(await code(await call(restarted, start, session))).not.toBe("session-required");
+		expect(await code(await call(restarted, start, crypto.randomUUID()))).toBe("session-required");
+		expect(await code(await call(restarted, start))).toBe("session-required");
+		expect(await code(await call(restarted, start, "x".repeat(500)))).toBe("session-required");
+
+		// Use is recorded at most once a minute.
+		let created = (await context.storage.mcpSessions.find(session))!.lastSeenAt;
+		context.now.setTime(context.now.getTime() + 30_000);
+		await call(restarted, start, session);
+		expect((await context.storage.mcpSessions.find(session))!.lastSeenAt).toEqual(created);
+		context.now.setTime(context.now.getTime() + 60_000);
+		await call(restarted, start, session);
+		expect((await context.storage.mcpSessions.find(session))!.lastSeenAt).toEqual(context.now);
+
+		// An idle one is forgotten, and its id is unknown again.
+		await context.storage.mcpSessions.deleteIdle(new Date(context.now.getTime() + 1));
+		expect(await code(await call(restarted, start, session))).toBe("session-required");
 	});
 });

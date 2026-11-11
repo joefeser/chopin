@@ -202,6 +202,59 @@ test(
 	},
 );
 
+test(
+	"Build draws task text in boxes a reader can find, and a long title keeps to two lines",
+	async ({ seed, join: enter, room }) => {
+		let graph = preparedGraph();
+		let [connect] = graph.versions[0]!.definition.tasks;
+		Object.assign(connect!, {
+			title: "Prove the decision core in `verified/src/login.rs`, then keep every login, refresh"
+				+ " and logout outcome reachable through that one proved function so that nothing"
+				+ " in the backend is decided twice or decided differently",
+		});
+		await seed("# Linked task\n\nThe second task is the one to read.\n", {
+			graph,
+			builds: [failedBuild(graph)],
+		});
+		let page = await enter("ana");
+		await page.goto(`${roomPath(room)}#task-review`);
+		let view = buildView(page);
+		await expect(view.getByRole("button", { name: /^Review the connection/ }))
+			.toHaveAttribute("aria-expanded", "true");
+		// A phrase is found by its words. A browser measures, scrolls to and waits for the rest of an
+		// element by its box, and text drawn in an element with none has a rectangle of nothing at the
+		// corner of the page: a test, or a screen magnifier, cannot tell where it is or whether it moves.
+		for (
+			let words of [
+				"Verify progress survives refresh.",
+				"The progress persists.",
+				"The dependency is visible.",
+			]
+		) {
+			let text = view.getByText(words, { exact: true });
+			await expect(text).toBeInViewport();
+			let box = (await text.boundingBox())!;
+			expect(box, words).not.toBeNull();
+			expect(box.width, words).toBeGreaterThan(0);
+			expect(box.height, words).toBeGreaterThan(0);
+		}
+		// The title clamps at two lines with its code chip in the running text, not on a line of its own.
+		let toggle = view.getByRole("button", { name: /^Prove the decision core/ });
+		let title = toggle.locator(".build-task-title");
+		let rows = await title.evaluate(element => {
+			let box = element.getBoundingClientRect();
+			let line = parseFloat(getComputedStyle(element).lineHeight);
+			let code = element.querySelector("code")!.getBoundingClientRect();
+			return {
+				lines: Math.round(box.height / line),
+				clamped: element.scrollHeight > element.clientHeight,
+				codeRow: Math.floor((code.top + code.height / 2 - box.top) / line),
+			};
+		});
+		expect(rows).toEqual({ lines: 2, clamped: true, codeRow: 0 });
+	},
+);
+
 async function connector(baseURL: string, command: string[], env: Record<string, string> = {}) {
 	let root = await mkdtemp(join(tmpdir(), "chopin-implementation-checkout-"));
 	let state = await mkdtemp(join(tmpdir(), "chopin-implementation-state-"));
@@ -218,6 +271,7 @@ async function connector(baseURL: string, command: string[], env: Record<string,
 		join(ROOT, "apps/connector/src/main.ts"),
 		"connect",
 		root,
+		"--no-sandbox",
 		"--",
 		...command,
 	], {
@@ -694,7 +748,7 @@ test("the agent-offline notice folds to its glyph before the document's title gi
 });
 
 test(
-	"Build plan waits for unanswered decisions and says so",
+	"Build plan proceeds while decisions are open and leaves them to answer",
 	async ({ seed, join: enter }) => {
 		let widget = "01K0N4TR8K7JGM4R1J7PW4R8YJ";
 		let question = "01K0N4V4E7Y6P4MJ5WD8XZF3B2";
@@ -709,13 +763,12 @@ test(
 			}],
 		};
 		await seed(
-			`# Blocked build\n\nA decision is open.\n\n<Questionnaire id="${widget}" by="ana">
+			`# Open decision\n\nA decision is open.\n\n<Questionnaire id="${widget}" by="ana">
 <Question id="${question}" header="Rollout" prompt="How should we deploy?" multiple="false">
 <Option id="${option}" label="Canary" />
 </Question>
 </Questionnaire>\n`,
 			{
-				revision: 1,
 				graph: preparedGraph(),
 				questions: [{
 					id: widget,
@@ -736,27 +789,23 @@ test(
 			},
 		);
 		let page = await enter("ana");
-		let plan = page.getByRole("button", { name: "1 decision left. Show blockers", exact: true });
+		let plan = page.getByRole("button", { name: "Build plan", exact: true });
 		await expect(plan).toBeVisible();
-		await expect(page.getByRole("button", { name: "Build plan", exact: true })).toHaveCount(0);
+		// Nothing about the open decision holds Build back: no waiting capsule, no inert button.
+		await expect(page.getByRole("button", { name: /decisions? left/ })).toHaveCount(0);
+		await expect(plan).not.toHaveAttribute("aria-disabled", "true");
+		let shots = process.env.CHOPIN_SHOTS;
+		if (shots) await page.screenshot({ path: `${shots}/build-plan-with-open-decision.png` });
 		await plan.click();
-		let popup = page.getByRole("dialog", { name: "Build blockers", exact: true });
-		let item = popup.getByRole("button", { name: "Review: How should we deploy?", exact: true });
-		await expect(item).toBeVisible();
-		let screenshot = test.info().outputPath("decision-blocker-header.png");
-		await page.screenshot({ path: screenshot });
-		await test.info().attach("decision-blocker-header", {
-			path: screenshot,
-			contentType: "image/png",
-		});
-		await item.click();
-		await expect(page.locator(`article[data-plan-sidecar-questionnaire="${widget}"]`).first())
-			.toBeFocused();
-		await expect(page.getByRole("button", { name: "Preparing tasks", exact: true })).toHaveCount(0);
+		// The press went ahead; with no local agent connected it stops there, not at the decision.
+		await expect(page.getByRole("button", { name: "Agent offline", exact: true })).toBeVisible();
 		await expect(
 			page.getByRole("group", { name: "Document view" })
 				.getByRole("button", { name: "Build", exact: true }),
-		).toBeDisabled();
+		).toBeEnabled();
+		// The decision stays open on the page, still answerable once the build is done with it.
+		await expect(page.locator(`article[data-plan-sidecar-questionnaire="${widget}"]`).first())
+			.toBeVisible();
 	},
 );
 
