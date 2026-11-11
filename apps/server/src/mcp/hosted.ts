@@ -80,6 +80,8 @@ export type HostedCallbacks = {
 	invokePlanner?: (input: PlannerInvocation) => Promise<InvokePlannerError | undefined>;
 	/** What `planner-not-attached` says for a document, at its URL; how to attach one by default. */
 	plannerNotAttached?: (channelId: string, url: string, repository: string) => Promise<string>;
+	/** Hand a Planner-left-open decision's external answer to the Planner, as the room's own Save does. */
+	onPlannerAnswer?: (channelId: string, id: string, generation: number) => void;
 };
 
 const BEARER = new RegExp("^Bearer ([A-Za-z0-9._~+/-]+=*)$", "i");
@@ -959,7 +961,7 @@ export function hosted(
 											optionIds: input.optionIds,
 											resolver: caller.user.login,
 											idempotencyKey: input.idempotencyKey,
-										}),
+										}, (id, generation) => callbacks.onPlannerAnswer?.(channel.id, id, generation)),
 								);
 							} catch (err) {
 								if (err instanceof Error && err.message === "document is unavailable") {

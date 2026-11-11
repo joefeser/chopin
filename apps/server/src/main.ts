@@ -3338,6 +3338,7 @@ registerMcpRoutes(
 		restoreChannel,
 		serializeDocument: (channelId, action) =>
 			withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),
+		onPlannerAnswer: answerDecision,
 	},
 	config.externalCoordination
 		? { approvers: config.coordinationApprovers ?? [] }

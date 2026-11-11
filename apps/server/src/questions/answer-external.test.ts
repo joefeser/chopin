@@ -4,6 +4,7 @@ import * as Question from "@chopin/question";
 
 import * as Questions from "./service";
 import * as Store from "./store";
+import { decisionGeneration } from "./card-actions";
 
 import { hosted } from "../plan/conversation-persistence.test-fixtures";
 import { seededPlan } from "../plan/projection-submit.test-fixtures";
@@ -272,5 +273,56 @@ describe("answerExternal", () => {
 			optionIds: [bridge.second],
 		});
 		expect(conflict).toEqual({ kind: "refused", code: "idempotency-conflict" });
+	});
+
+	it("hands a Planner-open decision's answer to the Planner, as the room's own Save does", async () => {
+		let state = await answerable();
+		// Model the `open_decisions` shape the hook exists for: a Planner
+		// created the dialog and nobody waits on the answer (`awaited` is
+		// unset — true of every restored plan too, since it is not stored).
+		let record = state.plan.records.get(state.id);
+		if (!record) throw new Error("card record missing");
+		record.origin = "planner";
+		let generation = decisionGeneration(record);
+		let handed: Array<[string, number]> = [];
+		let answered = await Questions.answerExternal(
+			state.plan,
+			state.plan.server,
+			state.context.channel.id,
+			{
+				questionId: state.id,
+				revision: state.revision,
+				optionIds: [state.first],
+				resolver: "octocat",
+				idempotencyKey: "d9:answer:1",
+			},
+			(id, handedGeneration) => handed.push([id, handedGeneration]),
+		);
+		if (answered.kind !== "answered") {
+			throw new Error(`external answer failed: ${JSON.stringify(answered)}`);
+		}
+		expect(handed).toEqual([[state.id, generation]]);
+	});
+
+	it("leaves a conversation-born decision on its prose path without a Planner handoff", async () => {
+		let state = await answerable();
+		let handed: Array<[string, number]> = [];
+		let answered = await Questions.answerExternal(
+			state.plan,
+			state.plan.server,
+			state.context.channel.id,
+			{
+				questionId: state.id,
+				revision: state.revision,
+				optionIds: [state.first],
+				resolver: "octocat",
+				idempotencyKey: "d9:answer:2",
+			},
+			(id, generation) => handed.push([id, generation]),
+		);
+		if (answered.kind !== "answered") {
+			throw new Error(`external answer failed: ${JSON.stringify(answered)}`);
+		}
+		expect(handed).toEqual([]);
 	});
 });

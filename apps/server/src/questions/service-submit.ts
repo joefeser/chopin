@@ -409,13 +409,17 @@ function resolveDecisionId(plan: Plan, ref: string): string | undefined {
  * through the same durable core as the room's own submit path: the same
  * pre-checks and re-checks, the same staged projection and size check, the
  * same persist-before-broadcast commit, with the B4 operation record riding
- * that commit so the answer and its idempotency ledger cannot diverge.
+ * that commit so the answer and its idempotency ledger cannot diverge. The
+ * Planner handoff is the room's own too: a decision the Planner left open to
+ * act on later hands its answer over exactly as a Save would, so an external
+ * settle starts the Planner's turn instead of starving it.
  */
 export async function answerExternal(
 	plan: Plan,
 	server: Server<SocketData>,
 	roomId: string,
 	input: ExternalAnswerInput,
+	onPlannerAnswer?: (id: string, generation: number) => void,
 ): Promise<ExternalAnswer> {
 	let decisionId = resolveDecisionId(plan, input.questionId);
 	if (!decisionId) {
@@ -553,6 +557,13 @@ export async function answerExternal(
 		};
 	}
 	outcome.finish();
+	// A decision the Planner left open to act on later (an `open_decisions`
+	// card, or an ask whose turn has since gone) hands its answer over the
+	// same way the room's own Save does, so the Planner's turn starts no
+	// matter which path settled it.
+	if (plannerToActOn(outcome.record, claimed.claim.entry)) {
+		onPlannerAnswer?.(decisionId, decisionGeneration(outcome.record));
+	}
 	notifyAnswered(plan, server, roomId, {
 		id: decisionId,
 		resolver: input.resolver,
