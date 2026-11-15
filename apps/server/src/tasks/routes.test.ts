@@ -11,6 +11,7 @@ import { implementationGraphs } from "./plan-graphs";
 import { registerImplementationRoutes } from "./routes";
 import { queueRebuild, requestBuild } from "./builds";
 import { implementationStatus } from "./notifications";
+import { buildNotices } from "./build-notices";
 import { LiveSyncCoordinator } from "./live-sync";
 import { serves } from "../experiments/connections";
 import type { GitHub } from "../github/client";
@@ -123,6 +124,8 @@ async function setup(
 		unreadable?: { locked: boolean };
 		/** How long after a restart a build's machine may come back and carry it on. */
 		resumeMs?: number;
+		/** Builds start from what the server reads on GitHub, where these commits are. */
+		github?: { commits: Set<string> };
 	} = {},
 ) {
 	let context = await openPlan("# Launcher plan\n");
@@ -154,6 +157,16 @@ async function setup(
 		async repositoryAccess(token: string) {
 			return github.repository(token, "owner", "repository");
 		},
+		...(options.github
+			? {
+				async branchHead() {
+					return "b".repeat(40);
+				},
+				async hasCommit(_token: string, _owner: string, _name: string, sha: string) {
+					return options.github!.commits.has(sha);
+				},
+			}
+			: {}),
 	} as unknown as GitHub;
 	let config = {
 		origin: "https://chopin.test",
@@ -218,6 +231,7 @@ async function setup(
 			takers: current.takers,
 			mayTake: current.mayTake,
 			machineChoices: current.machineChoices,
+			...(options.github ? { sourceFor: current.sourceFor } : {}),
 			busy: async connectionId =>
 				(await current.service.store.active()).some(item =>
 					item.connectionId === connectionId && ["running", "publishing"].includes(item.state)
@@ -392,7 +406,10 @@ test("the build owner can stop from the browser without losing reported pull req
 	expect(snapshot.build).toMatchObject({ state: "failed", error: "Stopped in Chopin." });
 	expect(context.experiments.connections.assigned(connection.id)).toBeUndefined();
 	expect(context.plan.live).toBeUndefined();
-	expect(snapshot.lifecycle.activity.tasks[0].pullRequest.url)
+	// The stop ends the run the build claimed, which keeps what it reported and opens the document.
+	expect(Plan.implementationActive(context.plan)).toBe(false);
+	expect(snapshot.lifecycle.execution.state).toBe("idle");
+	expect(snapshot.lifecycle.history.at(-1).progress.tasks[0].pullRequest.url)
 		.toBe("https://github.com/owner/repository/pull/7");
 	expect(
 		(await tool(context, connection.token, "renew_implementation_build", { id: built.id })).isError,
@@ -406,6 +423,96 @@ test("the build owner can stop from the browser without losing reported pull req
 		})).isError,
 	).toBe(true);
 	await Plan.close(context.plan);
+});
+
+test("a person's Stop names who stopped the build to its machine, its run record and Chat", async () => {
+	let context = await setup();
+	try {
+		let { connection, built } = await running(context);
+		expect((await context.call(`${context.path}/stop`, { id: built.id })).status).toBe(200);
+		let snapshot = await (await context.call(context.path)).json();
+		expect(snapshot.build).toMatchObject({ state: "failed", stoppedBy: "test" });
+		expect(snapshot.lifecycle.history.at(-1).outcome).toEqual({
+			kind: "revision_requested",
+			reason: "Stopped in Chopin by @test.",
+		});
+		// The machine's next heartbeat hears that a person stopped it, not that it was refused.
+		let refused = await tool(context, connection.token, "renew_implementation_build", {
+			id: built.id,
+			documentId: context.plan.id,
+		});
+		expect(refused.isError).toBe(true);
+		expect(refused.content[0].text).toBe("build-stopped: Stopped in Chopin by @test.");
+		expect(buildNotices(context.plan).at(-1)?.text).toBe("Build stopped by @test.");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a build whose agent blocked a task ends blocked, with its reason, wherever it shows", async () => {
+	let context = await setup();
+	try {
+		let { connection, built, claim } = await running(context);
+		await tool(context, claim.runToken, "start_task", { taskId: "first", idempotencyKey: "start" });
+		await tool(context, claim.runToken, "block_task", {
+			taskId: "first",
+			idempotencyKey: "block",
+			reason: "Missing source: the formal files are not in the repository",
+		});
+		let ended = await tool(context, connection.token, "report_implementation_build", {
+			id: built.id,
+			state: "stopped",
+		});
+		expect(ended).toEqual({
+			accepted: true,
+			ending: {
+				kind: "blocked",
+				task: "First",
+				reason: "Missing source: the formal files are not in the repository",
+			},
+		});
+		let snapshot = await (await context.call(context.path)).json();
+		expect(snapshot.lifecycle.history.at(-1).outcome).toEqual({
+			kind: "revision_requested",
+			reason: "“First” is blocked: Missing source: the formal files are not in the repository",
+		});
+		expect(buildNotices(context.plan).at(-1)?.text).toBe(
+			"Build blocked on “First”: Missing source: the formal files are not in the repository.",
+		);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a build that delivered tells its machine which pull requests it opened", async () => {
+	let context = await setup();
+	try {
+		let { connection, built, claim } = await running(context);
+		let url = "https://github.com/owner/repository/pull/7";
+		for (
+			let [name, args] of [
+				["start_task", { taskId: "first", idempotencyKey: "start" }],
+				["report_pr", { taskId: "first", idempotencyKey: "pr", url, state: "open" }],
+				["complete_task", { taskId: "first", idempotencyKey: "done", summary: "Launched" }],
+				["report_verification", {
+					idempotencyKey: "verified",
+					passed: true,
+					summary: "Reviewed.",
+					reviewerMethod: "Ran the suite.",
+					evidence: [{ taskId: "first", evidence: ["Suite passed."] }],
+					tasksNeedingWork: [],
+				}],
+			] as const
+		) expect((await tool(context, claim.runToken, name, args)).isError).toBeUndefined();
+		expect(
+			await tool(context, connection.token, "report_implementation_build", {
+				id: built.id,
+				state: "stopped",
+			}),
+		).toEqual({ accepted: true, ending: { kind: "finished", pullRequests: [url], tasks: 1 } });
+	} finally {
+		await Plan.close(context.plan);
+	}
 });
 
 test("a stale Stop rejects a naturally ended build instead of claiming cancellation", async () => {
@@ -539,7 +646,9 @@ test("a paired workspace claims a browser build once and reports through run-sco
 	});
 	snapshot = await (await context.call(context.path)).json();
 	expect(snapshot.build.session).toBe("acp-session");
-	expect(snapshot.lifecycle.activity.tasks[0].blocker).toBe("Choose the next tracer");
+	expect(snapshot.lifecycle.history.at(-1).progress.tasks[0].blocker).toBe(
+		"Choose the next tracer",
+	);
 	expect((await tool(context, claim.runToken, "read_implementation")).isError).toBe(true);
 	await Plan.close(context.plan);
 });
@@ -1050,7 +1159,7 @@ test.each([false, true])(
 					...args,
 					state: "stopped",
 				}),
-			).toEqual({ accepted: true });
+			).toEqual({ accepted: true, ending: { kind: "unfinished" } });
 			expect(context.plan.builds.at(-1)).toMatchObject({ state: "stopped" });
 		} finally {
 			await Plan.close(context.plan);
@@ -1179,7 +1288,7 @@ test("a build carries on across a server restart once its machine comes back", a
 				...hint,
 				state: "stopped",
 			}),
-		).toEqual({ accepted: true });
+		).toEqual({ accepted: true, ending: { kind: "unfinished" } });
 		expect(context.plan.builds.at(-1)).toMatchObject({ state: "stopped" });
 		expect(context.plan.builds.at(-1)!.error).toBeUndefined();
 		// Its run credential ended with the build.
@@ -1226,7 +1335,8 @@ test("a build that ended before a restart stays ended", async () => {
 			id: built.id,
 			documentId: context.plan.id,
 		});
-		expect(renewed.content[0].text).toMatch(/^build-inactive:/);
+		// Its machine hears who stopped it, after the restart too.
+		expect(renewed.content[0].text).toBe("build-stopped: Stopped in Chopin by @test.");
 		let agent = await tool(context, claim.runToken, "start_task", {
 			taskId: "first",
 			idempotencyKey: "start",
@@ -1394,6 +1504,7 @@ test("a build report retried after its answer was lost lands once, and an invali
 	await tool(context, connection.token, "report_implementation_build", stopped);
 	expect(await tool(context, connection.token, "report_implementation_build", stopped)).toEqual({
 		accepted: true,
+		ending: { kind: "unfinished" },
 	});
 	expect(context.plan.builds.at(-1)!.state).toBe("stopped");
 	// The run's earlier report no longer describes the build, so its key no longer passes.
@@ -1563,7 +1674,7 @@ test("a committed build wakes the waiting connector and a failed pickup can be r
 	}
 });
 
-test("returning a stopped implementation for changes durably unlocks it once", async () => {
+test("a stopped implementation is returned for changes as it stops, durably and once", async () => {
 	let context = await setup();
 	let connection = await paired(context);
 	try {
@@ -1578,29 +1689,33 @@ test("returning a stopped implementation for changes durably unlocks it once", a
 			state: "running",
 			session: "session",
 		});
+		expect(context.plan.execution?.id).toBe(built.id);
 		let input = { buildId: built.id, reason: "Resolve the missing design decision" };
 		expect((await context.call(`${context.path}/revise`, input)).status).toBe(409);
-		await tool(context, connection.token, "report_implementation_build", {
-			id: built.id,
-			state: "stopped",
-		});
-		expect(
-			(await context.call(`${context.path}/revise`, input, undefined, "https://other.test")).status,
-		)
-			.toBe(403);
 		let commit = context.storage.collaboration.commit;
 		context.storage.collaboration.commit = async () => {
 			throw new Error("offline");
 		};
-		expect((await context.call(`${context.path}/revise`, input)).status).toBe(409);
+		let stop = { id: built.id, state: "stopped" };
+		expect((await tool(context, connection.token, "report_implementation_build", stop)).isError)
+			.toBe(true);
 		expect(Plan.implementationActive(context.plan)).toBe(true);
+		expect(context.plan.execution?.id).toBe(built.id);
 		context.storage.collaboration.commit = commit;
-		expect((await context.call(`${context.path}/revise`, input)).status).toBe(200);
-		expect((await context.call(`${context.path}/revise`, input)).status).toBe(200);
+		await tool(context, connection.token, "report_implementation_build", stop);
 		expect(Plan.implementationActive(context.plan)).toBe(false);
+		expect(implementationStatus(context.plan).locked).toBe(false);
 		expect(context.plan.execution).toBeUndefined();
+		expect(context.plan.graph?.versions.at(-1)?.state).toBe("approved");
 		expect(context.plan.lifecycle.history).toHaveLength(1);
 		expect(context.plan.lifecycle.history[0].events.at(-1)?.kind).toBe("request_revision");
+		// Return to planning from a page that still shows the build as stopped changes nothing more.
+		expect(
+			(await context.call(`${context.path}/revise`, input, undefined, "https://other.test")).status,
+		)
+			.toBe(403);
+		expect((await context.call(`${context.path}/revise`, input)).status).toBe(200);
+		expect(context.plan.lifecycle.history).toHaveLength(1);
 	} finally {
 		await Plan.close(context.plan);
 	}
@@ -1711,8 +1826,8 @@ function edit(plan: Plan.Plan, text: string) {
 	}));
 }
 
-/** Deliver a live build, edit the document, then queue and start a rebuild of that edit. */
-async function rebuilding(autoRun = false) {
+/** Deliver a live build of the document's first revision. */
+async function deliveredLive(autoRun = false) {
 	let context = await setup();
 	context.plan.persistence.liveBuild = true;
 	let stopped: string[] = [];
@@ -1742,6 +1857,12 @@ async function rebuilding(autoRun = false) {
 		id: built.id,
 		state: "stopped",
 	});
+	return { context, connection, built, claim, stopped };
+}
+
+/** Deliver a live build, edit the document, then queue and start a rebuild of that edit. */
+async function rebuilding(autoRun = false) {
+	let { context, connection, built, claim, stopped } = await deliveredLive(autoRun);
 	let builtSource = context.plan.live!.baseSource;
 	expect((await edit(context.plan, "A rebuilt paragraph.")).ok).toBe(true);
 	let target = Plan.source(context.plan);
@@ -1812,14 +1933,69 @@ test("a running rebuild leaves editing open and reads its sealed delta", async (
 		expect((await edit(context.plan, "An edit during the rebuild.")).ok).toBe(true);
 		let read = await tool(context, rebuild.runToken, "read_rebuild");
 		expect(read).toEqual({
+			document: { url: expect.stringContaining("/documents/"), earlierUrls: [] },
 			before: builtSource,
 			after: target,
 			baseRevision: 0,
 			targetRevision: 1,
 			pullRequests: [{ url: pullRequest, title: "First" }],
 			tasks: [{ title: "First", goal: "Launch", pullRequest, summary: "Launched" }],
+			requestedBy: expect.objectContaining({ login: "test" }),
 		});
 		expect(read.after).not.toContain("An edit during the rebuild.");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a rebuild never pushes to a pull request a person closed, and names the document's address now", async () => {
+	let { context, rebuild } = await rebuilding();
+	try {
+		let asked: number[] = [];
+		(context.auth.github as unknown as Record<string, unknown>).pullRequest = async (
+			_token: string,
+			_owner: string,
+			_name: string,
+			number: number,
+		) => {
+			asked.push(number);
+			return { kind: "pull", number, state: "closed" };
+		};
+		// The machine's own GitHub sign-in reads it; this test's machines hold none.
+		context.auth.machines.use = async (_machine, read) => read("test") as never;
+		let read = await tool(context, rebuild.runToken, "read_rebuild");
+		expect(asked).toEqual([7]);
+		expect(read.pullRequests).toEqual([]);
+		expect(read.closedPullRequests).toEqual([{
+			url: pullRequest,
+			title: "First",
+			state: "closed",
+		}]);
+		let channel = (await context.storage.channels.get(context.plan.id))!;
+		expect(read.document).toEqual({
+			url: `https://chopin.test/documents/owner/repository/${channel.slug}`,
+			earlierUrls: [],
+		});
+		let pushed = await tool(context, rebuild.runToken, "report_rebuild", {
+			summary: "Pushed to the closed one.",
+			commits: [{ pullRequest, sha: "c".repeat(40), message: "Reopen it" }],
+			tasks: [],
+		});
+		expect(pushed.isError).toBe(true);
+		expect(JSON.stringify(pushed)).toContain("closedPullRequests");
+		let replacement = "https://github.com/owner/repository/pull/8";
+		expect(
+			await tool(context, rebuild.runToken, "report_rebuild", {
+				summary: "Moved to a new pull request.",
+				commits: [{ pullRequest: replacement, sha: "d".repeat(40), message: "Rebuild it" }],
+				tasks: [{ title: "Rebuilt paragraph", goal: "Render it", pullRequest: replacement }],
+			}),
+		).toEqual({ state: "stopped" });
+		expect(context.plan.live!.pullRequests).toEqual([replacement]);
+		expect(context.plan.live!.closedPullRequests).toMatchObject([{
+			url: pullRequest,
+			state: "closed",
+		}]);
 	} finally {
 		await Plan.close(context.plan);
 	}
@@ -2701,9 +2877,11 @@ async function shared(
 	own = false,
 	/** Its owner also let Chopin start work on it by itself. */
 	autoRun = false,
+	/** The connector protocol the shared machine speaks. */
+	protocol?: number,
 ) {
 	let mine = own ? await paired(context) : undefined;
-	let theirs = await paired(context, context.otherCookie, autoRun);
+	let theirs = await paired(context, context.otherCookie, autoRun, protocol);
 	let owner = (url: string, value: unknown) =>
 		context.call(url, value, undefined, undefined, context.otherCookie);
 	await owner(`/api/connector/machines/${theirs.machine}/label`, { label: "desk" });
@@ -2720,6 +2898,25 @@ async function shared(
 	return { mine, theirs, choose, owner };
 }
 let review = { planRevision: 0, graphVersion: 1, graphRevision: 1 };
+
+test("an older connector's build on a shared machine says it pushes with the owner's account", async () => {
+	let context = await setup();
+	try {
+		let { theirs } = await shared(context, false, false, 6);
+		let built = await (await context.call(context.path, review)).json();
+		let claim = await tool(context, theirs.token, "claim_implementation_build", { id: built.id });
+		await tool(context, theirs.token, "report_implementation_build", {
+			id: built.id,
+			state: "running",
+			session: "acp-session",
+		});
+		let read = await tool(context, claim.runToken, "read_implementation");
+		expect(read.requestedBy.pullRequestNote).toContain("Requested by test in https://chopin.test/");
+		expect(read.requestedBy.pullRequestNote).toContain("other's shared machine");
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
 
 test("Build goes to the teammate's shared machine the person chose, and runs there on their behalf", async () => {
 	let context = await setup();
@@ -2756,12 +2953,15 @@ test("Build goes to the teammate's shared machine the person chose, and runs the
 		).toBeUndefined();
 		// The run is recorded as the person's who asked, never the machine owner's.
 		expect(context.plan.execution?.user).toBe("U_test");
-		// The agent is told whose request it is, to say so in each pull request it opens.
+		// The agent is told whose request it is, to credit them in each pull request it opens: the
+		// machine's connector pushes as the GitHub App's bot, not as the machine's owner.
 		let read = await tool(context, claim.runToken, "read_implementation");
 		expect(read.requestedBy.login).toBe("test");
-		expect(read.requestedBy.pullRequestNote).toContain("Requested by test in https://chopin.test/");
-		expect(read.requestedBy.pullRequestNote).toContain("other's shared machine");
+		expect(read.requestedBy.pullRequestNote).toMatch(
+			/^Requested by @test in https:\/\/chopin\.test\/\S+\. Built by a coding agent with Chopin's GitHub App\.$/,
+		);
 		expect(read.requestedBy.instructions).toContain("pullRequestNote");
+		expect(read.requestedBy.instructions).toContain("request a review from test");
 		// Everyone who sees the build is told whose machine it ran on.
 		let snapshot = await (await context.call(context.path)).json();
 		expect(snapshot.startedBy).toBe("test");
@@ -3492,6 +3692,110 @@ test("Build is refused while the person's machine choice cannot be read, then us
 		expect(offline.status).toBe(409);
 		expect((await offline.json()).error).toBe("machine-offline");
 		expect(context.plan.builds).toEqual([]);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a build of a revision whose plan files were pushed starts from their commit, and its builder reads where", async () => {
+	let planned = { revision: 0, branch: "plans/launcher", commit: "c".repeat(40) };
+	let context = await setup({ github: { commits: new Set([planned.commit]) } });
+	try {
+		context.plan.planSources = [planned];
+		let connection = await paired(context);
+		let built = await (await context.call(context.path, {
+			planRevision: 0,
+			graphVersion: 1,
+			graphRevision: 1,
+		})).json();
+		expect(built.checkout).toEqual({
+			repository: "owner/repository",
+			branch: planned.branch,
+			commit: planned.commit,
+		});
+		expect(built.planSource).toEqual(planned);
+		expect((await (await context.call(context.path)).json()).build.planSource).toEqual(planned);
+		let claim = await tool(context, connection.token, "claim_implementation_build", {
+			id: built.id,
+		});
+		expect(claim.source).toMatchObject({ commit: planned.commit, branch: planned.branch });
+		await tool(context, connection.token, "report_implementation_build", {
+			id: built.id,
+			state: "running",
+			session: "acp-session",
+		});
+		expect((await tool(context, claim.runToken, "read_implementation")).planSource).toEqual(
+			planned,
+		);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a build with no plan source starts from the machine's checkout, as before", async () => {
+	let context = await setup({ github: { commits: new Set() } });
+	try {
+		await paired(context);
+		let built = await (await context.call(context.path, {
+			planRevision: 0,
+			graphVersion: 1,
+			graphRevision: 1,
+		})).json();
+		expect(built.checkout).toEqual(checkout);
+		expect(built.planSource).toBeUndefined();
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a plan source GitHub doesn't have refuses the build, saying so, and queues nothing", async () => {
+	let context = await setup({ github: { commits: new Set() } });
+	try {
+		context.plan.planSources = [{ revision: 0, branch: "plans/launcher", commit: "d".repeat(40) }];
+		await paired(context);
+		let response = await context.call(context.path, {
+			planRevision: 0,
+			graphVersion: 1,
+			graphRevision: 1,
+		});
+		expect(response.status).toBe(409);
+		expect((await response.json()).error).toBe("plan-source-unavailable");
+		expect(context.plan.builds).toEqual([]);
+	} finally {
+		await Plan.close(context.plan);
+	}
+});
+
+test("a rebuild keeps its base unless the plan's files were pushed for a revision since the last build", async () => {
+	let { context, connection } = await deliveredLive();
+	try {
+		let first = context.plan.builds[0]!;
+		let base = context.plan.live!.baseRevision;
+		// A source recorded for the revision already built is not newer: today's base stands.
+		context.plan.planSources = [{ revision: base, branch: "plans/one", commit: "c".repeat(40) }];
+		expect((await edit(context.plan, "A rebuilt paragraph.")).ok).toBe(true);
+		let kept = await queueRebuild(context.plan, context.experiments.connections);
+		if (kept.kind !== "queued") throw new Error(`rebuild was ${kept.kind}`);
+		expect(kept.build.checkout).toEqual(first.checkout);
+		expect(kept.build.planSource).toBeUndefined();
+		await tool(context, connection.token, "claim_implementation_build", { id: kept.build.id });
+		await tool(context, connection.token, "report_implementation_build", {
+			id: kept.build.id,
+			state: "stopped",
+		});
+		// The Planner pushed the edited revision's files: the next rebuild starts from them.
+		let newer = { revision: context.plan.revision, branch: "plans/two", commit: "e".repeat(40) };
+		context.plan.planSources = [...context.plan.planSources, newer];
+		let moved = await queueRebuild(context.plan, context.experiments.connections, {
+			by: "U_test",
+		});
+		if (moved.kind !== "queued") throw new Error(`rebuild was ${moved.kind}`);
+		expect(moved.build.checkout).toEqual({
+			repository: first.checkout.repository,
+			branch: newer.branch,
+			commit: newer.commit,
+		});
+		expect(moved.build.planSource).toEqual(newer);
 	} finally {
 		await Plan.close(context.plan);
 	}

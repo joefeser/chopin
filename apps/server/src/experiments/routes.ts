@@ -35,12 +35,18 @@ import type { Session } from "@chopin/protocol";
 import type { PlannerAssignment, PlannerControl } from "@chopin/protocol/connector";
 import { documentsPath } from "@chopin/protocol/document-url";
 import { documentUrl } from "../channels/document-url";
+import { isChannelId } from "../channels/id";
 import type { PlannerAttachments } from "../harness/remote/attachments";
 import type { MachinePlanners } from "../harness/remote/machine-planners";
 import { ANY_REPOSITORY_PROTOCOL, checkoutOf, Connections, serves } from "./connections";
-import { machineGitHubToken } from "./machine-github";
+import { launchGitHubToken, machineGitHubToken } from "./machine-github";
+import type { GitHubIdentity, LaunchRun } from "./machine-github";
+import { liveMcpLaunch, McpTokens, mintMcpToken } from "./mcp-token";
+import type { HostedCaller } from "../mcp/hosted";
+import type { GitHubApp } from "../github/app";
 import type { About, Connection } from "./connections";
 import type { Source } from "@chopin/experiment";
+import type { PlanSource } from "@chopin/protocol/implementation";
 import { PairingKeys } from "./pairing-keys";
 import { Experiments, fail } from "./service";
 import { datasetCsv } from "./export";
@@ -78,6 +84,8 @@ type Options = {
 	connectorVersion?: string;
 	/** Planner credentials for paired machines; set only under HARNESS=remote with AGENT on. */
 	planners?: MachinePlanners;
+	/** The GitHub App acting as itself, when the server has its key: it mints machines' tokens. */
+	app?: GitHubApp;
 	/** Who holds each document's Planner under HARNESS=remote, which a chosen machine's backend joins. */
 	attachments?: () => PlannerAttachments | undefined;
 	/** A person chose a machine for a document, or went back to automatic. */
@@ -231,16 +239,67 @@ function stoppedSharing(login: string) {
  * Protocol 5 connects the machine rather than one checkout: it takes work in any repository its
  * owner can push to. An older connector still connects, for its one checkout's repository.
  * Protocol 6 keeps the claimed document ID on build renewals and reports after assignment cleanup.
+ * Protocol 7 says what each GitHub token is for, takes the App's installation token for one
+ * repository and the bot and starter it names, and stops a launch Chopin gives no token.
  */
-export const CONNECTOR_PROTOCOLS: { min: number; max: number } = { min: 2, max: 6 };
+export const CONNECTOR_PROTOCOLS: { min: number; max: number } = { min: 2, max: 7 };
 
 /** A document's people read why a Planner backend keeps failing from this launch in a row on. */
 export const PLANNER_FAILURE_SHOWN_AT = 2;
+/**
+ * The first chopin release whose connector tells Chopin why a Planner backend keeps exiting before
+ * it attaches (`/api/connector/planner/failure`). A machine on an older one cannot, so Chopin says
+ * what it saw of that machine itself, and that updating it shows why.
+ */
+export const PLANNER_REPORTS_FROM = "0.0.23";
+/**
+ * How long a machine asked to run a document's Planner may go without one attaching before the
+ * document's people are told it is not answering, whatever its connector says or cannot say: long
+ * enough for a first start that clones a repository and builds what the backend needs.
+ */
+export const PLANNER_PATIENCE_MS = 2 * 60_000;
 /** The longest reason shown, in characters. */
 const START_REASON_CHARS = 300;
 
 /** What a machine's connector last said about its Planner backend failing to start. */
 type StartFailure = { attempts: number; reason: string; at: number };
+
+/**
+ * What Chopin saw itself of a machine starting a document's Planner, which needs nothing from its
+ * connector: when it began to wait, and each time the connector asked for a credential to launch
+ * the backend with. A launch that attached ends it, so more than one without that is a backend
+ * that exited before it attached.
+ */
+type StartTrail = { since: number; launches: number; lastLaunch?: number; stalled?: boolean };
+
+/** Whether the release `version` is older than `minimum`; a version that is not known is not. */
+function olderThan(version: string | undefined, minimum: string): boolean {
+	if (!version) return false;
+	let [have, need] = [version, minimum].map(value =>
+		value.split(/[-+]/, 1)[0]!.split(".").map(Number)
+	);
+	for (let index = 0; index < 3; index++) {
+		let difference = (have![index] ?? 0) - (need![index] ?? 0);
+		if (difference) return difference < 0;
+	}
+	return false;
+}
+
+/**
+ * Why a machine asked to run a Planner has not attached one, from what Chopin itself saw: `launches`
+ * is how many times it asked for a credential to start a backend with. A connector that cannot say
+ * why a backend exited (releases before `PLANNER_REPORTS_FROM`) is named with what to update.
+ */
+function silentReason(launches: number, version: string | undefined): string {
+	let why = launches >= 2
+		? "It started and stopped again before it connected"
+		: launches === 1
+		? "It started but hasn't connected yet"
+		: "It hasn't answered yet";
+	return olderThan(version, PLANNER_REPORTS_FROM)
+		? `${why}. It runs chopin ${version}, which can't say why: run \`chopin update\` on it`
+		: why;
+}
 
 /** Text from a connector, safe to show: no control characters, one line, short. */
 function plainText(text: string): string {
@@ -596,12 +655,44 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	 * restart.
 	 */
 	let startFailures = new Map<string, Map<string, StartFailure>>();
+	/**
+	 * What Chopin saw of each machine starting each document's Planner, by document id and then
+	 * machine id, for a connector that cannot say (see `StartTrail`). Forgotten as a failure is, and
+	 * when the document's machine is another: a machine that was waited on is not waited on again
+	 * from where it left off. Forgotten with a restart.
+	 */
+	let startTrails = new Map<string, Map<string, StartTrail>>();
 	function forgetStartFailure(documentId: string, machineId?: string) {
-		let failures = startFailures.get(documentId);
-		if (!failures) return;
-		if (machineId === undefined) failures.clear();
-		else failures.delete(machineId);
-		if (!failures.size) startFailures.delete(documentId);
+		for (let known of [startFailures, startTrails] as Array<Map<string, Map<string, unknown>>>) {
+			let machines = known.get(documentId);
+			if (!machines) continue;
+			if (machineId === undefined) machines.clear();
+			else machines.delete(machineId);
+			if (!machines.size) known.delete(documentId);
+		}
+	}
+	/** The trail of `machineId` starting `documentId`'s Planner, begun now if none was, and no other machine's. */
+	function startTrail(documentId: string, machineId: string): StartTrail {
+		let trails = startTrails.get(documentId) ?? new Map<string, StartTrail>();
+		startTrails.set(documentId, trails);
+		for (let other of trails.keys()) if (other !== machineId) trails.delete(other);
+		let trail = trails.get(machineId) ?? { since: auth.clock().getTime(), launches: 0 };
+		trails.set(machineId, trail);
+		return trail;
+	}
+	/** Whether a machine has been waited on for `PLANNER_PATIENCE_MS` without attaching. */
+	function stalled(trail: StartTrail) {
+		return auth.clock().getTime() - trail.since >= PLANNER_PATIENCE_MS;
+	}
+	/** Tells the rooms of the documents a machine has now waited on for its patience, once each. */
+	function announceStalled() {
+		for (let [documentId, trails] of startTrails) {
+			for (let trail of trails.values()) {
+				if (trail.stalled || !stalled(trail)) continue;
+				trail.stalled = true;
+				options.plannerStatus?.(documentId);
+			}
+		}
 	}
 	/**
 	 * Whether someone can push to a repository, by who was asked and the repository id, as GitHub
@@ -1023,17 +1114,24 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 				serves(value, channel.repositoryId) && runsPlanners(value)
 			);
 			if (!live) continue;
-			let failure = startFailures.get(documentId)?.get(machineId);
+			// What the connector said, else what Chopin saw: the launches that ended without attaching,
+			// and the time that has passed, which a connector that never answers cannot report.
+			let trail = startTrail(documentId, machineId);
+			let reported = startFailures.get(documentId)?.get(machineId);
+			let ended = reported?.attempts ?? Math.max(0, trail.launches - 1);
+			let told = reported
+				? ended >= PLANNER_FAILURE_SHOWN_AT
+				: ended >= PLANNER_FAILURE_SHOWN_AT || stalled(trail);
 			return {
 				login: live.login,
 				machineId,
-				...(failure ? { attempt: failure.attempts + 1 } : {}),
-				...(failure && failure.attempts >= PLANNER_FAILURE_SHOWN_AT
+				...(ended ? { attempt: ended + 1 } : {}),
+				...(told
 					? {
 						failure: {
-							attempts: failure.attempts,
-							reason: failure.reason,
-							at: new Date(failure.at).toISOString(),
+							attempts: ended,
+							reason: reported?.reason ?? silentReason(trail.launches, live.version),
+							at: new Date(reported?.at ?? trail.lastLaunch ?? trail.since).toISOString(),
 						},
 					}
 					: {}),
@@ -1562,15 +1660,33 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		let { document } = z.object({ document: z.string().min(1).max(2048) }).strict().parse(
 			await body(request),
 		);
-		let located = await machineRefusal(() => planners.locate(machine, document));
-		if (located === "forbidden") fail("repository-forbidden");
-		if (!located) fail("not-found");
-		let { channel } = await documentAccess(await machineCaller(machine), located.channel.id, true);
+		// A document named by its id needs no reading of its repository from GitHub to be found:
+		// `documentAccess` checks the machine can write it, through its token's installations.
+		let id = isChannelId(document) ? document : undefined;
+		if (!id) {
+			let located = await machineRefusal(() => planners.locate(machine, document));
+			if (located === "forbidden") fail("repository-forbidden");
+			if (!located) fail("not-found");
+			id = located.channel.id;
+		}
+		let { channel } = await documentAccess(await machineCaller(machine), id, true);
 		await auth.machines.seen(machine);
 		let url = new URL(await documentUrl(channel, auth.storage.channels), auth.config.origin).href;
+		let issued = await planners.issue(machine, channel.id);
+		// Each launch of a backend asks for one, from every release. One asked while nothing attached
+		// is a launch Chopin can count whatever the connector can say of it; one asked while the
+		// Planner is attached is a running backend's renewal, which is not.
+		if (
+			dispatched.get(machine.id)?.has(channel.id) && !options.attachments?.()?.holding(channel.id)
+		) {
+			let trail = startTrail(channel.id, machine.id);
+			trail.launches++;
+			trail.lastLaunch = auth.clock().getTime();
+			options.plannerStatus?.(channel.id);
+		}
 		// The repository says which of the machine's checkouts the Planner runs in.
 		return json({
-			...await planners.issue(machine, channel.id),
+			...issued,
 			document: {
 				id: channel.id,
 				url,
@@ -1621,19 +1737,189 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		return json({ recorded: true });
 	});
 	/**
-	 * A paired machine's own GitHub token, for its Planner commands and runs to push to
-	 * `repository` and open draft pull requests as its owner (see `machineGitHubToken`). Under
-	 * AUTH_MODE=local machines hold no GitHub token, so there is none to give.
+	 * A run or Planner on a paired machine, as the GitHub token for it needs it: a build of
+	 * `document`, or an investigation or prototype, which are known by their ID alone.
+	 */
+	/** Who launch tokens were issued for, by user ID, so a build can credit them by name. */
+	let identities = new Map<string, GitHubIdentity>();
+	async function launchRun(
+		id: string,
+		document: string | undefined,
+	): Promise<LaunchRun | undefined> {
+		let investigation = await auth.storage.experiments.get(id);
+		if (investigation) {
+			if (!["queued", "running", "publishing"].includes(investigation.state)) return undefined;
+			let repository = investigation.input?.source.repository;
+			if (!repository) return undefined;
+			let held = investigation.connectionId
+				? connections.get(investigation.connectionId)
+				: undefined;
+			return {
+				kind: investigation.spike ? "spike" : "investigation",
+				repository,
+				starter: investigation.input?.authorizer ?? investigation.requester,
+				...(held ? { machineId: held.machineId } : {}),
+				documentId: investigation.documentId,
+			};
+		}
+		if (!document) return undefined;
+		let build = await options.implementations?.()?.build(document, id);
+		return build && { kind: "build", ...build, documentId: document };
+	}
+	/** Signs launches' MCP tokens; see `mcp-token.ts`. Every deployment has the key it needs. */
+	let mcpTokens: McpTokens | undefined;
+	let mcpSources = {
+		get tokens() {
+			return mcpTokens ??= new McpTokens(auth.config.encryptionKey);
+		},
+		now: () => auth.clock().getTime(),
+		plannerCredential: (digest: Uint8Array) =>
+			auth.storage.plannerCredentials.find(digest, auth.clock()),
+		runCredential(token: string) {
+			try {
+				let { grant, connection } = connections.lookup(token);
+				return grant.run
+					? {
+						runId: grant.run.id,
+						documentId: grant.run.documentId,
+						machineId: connection.machineId,
+					}
+					: undefined;
+			} catch {
+				// A build's credential still names its run after a restart, before its machine is back.
+				let durable = connections.durableRun(token);
+				return durable && { runId: durable.id, documentId: durable.documentId };
+			}
+		},
+		run: (id: string, documentId: string) => launchRun(id, documentId),
+	};
+	/**
+	 * An MCP token for one launch on this machine, minted from the credential the launch holds: a
+	 * Planner credential or a run credential. The connector gives it, in a file it renews, to the
+	 * launch and every process it starts; it reaches only Chopin's tools at `/mcp`, only for that
+	 * launch's documents, and only while the launch lasts (see `mcp-token.ts`).
+	 */
+	route("POST", "/api/connector/mcp-token", async request => {
+		if (!auth.machines.durable) fail("not-found");
+		compatible(request, auth.config.origin, options.connectorVersion);
+		let machine = await machineRefusal(() => auth.machines.authenticate(bearer(request)));
+		let credential = z.string().min(1).max(1024);
+		let from = z.union([
+			z.object({ planner: credential }).strict(),
+			z.object({ run: credential }).strict(),
+		]).parse(await body(request));
+		let minted = await mintMcpToken(mcpSources, machine, from);
+		await auth.machines.seen(machine);
+		return json(minted);
+	});
+	/** The `/mcp` caller an MCP token names, while its launch and its machine are live. */
+	async function mcpCaller(token: string): Promise<HostedCaller | undefined> {
+		if (!auth.machines.durable) return undefined;
+		let launch = await liveMcpLaunch(mcpSources, token);
+		if (!launch) return undefined;
+		let machine: StoredMachine;
+		try {
+			machine = await auth.machines.current(launch.machineId);
+		} catch (error) {
+			if (error instanceof MachineError) return undefined;
+			throw error;
+		}
+		let channel = await auth.storage.channels.get(launch.documentId);
+		let user = await auth.storage.users.get(launch.userId);
+		if (!channel || !user) return undefined;
+		let documentId = launch.documentId;
+		return {
+			oauthToken: "",
+			user: { id: user.id, login: user.login, avatarUrl: user.avatarUrl },
+			launch: {
+				// The repository is read with the machine's own grant, as its work is.
+				repository: async (owner, name) => {
+					try {
+						return await auth.machines.use(
+							machine,
+							token => auth.github.repository(token, owner, name),
+						);
+					} catch (error) {
+						if (error instanceof MachineError) return undefined;
+						throw error;
+					}
+				},
+				hasCommit: async (owner, name, sha) => {
+					let github = auth.github;
+					if (!github.hasCommit) return false;
+					try {
+						return await auth.machines.use(
+							machine,
+							token => github.hasCommit!(token, owner, name, sha),
+						);
+					} catch (error) {
+						if (error instanceof MachineError) return false;
+						throw error;
+					}
+				},
+				// A Planner serves its document and the document's children; a run, its document.
+				allows: value =>
+					value.repositoryId === channel.repositoryId
+					&& (value.id === documentId
+						|| (launch.kind === "planner" && value.parentChannelId === documentId)),
+			},
+		};
+	}
+	/**
+	 * A GitHub token for a paired machine's Planner or run. A connector that says what it is for
+	 * gets one of the App's installation tokens for the one repository, acting as the App's bot and
+	 * naming who it is for (see `launchGitHubToken`); `check` only says whether it would. One that
+	 * names only the repository is an older release's, and still gets its owner's own token for one
+	 * more release (see `machineGitHubToken`). Under AUTH_MODE=local machines hold no GitHub token,
+	 * so there is none to give.
 	 */
 	route("POST", "/api/connector/github-token", async request => {
 		if (!auth.machines.durable) fail("not-found");
 		compatible(request, auth.config.origin, options.connectorVersion);
 		let machine = await machineRefusal(() => auth.machines.authenticate(bearer(request)));
-		let { repository } = z.object({ repository: z.string().min(3).max(256) }).strict().parse(
-			await body(request),
-		);
+		let id = z.string().min(1).max(2048);
+		let asked = z.object({
+			repository: z.string().min(3).max(256),
+			purpose: z.enum(["run", "planner", "check"]).optional(),
+			run: id.optional(),
+			document: id.optional(),
+		}).strict().parse(await body(request));
+		if (!asked.purpose) {
+			if (asked.run || asked.document) fail("invalid-request");
+			let issued = await machineRefusal(() =>
+				machineGitHubToken(
+					{ machines: auth.machines, github: auth.github },
+					machine,
+					asked.repository,
+				)
+			);
+			console.warn(
+				`chopin: legacy GitHub token for machine ${machine.id} in ${asked.repository}: its `
+					+ "connector predates App installation tokens",
+			);
+			await auth.machines.seen(machine);
+			return json({ ...issued, legacy: true });
+		}
+		let purpose = asked.purpose;
 		let issued = await machineRefusal(() =>
-			machineGitHubToken({ machines: auth.machines, github: auth.github }, machine, repository)
+			launchGitHubToken(
+				{
+					machines: auth.machines,
+					github: auth.github,
+					...(options.app ? { app: options.app } : {}),
+					slug: auth.config.appSlug,
+					run: launchRun,
+					user: id => auth.storage.users.get(id),
+					remember: (userId, identity) => identities.set(userId, identity),
+				},
+				machine,
+				{
+					repository: asked.repository,
+					purpose,
+					...(asked.run ? { run: asked.run } : {}),
+					...(asked.document ? { document: asked.document } : {}),
+				},
+			)
 		);
 		await auth.machines.seen(machine);
 		return json(issued);
@@ -2030,6 +2316,11 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			/** The caller's favorite machine, theirs or a teammate's, which Automatic prefers where it serves the repository. */
 			favorite: favorite ?? null,
 			planner: plannerState(userId, channel, serving),
+			// Where its Planner runs is the creator's choice, once they made one: another person's
+			// choice runs only their own builds and runs.
+			...(userId !== channel.createdBy && connections.chosen(documentId, channel.createdBy)
+				? { creatorDecides: true as const }
+				: {}),
 			automatic: automaticId
 				? { id: automaticId, label: label(automaticId), favorite: automaticId === favorite }
 				: null,
@@ -2369,11 +2660,17 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		return channel;
 	}
 	/**
-	 * The checkout a connection's work on a document starts from: the one it said it has of the
-	 * document's repository, else the head of the repository's default branch on GitHub, read with
-	 * the machine's own authorization, which its connector clones or fetches.
+	 * The checkout a connection's work on a document starts from: the plan source's commit when the
+	 * Planner pushed the plan's files (`plan`), else the one the connection said it has of the
+	 * document's repository, else the head of the repository's default branch on GitHub. GitHub is
+	 * read with the machine's own authorization, as its connector clones or fetches; a plan source
+	 * it can't find there refuses the work with `plan-source-unavailable`.
 	 */
-	async function sourceFor(connection: Connection, documentId: string): Promise<Source> {
+	async function sourceFor(
+		connection: Connection,
+		documentId: string,
+		plan?: PlanSource,
+	): Promise<Source> {
 		let channel = await auth.storage.channels.get(documentId);
 		if (!channel) fail("not-found");
 		let repository = {
@@ -2382,8 +2679,8 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 			name: channel.repositoryName,
 		};
 		let checkout = checkoutOf(connection, repository.id);
-		if (checkout) return checkout;
-		if (!connection.anyRepository) fail("repository-forbidden");
+		if (checkout && !plan) return checkout;
+		if (!checkout && !connection.anyRepository) fail("repository-forbidden");
 		let caller = await machineCaller(
 			await machineRefusal(() => auth.machines.current(connection.machineId)),
 		);
@@ -2392,6 +2689,25 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		);
 		if (!found || found.id !== repository.id) fail("repository-forbidden");
 		let github = auth.github;
+		if (plan) {
+			let present = github.hasCommit
+				&& await caller.use(token =>
+					github.hasCommit!(token, repository.owner, repository.name, plan.commit)
+				);
+			if (!present) {
+				fail(
+					"plan-source-unavailable",
+					`The plan's commit ${plan.commit.slice(0, 7)} on ${plan.branch} isn't in `
+						+ `${found.fullName} on GitHub.`,
+				);
+			}
+			return {
+				repositoryId: repository.id,
+				repository: found.fullName,
+				commit: plan.commit,
+				branch: plan.branch,
+			};
+		}
 		if (!github.branchHead) fail("no-workspace");
 		let commit = await caller.use(token =>
 			github.branchHead!(token, repository.owner, repository.name, found.defaultBranch)
@@ -2718,7 +3034,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 							args.progress === undefined ? undefined : z.string().max(2000).parse(args.progress),
 						);
 					} else if (name === "upload_investigation_image") {
-						let prepared = prepareImage({ id: current.documentId, ...args });
+						let prepared = await prepareImage({ id: current.documentId, ...args });
 						if (!prepared) fail("invalid-image");
 						if ("refusal" in prepared) fail(prepared.refusal);
 						let { bytes, mimeType } = prepared.input;
@@ -2821,6 +3137,7 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 	});
 	async function sweep() {
 		connections.sweep();
+		announceStalled();
 		await finishShared().catch(error =>
 			console.error("chopin: could not stop a machine's finished teammate Planners -", error)
 		);
@@ -2886,5 +3203,9 @@ export function registerExperimentRoutes(router: Router, auth: HostedAuth, optio
 		/** Whether this server runs Planners on people's machines: HARNESS=remote, machines' own GitHub. */
 		plannerMachines: !!options.planners && auth.machines.durable,
 		sourceFor,
+		/** The caller a launch's MCP token names at `/mcp`, while the launch lasts. */
+		mcpCaller,
+		/** The GitHub identity of a person a launch token was last issued for, to credit them. */
+		identity: (userId: string) => identities.get(userId),
 	};
 }

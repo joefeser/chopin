@@ -1,6 +1,5 @@
 import { expect, test as base } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
-import { approvedContrast } from "./approved-contrast";
 
 import type { Locator, Page, TestInfo } from "@playwright/test";
 
@@ -34,7 +33,15 @@ export let test = base.extend<DesignOptions>({
 			await expect(page.locator('[data-audit-item="diagram"] .plan-diagram svg')).toBeVisible();
 			await expect(page.locator('[data-audit-item="diagram"] [data-plan-error]')).toBeVisible();
 			await expect(page.locator('[data-audit-item="formula"] .katex')).toHaveCount(2);
-			await expect(page.locator('[data-audit-item="code"] diffs-container pre')).toHaveCount(2);
+			// Code is coloured in place once the highlighter loads; only a patch draws a preview.
+			await expect.poll(() =>
+				plate(page, "code").evaluate(element =>
+					[...CSS.highlights].some(([name, highlight]) =>
+						name.startsWith("plan-code-")
+						&& [...highlight].some(range => element.contains(range.startContainer))
+					)
+				)
+			).toBe(true);
 			// The catalogue's later image plate uses native lazy loading. Load its fixed fixtures
 			// now so scrolling to the table does not replace placeholders underneath capture.
 			await page.locator("img[loading=lazy]").evaluateAll(images => {
@@ -62,14 +69,6 @@ export function plate(page: Page, id: string) {
 
 export async function scan(page: Page, info: TestInfo, name: string, selector: string) {
 	let result = await new AxeBuilder({ page }).include(selector).analyze();
-	let approved = approvedContrast(name, info.project.name);
-	if (approved.length) {
-		await info.attach("approved-colour-decision", {
-			body:
-				"Maggie retained the original Delete red, named supplementary chat/audit text and original code palette. Each accepted node is annotated with its approved role in approved-contrast/. Other findings still fail; see apps/web/DESIGN.md.",
-			contentType: "text/plain",
-		});
-	}
 	await info.attach(`axe-${name}`, {
 		body: JSON.stringify(result, null, 2),
 		contentType: "application/json",
@@ -93,7 +92,7 @@ export async function scan(page: Page, info: TestInfo, name: string, selector: s
 			evidence: node.failureSummary,
 		}))
 	);
-	expect(failures, `Axe findings for ${name}; see attached JSON and summary`).toEqual(approved);
+	expect(failures, `Axe findings for ${name}; see attached JSON and summary`).toEqual([]);
 }
 
 export async function capture(page: Page, target: Locator, name: string, padding = 6) {

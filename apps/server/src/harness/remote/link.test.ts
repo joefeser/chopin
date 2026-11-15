@@ -1008,6 +1008,48 @@ describe("Agent connection protocol", () => {
 		}
 	});
 
+	it("names a turn's message, and a retry of it, only to a client that asked for retry-turn", async () => {
+		let { server, channel } = await setup();
+		for (
+			let [header, answers, sent] of [
+				[undefined, { id: "msg-1", retry: true }, {}],
+				["steer-turn", { id: "msg-1", retry: true }, {}],
+				["retry-turn", { id: "msg-1" }, { message: "msg-1" }],
+				["retry-turn", { id: "msg-1", retry: true }, { message: "msg-1", retry: true }],
+				["retry-turn", undefined, {}],
+			] as const
+		) {
+			let planner: RemotePlanner = { channelId: channel.id, isolated: false };
+			let agent = agentFor(adapterFor(server, planner));
+			let raw = await rawLink(server.url, undefined, header);
+			raw.send({ type: "attach", version: 1, document: channel.id });
+			await raw.next("attached");
+			let started = raw.next("start").then(start => {
+				raw.send({ type: "started", session: start.session });
+				return raw.next("turn");
+			});
+			let session = await agent.createSession({ sandboxSession });
+			cleanups.push(() => session.destroy());
+			planner.turnMessage = answers ? { ...answers } : undefined;
+			let outcome = (async () => {
+				let result = await agent.stream({ session, prompt: "@ana: hello" });
+				for await (let _part of result.fullStream);
+			})();
+			let turn = await started;
+			expect({ message: turn.message, retry: turn.retry }).toEqual({
+				message: undefined,
+				retry: undefined,
+				...sent,
+			});
+			// Taken by its turn: the next one names nothing unless it is told again.
+			expect(planner.turnMessage).toBeUndefined();
+			raw.send({ type: "turn-end", session: turn.session, turn: turn.turn, status: "finished" });
+			await outcome;
+			raw.send({ type: "detach" });
+			await raw.closed;
+		}
+	});
+
 	it("merges stage deltas into a run's stages, and a full card replaces them", async () => {
 		let { server, channel, client } = await setup({});
 		expect(client.features).toEqual(["run-stage-deltas", "decision-option-previews"]);
@@ -1523,6 +1565,89 @@ describe("Agent connection protocol", () => {
 			output: { error: "The session has ended." },
 			isError: true,
 		});
+	});
+});
+
+describe("Agent connection steering", () => {
+	/** A turn that hangs until it is aborted, on a session of its own. */
+	async function hanging(handlers: Partial<AgentHandlers>) {
+		let running = Promise.withResolvers<void>();
+		let fixture = await setup({
+			async turn(context) {
+				context.emit({ type: "stream-start", modelId: "scripted" });
+				running.resolve();
+				await new Promise(resolve => context.signal.addEventListener("abort", resolve));
+			},
+			...handlers,
+		});
+		let harness = adapterFor(fixture.server, { channelId: fixture.channel.id, isolated: false });
+		let agent = agentFor(harness);
+		let session = await agent.createSession({ sandboxSession });
+		cleanups.push(() => session.destroy());
+		let abort = new AbortController();
+		let result = await agent.stream({ session, prompt: "turn", abortSignal: abort.signal });
+		let drained = (async () => {
+			for await (let _part of result.fullStream);
+		})();
+		await running.promise;
+		return {
+			...fixture,
+			harness,
+			session,
+			end: async () => {
+				abort.abort();
+				await drained.catch(() => {});
+			},
+		};
+	}
+
+	it("reaches the running turn of a client that offered steer-turn, which answers it", async () => {
+		let heard: Array<{ turn: string; prompt: string }> = [];
+		let { session, server, channel, harness, end } = await hanging({
+			steer(message) {
+				heard.push({ turn: message.turn, prompt: message.prompt });
+			},
+		});
+		expect(server.links.at(-1)!.steers).toBe(true);
+		expect(harness.steers(channel.id)).toBe(true);
+		await session.experimental_steerTurn("@bo: Also say what it costs.");
+		expect(heard).toHaveLength(1);
+		expect(heard[0]!.prompt).toBe("@bo: Also say what it costs.");
+		await end();
+	});
+
+	it("is offered only to a client that asked for steer-turn, and says so for its document", async () => {
+		let { server, channel, harness, session, end } = await hanging({});
+		expect(server.links.at(-1)!.steers).toBe(false);
+		expect(harness.steers(channel.id)).toBe(false);
+		await expect(session.experimental_steerTurn("@bo: hello")).rejects.toThrow(
+			/does not support steering/,
+		);
+		await end();
+	});
+
+	it("tells the sender when the client could not take it", async () => {
+		let { session, end } = await hanging({
+			steer() {
+				throw new Error("The model is between steps.");
+			},
+		});
+		await expect(session.experimental_steerTurn("@bo: hello")).rejects.toThrow(
+			"The model is between steps.",
+		);
+		await end();
+	});
+
+	it("is refused once the turn has ended, without a frame going to the client", async () => {
+		let heard: string[] = [];
+		let { session, end } = await hanging({
+			steer(message) {
+				heard.push(message.prompt);
+			},
+		});
+		await end();
+		await expect(session.experimental_steerTurn("@bo: too late")).rejects.toThrow();
+		expect(heard).toEqual([]);
 	});
 });
 

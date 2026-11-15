@@ -7,7 +7,7 @@ import { SELF } from "./machine";
 import type { ServiceHost } from "./service";
 import { collectStatus, formatStatus } from "./status";
 import { CONNECTOR_PROTOCOL, VERSION } from "./version";
-import { processStart } from "./workspace";
+import { processStart, tokenFolder } from "./workspace";
 
 let scratch = await mkdtemp(join(tmpdir(), "chopin-status-"));
 afterAll(() => rm(scratch, { recursive: true, force: true }));
@@ -134,6 +134,7 @@ test("status reports a paired machine Chopin accepts, its connectors, a stale lo
 		plannerWorktrees: [],
 		checkouts: {},
 		clones: [],
+		github: {},
 	});
 	expect(JSON.stringify(report)).not.toContain(TOKEN);
 	let text = formatStatus(report);
@@ -155,6 +156,50 @@ test("status reports a paired machine Chopin accepts, its connectors, a stale lo
 		`Base dir:   ${directory}`,
 	]);
 	expect(text.join("\n")).not.toContain(TOKEN);
+});
+
+test("status shows each repository's spare Planner under its connector, and a spare's slot under the document it became the worktree of", async () => {
+	let { directory, host } = await machine();
+	let lock = `${"f".repeat(64)}`;
+	await writeFile(
+		join(directory, `${lock}.lock`),
+		JSON.stringify({ pid: process.pid, checkouts: { "octo-org/score": "/work/score" } }),
+	);
+	let since = Date.now() - 5 * 60_000;
+	await writeFile(
+		join(directory, `${lock}.spares.json`),
+		JSON.stringify([
+			{ repository: "octo-org/score", state: "ready", since, command: "pdd" },
+			{ repository: "octo-org/other", state: "unsupported", since },
+		]),
+	);
+	let folder = join(directory, "planners", "octo-org", "score");
+	await mkdir(join(folder, "spare-0123456789ab"), { recursive: true });
+	await writeFile(join(folder, "D_1.worktree"), "spare-0123456789ab\n");
+	// A spare still waiting for a document is no document's worktree.
+	await mkdir(join(folder, "spare-ba9876543210"), { recursive: true });
+	let report = await collectStatus({ directory, server: "https://x", source: "config", host });
+	expect(report.connectors[0]?.spares).toEqual([
+		{
+			repository: "octo-org/score",
+			state: "ready",
+			since: new Date(since).toISOString(),
+			command: "pdd",
+		},
+		{ repository: "octo-org/other", state: "unsupported", since: new Date(since).toISOString() },
+	]);
+	expect(report.plannerWorktrees).toEqual([
+		{ path: join(folder, "spare-0123456789ab"), repository: "octo-org/score", document: "D_1" },
+	]);
+	let text = formatStatus(report);
+	expect(text).toContain(
+		"              Spare Planner for octo-org/score: ready (since 5 min ago, pdd)",
+	);
+	expect(text).toContainEqual(
+		expect.stringMatching(
+			/Spare Planner for octo-org\/other: not taken: the Planner command didn't start as a spare/,
+		),
+	);
 });
 
 test("status lists the checkouts the running connector registered and the repositories it cloned", async () => {
@@ -265,27 +310,71 @@ test("status shows an agent that failed to start under its connector", async () 
 	);
 });
 
-test("status says once a connector's machine uses its own GitHub login because the App can't push", async () => {
-	let { directory, host } = await machine();
-	let lock = "f".repeat(64);
-	await writeFile(
-		join(directory, `${lock}.lock`),
-		JSON.stringify({
-			pid: process.pid,
-			processStart: (await processStart()(process.pid))!.id,
-			root: "/work/score",
-		}),
-	);
-	await writeFile(
-		join(directory, `${lock}.github.json`),
-		JSON.stringify({ repository: "octo-org/score" }),
-	);
-	let report = await collectStatus({ directory, server: "https://x", source: "config", host });
-	expect(report.connectors[0]?.githubCannotPush).toEqual(["octo-org/score"]);
-	expect(formatStatus(report)).toContain(
-		"              The GitHub App can't push to octo-org/score (it needs Contents and Pull requests "
-			+ "write), so this machine uses its own GitHub login for it.",
-	);
+test("status asks Chopin, without a token being made, whether each registered checkout's repository can have one, and says why not", async () => {
+	let asked: unknown[] = [];
+	let server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(request) {
+			let { pathname } = new URL(request.url);
+			if (pathname === "/api/connector/machine") return Response.json({ login: "ada" });
+			if (pathname !== "/api/connector/github-token") return new Response(null, { status: 404 });
+			let body = await request.json() as { repository: string };
+			asked.push(body);
+			if (body.repository === "octo-org/score") return Response.json({ ok: true });
+			if (body.repository === "octo-org/old") {
+				// A Chopin from before the check refuses what it doesn't know.
+				return Response.json({ error: "invalid-request" }, { status: 400 });
+			}
+			return Response.json({ error: "app-cannot-push" }, { status: 403 });
+		},
+	});
+	try {
+		let url = `http://127.0.0.1:${server.port}`;
+		let { directory, host } = await machine(url);
+		await writeFile(
+			join(directory, "config.json"),
+			JSON.stringify({
+				connect: {
+					server: url,
+					command: ["agent"],
+					planners: [],
+					plannerCommand: [],
+					checkouts: {
+						"octo-org/score": "/work/score",
+						"octo-org/site": "/work/site",
+						"octo-org/old": "/work/old",
+					},
+				},
+			}),
+		);
+		let report = await collectStatus({ directory, server: url, source: "config", host });
+		expect(asked).toEqual(expect.arrayContaining([
+			{ repository: "octo-org/score", purpose: "check" },
+			{ repository: "octo-org/site", purpose: "check" },
+		]));
+		expect(report.github).toEqual({
+			"octo-org/score": "ok",
+			"octo-org/site": "app-cannot-push",
+			"octo-org/old": "unknown",
+		});
+		let text = formatStatus(report).join("\n");
+		expect(text).toContain(
+			"octo-org/site at /work/site; Chopin's GitHub App can't write to octo-org/site",
+		);
+		expect(text).not.toContain("own GitHub login for it");
+		// Unpaired, nothing is asked.
+		let unpaired = await machine();
+		let none = await collectStatus({
+			directory: unpaired.directory,
+			server: url,
+			source: "config",
+			host: unpaired.host,
+		});
+		expect(none.github).toEqual({});
+	} finally {
+		server.stop(true);
+	}
 });
 
 test("status names a built-in agent by its --agent id, with the command it runs", async () => {
@@ -346,6 +435,8 @@ test("status lists the Planners' worktrees and the finished runs kept, with thei
 	await writeFile(join(runs, "spike.json"), JSON.stringify({ id: "spike", state: "finished" }));
 	let planner = join(directory, "planners", "octo-org", "score", "D_1");
 	await mkdir(planner, { recursive: true });
+	// Its token folder, beside it, is no Planner of its own.
+	await mkdir(tokenFolder(planner), { recursive: true });
 	// The folder for a Planner that has yet to make its worktree.
 	await mkdir(join(directory, "planners", "octo-org", "other"), { recursive: true });
 

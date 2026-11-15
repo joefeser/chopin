@@ -17,9 +17,14 @@ import { ulid } from "@chopin/dialect";
 import * as Service from "../plan/service";
 import { openPlan } from "../testing/plan";
 import { setup } from "./attachments.test-fixtures";
-import { installJobCleanup, until } from "./job.test-fixtures";
+import { harness, installJobCleanup, member, until } from "./job.test-fixtures";
+import * as Chat from "./service";
+import * as Threads from "./threads";
+import { DEBOUNCE_MS } from "./reaction-reply";
+import { finishTurn, installReactionFixtures, reactAs } from "./reaction.test-fixtures";
 
 import type { Chat as Wire } from "@chopin/protocol";
+import type { Room as ReactionRoom } from "./reaction.test-fixtures";
 
 installJobCleanup();
 
@@ -310,6 +315,261 @@ describe("a transcript with pointers in it, on the server it would be rolled bac
 			expect(entries.find(entry => entry.id === id)!.text).toBe(
 				"/research @Overview, @src/index.ts and @Choice",
 			);
+		},
+		240_000,
+	);
+});
+
+/**
+ * The sidecar this server writes for a Chat holding reactions on member, Planner and system
+ * messages, `answeredIntents` on a Planner message whose reaction was answered, and `viaReaction`
+ * on the Planner's reply.
+ */
+async function writtenWithReactions(
+	makeRoom: () => Promise<ReactionRoom>,
+): Promise<{ sidecar: Record<string, unknown> }> {
+	let h = await makeRoom();
+	await reactAs(h, "ana", "✅", true, "m0");
+	await reactAs(h, "ben", "👍🏽", true, "m0");
+	await reactAs(h, "ana", "👀", true, "s1");
+	await reactAs(h, "ben", "❓", true, "a1");
+	await h.clock.advance(DEBOUNCE_MS);
+	await until(() => h.prompts.length === 1);
+	await finishTurn(h, "Let me explain that section.");
+
+	let context = await openPlan();
+	context.plan.chat.entries.push(...(structuredClone(h.chat.entries) as Wire.Entry[]));
+	await Service.persist(context.plan);
+	await Service.close(context.plan);
+	let loaded = (await context.storage.collaboration.load(context.channel.id, context.now))!;
+	let sidecar = structuredClone(loaded.sidecar ?? loaded.snapshot!.sidecar) as Record<
+		string,
+		unknown
+	>;
+	return { sidecar };
+}
+
+describe("a transcript with reactions in it, on the server it would be rolled back to", () => {
+	let reactionFixtures = installReactionFixtures();
+
+	it(
+		"is opened by this checkout with every reaction, answered reading and reaction-turn mark kept",
+		async () => {
+			let { sidecar } = await writtenWithReactions(() => reactionFixtures.room());
+			let file = join(scratch, "reactions-control.json");
+			await Bun.write(file, JSON.stringify(sidecar));
+			let result = await read(ROOT, file);
+			expect(result.ok, JSON.stringify(result)).toBe(true);
+			let entries = (result as Extract<Read, { ok: true }>).entries;
+			expect(entries.find(entry => entry.id === "m0")?.reactions).toEqual([
+				{ emoji: "✅", handles: ["ana"] },
+				{ emoji: "👍🏽", handles: ["ben"] },
+			]);
+			expect(entries.find(entry => entry.id === "a1")).toMatchObject({
+				reactions: [{ emoji: "❓", handles: ["ben"] }],
+				answeredIntents: ["confused"],
+			});
+			expect(entries.at(-1)).toMatchObject({
+				author: { kind: "agent" },
+				text: "Let me explain that section.",
+				viaReaction: true,
+			});
+
+			let broken = structuredClone(sidecar) as { transcript: Array<Record<string, unknown>> };
+			broken.transcript[0]!.reactions = "not-an-array";
+			let bad = join(scratch, "reactions-broken.json");
+			await Bun.write(bad, JSON.stringify(broken));
+			let refused = await read(ROOT, bad);
+			expect(refused).toMatchObject({ ok: false });
+			expect((refused as { error: string }).error).toContain("invalid chat reactions");
+		},
+		120_000,
+	);
+
+	it.skipIf(!available)(
+		`is opened by the real ${BASE} reader, with every message and reaction entry readable`,
+		async () => {
+			let older = olderServer();
+			let { sidecar } = await writtenWithReactions(() => reactionFixtures.room());
+			let file = join(scratch, "reactions-written.json");
+			await Bun.write(file, JSON.stringify(sidecar));
+			let result = await read(older, file);
+			expect(result.ok, JSON.stringify(result)).toBe(true);
+			let entries = (result as Extract<Read, { ok: true }>).entries;
+			let before = sidecar.transcript as Array<Record<string, unknown>>;
+			expect(entries.map(entry => entry.id)).toEqual(before.map(entry => entry.id));
+			for (let entry of before) {
+				let kept = entries.find(value => value.id === entry.id)!;
+				expect(kept.text, String(entry.id)).toBe(entry.text);
+				expect(kept.author, String(entry.id)).toEqual(entry.author);
+			}
+			expect(entries.at(-1)?.text).toBe("Let me explain that section.");
+		},
+		240_000,
+	);
+});
+
+describe("a document with Chat threads and session compactions, on the server it would be rolled back to", () => {
+	it.skipIf(!available)(
+		`is opened by the real ${BASE} reader with top-level and alsoToChat messages intact and thread replies outside the sidecar`,
+		async () => {
+			let older = olderServer();
+			await Bun.write(join(older, READER), Bun.file(join(ROOT, READER)));
+			let { h, ana } = await setup();
+			let topRoom = Threads.bindTopLevel(h.context);
+			let rootId = crypto.randomUUID();
+			await Threads.sendMessage(topRoom, ana, {
+				kind: "chat:send",
+				rid: "rb-1",
+				requestId: rootId,
+				to: "room",
+				text: "Root message before thread",
+				ts: 0,
+			});
+			await Threads.sendMessage(topRoom, ana, {
+				kind: "chat:send",
+				rid: "rb-2",
+				requestId: crypto.randomUUID(),
+				to: "room",
+				thread: rootId,
+				text: "Private side-thread reply",
+				ts: 0,
+			});
+			await Threads.sendMessage(topRoom, ana, {
+				kind: "chat:send",
+				rid: "rb-3",
+				requestId: crypto.randomUUID(),
+				to: "room",
+				thread: rootId,
+				alsoToChat: true,
+				text: "Summary shared back to Chat",
+				ts: 0,
+			});
+			let context = await openPlan();
+			context.plan.chat.entries.push(...(structuredClone(h.chat.entries) as Wire.Entry[]));
+			await Service.persist(context.plan);
+			await Service.close(context.plan);
+			let loaded = (await context.storage.collaboration.load(context.channel.id, context.now))!;
+			let sidecar = structuredClone(loaded.sidecar ?? loaded.snapshot!.sidecar) as Record<
+				string,
+				unknown
+			>;
+			let file = join(scratch, "threads-written.json");
+			await Bun.write(file, JSON.stringify(sidecar));
+			let result = await read(older, file);
+			expect(result.ok, JSON.stringify(result)).toBe(true);
+			let entries = (result as Extract<Read, { ok: true }>).entries;
+			expect(entries.map(entry => entry.text)).toEqual([
+				"Root message before thread",
+				"Summary shared back to Chat",
+			]);
+		},
+		240_000,
+	);
+});
+
+describe("a transcript with a message given to the running turn, on the server it would be rolled back to", () => {
+	it.skipIf(!available)(
+		`is opened by the real ${BASE} reader with every message, the steered one included, as an ordinary one`,
+		async () => {
+			let older = olderServer();
+			await Bun.write(join(older, READER), Bun.file(join(ROOT, READER)));
+			let h = harness();
+			let speaking = (handle: string) =>
+				({ data: { handle, principalId: `U_${handle}` }, send: () => {} }) as never;
+			await Chat.send(h.context, speaking("ana"), member("@chopin plan the rollout"));
+			await until(() => h.prompts.length === 1);
+			await Chat.send(h.context, speaking("bo"), member("@chopin also cover the rollback"));
+			await until(() => h.steered.length === 1);
+			await Chat.send(h.context, speaking("bo"), { ...member("Thanks, team"), to: "room" });
+			h.emit("session.idle");
+			await until(() => !h.chat.busy);
+			let context = await openPlan();
+			context.plan.chat.entries.push(...(structuredClone(h.chat.entries) as Wire.Entry[]));
+			await Service.persist(context.plan);
+			await Service.close(context.plan);
+			let loaded = (await context.storage.collaboration.load(context.channel.id, context.now))!;
+			let sidecar = structuredClone(loaded.sidecar ?? loaded.snapshot!.sidecar) as Record<
+				string,
+				unknown
+			>;
+			let file = join(scratch, "steered-written.json");
+			await Bun.write(file, JSON.stringify(sidecar));
+			let result = await read(older, file);
+			expect(result.ok, JSON.stringify(result)).toBe(true);
+			let entries = (result as Extract<Read, { ok: true }>).entries;
+			expect(entries.map(entry => entry.text)).toEqual([
+				"plan the rollout",
+				"also cover the rollback",
+				"Thanks, team",
+			]);
+			// Nothing the older server reads says a message waits, was sent or failed.
+			for (let entry of entries) expect(entry.deliveryState).toBeUndefined();
+		},
+		240_000,
+	);
+});
+
+async function writtenWithPlannerImages(): Promise<
+	{ sidecar: Record<string, unknown>; id: string }
+> {
+	let context = await openPlan();
+	let id = ulid();
+	let sha = "a".repeat(64);
+	context.plan.chat.entries.push({
+		id,
+		author: { kind: "agent" },
+		text: "Here are the diagrams.",
+		ts: 1_700_000_000,
+		images: [
+			{
+				src: `/images/${sha}.png`,
+				alt: "Cache write-back diagram",
+				caption: "Writes buffer before flushing.",
+				width: 960,
+				height: 420,
+				generated: true,
+			},
+		],
+		refusedImages: [
+			{ before: 1, reason: "Image too large to show (12 MB, limit 10 MB)" },
+		],
+	});
+	await Service.persist(context.plan);
+	await Service.close(context.plan);
+	let loaded = (await context.storage.collaboration.load(context.channel.id, context.now))!;
+	let sidecar = structuredClone(loaded.sidecar ?? loaded.snapshot!.sidecar) as Record<
+		string,
+		unknown
+	>;
+	return { sidecar, id };
+}
+
+describe("a transcript with Planner images and refused images in it, on the server it would be rolled back to", () => {
+	it("is opened by this checkout with its images and refusals intact", async () => {
+		let { sidecar, id } = await writtenWithPlannerImages();
+		let file = join(scratch, "images-control.json");
+		await Bun.write(file, JSON.stringify(sidecar));
+		let result = await read(ROOT, file);
+		expect(result.ok, JSON.stringify(result)).toBe(true);
+		let entry = (result as Extract<Read, { ok: true }>).entries.find(item => item.id === id)!;
+		expect(entry.images).toHaveLength(1);
+		expect(entry.refusedImages).toHaveLength(1);
+	}, 120_000);
+
+	it.skipIf(!available)(
+		`is opened by the real ${BASE} reader without refusing the transcript`,
+		async () => {
+			let older = olderServer();
+			await Bun.write(join(older, READER), Bun.file(join(ROOT, READER)));
+			let { sidecar, id } = await writtenWithPlannerImages();
+			let file = join(scratch, "images-written.json");
+			await Bun.write(file, JSON.stringify(sidecar));
+			let result = await read(older, file);
+			expect(result.ok, JSON.stringify(result)).toBe(true);
+			let entry = (result as Extract<Read, { ok: true }>).entries.find(item => item.id === id)!;
+			expect(entry.text).toBe("Here are the diagrams.");
+			expect(entry.author).toEqual({ kind: "agent" });
 		},
 		240_000,
 	);

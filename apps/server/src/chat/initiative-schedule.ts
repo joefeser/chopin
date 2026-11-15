@@ -33,8 +33,15 @@ type Opportunity<T> = {
 
 export type InitiativeSchedule<T> = {
 	receive(contribution: Contribution<T>): void;
+	/**
+	 * Whether a contribution may still get a reply: it waits for silence, is being judged, or its
+	 * reply is running. Background work that would take the Planner first waits for it.
+	 */
+	holds(): boolean;
 	typing(client: string, actor: string, active: boolean): void;
 	depart(client: string): void;
+	/** Who is in the conversation now: who spoke in the last two minutes, and who is typing. */
+	people(): Set<string>;
 	replied(): void;
 	cancel(): void;
 	pause(paused: boolean): void;
@@ -48,6 +55,10 @@ export function createInitiativeSchedule<T>(options: {
 	paused?: boolean;
 	admit(value: T): "ready" | "wait" | "drop";
 	judge(value: T, signal: AbortSignal, turn: TurnContext): Promise<TurnDecision>;
+	/** Called when the schedule stops holding a contribution, replied to or not. */
+	settled?(): void;
+	/** Called when who is in the conversation may have changed, a lease or window running out included. */
+	changed?(): void;
 	/** Resolves after the normal Planner turn ends; false means admission raced with other work. */
 	dispatch(value: T, move: "respond" | "direct", signal: AbortSignal, lifecycle: {
 		started(): void;
@@ -73,9 +84,34 @@ export function createInitiativeSchedule<T>(options: {
 		}
 	}
 
-	function group(now: number) {
+	function people(now: number) {
 		prune(now);
-		return new Set([...participants.keys(), ...[...typing.values()].map(x => x.actor)]).size > 1;
+		return new Set([...participants.keys(), ...[...typing.values()].map(x => x.actor)]);
+	}
+
+	function group(now: number) {
+		return people(now).size > 1;
+	}
+
+	// Says so when a typing lease or a speaker's window runs out, as when someone arrives.
+	let expiry: unknown;
+	function changed() {
+		if (!options.changed) return;
+		if (expiry !== undefined) time.clear(expiry);
+		expiry = undefined;
+		options.changed();
+		if (closed) return;
+		let now = time.now();
+		prune(now);
+		let next = Math.min(
+			...[...participants.values()].map(at => at + PARTICIPANT_WINDOW_MS),
+			...[...typing.values()].map(lease => lease.until),
+		);
+		if (next === Infinity) return;
+		expiry = time.set(() => {
+			expiry = undefined;
+			changed();
+		}, Math.max(1, next - now));
 	}
 
 	function due(opportunity: Opportunity<T>, now: number, quiet = opportunity.yielded) {
@@ -111,7 +147,25 @@ export function createInitiativeSchedule<T>(options: {
 			&& time.now() - opportunity.at < OPPORTUNITY_LIFETIME_MS;
 	}
 
+	let held = false;
+	let waiting = () => !!pending && !pending.yielded;
+	// A contribution its admission would drop holds nothing back.
+	let holds = () => waiting() && options.admit(pending!.contribution.value) !== "drop";
+	function notify() {
+		let now = waiting();
+		if (held && !now) options.settled?.();
+		held = now;
+	}
+
 	async function check() {
+		try {
+			await evaluate();
+		} finally {
+			notify();
+		}
+	}
+
+	async function evaluate() {
 		let opportunity = pending;
 		if (!opportunity || closed || opportunity.controller) return;
 		let now = time.now();
@@ -174,14 +228,20 @@ export function createInitiativeSchedule<T>(options: {
 		}
 	}
 
-	function cancel() {
+	function drop() {
 		clearTimer();
 		pending?.controller?.abort();
 		active?.controller.abort();
 		pending = undefined;
 	}
 
+	function cancel() {
+		drop();
+		notify();
+	}
+
 	return {
+		holds,
 		receive(contribution) {
 			if (closed || seen.has(contribution.id)) return;
 			seen.add(contribution.id);
@@ -191,9 +251,11 @@ export function createInitiativeSchedule<T>(options: {
 			participants.delete(contribution.actor);
 			participants.set(contribution.actor, now);
 			if (participants.size > 32) participants.delete(participants.keys().next().value!);
-			cancel();
+			drop();
 			pending = { contribution, at: now, quietSince: now };
+			notify();
 			arm();
+			changed();
 		},
 		typing(client, actor, isTyping) {
 			if (closed) return;
@@ -209,13 +271,17 @@ export function createInitiativeSchedule<T>(options: {
 				pending.controller = undefined;
 				arm();
 			}
+			changed();
 		},
 		depart(client) {
 			typing.delete(client);
 			arm();
+			changed();
 		},
+		people: () => people(time.now()),
 		replied() {
 			participants.clear();
+			changed();
 		},
 		cancel,
 		pause(value) {
@@ -228,6 +294,8 @@ export function createInitiativeSchedule<T>(options: {
 			typing.clear();
 			participants.clear();
 			seen.clear();
+			if (expiry !== undefined) time.clear(expiry);
+			expiry = undefined;
 		},
 	};
 }

@@ -1,4 +1,4 @@
-import { chatCaret, chatInput, expectChatValue, fillChat } from "./chat-input";
+import { chatCaret, chatInput, chatValue, expectChatValue, fillChat } from "./chat-input";
 import { seedChildChannel } from "./database";
 import { authenticate, expect, roomPath, test } from "./room";
 
@@ -21,7 +21,7 @@ test("touch chat input stays at least 16px to avoid focus zoom", async ({ join }
 });
 
 for (let touch of [false, true]) {
-	test(`chat input rests at ${touch ? "one line" : "two lines"} and grows to its cap on ${touch ? "a touch phone" : "desktop"}`, async ({ join }) => {
+	test(`chat input rests at one line and grows to its cap on ${touch ? "a touch phone" : "desktop"}`, async ({ join }) => {
 		let page = await join("ana", {
 			hasTouch: touch,
 			viewport: touch ? { width: 390, height: 844 } : { width: 1440, height: 900 },
@@ -32,8 +32,7 @@ for (let touch of [false, true]) {
 		}
 		let input = chatInput(chatPane(page));
 		await expect(input).toBeVisible();
-		// The field the draft sits in is what is capped and scrolls, so the Chopin chip that floats at
-		// the start of the draft goes with the first line.
+		// The field the draft sits in is what is capped and scrolls.
 		let field = input.locator("xpath=..");
 		let initial = await input.evaluate(element => {
 			let style = getComputedStyle(element);
@@ -44,8 +43,8 @@ for (let touch of [false, true]) {
 				maximum: parseFloat(getComputedStyle(element.parentElement!).maxHeight),
 			};
 		});
-		// A phone's pill composer rests at one line; desktop keeps room for two.
-		expect(initial.height).toBeCloseTo(initial.padding + (touch ? 1 : 2) * initial.line, 0);
+		// Slack's message box rests at one line, on a phone and on a desktop alike.
+		expect(initial.height).toBeCloseTo(initial.padding + initial.line, 0);
 		await fillChat(input, "One\nTwo\nThree\nFour");
 		await expect.poll(() => input.evaluate(element => element.getBoundingClientRect().height))
 			.toBeGreaterThan(initial.height);
@@ -63,7 +62,7 @@ async function enablePlanner(page: Page): Promise<void> {
 	});
 }
 
-test("Control+J preserves the draft and sends with the chip, which stays on after acknowledgement", async ({ join, page }) => {
+test("Control+J writes @chopin at the caret and the message asks chopin, with nothing left on after it", async ({ join, page }) => {
 	await enablePlanner(page);
 	let sent: Chat.Send[] = [];
 	let release: (() => void) | undefined;
@@ -84,42 +83,36 @@ test("Control+J preserves the draft and sends with the chip, which stays on afte
 	});
 	let chat = chatPane(await join("ana"));
 	let input = chatInput(chat);
-	let chip = chat.getByRole("group", { name: "Asking Chopin", exact: true });
-	let remove = chat.getByRole("button", { name: "Remove Chopin", exact: true });
-	await expect(chip).toHaveCount(0);
 	await input.fill("Outline export options");
-	await input.press("ArrowLeft");
-	let caret = await chatCaret(input);
+	await input.press("Home");
 	await input.press("ControlOrMeta+j");
-	await expect(chip).toBeVisible();
-	await expectChatValue(input, "Outline export options");
-	expect(await chatCaret(input)).toBe(caret);
+	await expectChatValue(input, "@chopin Outline export options");
+	expect(await chatCaret(input)).toBe("@chopin ".length);
 	await input.evaluate(element => {
 		let event = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
 		Object.defineProperty(event, "keyCode", { value: 229 });
 		element.dispatchEvent(event);
 	});
-	await expectChatValue(input, "Outline export options");
+	await expectChatValue(input, "@chopin Outline export options");
 	expect(sent).toHaveLength(0);
 	await input.press("Enter");
 	await expect.poll(() => sent.length).toBe(1);
 	expect(sent[0]).toMatchObject({ text: "@chopin Outline export options", to: "planner" });
-	// The message is in the Chat at once, waiting to send, and the composer is empty and free for
-	// the next one, with the chip still on: nothing waits on the acknowledgement.
+	// The message is in the Chat at once, saying Sending while only this browser has it, and the
+	// composer is empty and free for the next one: nothing waits on the acknowledgement.
 	let outline = chat.locator("[data-chat-message-id]").filter({
 		hasText: "Outline export options",
 	});
 	await expect(outline).toHaveCount(1);
-	await expect(outline.getByRole("img", { name: "Waiting to send" })).toBeVisible();
+	await expect(outline.getByText("Sending", { exact: true })).toBeVisible();
 	await expect(input).toHaveAttribute("contenteditable", "true");
 	await expectChatValue(input, "");
-	await expect(remove).toBeEnabled();
-	await expect(chip).toBeVisible();
+	await expect(chat.getByRole("button", { name: "Ask chopin", exact: true })).toBeEnabled();
 	release!();
-	await expect(outline.getByRole("img", { name: "Waiting to send" })).toHaveCount(0);
+	await expect(outline.getByText("Sending", { exact: true })).toHaveCount(0);
 	await expect(outline).toHaveCount(1);
 	await expectChatValue(input, "");
-	await expect(chip).toBeVisible();
+	await expect(chat.getByRole("group", { name: "Asking chopin" })).toHaveCount(0);
 	await expect(input).toBeFocused();
 	await input.press("Tab");
 	await page.evaluate(() =>
@@ -146,7 +139,7 @@ test("wrapped document mentions keep caret placement, edits and undo aligned", a
 	await expect(reference).toHaveAttribute("data-document-id", target);
 	await expect.poll(() => reference.evaluate(element => element.getClientRects().length))
 		.toBeGreaterThan(1);
-	let before = await input.textContent();
+	let before = await chatValue(input);
 	await expect.poll(() => chatCaret(input)).toBe(before!.length);
 	let caret = await reference.evaluate(element => {
 		let walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
@@ -169,17 +162,20 @@ test("wrapped document mentions keep caret placement, edits and undo aligned", a
 	await input.pressSequentially(" and PDF");
 	await expectChatValue(input, before + " and PDF");
 	await expect(reference).toHaveAttribute("data-document-id", target);
-	await input.press("Meta+z");
+	await input.press("ControlOrMeta+z");
 	await expectChatValue(input, before!);
 	await expect(reference).toHaveAttribute("data-document-id", target);
-	await input.press("Meta+Shift+z");
+	await input.press("ControlOrMeta+Shift+z");
 	await expectChatValue(input, before + " and PDF");
+	// Command+J writes the mention at the caret, after the reference, which keeps its target.
 	await input.press("ControlOrMeta+j");
-	await expectChatValue(input, before + " and PDF");
-	await expect.poll(() => chatCaret(input)).toBe(before!.length + 8);
+	await expectChatValue(input, before + " and PDF @chopin ");
+	await expect.poll(() => chatCaret(input)).toBe(before!.length + " and PDF @chopin ".length);
+	await expect(reference).toHaveAttribute("data-document-id", target);
+	await page.keyboard.insertText("too.");
 	await input.press("Shift+Enter");
 	await page.keyboard.insertText("Keep comments attached.");
-	await expectChatValue(input, before + " and PDF\nKeep comments attached.");
+	await expectChatValue(input, before + " and PDF @chopin too.\nKeep comments attached.");
 	await expect(reference).toHaveAttribute("data-document-id", target);
 });
 
@@ -217,7 +213,7 @@ test("read-only and archived notices replace the composer input", async ({ join,
 	await expect(chatInput(chat)).toHaveCount(0);
 });
 
-test("removing the chip removes multiple addresses while preserving a document mention between them", async ({ baseURL, join, page, room }) => {
+test("the button adds no second address beside a document mention, which keeps its target", async ({ baseURL, join, page, room }) => {
 	let target = crypto.randomUUID();
 	let title = `Export @chopin ${target.slice(0, 8)}`;
 	await seedChildChannel(Number(new URL(baseURL!).port), room, target, title, "# Export formats\n");
@@ -225,17 +221,19 @@ test("removing the chip removes multiple addresses while preserving a document m
 	await page.setViewportSize({ width: 1600, height: 1000 });
 	let chat = chatPane(await join("ana"));
 	let input = chatInput(chat);
-	await input.fill(`@chopin See #${target.slice(0, 8)}`);
+	await input.fill(`See #${target.slice(0, 8)}`);
 	await chat.getByRole("option", { name: title, exact: true }).click();
-	await page.keyboard.insertText(" @chopin");
 	let reference = input.locator(".draft-reference");
 	await expect(reference).toHaveAttribute("data-document-id", target);
-	await chat.getByRole("button", { name: "Remove Chopin", exact: true }).click();
-	await expect(chat.getByRole("group", { name: "Asking Chopin", exact: true })).toHaveCount(0);
+	// The reference's own words name chopin, but they are not an address: the button writes one.
+	await chat.getByRole("button", { name: "Ask chopin", exact: true }).click();
 	await expect(reference).toHaveAttribute("data-document-id", target);
 	await expect(reference).toHaveText(`#${title}`);
-	expect((await input.textContent())!.match(/@chopin/g)).toHaveLength(1);
-	await page.keyboard.insertText(" after");
+	expect((await input.textContent())!.match(/@chopin/g)).toHaveLength(2);
+	// Now the draft asks chopin, so asking again adds nothing.
+	await input.press("ControlOrMeta+j");
+	expect((await input.textContent())!.match(/@chopin/g)).toHaveLength(2);
+	await page.keyboard.insertText("after");
 	await expect(reference).toHaveAttribute("data-document-id", target);
 });
 
@@ -287,18 +285,16 @@ test(
 	},
 );
 
-test("context-menu paste undo restores the replaced native selection", async ({ join, page }) => {
+test("a rich paste keeps its formatting, and undo restores the replaced native selection", async ({ join, page }) => {
 	let input = chatInput(chatPane(await join("ana")));
 	await input.fill("hello world");
+	await input.press("Home");
+	for (let index = 0; index < 6; index++) await input.press("ArrowRight");
+	for (let index = 0; index < 5; index++) await input.press("Shift+ArrowRight");
+	await expect.poll(() => input.page().evaluate(() => window.getSelection()!.toString())).toBe(
+		"world",
+	);
 	await input.evaluate(element => {
-		let text = element.firstChild!;
-		let range = document.createRange();
-		range.setStart(text, 6);
-		range.setEnd(text, 11);
-		let selection = window.getSelection()!;
-		selection.removeAllRanges();
-		selection.addRange(range);
-		document.dispatchEvent(new Event("selectionchange"));
 		let clipboardData = new DataTransfer();
 		clipboardData.setData("text/plain", "friends");
 		clipboardData.setData("text/html", "<strong>friends</strong>");
@@ -310,14 +306,15 @@ test("context-menu paste undo restores the replaced native selection", async ({ 
 			}),
 		);
 	});
-	await expectChatValue(input, "hello friends");
-	await expect(input.locator("strong")).toHaveCount(0);
-	await input.press("Meta+z");
+	// The draft draws it bold, and sends it as Markdown.
+	await expectChatValue(input, "hello **friends**");
+	await expect(input.locator("strong")).toHaveText("friends");
+	await input.press("ControlOrMeta+z");
 	await expectChatValue(input, "hello world");
 	expect(await page.evaluate(() => window.getSelection()!.toString())).toBe("world");
 	expect(await chatCaret(input)).toBe(11);
-	await input.press("Meta+Shift+z");
-	await expectChatValue(input, "hello friends");
+	await input.press("ControlOrMeta+Shift+z");
+	await expectChatValue(input, "hello **friends**");
 });
 
 test("copied assistant-ui stylesheet stays off non-document pages and is applied before the first copied element mounts", async ({ baseURL, page, room }) => {
@@ -346,7 +343,7 @@ test("copied assistant-ui stylesheet stays off non-document pages and is applied
 		new MutationObserver(() => {
 			if (recorded) return;
 			let copy = document.querySelector<HTMLElement>(
-				'[data-slot="composer-voice-button"], [data-slot="directive-text-chip"], [data-slot="model-selector-trigger"]',
+				'[data-slot="composer-voice-button"], [data-slot="composer-menu"], [data-slot="model-selector-trigger"]',
 			);
 			if (!copy) return;
 			recorded = true;
@@ -374,8 +371,9 @@ test("copied assistant-ui stylesheet stays off non-document pages and is applied
 	let input = chatInput(chat);
 	await expect(input).toBeVisible();
 	await input.focus();
-	await input.press("ControlOrMeta+j");
-	await expect(chat.locator('[data-slot="directive-text-chip"]')).toBeVisible();
+	// The @ menu is a copied element, so one is on the page now whatever else the composer shows.
+	await page.keyboard.type("@");
+	await expect(chat.locator('[data-slot="composer-menu"]')).toBeVisible();
 
 	let firstCopy = await page.evaluate(() =>
 		(window as unknown as {
@@ -390,5 +388,10 @@ test("copied assistant-ui stylesheet stays off non-document pages and is applied
 	expect(firstCopy).toBeDefined();
 	expect(firstCopy?.assistantUiLoaded).toBe(true);
 	expect(firstCopy?.height).toBeGreaterThan(0);
-	if (firstCopy?.slot === "directive-text-chip") expect(firstCopy.fontSize).toBe("12px");
+	// It was drawn at the size the loaded stylesheet gives it from its first paint.
+	expect(firstCopy?.fontSize).toBe(
+		await page.locator(`[data-slot="${firstCopy!.slot}"]`).first().evaluate(element =>
+			getComputedStyle(element).fontSize
+		),
+	);
 });

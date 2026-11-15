@@ -4,14 +4,16 @@ import {
 	chooseLevel,
 	chooseModel,
 	composerModelNotice,
-	defaultStepLabel,
 	fallbackNotice,
 	levelSteps,
 	matchesQuery,
+	pendingLabel,
+	pendingTrigger,
 	pickerGroups,
 	pickerOptions,
 	reasoningLevels,
 	sameChoice,
+	shownLevel,
 	shownModel,
 	triggerLabel,
 	triggerText,
@@ -64,12 +66,12 @@ describe("what the picker lists", () => {
 		]);
 	});
 
-	test("marks the harness's own model, and the one that will run", () => {
+	test("marks the model that will run, the agent's own while nobody chose", () => {
 		let flat = (choice?: Chat.ModelChoice) => pickerOptions(pickerGroups(catalog, choice, ""));
-		expect(flat().map(model => [model.id, model.isDefault, model.selected])).toEqual([
-			["acme/large", false, false],
-			["acme/small", true, true],
-			["beta/mini", false, false],
+		expect(flat().map(model => [model.id, model.selected])).toEqual([
+			["acme/large", false],
+			["acme/small", true],
+			["beta/mini", false],
 		]);
 		expect(flat({ model: "beta/mini" }).filter(model => model.selected).map(model => model.id))
 			.toEqual(["beta/mini"]);
@@ -103,13 +105,15 @@ describe("what the picker lists", () => {
 });
 
 describe("what the trigger says", () => {
-	test("names the default model until somebody chooses, and says Default when the harness names none", () => {
+	test("names the agent's own model until somebody chooses, and asks for a choice where it names none", () => {
 		expect(triggerText(catalog, undefined)).toEqual({ name: "Small" });
-		expect(triggerText({ models: catalog.models }, undefined)).toEqual({ name: "Default" });
+		expect(triggerText({ models: catalog.models }, undefined)).toEqual({ name: "Choose a model" });
 		expect(shownModel({ models: catalog.models }, undefined)).toBeUndefined();
+		// No word of the agent's own is ever "Default".
+		expect(triggerLabel({ models: catalog.models }, undefined)).not.toMatch(/default/i);
 	});
 
-	test("adds the level only when one was chosen for the model", () => {
+	test("adds the level that will run: the chosen one, else the agent's own for its own model", () => {
 		expect(triggerText(catalog, { model: "acme/large", thinkingLevel: "high" })).toEqual({
 			name: "Large",
 			level: "high",
@@ -119,12 +123,29 @@ describe("what the trigger says", () => {
 		expect(triggerText(catalog, { model: "acme/large", thinkingLevel: "max" })).toEqual({
 			name: "Large",
 		});
+		let levelled = { ...catalog, default: { model: "acme/small", thinkingLevel: "high" } };
+		expect(triggerText(levelled, undefined)).toEqual({ name: "Small", level: "high" });
+		expect(triggerText(levelled, { model: "acme/small" })).toEqual({
+			name: "Small",
+			level: "high",
+		});
+		// A level gone from the agent's own model falls back to the agent's own level, as the turn does.
+		expect(triggerText(levelled, { thinkingLevel: "xhigh" })).toEqual({
+			name: "Small",
+			level: "high",
+		});
+		// Another model's own level is the agent's to say, and it has not said it.
+		expect(triggerText(levelled, { model: "acme/large" })).toEqual({ name: "Large" });
+		expect(shownLevel(levelled, { model: "acme/large" })).toBeUndefined();
+		// A default level its model does not list is not one it runs.
+		let unlisted = { ...catalog, default: { model: "acme/small", thinkingLevel: "off" } };
+		expect(shownLevel(unlisted, undefined)).toBeUndefined();
 	});
 
 	test("gives the model, its level and what went missing as the name of the control", () => {
 		expect(triggerLabel(catalog, undefined)).toBe("Model: Small");
 		expect(triggerLabel(catalog, { model: "acme/large", thinkingLevel: "xhigh" })).toBe(
-			"Model: Large, xhigh reasoning is no longer available for this model, so Chopin used its default.",
+			"Model: Large, xhigh reasoning is no longer available for this model, so chopin used its default.",
 		);
 	});
 
@@ -162,7 +183,7 @@ describe("what the trigger says", () => {
 		expect(reasoningLevels(alike, undefined).levels).toEqual(alikeLevels);
 		for (let level of alikeLevels) {
 			let asked = chooseLevel(alike, undefined, level);
-			expect(asked).toEqual({ thinkingLevel: level });
+			expect(asked).toEqual({ model: "acme/odd", thinkingLevel: level });
 			expect(reasoningLevels(alike, asked).current).toBe(level);
 		}
 		expect(levelSteps(alikeLevels, "High").filter(step => step.checked).map(step => step.level))
@@ -171,10 +192,10 @@ describe("what the trigger says", () => {
 
 	test("says what a gone model fell back to, and nothing when the choice stands", () => {
 		expect(fallbackNotice(catalog, { model: "acme/gone" })).toBe(
-			"acme/gone is no longer available, so Chopin used its default model.",
+			"acme/gone is no longer available, so chopin used its default model.",
 		);
 		expect(triggerLabel(catalog, { model: "acme/gone" })).toBe(
-			"Model: Small, acme/gone is no longer available, so Chopin used its default model.",
+			"Model: Small, acme/gone is no longer available, so chopin used its default model.",
 		);
 		expect(fallbackNotice(catalog, { model: "acme/large", thinkingLevel: "low" })).toBeUndefined();
 		expect(fallbackNotice(catalog, undefined)).toBeUndefined();
@@ -183,7 +204,7 @@ describe("what the trigger says", () => {
 
 describe("what the composer's strip says about the document's model", () => {
 	let held = { catalog, choice: { model: "acme/large" } as Chat.ModelChoice, refusal: undefined };
-	let unread = "This document's model choice couldn't be read, so Chopin used its default model.";
+	let unread = "This document's model choice couldn't be read, so chopin used its default model.";
 
 	test("says nothing while the choice stands, and nothing where no model can be chosen", () => {
 		expect(composerModelNotice(held, false)).toBeUndefined();
@@ -198,7 +219,7 @@ describe("what the composer's strip says about the document's model", () => {
 
 	test("keeps what a saved choice fell back from where the harness offers no models at all", () => {
 		// The picker is gone (no control, no catalog), and the choice the document holds is still said.
-		let gone = "acme/large is no longer available, so Chopin used its default model.";
+		let gone = "acme/large is no longer available, so chopin used its default model.";
 		expect(composerModelNotice(undefined, false, { model: "acme/large" })).toEqual({
 			tone: "info",
 			text: gone,
@@ -207,7 +228,7 @@ describe("what the composer's strip says about the document's model", () => {
 			.toEqual({ tone: "info", text: gone });
 		expect(composerModelNotice(undefined, false, { thinkingLevel: "xhigh" })).toEqual({
 			tone: "info",
-			text: "xhigh reasoning is no longer available for this model, so Chopin used its default.",
+			text: "xhigh reasoning is no longer available for this model, so chopin used its default.",
 		});
 		// What could not be read still comes before it, as it does with a catalog.
 		expect(composerModelNotice(undefined, true, { model: "acme/large" })).toEqual({
@@ -226,7 +247,7 @@ describe("what the composer's strip says about the document's model", () => {
 	});
 
 	test("names a saved choice before and after the picker goes away", () => {
-		let text = "Large is no longer available, so Chopin used its default model.";
+		let text = "Large is no longer available, so chopin used its default model.";
 		let gone = { ...held, choice: { model: "acme/gone" }, modelName: "Large" };
 		expect(composerModelNotice(gone, false)).toEqual({ tone: "info", text });
 		expect(composerModelNotice(undefined, false, { model: "acme/gone" }, [], "Large"))
@@ -236,7 +257,7 @@ describe("what the composer's strip says about the document's model", () => {
 
 	test("does not repeat a fallback already recorded in Chat, but keeps other notices", () => {
 		let gone = { ...held, choice: { model: "acme/gone" } };
-		let text = "acme/gone is no longer available, so Chopin used its default model.";
+		let text = "acme/gone is no longer available, so chopin used its default model.";
 		let entries = [{ id: "1", author: { kind: "system" as const }, text, ts: 1 }];
 		expect(composerModelNotice(gone, false, undefined, entries)).toBeUndefined();
 		expect(composerModelNotice(gone, true, undefined, entries)).toEqual({
@@ -268,59 +289,34 @@ describe("what the composer's strip says about the document's model", () => {
 		let gone = { ...held, choice: { model: "acme/gone" } };
 		expect(composerModelNotice(gone, false)).toEqual({
 			tone: "info",
-			text: "acme/gone is no longer available, so Chopin used its default model.",
+			text: "acme/gone is no longer available, so chopin used its default model.",
 		});
 		expect(composerModelNotice(gone, true)).toEqual({ tone: "info", text: unread });
 	});
 });
 
-describe("the reasoning control's own default beside the levels a model lists", () => {
-	test("is called Default, as it always was, when no level of the model reads like it", () => {
-		expect(defaultStepLabel([])).toBe("Default");
-		expect(defaultStepLabel(["off", "low", "high", "xhigh"])).toBe("Default");
-		// A level that only contains the word is another level.
-		expect(defaultStepLabel(["default-fast", "Defaults", "undefault"])).toBe("Default");
-	});
-
-	test("says Model default instead when a level of the model would be taken for it, by any case or padding", () => {
-		for (let level of ["Default", "default", "DEFAULT", " default ", "Default\t"]) {
-			expect(defaultStepLabel(["low", level, "high"]), JSON.stringify(level)).toBe("Model default");
-		}
-	});
-
-	test("never shares a label with a level, however the model spells them, and shows no level differently", () => {
-		let crowded = ["Default", "Model default", "model default (reset)", "high"];
-		let label = defaultStepLabel(crowded);
-		expect(label).toBe("Model default (reset) (reset)");
-		for (let levels of [[], ["Default"], ["default", "Model default"], crowded]) {
-			let own = defaultStepLabel(levels);
-			expect(levels.map(level => level.trim().toLowerCase())).not.toContain(own.toLowerCase());
-		}
-		// The levels' own labels are what the client reported, with this unchanged.
-		expect(["Default", "default", "Model default"].map(level => levelLabel(level))).toEqual([
-			"Default",
-			"default",
-			"Model default",
-		]);
-	});
-
-	test("asks for the model's own level when the default is chosen, and for the level of that name when it is", () => {
+describe("levels that read like a default", () => {
+	test("are levels like any other, shown and asked for exactly as the model lists them", () => {
 		let named: Chat.ModelCatalog = {
 			models: [{ id: "acme/odd", name: "Odd", thinkingLevels: ["Default", "default", "high"] }],
-			default: { model: "acme/odd" },
+			default: { model: "acme/odd", thinkingLevel: "high" },
 		};
-		// The step for the model's own is `undefined`; each level is the string that was listed.
-		expect(levelSteps(["Default", "default", "high"], undefined).map(step => step.level)).toEqual([
-			undefined,
+		expect(levelSteps(["Default", "default", "high"], "high").map(step => step.level)).toEqual([
 			"Default",
 			"default",
 			"high",
 		]);
-		expect(chooseLevel(named, { thinkingLevel: "Default" }, undefined)).toEqual({});
-		expect(chooseLevel(named, undefined, "Default")).toEqual({ thinkingLevel: "Default" });
-		expect(chooseLevel(named, undefined, "default")).toEqual({ thinkingLevel: "default" });
+		expect(chooseLevel(named, undefined, "Default")).toEqual({
+			model: "acme/odd",
+			thinkingLevel: "Default",
+		});
+		expect(chooseLevel(named, undefined, "default")).toEqual({
+			model: "acme/odd",
+			thinkingLevel: "default",
+		});
 		expect(triggerLabel(named, { thinkingLevel: "Default" })).toBe("Model: Odd, reasoning Default");
-		expect(triggerLabel(named, {})).toBe("Model: Odd");
+		expect(triggerLabel(named, {})).toBe("Model: Odd, reasoning high");
+		expect(["Default", "default"].map(level => levelLabel(level))).toEqual(["Default", "default"]);
 	});
 });
 
@@ -398,6 +394,30 @@ describe("what a pick asks for", () => {
 		expect(chooseModel(catalog, undefined, "acme/large")).toEqual({ model: "acme/large" });
 	});
 
+	test("records the level that runs with a model chosen alone, and the model with a level chosen alone", () => {
+		let levelled = { ...catalog, default: { model: "acme/small", thinkingLevel: "high" } };
+		// The agent's own level runs now, and the new model offers it.
+		expect(chooseModel(levelled, undefined, "acme/large")).toEqual({
+			model: "acme/large",
+			thinkingLevel: "high",
+		});
+		// The level chosen comes first; the agent's own level is next where the model offers it.
+		expect(chooseModel(levelled, { model: "acme/small", thinkingLevel: "low" }, "acme/large"))
+			.toEqual({ model: "acme/large", thinkingLevel: "low" });
+		expect(chooseModel(levelled, { model: "acme/small", thinkingLevel: "max" }, "acme/large"))
+			.toEqual({ model: "acme/large", thinkingLevel: "high" });
+		expect(chooseModel(levelled, undefined, "beta/mini")).toEqual({ model: "beta/mini" });
+		// A level alone keeps the model that runs now with it.
+		expect(chooseLevel(levelled, undefined, "low")).toEqual({
+			model: "acme/small",
+			thinkingLevel: "low",
+		});
+		// Both stand when the agent's own default moves.
+		let moved = { ...levelled, default: { model: "acme/large", thinkingLevel: "off" } };
+		let chosen = chooseLevel(levelled, undefined, "low");
+		expect(triggerText(moved, chosen)).toEqual({ name: "Small", level: "low" });
+	});
+
 	test("a model chosen while it was the default stays chosen when the client's default moves", () => {
 		let chosen = chooseModel(catalog, undefined, "acme/small");
 		let moved = { ...catalog, default: { model: "acme/large" } };
@@ -422,18 +442,21 @@ describe("what a pick asks for", () => {
 	test("never carries a gone model's level, or the gone model, into a new choice", () => {
 		let gone = { model: "acme/gone", thinkingLevel: "high" };
 		expect(chooseModel(catalog, gone, "beta/mini")).toEqual({ model: "beta/mini" });
-		expect(chooseLevel(catalog, gone, "low")).toEqual({ thinkingLevel: "low" });
+		// A level chosen in its place is the agent's own model's, which runs now.
+		expect(chooseLevel(catalog, gone, "low")).toEqual({
+			model: "acme/small",
+			thinkingLevel: "low",
+		});
 	});
 
-	test("a level keeps the chosen model, and no level goes back to the model's own", () => {
+	test("a level keeps the chosen model", () => {
 		expect(chooseLevel(catalog, { model: "acme/large" }, "off")).toEqual({
 			model: "acme/large",
 			thinkingLevel: "off",
 		});
-		expect(chooseLevel(catalog, { model: "acme/large", thinkingLevel: "off" }, undefined)).toEqual({
-			model: "acme/large",
+		expect(chooseLevel({ models: catalog.models }, undefined, "low")).toEqual({
+			thinkingLevel: "low",
 		});
-		expect(chooseLevel(catalog, undefined, "low")).toEqual({ thinkingLevel: "low" });
 	});
 
 	test("compares choices field by field", () => {
@@ -483,20 +506,48 @@ describe("a catalog that repeats an id or a level", () => {
 		expect(key("third", "A, third")).toBe(key("", "A, third"));
 	});
 
-	test("steps through Default and every level once, checking the first that is the choice", () => {
+	test("steps through every level once, checking the first that is the choice", () => {
 		let steps = levelSteps(["high", "off", "high", "default"], "high");
-		expect(steps.map(step => step.level)).toEqual([undefined, "high", "off", "high", "default"]);
+		expect(steps.map(step => step.level)).toEqual(["high", "off", "high", "default"]);
 		expect(new Set(steps.map(step => step.key)).size).toBe(steps.length);
-		expect(steps.map(step => step.checked)).toEqual([false, true, false, false, false]);
+		expect(steps.map(step => step.checked)).toEqual([true, false, false, false]);
 	});
 
-	test("takes a level named default for a level, and Default for the model's own", () => {
+	test("takes a level named default for a level, and checks none where the level is not known", () => {
 		let levels = ["off", "default"];
-		expect(levelSteps(levels, undefined).map(step => step.checked)).toEqual([true, false, false]);
-		expect(levelSteps(levels, "default").map(step => step.checked)).toEqual([false, false, true]);
+		expect(levelSteps(levels, undefined).map(step => step.checked)).toEqual([false, false]);
+		expect(levelSteps(levels, "default").map(step => step.checked)).toEqual([false, true]);
 		expect(levelSteps(levels, "default").map(step => step.key)).toEqual(
 			levelSteps(levels, undefined).map(step => step.key),
 		);
-		expect(new Set(levelSteps(levels, undefined).map(step => step.key)).size).toBe(3);
+	});
+});
+
+describe("the pill that waits for the machine's models", () => {
+	test("says the saved model by its catalog name and the saved level, else just Model", () => {
+		expect(pendingTrigger({ model: "acme/large", thinkingLevel: "high" }, "Large")).toEqual({
+			pending: true,
+			name: "Large",
+			level: "high",
+		});
+		// A model saved without the name a catalog gave it is not named by its id.
+		expect(pendingTrigger({ model: "acme/large" })).toEqual({ pending: true, name: "Model" });
+		expect(pendingTrigger({ thinkingLevel: "xhigh" })).toEqual({
+			pending: true,
+			name: "Model",
+			level: "xhigh",
+		});
+		expect(pendingTrigger(undefined)).toEqual({ pending: true, name: "Model" });
+	});
+
+	test("is named for what it waits for, never as the real pill is", () => {
+		expect(pendingLabel({ name: "Model" })).toBe("Loading the machine's models");
+		expect(pendingLabel({ name: "Large", level: "high" })).toBe(
+			"Loading the machine's models (Large, reasoning high)",
+		);
+		expect(pendingLabel({ name: "Model", level: "xhigh" })).toBe(
+			"Loading the machine's models (reasoning xhigh)",
+		);
+		expect(pendingLabel({ name: "Large" })).not.toMatch(/^Model: /);
 	});
 });

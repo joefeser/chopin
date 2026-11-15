@@ -495,6 +495,52 @@ test("says nothing of a machine while the list was read before the socket's word
 	expect(told(undefined, starting("mona"), "mona", true, false)).toBeNull();
 });
 
+test("a word that says which machine starts it names the document's own machine without waiting for the list", () => {
+	let boxA = machine({ id: "M_a", label: "Box A" });
+	let boxB = machine({ id: "M_b", label: "Box B" });
+	// The list was read before the word and still says the Planner is on Box A; the word says Box B.
+	let listed = state({
+		choice: "M_b",
+		machines: [boxA, boxB],
+		planner: { state: "starting", login: null, machine: "M_a" },
+	});
+	let failure = { attempts: 2, reason: "exit 1", at: new Date(NOW).toISOString() };
+	for (
+		let word of [{ ...starting("mona"), machine: "M_b" }, {
+			...starting("mona"),
+			machine: "M_b",
+			failure,
+		}]
+	) {
+		expect(told(listed, word, "mona", true, false)).toBe("Box B");
+	}
+	// A word naming a machine other than the document's own says nothing, even where a newer list
+	// says the Planner moved there: the word is about the machine left, and its failure is not Box B's.
+	expect(told(listed, { ...starting("mona"), machine: "M_a" }, "mona", true, false)).toBeNull();
+	let moved = state({
+		choice: "M_b",
+		machines: [boxA, boxB],
+		planner: { state: "starting", login: null, machine: "M_b" },
+	});
+	for (let current of [false, true]) {
+		expect(told(moved, { ...starting("mona"), machine: "M_a", failure }, "mona", true, current))
+			.toBeNull();
+	}
+	// A machine the list does not hold, a teammate's this person cannot use, is named by its
+	// owner's login, as a word with no machine is.
+	expect(told(state({ machines: [] }), { ...starting("mona"), machine: "M_x" }, "hubot", true))
+		.toBeUndefined();
+	// Where the creator decides, the login names it, as before.
+	expect(
+		told(
+			{ ...listed, creatorDecides: true },
+			{ ...starting("drew"), machine: "M_b" },
+			"mona",
+			true,
+		),
+	).toBeUndefined();
+});
+
 test("a word that waits for a newer read of the list says nothing, never what the status said of an older word, and is drawn at once", () => {
 	let listed = state({
 		choice: "M_box",
@@ -548,4 +594,34 @@ test("a read that says what the choice held changes nothing the page draws, unle
 	let moved = state({ choice: "M_box", machines: [machine({ connected: false })] });
 	expect(afterRead(held, moved, 6, 5)).toEqual({ state: moved, read: 6 });
 	expect(afterRead({ read: 0 }, same, 1, 0)).toEqual({ state: same, read: 1 });
+});
+
+test("where the creator's choice decides, the list says nothing of the machine, however old it is: the owner's login names it", () => {
+	let box = machine({ id: "M_theirs", label: "their-box", teammate: true });
+	let own = machine({ id: "M_mine", label: "my-box" });
+	let list = state({
+		choice: "M_mine",
+		machines: [own, box],
+		creatorDecides: true,
+		planner: { state: "none", login: null, machine: null },
+	});
+	// The person's own choice is not where it runs, so nothing in the list can name a machine for the
+	// word, current or not: it says whose machine it is, as the word does, and is not withheld.
+	for (let current of [true, false]) {
+		expect(told(list, { state: "starting", login: "drew" }, "quinn", false, current))
+			.toBeUndefined();
+		expect(told(list, { state: "disconnected", login: "drew" }, "quinn", false, current))
+			.toBeUndefined();
+	}
+	// Where the person decides, a list older than the word still names nothing.
+	expect(
+		told(
+			{ ...list, creatorDecides: undefined },
+			{ state: "starting", login: "quinn" },
+			"quinn",
+			false,
+			false,
+		),
+	)
+		.toBeNull();
 });

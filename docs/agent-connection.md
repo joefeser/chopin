@@ -117,6 +117,9 @@ client must then use none of them.
 | `restart-notice`           | A [`restarting`](#server-to-client) message before the server closes the link with 1012, and the [client rule](#when-the-server-is-restarting) that follows it                |
 | `capability-catalog`       | A [`capabilities`](#capability-catalog) report of the models, thinking levels and commands the client offers, and a person's choice of model and thinking level in the `turn` |
 | `attachments`              | The images and text files a person sent with a message, in the `turn`'s [`attachments`](#images-and-files-in-a-turn)                                                          |
+| `session-forks`            | A [`fork`](#server-to-client) message to branch a thread's Planner session from an earlier session and turn, multiplexed over the same connection                             |
+| `steer-turn`               | A [`steer`](#server-to-client) message: a person's message for the turn the client is running, read at its next step                                                          |
+| `retry-turn`               | A `turn`'s `message`, the Chat message it answers, and `retry` when it [runs a failed message again](#retrying-a-failed-turn)                                                 |
 
 ### Pings
 
@@ -355,13 +358,11 @@ resuming, except `unavailable`: Chopin could not decide, so the refusal carries
 ### Without an attached Planner
 
 On a server running `HARNESS=remote`, an `@chopin` message in the browser and
-an MCP `invoke_planner` call for a document with no attached client are never refused
-for it: they are [saved](hosted-agent.md#saved-requests), appear in
-Chat as sent, and start once a client attaches, in hosted mode and under `AUTH_MODE=local`
-alike. A
-document whose Planner is within its grace period, or disconnected with its work kept
-(the message then says the machine is offline, that the work is kept and that it picks
-up when the machine is back), counts as
+an MCP `invoke_planner` call for a document with no attached client are refused with
+`planner-not-attached`, and nothing is kept for when a client attaches: no message is ever
+held for a Planner (see [messages while the Planner works](hosted-agent.md#messages-while-the-planner-works)).
+A document whose Planner is within its grace period, or disconnected with its work kept
+(the message then says the machine is offline), counts as
 unattached, and so
 does one whose attached connection the request finds stale: its owner's browser
 sign-in has ended or the stored ownership no longer names it. The request closes
@@ -375,12 +376,15 @@ Still connecting to @<login>'s machine. Try again in a moment.
 ```
 
 Once the machine's backend has exited before attaching more than once in a row,
-the refusal says why, from what its connector reported (see
+the refusal says why, from what its connector reported or, for a connector that cannot
+say or a machine that has not answered in two minutes, from what Chopin saw itself (see
 [Hosted agent](hosted-agent.md#remote-planner)), and still only names the login:
 
 ```text
-Can't connect to @<login>'s machine: <reason> (3 attempts in a row). It keeps trying; try again once that is fixed.
+Can't connect to @<login>'s machine: <reason>. Try again once that is fixed.
 ```
+
+How often it was tried is never said: it connects, or it can't, and why.
 
 If no machine is starting one, the message says how to get one, in plain words:
 a machine is needed. Where Chopin runs Planners on paired machines:
@@ -395,11 +399,19 @@ Elsewhere it names the document URL:
 Connect a machine to get a reply. Connect an agent client to <document URL> over the agent connection from a session in a checkout of <owner/name>.
 ```
 
-A document whose Planner is disconnected is refused with the machine named by its
-owner's login, never by its own name:
+A document whose Planner is disconnected, or stepped away within its grace period, is refused
+with the machine named by its owner's login, never by its own name. It says what happened to the message and what to do,
+and nothing of keeping it, since nothing is kept for a machine that is away (the machine's own
+work, its runs and open questions, is kept, and the document says so where it shows the machine):
 
 ```text
-@<login>'s machine is offline, so it can't reply now. Your work is kept and picks up when it's back.
+@<login>'s machine is offline, so this message wasn't sent. Send it again when it's back.
+```
+
+Inside a deploy's hand-over window before the client has resumed, it says:
+
+```text
+Still connecting to @<login>'s machine, so this message wasn't sent. Send it again in a moment.
 ```
 
 [Local agent MCP](local-agent-mcp.md#hand-an-instruction-to-the-planner) shows
@@ -410,8 +422,10 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 
 ```text
 { "type": "start", "session": "", "mode": "planner" }
-{ "type": "turn", "session": "", "turn": "", "prompt": "", "instructions?": "", "model?": "", "thinkingLevel?": "", "attachments?": [{ "id": "", "name": "", "kind": "image", "mediaType": "", "size": 0, "data": "" }], "tools": [], "responseFormat?": {} }
+{ "type": "fork", "session": "", "mode": "planner", "from": { "session": "", "turn?": "" } }
+{ "type": "turn", "session": "", "turn": "", "prompt": "", "instructions?": "", "model?": "", "thinkingLevel?": "", "attachments?": [{ "id": "", "name": "", "kind": "image", "mediaType": "", "size": 0, "data": "" }], "message?": "", "retry?": true, "tools": [], "responseFormat?": {} }
 { "type": "abort", "session": "", "turn": "" }
+{ "type": "steer", "request": "", "session": "", "turn": "", "prompt": "" }
 { "type": "host-tool-result", "session": "", "turn": "", "toolCallId": "", "output": json, "isError?": true }
 { "type": "input-result", "request": "", "status": "answered", "value?": json, "message?": "" }
 { "type": "stop", "request": "", "session": "", "run?": "" }
@@ -427,6 +441,15 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   session refused with `start-failed` or not answered in time gets `destroy`,
   and any question asked for it meanwhile is withdrawn and answered
   `cancelled`.
+- `fork`, with `session-forks`, opens a thread's Planner session branched from
+  `from.session` (and `from.turn` when named), preserving the conversation,
+  tool results, compaction state and session memory up to that point. Answer
+  with `started` or `start-failed` within **10 seconds**, exactly as for
+  `start`. Once started, turns, host tools, questions, runs and `destroy`
+  multiplex over the connection by `session`. A client that did not offer
+  `session-forks` never receives `fork`; when a client answers `fork` with
+  `start-failed` (such as when the source session is no longer held), Chopin
+  falls back to `start` with the transcript up to the thread's root message.
 - `turn` runs one turn. `tools` lists at most 256 of Chopin's host tools as
   `{ "name": "", "description?": "", "inputSchema?": {json schema} }`;
   `description` may be 64,000 characters. `instructions` is the Planner's
@@ -436,12 +459,25 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   `thinkingLevel` is sent only with `capability-catalog`, and only when a person chose one.
   `attachments` is sent only with `attachments`, and only when the message that began the turn
   carried images or files (see [Images and files in a turn](#images-and-files-in-a-turn)).
+  `message` and `retry` are sent only with `retry-turn` (see
+  [Retrying a failed turn](#retrying-a-failed-turn)).
   `responseFormat` is `{ "type": "text" }` or
   `{ "type": "json", "schema?": {}, "name?": "", "description?": "" }`; for
   `json`, the turn's text must be that JSON.
 - `abort` stops the turn. Answer with `turn-end`; after **10 seconds** the
   server ends the turn anyway. The server sends no `host-tool-result` for the
   turn's calls after `abort`, so settle any call still waiting as failed.
+- `steer`, with `steer-turn`, gives the turn that is running a message a person sent to Chopin
+  while it works. Chopin never holds a message for the next turn, so this is how a person talks to
+  a Planner mid-reply: `prompt` is the message as the model should read it (the sender's handle
+  first, `@bo: ...`), to be read at the turn's next step, after the tool calls of the step it is
+  in and before its next call to the model, as an ordinary user message in the same turn. Answer
+  with `control-result` within **10 seconds**: `ok: true` once the turn has taken it, `ok: false`
+  with a `message` when it has not, because the turn has ended or the client has no way to hand
+  it on. A refusal is final: Chat then says the message was not read, and it is not sent again.
+  A client that did not offer the feature never receives one, and a message sent while it works
+  is refused in Chat ("chopin can't take messages while it works on this machine. Stop it to ask
+  now.") rather than kept for later.
 - `host-tool-result` answers a `host-tool-call`. `output` is the tool's result
   as JSON. A failed call has `"isError": true` and `output`
   `{ "error": "<message>" }`; that includes a tool that threw, invalid input, a
@@ -461,7 +497,9 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   nothing; answer it `ok: true`. A client that answers `ok: false`, for a run that
   has since ended, only has the refusal logged for a `stop` sent again.
 - `destroy` ends the session; abandon its turn, its waiting host calls, and its
-  questions.
+  questions. A client offering `session-forks` may retain the finished session's
+  conversation history so a later `fork` naming `from.session` can branch from
+  it, or answer `start-failed` once it has evicted it.
 - `restarting`, with `restart-notice`, precedes a close with 1012 when the server is
   restarting. `reconnectWithinMs` is how long, in milliseconds, a new process is expected to
   take to take over; see [When the server is restarting](#when-the-server-is-restarting). A
@@ -535,7 +573,7 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   have the Planner act on a run that ended, call `invoke_planner` with
   `as: "system"` and a GitHub token of the account holding the Planner; see
   [Automatic follow-ups](local-agent-mcp.md#automatic-follow-ups).
-- `control-result` answers `stop` or `resume`.
+- `control-result` answers `stop`, `resume` or, with `steer-turn`, `steer`.
 - `detach` closes the connection with code 1000. The account keeps the document's
   Planner for the grace period in [Ownership](#ownership). It ends everything the
   link held, even with `resumable-sessions`: only a link that drops without it keeps
@@ -605,7 +643,7 @@ level can therefore never be chosen, and a turn never carries one.
   may define their own, spelled as they like. Chopin shows
   every level exactly as written, Atomic's own included (`xhigh`, not Extra high), its case
   unchanged, so that `xhigh` and `extra high`, `ß-fast` and `SS-fast`, and `high` and `High` are
-  each two levels a person can tell apart, and the turn carries the string they saw. The composer's own first step, which returns the level to the model's own, is called Default, or Model default where the model lists a level of that name, so no level shares its label. A model with none or an empty list has no reasoning control, and the composer
+  each two levels a person can tell apart, and the turn carries the string they saw. The composer lists only the model's levels, a level named `Default` among them, with the one that will run checked. A model with none or an empty list has no reasoning control, and the composer
   hides it. An empty string is not a level: it is dropped. Chopin sends back only a level the model
   listed.
 - **`inputTypes`** is what the model reads: `text`, and `image` where it reads images, as strings
@@ -615,8 +653,10 @@ level can therefore never be chosen, and a turn never carries one.
   `inputTypes`, an empty list, or no catalog at all reads as text only, so a client from before the
   field is never sent an image. A text file does not depend on it.
 - **`models.default`** is what the client runs when a turn names no model or no level. Its `id`
-  should be one of `available`; the composer shows that model as the document's current one until
-  somebody chooses another. An operator's `MODEL` takes its place when it is set. A default with an
+  should be one of `available`; the composer shows that model, and its `thinkingLevel` where the
+  model lists it, as the document's current ones until somebody chooses others. A person's pick
+  records a model and a level together where the catalog says which level runs, so a client should
+  report the `thinkingLevel` its default model runs at. An operator's `MODEL` takes its place when it is set. A default with an
   empty `id` is ignored, and an empty `thinkingLevel` is dropped from it.
 - **`commands`** is reserved for the commands a client offers, such as skills,
   prompt templates and workflows: `name`, `description` and `kind`, a string the client defines
@@ -688,6 +728,45 @@ A person can send images and text files with a message to the Planner (see [File
 The field is optional and additive: nothing here changes an existing message for a client that
 did not offer the feature, so the subprotocol stays `chopin.agent.v1`.
 
+### Retrying a failed turn
+
+A reply can fail part way: the model's provider is down, a request times out, the client loses
+its model. Chat then shows the failure under the message, and the person who sent it can press
+**Retry**. Retry is not a new message. Chat keeps the one message, takes the failed attempt out
+of the transcript (its partial reply, its tool rows and the failure line) for everyone, and runs
+the same message's turn again. The model must read that message once and nothing of the attempt
+that failed.
+
+With `retry-turn`, every `turn` that a person's Chat message began names it:
+
+```text
+{ "type": "turn", "session": "s2", "turn": "t2", "prompt": "@ana: Hey there!", "message": "0f8c…", "tools": [] }
+{ "type": "turn", "session": "s3", "turn": "t3", "prompt": "@ana: Hey there!", "message": "0f8c…", "retry": true, "tools": [] }
+```
+
+- **`message`** is the id of the Chat message the turn answers, the same id the room sees. It is
+  absent from a turn no person's message began (a background job, a decision follow-up, an
+  instruction Chopin wrote). When Chopin asks the same session to repair a reply it withheld, that
+  second `turn` carries the same `message`, without `retry`.
+- **`retry: true`** says this turn runs `message` again after an earlier turn for it failed. Its
+  `prompt` is the message as it was first given, and its `attachments` the same files. Before
+  running it, the client drops from whatever it keeps across sessions or turns everything the
+  earlier turns for `message` added: their prompt, the model's partial reply and reasoning, their
+  tool calls and results, and the error. It then runs the prompt as that message's only turn. A
+  client that keeps nothing beyond its session has nothing to drop.
+- **What Chopin already does.** A failed turn's session is destroyed, so a retry normally runs in
+  a fresh `start` session. Its `instructions` carry the conversation so far without the message
+  (which is the prompt) and without anything of the failed attempt, which is no longer in the
+  transcript. A client that does not offer the feature therefore still gets a clean context for an
+  ordinary retry; only a client that keeps its own memory beyond Chopin's sessions, or a session
+  Chopin kept because it owns a workflow run or an open question, needs `message` and `retry` to
+  drop the attempt itself.
+- A thread forked later from the retried message branches from the retried turn, never the failed
+  one: Chopin forgets the fork point the failed attempt recorded.
+
+Nothing here changes an existing message for a client that did not offer the feature, so the
+subprotocol stays `chopin.agent.v1`.
+
 ### Stream parts
 
 `part.part` is one of these AI SDK `HarnessV1StreamPart`s, without metadata
@@ -721,6 +800,8 @@ fields:
   `host-tool-call`) or a declared own tool.
 - A failed own tool's `tool-result` may carry a
   [structured tool error](#structured-tool-errors) as its `result`.
+- A successful own tool's `tool-result` may carry the
+  [images it made](#images-a-tool-made) as content blocks in its `result`.
 - `finishReason.unified` is one of `stop`, `length`, `content-filter`,
   `tool-calls`, `error`, `other`. `usage` and `totalUsage` are
   `{ "inputTokens": { "total?", "noCache?", "cacheRead?", "cacheWrite?" }, "outputTokens": { "total?", "text?", "reasoning?" } }`
@@ -790,6 +871,92 @@ what crosses the connection: `host-tool-result.output` reaches the client exactl
 the host tool returned it (except the two reading tools; see
 [Reading a large document](#reading-a-large-document)), and a failed host call
 keeps its `{ "error": "<message>" }` output.
+
+### Images a tool made
+
+An own tool that made images, such as an image generator, shows them in Chat by
+sending, as its final successful `result`, an object whose `content` array holds
+`image` blocks beside any `text` blocks, the shape MCP and Atomic tool results
+already have:
+
+```text
+{ "content": [
+  { "type": "text", "text": "" },
+  { "type": "image", "data": "<base64>", "mimeType": "image/png", "alt?": "", "caption?": "" }
+] }
+```
+
+- `data` is the image's bytes in standard base64, with or without its `=` padding;
+  `mimeType` is their type:
+  `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/avif`, `image/bmp`
+  or `image/x-icon`. The usual other names, such as `image/jpg`, `image/apng`,
+  `image/x-ms-bmp` and `image/vnd.microsoft.icon`, are read as the type their
+  bytes are.
+- `alt` says what the image shows, in words, and `caption` is a line shown with it.
+  Both are optional and kept as given, an empty string included. Chat shows its
+  own words for an image without `alt`.
+- Extra keys in a block, and an `alt` or `caption` that is not a string, are
+  ignored. The JSON text of the same object is read the same way.
+
+Chopin stores each image block it can host, a raster image a browser draws (PNG,
+JPEG, WebP, GIF, AVIF, BMP or ICO) whose bytes are of its `mimeType` and whose
+size it can read, as one of the document's own images and as the type its bytes
+are. The store is the one `upload_image` uses, which still takes only a PNG,
+JPEG, WebP or GIF. Only after the bytes are
+stored does Chat show it, labelled as generated, on the turn's message: every
+image a turn makes, from any call, goes on one message, in the order they were
+made, and several show as one gallery. Browsers load it from
+`/images/<sha256>.<ext>`, which serves it only to people who can read the
+document, with its own `Content-Type`, `X-Content-Type-Options: nosniff` and a
+`sandbox` content security policy, so no SVG or HTML is ever served from it.
+A block Chopin will not host, SVG and HTML among them, is not shown, and the
+message does not leave it unsaid: the turn's message lists `refusedImages`, one
+entry per such block in the order of the result's blocks, duplicates kept, each
+with a plain sentence that starts `Image couldn't be shown:` and says why, and
+`before`, how many of the message's images come before it. The reasons are that
+its type is not one Chat shows, that its data is not base64, that its bytes are
+not the type it names (or are another type, or are cut short), that its block
+has no data or type, that it did not fit one message, that Chopin could not
+store it, which gives no detail of the failure, and that it is more pixels than
+Chopin can make smaller. An image is never refused for its size: one larger than
+the server's `MAX_STORED_IMAGE_BYTES`, 10 MiB by default, is stored as a smaller
+copy of itself, as below. Turns before that saved
+`Image too large to show (N MB, limit M MB)` for such an image, which does not
+start with `Image couldn't be shown:`; a saved `refusedImages` entry is valid with
+either. `refusedImages` is an optional field that old browsers ignore,
+saved with the message; a message may have it without `images`. The tool's row
+in Work details shows the `text` blocks and how many images the result carried,
+never their bytes. A `preliminary` or failed result shows no images and no
+reasons.
+`@chopin/agent-link` exports the block as `toolImageSchema`. Like the
+[structured tool error](#structured-tool-errors), it is a convention, not a new
+wire shape: `result` is still any JSON, so a client sends it to any server, and a
+server that does not know it shows the result as before. A picture has no
+size limit of its own: the `MAX_STORED_IMAGE_BYTES` setting (10 MiB by default, see
+[Self-hosting](self-hosting.md)) bounds the decoded bytes Chopin stores for every image a
+tool made, whichever harness ran the tool, and a larger one is stored as a smaller copy of
+itself (at most 4096 pixels on its longest side, then narrower until it fits; a JPEG stays a
+JPEG and anything else becomes a WebP, which keeps transparency), the way Slack keeps a
+large photo and shows a smaller one. Chat then reads it at Slack's thumbnail widths
+(`?w=360` and so on, see [Storage](storage.md)). Over this connection the whole message,
+images included, stays within the 2 MiB message limit as well.
+
+A connection refuses a message over that limit before the server reads it, so
+only the client can make an image fit. The `@chopin/agent-link` client does:
+when a `tool-result` part would be over the limit, it sends each image that does
+not fit, largest first and the later of equals first, as a smaller copy of itself
+that fits what is left of the message, made with `Bun.Image` on the client's own
+machine, and the parts after it wait for it, so they arrive in order. Only where no
+copy can be made (a runtime without `Bun.Image`, or bytes that do not decode) does it
+send the block with `data` empty and `tooLarge` set to the bytes the image would have
+taken, and Chat then says so beside the images. A block with `tooLarge` is never stored,
+whatever else it holds. A client that does not do this, as before it did, has its
+message refused with the generic `error` whose `code` is `message-too-large`,
+which names no image, and its link closed with 1009 (see [Closing](#closing)),
+and Chat shows no reason for the missing images, since the server never reads
+the result; a server that does not know `tooLarge` leaves such a block out
+without saying why. A result that still does not fit with its images left out
+is not sent, and its `emit` throws, as it always did.
 
 ### Reading a large document
 
@@ -1010,16 +1177,19 @@ document's own images and returns the Markdown to use, in an option's `preview`,
 a question's body, or the plan:
 
 ```text
-input:  { "data": "<standard base64, at most 1 MiB decoded>", "mimeType": "image/png" | "image/jpeg" | "image/webp" | "image/gif", "alt": "" }
+input:  { "data": "<standard base64, at most 16 MiB decoded>", "mimeType": "image/png" | "image/jpeg" | "image/webp" | "image/gif", "alt": "" }
 output: { "path": "/images/<sha256>.<ext>", "markdown": "![alt](/images/<sha256>.<ext>)" }
 ```
 
 `alt` is required, one line of at most 200 characters. The same bytes uploaded
 twice give the same path. The server never reads a path on the Planner's side:
 a remote Planner encodes its own file. A call fails with the usual host tool
-error for an image over 1 MiB, an unsupported type, bytes that are not the
+error for an image over 16 MiB (one over 1 MiB is stored as a smaller copy of
+itself, so it fits a document's images), an unsupported type, bytes that are not the
 declared type, an archived document, or a call outside a live Planner turn. The
-image loads only for people who can read this document. A workflow stage has no
+image loads only for people who can read this document. Chat also shows the
+image, with its `alt`, as a generated image on the turn's message, like the
+[images a tool made](#images-a-tool-made). A workflow stage has no
 turn of its own, so from a stage use the MCP `upload_image` tool with the same
 bytes, or pass the Markdown down from a Planner turn.
 
@@ -1184,7 +1354,9 @@ not apply to it.
   same account attaching with a client that does not resume, which includes a browser
   sign-in attaching over a paired machine's parked work, since that client cannot
   resume it. All of these withdraw the questions and show the runs as `stopped`, and a
-  later `resume` finds nothing. A server restart does not end it: see below. A person
+  later `resume` finds nothing. Archiving stops the document's run cards itself, before it
+  releases the link, so they end even when the Planner is disconnected or a deploy is handing
+  over and its link reports nothing; an archived document always opens with its runs stopped. A server restart does not end it: see below. A person
   with write access can always end a disconnected Planner by resetting it.
 
 #### When the server is restarting
@@ -1228,8 +1400,9 @@ Planner had asked stay open and answerable in the document.
 The next process rebuilds each hold as a suspended one. Until its **hand-over window**
 (`HANDOVER_PLANNER_WINDOW_MS`, 10 seconds by default, counted from the release of the lease: the
 next process starts it as it rebuilds the hold, after the release) ends, the
-document's members see the Planner attached, the run cards Chat stored stay as they were, and
-a `@chopin` message, comment note or task draft is saved and started when the client resumes.
+document's members see the Planner attached and the run cards Chat stored stay as they were; a
+`@chopin` message, comment note or task draft sent before the client resumes is refused saying
+it is still connecting, with nothing kept for later.
 A returning client attaches, and sends `resume` as usual:
 
 - **Before the owner's browser sign-in is back,** which a browser's cookie restores, the
@@ -1251,9 +1424,13 @@ A returning client attaches, and sends `resume` as usual:
   sent, once. An answer given before the client is back waits and is sent after `resumed`; one
   given after goes straight to it. No turn of its own follows, because the question is waited
   on. A question a client resumes without, because it no longer waits on it, is withdrawn, as
-  `input-cancel` withdraws it. Each Stop held for the client is sent first. The client's
-  `runs` for a resumed session update nothing Chat shows until a Planner turn starts a session
-  of its own.
+  `input-cancel` withdraws it. Each Stop held for the client is sent first. No turn of the new
+  process opened a resumed session, yet it is the document's as before: its `runs` are Chat's
+  run cards, and a document that opens after the client is back shows them live, never stopped,
+  with what the client last reported. A question it asks after the restart, an `input-request`
+  on the resumed session, becomes Decisions as one asked before it did, and its answer goes to
+  that request; the document is opened for it if nobody has it open, and kept open until the
+  question ends.
 - **An answer its client is never given.** When the client that asked does not come back to
   resume (it attaches with nothing to resume, or resumes without the session), an answer a
   member had given meanwhile cannot reach its request. It reaches the Planner once, as a turn of
@@ -1325,17 +1502,18 @@ long to mask is left out, with a note in its place.
 
 Each launch gets the connector's environment, your `--env` values, and these:
 
-| Variable                         | Value                                                                                    |
-| -------------------------------- | ---------------------------------------------------------------------------------------- |
-| `CHOPIN_URL`                     | The server's origin.                                                                     |
-| `CHOPIN_DOCUMENT`                | The document as given to `--planner`, or its URL when Chopin chose this machine.         |
-| `CHOPIN_PLANNER_TOKEN`           | This launch's [credential](#credential).                                                 |
-| `CHOPIN_PLANNER_TOKEN_FILE`      | A file (mode `0600`) that always holds a current credential, replaced before it expires. |
-| `CHOPIN_CHECKOUT`                | The absolute root of the document's repository's checkout or clone.                      |
-| `CHOPIN_WORKTREE`                | The command's own worktree path, `<base dir>/planners/<owner>/<repo>/<document id>`.     |
-| `CHOPIN_GITHUB_TOKEN`            | The machine owner's token from Chopin's GitHub App, for pushing and draft pull requests. |
-| `CHOPIN_GITHUB_TOKEN_EXPIRES_AT` | When that token expires, in ISO 8601.                                                    |
-| `CHOPIN_GITHUB_TOKEN_FILE`       | A file (mode `0600`) that always holds the current token.                                |
+| Variable                         | Value                                                                                              |
+| -------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `CHOPIN_URL`                     | The server's origin.                                                                               |
+| `CHOPIN_DOCUMENT`                | The document as given to `--planner`, or its URL when Chopin chose this machine.                   |
+| `CHOPIN_PLANNER_TOKEN`           | This launch's [credential](#credential).                                                           |
+| `CHOPIN_PLANNER_TOKEN_FILE`      | A file (mode `0600`) that always holds a current credential, replaced before it expires.           |
+| `CHOPIN_CHECKOUT`                | The absolute root of the document's repository's checkout or clone.                                |
+| `CHOPIN_WORKTREE`                | The command's own worktree path, `<base dir>/planners/<owner>/<repo>/<document id>`.               |
+| `CHOPIN_GITHUB_TOKEN`            | A token of Chopin's GitHub App for the document's repository, for pushing and draft pull requests. |
+| `CHOPIN_GITHUB_TOKEN_EXPIRES_AT` | When that token expires, in ISO 8601.                                                              |
+| `CHOPIN_GITHUB_TOKEN_FILE`       | A file (mode `0600`) that always holds the current token.                                          |
+| `CHOPIN_MCP_TOKEN_FILE`          | A file (mode `0600`) holding the token for Chopin's tools at `/mcp`, renewed with the credential.  |
 
 `CHOPIN_WORKTREE` stays the same across launches. The connector makes its
 parent folders but never removes the worktree itself. Whether the backend or the
@@ -1373,8 +1551,11 @@ launch's credential, never reaches the connector's output. A backend that outliv
 link, as a `resumable-sessions` one does, reads it again before reattaching.
 
 The connector renews the GitHub token in the file 25 minutes before it expires,
-so read the file before each use. The three `CHOPIN_GITHUB_TOKEN` variables are
-absent when Chopin gives no token; see
+so read the file before each use. It acts as the App's bot, so `gh api user`
+fails with it; who the work is for is in `CHOPIN_STARTER_LOGIN`. Use the GitHub
+token for Git and gh only, and `CHOPIN_MCP_TOKEN_FILE` for Chopin's tools. When
+Chopin refuses a token the command doesn't start. The rest of what the launch
+gets for GitHub, and what it doesn't inherit, is in
 [Which GitHub account pushes](chopin-cli.md#which-github-account-pushes).
 
 ### Credential
@@ -1475,3 +1656,47 @@ the answer leaves its document out. When a document is renamed, the poll's next
 answer names it at its new address; the connector shows that address in
 `chopin status` and its output, and starts the backend there next time, without
 restarting a backend that is running.
+
+### Plan sources
+
+A backend that writes files for a document revision (a specification, a proof, a
+schema) in `CHOPIN_WORKTREE` makes them reachable by a build by committing them on a
+branch, pushing it to the document's repository, and recording where at `/mcp`,
+with the MCP token in `CHOPIN_MCP_TOKEN_FILE`:
+
+```json
+{
+	"name": "record_plan_source",
+	"arguments": {
+		"id": "<document id or URL>",
+		"revision": 12,
+		"branch": "plans/<document id>",
+		"commit": "<40 hex characters>"
+	}
+}
+```
+
+`revision` is the document revision the files belong to, such as the one
+`update_document` returned; `branch` is a branch name git accepts, without
+`refs/heads/`; `commit` is the full SHA, already pushed. Chopin asks GitHub for the
+commit with the machine's own grant and keeps one source per revision, the newest
+20 revisions, beside the document; recording another commit for a revision replaces
+it, and the same one again changes nothing. It answers
+`{ "recorded": true, "revision", "branch", "commit" }`, or an error whose `code` is
+`invalid-plan-source` (a bad branch or SHA), `plan-source-unavailable` (GitHub has
+no such commit in the repository), `revision-conflict` with the document's current
+`revision` (one it has not reached), `document-archived`, `document-unavailable` or
+`repository-forbidden`. A server without the tool answers JSON-RPC error `-32601`.
+
+A build of the tasks drafted against revision R starts from the source recorded for
+the newest revision at or before R, instead of the builder's checkout or the default
+branch: its worktree is detached at that commit. Build checks the commit again with
+the building machine's grant as it is pressed, and refuses with
+`plan-source-unavailable` when GitHub no longer has it; a connector that cannot fetch
+it fails the build naming the commit. The build records the source, the Build tab
+says _Built from plan revision 12 at plans/…@1a2b3c4_, and its run's
+`read_implementation` returns it as `planSource`. A rebuild of a built document keeps
+the base it had unless a source was recorded for a revision after the one last built,
+which the rebuild then starts from. The Planner's `read_implementation_graph` returns
+the source for the current revision as `plan_source`. A document with no recorded
+source builds as before.

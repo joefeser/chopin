@@ -1,0 +1,81 @@
+/* A message whose thread is open keeps its row in the selected wash, as Slack marks a thread's root. */
+.chat-message-body[data-thread-root-open]::before {
+	background: var(--color-chat-row-selected);
+	opacity: 1;
+}
+
+/*
+ * Slack's reply bar (`c-message__reply_bar`): 34px, 24px faces 4px inside its edge, and drawn out
+ * past the text's edge by that inset and its hairline, so its first face lines up with the text.
+ */
+.chat-thread-summary-row {
+	display: inline-flex;
+	max-width: 100%;
+	align-items: center;
+	gap: calc(var(--spacing) * 2);
+	margin-top: var(--spacing);
+	margin-inline-start: calc(-1 * (var(--spacing) + var(--edge-width)));
+	padding: var(--spacing) calc(var(--spacing) * 2) var(--spacing) var(--spacing);
+	border-radius: var(--radius-md);
+	border: var(--edge-width) solid transparent;
+	background: transparent;
+	text-align: left;
+	cursor: pointer;
+	transition:
+		background-color var(--duration-fast) var(--ease-out),
+		border-color var(--duration-fast) var(--ease-out);
+}
+
+.chat-thread-summary-row:hover,
+.chat-thread-summary-row:focus-visible {
+	background: var(--color-page);
+	border-color: var(--color-edge);
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.chat-thread-summary-row {
+		transition: none;
+	}
+}
+
+.chat-thread-summary-avatars {
+	display: inline-flex;
+	align-items: center;
+	gap: var(--spacing);
+	flex-shrink: 0;
+}
+
+.chat-thread-summary-count {
+	color: var(--color-brand);
+	font-size: var(--text-xs);
+	font-weight: 600;
+	line-height: 1.35;
+	white-space: nowrap;
+}
+
+.chat-thread-summary-age {
+	color: var(--color-text-tertiary);
+	font-size: var(--text-xs);
+	line-height: 1.35;
+	white-space: nowrap;
+}
+
+.chat-thread-summary-view {
+	display: none;
+	align-items: center;
+	gap: calc(var(--spacing) * 0.5);
+	color: var(--color-text-secondary);
+	font-size: var(--text-xs);
+	line-height: 1.35;
+	white-space: nowrap;
+}
+
+.chat-thread-summary-row:hover .chat-thread-summary-age,
+.chat-thread-summary-row:focus-visible .chat-thread-summary-age {
+	display: none;
+}
+
+.chat-thread-summary-row:hover .chat-thread-summary-view,
+.chat-thread-summary-row:focus-visible .chat-thread-summary-view {
+	display: inline-flex;
+}

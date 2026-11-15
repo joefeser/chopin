@@ -349,8 +349,9 @@
 	}
 }
 
+/* A field's edge is how it is found, so it is the control boundary (3:1 on every ground), not a hairline. */
 @utility field {
-	border: var(--edge-width) solid var(--color-control-edge);
+	border: var(--edge-width) solid var(--color-control-boundary);
 	border-radius: var(--radius-md);
 	background-color: var(--color-page);
 	box-shadow: var(--shadow-resting);
@@ -399,7 +400,7 @@
 
 @utility choice-control {
 	appearance: none;
-	border: var(--edge-width) solid var(--color-control-edge);
+	border: var(--edge-width) solid var(--color-control-boundary);
 	background-color: var(--color-page);
 	color: var(--color-text-primary);
 
@@ -445,14 +446,14 @@
 	}
 }
 
-/* Extra contrast is an opt-in accommodation, not the normal control edge. */
+/* Extra contrast is an opt-in accommodation for other control edges; fields and choices meet it. */
 @media (prefers-contrast: more) {
-	:where(.control-edge, .field, .choice-control):not([aria-invalid="true"]) {
+	:where(.control-edge):not([aria-invalid="true"]) {
 		outline: var(--edge-width) solid var(--color-control-boundary);
 		outline-offset: calc(-1 * var(--edge-width));
 	}
 
-	:where(.control-edge, .field, .choice-control):disabled {
+	:where(.control-edge):disabled {
 		outline-color: var(--color-edge);
 	}
 }
@@ -486,11 +487,12 @@ body {
 	overscroll-behavior: none;
 }
 
+/* `viewport.ts` writes the visual viewport's left, top and width on the element itself. */
 #root {
 	position: fixed;
-	left: var(--app-left, 0px);
-	top: var(--app-top, 0px);
-	width: var(--app-width, 100%);
+	left: 0;
+	top: 0;
+	width: 100%;
 	height: 100%;
 	height: var(--app-height, 100dvh);
 }
@@ -1161,11 +1163,6 @@ body {
 	--activity-badge-ring: var(--color-gray-300);
 }
 
-.workspace-root[data-workspace-mode="split"] .workspace-chat-panel .chat-composer {
-	padding-inline: var(--spacing);
-	padding-bottom: env(safe-area-inset-bottom);
-}
-
 .motion-panel {
 	opacity: 0;
 	transform: translateX(calc(var(--panel-distance) * var(--panel-direction, 1)));
@@ -1189,10 +1186,19 @@ body {
 
 /*
  * Split Chat is a track: its width moves the document, and Chat slides under its clip.
- * Only the width clips, so the composer's focus ring can pass the panel's bottom edge.
+ * Only the width clips, so the composer's focus ring can pass the panel's bottom edge, and at its
+ * start only beyond the frame's gutter, which Chat's rows are shaded across (workspace-sizing.css).
+ * Its top and foot are unbounded, not merely far: an image's lazy loading counts a clip path's
+ * edges, and one a screen above and below Chat kept the images further up from loading. (An
+ * overflow clip's margin would do, but Chromium draws one only where both axes clip.)
  */
 .workspace-root[data-workspace-mode="split"] .workspace-chat-panel {
-	overflow: clip visible;
+	overflow: visible;
+	clip-path: inset(
+		calc(-1px * infinity)
+		0 calc(-1px * infinity)
+		calc(-1 * (var(--spacing) * 3 + env(safe-area-inset-left)))
+	);
 	width: 0;
 	order: -1;
 	--panel-direction: -1;
@@ -1226,10 +1232,6 @@ body {
 	--panel-direction: -1;
 	--panel-distance: var(--page-slide-distance);
 	transition-duration: var(--page-slide-dur);
-}
-
-.workspace-root[data-workspace-travel="back"] {
-	--swap-direction: -1;
 }
 
 .content-swap-stack {
@@ -1328,31 +1330,6 @@ body {
 @media (pointer: coarse) {
 	.workspace-status-row .plan-status-detail {
 		display: block;
-	}
-}
-
-/* Jump-to-source: a tint behind the message that fades; the message itself never moves. */
-.chat-message-body[data-chat-source] {
-	isolation: isolate;
-}
-
-.chat-source-tint {
-	position: absolute;
-	inset: -2px -6px;
-	z-index: -1;
-	border-radius: var(--radius-md);
-	background: var(--color-brand-wash);
-	pointer-events: none;
-	animation: chat-source-tint calc(var(--duration-linger) * 2) var(--ease-out) forwards;
-}
-
-@keyframes chat-source-tint {
-	0%,
-	40% {
-		opacity: 1;
-	}
-	100% {
-		opacity: 0;
 	}
 }
 
@@ -1496,14 +1473,6 @@ body {
 	.hosted-header {
 		padding-right: calc(1.5rem + env(safe-area-inset-right));
 		padding-left: calc(1.5rem + env(safe-area-inset-left));
-	}
-}
-
-@media (min-width: 1200px) {
-	/* The desktop composer keeps the same clearance on each exposed edge. */
-	.chat-composer {
-		padding-inline: 1rem;
-		padding-bottom: calc(1rem + env(safe-area-inset-bottom));
 	}
 }
 
@@ -1733,6 +1702,7 @@ body {
 
 [data-question-markdown] pre {
 	overflow-x: auto;
+	border: 0;
 	border-radius: var(--radius-md);
 	background: var(--color-inset);
 	padding: 0.5rem 0.75rem;
@@ -2455,6 +2425,11 @@ textarea.question-written-field {
 	--focus-ring-offset: -2px;
 }
 
+/* The image viewer's controls sit on a dark ground, where petrol is under 3:1: theirs is white. */
+:is(.image-viewer-control, .image-viewer-slider) {
+	--focus-ring-color: var(--color-page);
+}
+
 :where(a, button, input, select, summary, textarea, [role="button"], [tabindex]):is(:focus-visible, [data-force-state="focus"]) {
 	outline: var(--focus-ring-width) solid var(--focus-ring-color);
 	outline-offset: var(--focus-ring-offset);
@@ -2514,10 +2489,11 @@ textarea.question-written-field {
 
 /*
  * The ring answers "where am I?" for keyboard users, so it hides after a pointer
- * press. Text fields keep theirs: a caret alone is easy to lose.
+ * press. Text fields keep theirs: a caret alone is easy to lose. The mark is on the
+ * focused element (`useFocusInput`): keyed on the root, every control restyled.
  */
-:root[data-focus-input="pointer"]
-	:where(button, select, summary, [role="button"], [role="listbox"], [role="option"], [tabindex]:not(input, textarea)):focus-visible {
+:root
+	:where(button, select, summary, [role="button"], [role="listbox"], [role="option"], [tabindex]:not(input, textarea))[data-focus-pointer]:focus-visible {
 	outline: none;
 }
 
@@ -2554,10 +2530,6 @@ textarea.question-written-field {
 }
 
 @media (prefers-reduced-motion: reduce) {
-	.chat-source-tint {
-		animation: none;
-	}
-
 	.btn[aria-busy="true"] [data-button-loader] {
 		animation: none;
 	}

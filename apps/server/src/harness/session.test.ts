@@ -6,7 +6,12 @@ import { openPlannerSession } from "./session";
 import { fullPlanner } from "./atomic/full";
 import { forgetWorkspaces, rememberCheckout, stateDirectory } from "./atomic/workspace";
 import { plannerInstructions } from "../agent/planner";
-import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES, VISUAL_PLANNER_TOOL_NAMES } from "./tool-names";
+import {
+	BACKGROUND_TOOL_NAMES,
+	PLANNER_TOOL_NAMES,
+	REACTION_TOOL_NAMES,
+	VISUAL_PLANNER_TOOL_NAMES,
+} from "./tool-names";
 import { remotePlanner } from "./remote/registry";
 import { hostInputRoom, laterTimers } from "../testing/decisions";
 
@@ -60,6 +65,35 @@ function fixture() {
 }
 
 describe("openPlannerSession", () => {
+	it("gives a Planner turn's session a way to steer its running turn, and a background job's none", async () => {
+		let { owner, channel, deps } = fixture();
+		let steered: string[] = [];
+		deps.agent = {
+			createSession: async () => ({
+				destroy: async () => {},
+				experimental_steerTurn: async (text: string) => {
+					steered.push(text);
+				},
+			}),
+		} as never;
+		let planner = await openPlannerSession(owner, channel, deps);
+		if (!planner.ok) throw new Error("the Planner session did not open");
+		await planner.value.steer!("@bo: Also say what it costs.");
+		expect(steered).toEqual(["@bo: Also say what it costs."]);
+		await planner.value.destroy();
+
+		channel.room = {
+			id: "channel",
+			plan: { chat: { job: { kind: "heading" } } },
+			server: {},
+		} as never;
+		deps.headingAgent = deps.agent;
+		let job = await openPlannerSession(owner, channel, deps);
+		if (!job.ok) throw new Error("the job session did not open");
+		expect(job.value.steer).toBeUndefined();
+		await job.value.destroy();
+	});
+
 	it("uses the visual Planner profile only when the room has Jev routing", async () => {
 		let { owner, channel, deps } = fixture();
 		let visualOpened = false;
@@ -183,6 +217,94 @@ describe("openPlannerSession", () => {
 		expect(opened.value.activeTools).toEqual(BACKGROUND_TOOL_NAMES.heading);
 		await opened.value.stream("prompt", new AbortController().signal);
 		expect(instructions).toContain("You have no shell");
+		await opened.value.destroy();
+		expect(remotePlanner(sessionId)).toBeUndefined();
+	});
+
+	it("opens a reader's answer on the reaction agent, with no tools and no Planner instructions", async () => {
+		let { owner, channel, deps } = fixture();
+		let reactionOpened = false;
+		let instructions = "";
+		deps.agent = undefined;
+		deps.reactionAgent = {
+			createSession: async () => {
+				reactionOpened = true;
+				return { destroy: async () => {} };
+			},
+			stream: async (call: { options: { instructions: string } }) => {
+				instructions = call.options.instructions;
+			},
+		} as never;
+		let opened = await openPlannerSession(owner, {
+			...channel,
+			reader: true,
+			instructions: "Answer the reaction",
+		}, deps);
+		if (!opened.ok) throw new Error("Planner unavailable");
+		expect(reactionOpened).toBe(true);
+		expect(opened.value.activeTools).toEqual(REACTION_TOOL_NAMES);
+		expect(opened.value.activeTools).toEqual([]);
+		await opened.value.stream("prompt", new AbortController().signal);
+		expect(instructions).toBe("Answer the reaction");
+		await opened.value.destroy();
+	});
+
+	it("keeps a reader's answer out of the full Atomic session, with no workspace and no run control", async () => {
+		let { owner, channel, deps } = fixture();
+		let room = await hostInputRoom();
+		let sessionId = "";
+		deps.agent = undefined;
+		deps.reactionAgent = {
+			createSession: async (options: { sessionId: string }) => {
+				sessionId = options.sessionId;
+				return { destroy: async () => {} };
+			},
+			stream: async () => {},
+		} as never;
+		let opened = await openPlannerSession(owner, {
+			...channel,
+			room: room.room,
+			harness: "atomic",
+			reader: true,
+			instructions: "Answer the reaction",
+		}, deps);
+		if (!opened.ok) throw new Error("Planner unavailable");
+		try {
+			expect(fullPlanner(sessionId)).toBeUndefined();
+			expect(opened.value.inputs).toBeUndefined();
+			expect(opened.value.pauseRuns).toBeUndefined();
+			expect(opened.value.activeTools).toEqual([]);
+		} finally {
+			await opened.value.destroy();
+			await room.close();
+		}
+	});
+
+	it("keeps a remote reader's answer isolated, so its client can offer no tool of its own", async () => {
+		let { owner, channel, deps } = fixture();
+		let sessionId = "";
+		deps.agent = undefined;
+		deps.reactionAgent = {
+			createSession: async (options: { sessionId: string }) => {
+				sessionId = options.sessionId;
+				return { destroy: async () => {} };
+			},
+			stream: async () => {},
+		} as never;
+		let opened = await openPlannerSession(owner, {
+			...channel,
+			room: { id: "channel", plan: {}, server: {} } as never,
+			harness: "remote",
+			reader: true,
+			instructions: "Answer the reaction",
+		}, deps);
+		if (!opened.ok) throw new Error("Planner unavailable");
+		expect(remotePlanner(sessionId)).toMatchObject({ channelId: "channel", isolated: true });
+		expect(remotePlanner(sessionId)!.humanInput).toBeUndefined();
+		expect(opened.value.inputs).toBeUndefined();
+		expect(opened.value.pauseRuns).toBeUndefined();
+		expect(opened.value.rebind).toBeUndefined();
+		expect(opened.value.activeTools).toEqual([]);
 		await opened.value.destroy();
 		expect(remotePlanner(sessionId)).toBeUndefined();
 	});
@@ -325,6 +447,7 @@ describe("Planner workspaces", () => {
 			expect(instructions).toContain("Chat shows a card for each workflow run you start");
 			expect(instructions).toContain("`intercom` tool can reach other sessions");
 			expect(instructions).toContain("one working in a checkout of owner/repo");
+			expect(instructions).toContain('wait: { kind: "foreground", budgetMs: 600000 }');
 			expect(instructions).not.toContain("You have no shell");
 		}
 		let git = Bun.spawn(["git", "-C", path, "remote", "set-url", "origin", "workgit:other/repo"], {

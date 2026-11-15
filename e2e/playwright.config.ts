@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 import { defineConfig, devices } from "@playwright/test";
 
+import { GITHUB_APP_ENV } from "./github-app";
 import { e2ePort } from "./ports";
 import { FIXTURES, HARNESS, HOST, PLAIN, ROOT, SETUP_AGENTS } from "./servers";
 
@@ -50,6 +51,7 @@ function server(port: number, database: string, extra: Record<string, string>) {
 			GITHUB_APP_SLUG: "chopin-e2e",
 			GITHUB_APP_CLIENT_ID: "e2e",
 			GITHUB_APP_CLIENT_SECRET: "e2e",
+			...GITHUB_APP_ENV,
 			GITHUB_ALLOWED_USERS: "",
 			GITHUB_ALLOWED_ORGANIZATIONS: "githubnext",
 			SESSION_ENCRYPTION_KEY: process.env.SESSION_ENCRYPTION_KEY!,
@@ -185,7 +187,15 @@ export default defineConfig({
 				"**/harness-decisions-deck.e2e.ts",
 				"**/harness-children.e2e.ts",
 				"**/harness-investigation.e2e.ts",
+				"**/chat-threads.e2e.ts",
+				"**/chat-thread-reactions.e2e.ts",
+				"**/chat-tab-complete.e2e.ts",
+				"**/chat-mention-format.e2e.ts",
 				"**/run-card.e2e.ts",
+				"**/chat-run-strip.e2e.ts",
+				"**/chat-run-scrollbars.e2e.ts",
+				"**/message-reactions.e2e.ts",
+				"**/reaction-reader.e2e.ts",
 				"**/auth-lifecycle.e2e.ts",
 				"**/demo-collaborators.e2e.ts",
 			],
@@ -222,7 +232,15 @@ export default defineConfig({
 				"**/harness-decisions-deck.e2e.ts",
 				"**/harness-children.e2e.ts",
 				"**/harness-investigation.e2e.ts",
+				"**/chat-threads.e2e.ts",
+				"**/chat-thread-reactions.e2e.ts",
+				"**/chat-tab-complete.e2e.ts",
+				"**/chat-mention-format.e2e.ts",
 				"**/run-card.e2e.ts",
+				"**/chat-run-strip.e2e.ts",
+				"**/chat-run-scrollbars.e2e.ts",
+				"**/message-reactions.e2e.ts",
+				"**/reaction-reader.e2e.ts",
 			],
 			use: { ...devices["Desktop Chrome"], baseURL: `http://${HOST}:${HARNESS}` },
 		},

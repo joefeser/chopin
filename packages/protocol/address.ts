@@ -14,6 +14,8 @@
 /** How the agent is summoned. */
 export const MENTION = "@chopin";
 
+export { PLANNER_NAME } from "./planner-name";
+
 /**
  * Word-boundary match, so an address in prose does not count.
  *

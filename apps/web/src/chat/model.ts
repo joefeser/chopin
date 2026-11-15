@@ -1,5 +1,5 @@
-import { displayName as capitalize } from "@chopin/editor";
 import { instruction } from "@chopin/protocol/address";
+import { PLANNER_NAME } from "@chopin/editor/people";
 
 import type { Chat } from "@chopin/protocol";
 
@@ -12,19 +12,18 @@ export type Message = {
 	ts?: number;
 	streaming?: boolean;
 	tools?: Chat.Activity[];
+	/** What the agent's turn made or showed, in order; see `Chat.Entry.images`. */
+	images?: Chat.Image[];
+	refusedImages?: Chat.ImageRefusal[];
 	references?: Chat.Reference[];
 	/** The images and files sent with it. */
 	attachments?: Chat.Attachment[];
+	reactions?: Chat.Reaction[];
 	/** Set only when the sender addressed the Planner. */
 	to?: Chat.Destination;
-	/** How far a message to the machine has got; see `deliveryOf`. */
-	deliveryState?: Chat.DeliveryState;
-	deliveryFailure?: Chat.DeliveryFailure;
-	/** Only this browser has it so far (`delivery.ts`), why it was refused, and whether it can be dropped. */
+	/** Only this browser has it so far (`delivery.ts`), and why the server refused it. */
 	echo?: true;
 	failure?: string;
-	deletable?: boolean;
-	queued: boolean;
 	working?: boolean;
 	workDisconnected?: boolean;
 	workStreaming?: boolean;
@@ -32,7 +31,7 @@ export type Message = {
 };
 
 export type Group =
-	| { kind: "messages"; author: Speaker; messages: Message[]; queued: boolean }
+	| { kind: "messages"; author: Speaker; messages: Message[] }
 	| {
 		kind: "system";
 		id: string;
@@ -68,19 +67,19 @@ export type WorkPhase =
 export function workAnnouncement(phase: WorkPhase): string {
 	switch (phase) {
 		case "Getting oriented":
-			return "Chopin has started.";
+			return `${PLANNER_NAME} has started.`;
 		case "Gathering context":
-			return "Chopin is gathering context.";
+			return `${PLANNER_NAME} is gathering context.`;
 		case "Waiting for an answer":
-			return "Chopin needs an answer.";
+			return `${PLANNER_NAME} needs an answer.`;
 		case "Making changes":
-			return "Chopin is making changes.";
+			return `${PLANNER_NAME} is making changes.`;
 		case "Working through the request":
-			return "Chopin is working on the request.";
+			return `${PLANNER_NAME} is working on the request.`;
 		case "Writing a response":
-			return "Chopin is writing a reply.";
+			return `${PLANNER_NAME} is writing a reply.`;
 		case "Reviewing the next step":
-			return "Chopin is preparing to continue.";
+			return `${PLANNER_NAME} is preparing to continue.`;
 	}
 }
 
@@ -88,25 +87,26 @@ function speaker(author: Speaker): string {
 	return author.kind === "agent" ? "agent" : `member:${author.handle}`;
 }
 
-export { capitalize };
-
-/** Tool names are protocol identifiers; the transcript is for people. */
+/** Tool names are protocol identifiers; the transcript is for people, in sentence case. */
 export function toolCopy(name: string): string {
 	if (name === "ask") return "Questions";
-	return capitalize(name.replaceAll(/[_/]/g, " "));
+	let words = name.replaceAll(/[_/]/g, " ");
+	return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
-/** Mentions remain useful input syntax, but are not part of rail typography. */
+/**
+ * Mentions remain useful input syntax, but are not part of rail typography: the `@` goes and the
+ * handle stays exactly as written, an Enterprise Managed User's `_shortcode` included.
+ */
 export function displayText(value: string): string {
 	return instruction(value).replace(
-		/(^|[^\w@])@([a-z0-9][a-z0-9-]*)\b/gi,
-		(_match, before: string, handle: string) => `${before}${capitalize(handle)}`,
+		/(^|[^\w@])@([a-z0-9][\w-]*)/gi,
+		(_match, before: string, handle: string) => `${before}${handle}`,
 	);
 }
 
 export function group(
 	entries: Chat.Entry[],
-	queued: Chat.Waiting[],
 	working?: Pick<Chat.Turn, "id" | "started" | "entryOffset">,
 	completed: CompletedWork[] = [],
 	suspended?: CompletedWork,
@@ -158,7 +158,6 @@ export function group(
 			...anchor.entry,
 			author: { kind: "agent" },
 			tools,
-			queued: false,
 			...(span.disconnected ? { workDisconnected: true } : {}),
 			...(span.active
 				? {
@@ -185,68 +184,48 @@ export function group(
 				author: { kind: "agent" as const },
 				text: "",
 				ts: working.started,
-				queued: false,
 				working: true,
 			}]
 			: []),
-		...queued.map(item => ({
-			id: item.id,
-			author: { kind: "member" as const, handle: item.handle },
-			text: item.text,
-			references: item.references,
-			to: "planner" as const,
-			queued: true,
-		})),
 	];
 	let result: Group[] = [];
 
 	for (let row of rows) {
-		if ("queued" in row) {
-			append(result, row);
-			continue;
-		}
 		if (row.author.kind === "system") {
+			let notice = row as Chat.Entry;
 			// Filter at presentation time so saved turn offsets and comment references stay intact.
 			if (
-				row.decision?.kind === "activity"
-				&& /^Chopin (?:drafted|updated|refined|suggested|wrote up)\b/.test(row.text)
+				notice.decision?.kind === "activity"
+				&& /^Chopin (?:drafted|updated|refined|suggested|wrote up)\b/i.test(notice.text)
 			) continue;
 			if (
-				!row.decision && !row.comment
+				!notice.decision && !notice.comment
 				&& /^(?:@[\w-]+|Chopin) (?:joined|left|connecting|connected|disconnected)\.?$/i
-					.test(row.text)
+					.test(notice.text)
 			) continue;
 			result.push({
 				kind: "system",
-				id: row.id,
-				text: row.text,
-				ts: row.ts,
-				decision: row.decision,
-				...(row.comment ? { comment: row.comment } : {}),
+				id: notice.id,
+				text: notice.text,
+				ts: notice.ts,
+				decision: notice.decision,
+				...(notice.comment ? { comment: notice.comment } : {}),
 			});
 			continue;
 		}
-		append(result, { ...row, author: row.author, queued: false });
+
+		append(result, { ...row, author: row.author });
 	}
 	return result;
 }
 
 function append(result: Group[], message: Message): void {
 	let previous = result.at(-1);
-	if (
-		previous?.kind === "messages"
-		&& previous.queued === message.queued
-		&& speaker(previous.author) === speaker(message.author)
-	) {
+	if (previous?.kind === "messages" && speaker(previous.author) === speaker(message.author)) {
 		previous.messages.push(message);
 		return;
 	}
-	result.push({
-		kind: "messages",
-		author: message.author,
-		messages: [message],
-		queued: message.queued,
-	});
+	result.push({ kind: "messages", author: message.author, messages: [message] });
 }
 
 export type ToolKind = "ask" | "read" | "write" | "other";

@@ -31,8 +31,9 @@ process:
 
 1. Keeps serving and stays ready. From the signal on, every answer carries `Connection: close`,
    so the proxy keeps no idle connection to it. It starts no new Planner turn: a request that
-   would have started one is saved and waits for the new process. It asks GitHub for no token
-   refresh.
+   would have started one is not answered, so its browser sends it again to the new process
+   (an `invoke_planner` call is answered `planner-unavailable`, which its caller may retry).
+   It asks GitHub for no token refresh.
 2. Lets turns already running finish, up to `HANDOVER_TURN_WAIT_MS`, with no socket closed. A turn
    still running then is cut off, with a notice in its Chat, and is never run again.
 3. Commits and checkpoints every document, still serving.
@@ -54,10 +55,10 @@ process:
 
 A message, an `invoke_planner` call or a Build press that was being saved when step 4 began is
 finished first: closing a document's Chat waits for every send already admitted, so each is saved
-as a row and answered, never refused as closed. A message that reaches the process after that, and
+and answered, never refused as closed. A message that reaches the process after that, and
 every frame from step 4 on, gets no answer at all. Its page keeps it, sees the socket close with
 1012, and sends it again, with the same request id, to the new process, which saves it once; the
-page shows it as waiting to send meanwhile, and never as a message that could not be sent. A Build
+page shows it as sending meanwhile, and never as a message that could not be sent. A Build
 press is not sent again by the page: one that reaches a closed Chat reads as any request lost to a
 restart does, and can be pressed again. MCP has no such page: no HTTP request reaches the process
 after step 2, and one still running at the bound of step 3 is the one planned exception (its
@@ -66,8 +67,9 @@ Chat answers `planner-unavailable`, which the caller may retry; the retry is hel
 until the new process is ready.
 
 The new process takes the lease within about 100 ms of the release, finishes its startup and
-becomes ready. The proxy's next health check adopts it and the requests it held reach it. Then it
-starts the Planner requests that were saved. Browsers that lost their socket at step 6 reconnect
+becomes ready. The proxy's next health check adopts it and the requests it held reach it. It
+closes any row an earlier release held for a Planner (see [Storage](storage.md#a-live-database-from-an-earlier-release)).
+Browsers that lost their socket at step 6 reconnect
 inside their grace and show nothing; the editor keeps every update the old process had not
 acknowledged and sends it again.
 
@@ -235,8 +237,9 @@ it too, provided it follows the rules below.
 - At the cut, the server writes each live link's sessions, waiting requests, unacknowledged
   answers and unheard Stops to storage, with a hand-over window of `HANDOVER_PLANNER_WINDOW_MS`
   from the release: the next process counts it from the moment it rebuilds the hold, so a slow
-  write or release takes nothing from what the client was told. Until it ends, the document shows the machine as connected, and a message to
-  it is saved and started when the client returns.
+  write or release takes nothing from what the client was told. Until it ends, the document shows the machine as connected; a message sent to it
+  meanwhile is refused saying _Still connecting to @<login>'s machine, so this message wasn't sent.
+  Send it again in a moment._, with the typed text kept in the draft and nothing kept on the server.
 - A client that offered the `restart-notice` feature is sent `restarting` with
   `reconnectWithinMs` before the close. It must connect again at once and, if its `resume` is
   refused with `retry`, try again every 250 ms until `reconnectWithinMs` has passed, then on its
@@ -245,7 +248,7 @@ it too, provided it follows the rules below.
   See [Agent connection](agent-connection.md#when-the-server-is-restarting).
 - A client without the feature sees a 1012 close and resumes on its own backoff. If that is
   longer than the window, the document shows the machine as away when the window ends, as for any
-  lost connection, and what was sent meanwhile waits.
+  lost connection.
 - A paired machine's backend keeps working: the credential the server issued it is stored by
   digest, so the new process accepts an unexpired one at once and the backend sees no HTTP 401.
   Older connectors need no change. The machine's connection itself is kept in memory, so its
@@ -256,12 +259,11 @@ it too, provided it follows the rules below.
   are in use is not kept. Without that the connector's first poll would be told to run no
   Planners and would stop the backend.
 
-A message to the document's machine is never refused because it is away. It appears in Chat at
-once, is saved on the server, and is delivered by itself, in order and exactly once, when the
-machine is back. Its mark says how far it has got: waiting to send while the browser itself is
-offline, sent once the server has it, delivered once the machine took it. A deploy is one
-more reason the machine can be away for a moment. See
-[Saved requests](hosted-agent.md#saved-requests).
+A message to the document's machine is never held while the machine is away: it is refused,
+puts the typed text back in the composer draft with the reason above it, and is sent again by the
+person. A deploy is one more reason the machine can be reconnecting for a moment. A message sent
+while a turn runs is given to that turn. See
+[Messages while the Planner works](hosted-agent.md#messages-while-the-planner-works).
 
 ## Rollback
 
@@ -271,9 +273,11 @@ more reason the machine can be away for a moment. See
 - The previous release refuses migration IDs it does not know, so rolling back to a release
   without this stage needs a database restore past the newer migrations, as before. The new
   tables are unused by it.
-- Saved Planner requests are rows the previous release does not read. Before an older release
-  takes over, a newer one should resolve every row (cancel those waiting, mark those started
-  as interrupted, each with a notice). That drain option is not built.
+- Rows an earlier release saved for Planner requests (`planner_deferred_turns`) are not written
+  or read by this release, and the previous release finds them closed: at start the writer
+  lease's holder cancels those waiting and marks those started as interrupted, and adds no
+  migration. Rolling back therefore needs no database restore for them; the messages they
+  held stay in their Chats as ordinary ones.
 
 ## Try it locally
 
@@ -306,7 +310,31 @@ processes itself.
 lease from one to the other under open tabs, with a paired machine's Planner backend (and, in two
 cases, a Planner attached under its owner's own sign-in) attached through the proxy. It is part of
 `bun run e2e`, on ports 8801 to 8803 and a database of its own in the fourth database's cluster.
-Its cases:
+Since nothing is held for a Planner, it sends no stream of Planner messages across a deploy and
+reads no saved rows for them; what a hand-over does to a stream of them under load is the load run's
+to measure ([Deploy under load](#deploy-under-load)). Three of its cases (the second runs once for a
+machine that takes a message mid-run and once for one that does not) send a few, each of which
+must end visibly as started, given to the running turn, or refused, and none lost, doubled or left
+at Sending:
+
+- Messages sent before, during and after the machine's hand-over window: the first starts a turn
+  and the next two, sent while it runs, one before the deploy and one while the old process waits
+  for it, are given to it, which reads both. One sent while the page is between processes is held
+  by the browser alone, goes to the new process while the machine's client has not resumed, inside
+  its window, and is refused (_Still connecting to @mona's machine, so this message wasn't sent.
+  Send it again in a moment._) with the typed text kept in the draft and nothing kept on the server.
+  One sent once the machine is back starts a turn. A tab opened afterwards has every message but
+  the refused one, once, and the server holds no row for any.
+- A turn running when the deploy begins is not cut off or run twice, and ends in one reply, with
+  no notice of being stopped. A message sent to it while the old process waits for it reaches it
+  when its machine takes a message mid-run; when the machine does not, the message is refused
+  (_chopin can't take messages while it works on this machine. Stop it to ask now._), kept
+  nowhere, and starts a turn once the person sends it again.
+- Once the new release has the lease, the transcript, in the tab that lived through the deploy
+  and in one opened after it, holds what was said once and nothing waiting, sending or refused; a row an earlier release left open (`waiting`) is closed by the release that took the
+  lease and never reaches the machine; and a new `@chopin` message starts a turn of its own.
+
+The others:
 
 - A person types without stopping, with an unsent message in the composer, while the old process
   is stopped. The page is sampled every 25 ms: it says nothing of the connection or the machine
@@ -321,14 +349,6 @@ Its cases:
 - A comment being written, with its words and its offer to send it to Chopin (made while a
   Planner runs for the document), is still open with both after the hand-over, and a comment
   started after it is offered the same.
-- A message sent to the Planner with a turn running, one sent while the old process waits for the
-  turn, a comment sent to Chopin, one typed before the cut and sent after it, and one the page had
-  not yet sent, are each answered once and in the order they were accepted, and a teammate's tab
-  and a tab opened afterwards see each reply once.
-- A message sent from an open child keeps the child it was about, and the turn can read it in the
-  new process.
-- A message sent while the machine's Planner is away through the whole cut shows as sent, never as
-  failed, and is delivered once, with one reply, when it is back.
 - A Planner attached under its owner's sign-in, with a question left open, resumes within its
   window, with the owner's tab in front, with it really in the background, and with it frozen
   for a moment. The client resumes with its question still waiting, and the answer a member
@@ -432,10 +452,11 @@ tests, the only thing that is faked besides the model that checks a reply). Thro
   and a backend attached for each document that answers each message once and resumes its session
   after a restart as [Agent connection](agent-connection.md) asks of one.
 - **Planner requests of every kind.** Steadily, and before and during every deploy: a turn is
-  running at the signal and a message waits behind it, and while the old process waits for that
+  running at the signal and a message is given to it, and while the old process waits for that
   turn it is given one of each kind (a Chat message, an `invoke_planner` call, a system
-  `invoke_planner` call, a comment note, a task draft), all saved as rows and started by the new
-  process.
+  `invoke_planner` call, a comment note, a task draft); none is held, so each is answered, given
+  to the running turn, or refused, and the driver counts a refusal as what it is rather than
+  as a request nobody answered.
 - **MCP.** Sessions that read documents every 200 ms and make the `invoke_planner` calls above.
 - **A build.** The real connector (`apps/connector`) paired with a key, running the fake
   implementer of its own tests, which stops at its first task until the deploys are over, so a
@@ -489,7 +510,7 @@ Every gate passed in each.
 | Image, 3 documents, 6 clients, with a build                      | 3       | 227 to 592 ms                  | 0 of 4,201       | 0 of 794              |
 | Processes, 20 documents, 60 clients, reference Caddy             | 10      | 146 to 354 ms                  | 0 of 13,218      | 0 of 6,038            |
 
-In the first row 282 Planner requests (114 Chat messages, 54 comment notes, 54 and 30
+In the first row, measured while Planner requests were still saved as rows, 282 Planner requests (114 Chat messages, 54 comment notes, 54 and 30
 `invoke_planner` calls, 30 task drafts) were each started exactly once, 1,850 MCP calls were
 answered, the build finished Built, and the slowest Planner client of each deploy resumed 522 to
 895 ms after the release, inside its 10 s window. The old process's cut took 41 ms to commit, 21

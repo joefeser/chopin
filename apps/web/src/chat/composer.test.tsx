@@ -37,42 +37,46 @@ test("renders the draft as a combobox in the field", () => {
 	expect(markup).toContain('class="composer-surface"');
 	expect(markup).toContain('role="combobox"');
 	expect(markup).toContain('aria-label="Message"');
-	expect(markup).toContain("Message the team, or @Chopin to ask");
+	expect(markup).toContain("Message the team, or @chopin to ask");
 	expect(markup).not.toContain("composer-notice");
 	expect(markup).not.toContain('data-planner="off"');
 });
 
-const CHOPIN = { chip: false, disabled: false, onAdd: () => {}, onRemove: () => {} };
+const CHOPIN = { disabled: false, onAsk: () => {} };
 
-test("there is no Chat/Chopin switch: Chopin is asked by a button and a chip, never a mode", () => {
-	let off = render({ chopin: CHOPIN });
-	expect(off).not.toContain("Talk to Chopin");
-	expect(off).not.toContain("data-mode");
-	expect(off).not.toContain("composer-chopin-row");
-	expect(off).toContain('aria-label="Ask Chopin"');
-	expect(off).not.toContain('aria-label="Asking Chopin"');
-	expect(off).not.toContain('aria-label="Remove Chopin"');
-});
-
-test("the chip starts the field, named for a screen reader, with a button that removes it", () => {
-	let on = render({ chopin: { ...CHOPIN, chip: true } });
-	expect(on).toMatch(/<span aria-label="Asking Chopin" class="composer-chip" role="group">/);
-	expect(on).toContain('aria-label="Remove Chopin"');
-	// It comes before the draft in the field, which is what lets the first line begin after it.
-	expect(on.indexOf("composer-chip")).toBeLessThan(on.indexOf('role="combobox"'));
-	// It is assistant-ui's mention chip: its icon, its label and the cross it draws.
-	expect(on).toContain('data-slot="directive-text-chip"');
-	expect(on).toContain("Ask Chopin…");
-	// Chopin is already being asked, so the button that asks is spent.
-	expect(on.match(/<button[^>]*aria-label="Ask Chopin"[^>]*>/)![0]).toContain('disabled=""');
-});
-
-test("without an agent there is nobody to ask: no button, no chip, and the team's placeholder", () => {
-	let markup = render({ agent: false });
-	expect(markup).not.toContain('aria-label="Ask Chopin"');
+test("chopin is asked by a button that writes the mention, with no chip and no mode", () => {
+	let markup = render({ chopin: CHOPIN });
+	let button = markup.match(/<button[^>]*aria-label="Ask chopin"[^>]*>/)![0];
+	expect(button).toContain('aria-keyshortcuts="Control+J Meta+J"');
+	expect(button).not.toContain("disabled");
+	expect(button).not.toContain("aria-pressed");
+	// Nothing is drawn in the field but the draft: no chip, no group, no button to remove one.
 	expect(markup).not.toContain("composer-chip");
+	expect(markup).not.toContain("Asking chopin");
+	expect(markup).not.toContain("Remove chopin");
+	expect(markup).not.toContain("directive-text");
+	expect(markup).not.toContain("Ask chopin…");
+	expect(markup).toMatch(/<div class="composer-field">(<div|<p)[^>]*role="combobox"/);
+	expect(markup.toLowerCase()).not.toContain("talk to chopin");
+	expect(markup).not.toContain("data-mode");
+	expect(render({ chopin: { ...CHOPIN, disabled: true } })).toMatch(
+		/<button[^>]*aria-label="Ask chopin"[^>]*disabled=""/,
+	);
+});
+
+test("without an agent there is nobody to ask: no button, and the team's placeholder", () => {
+	let markup = render({ agent: false });
+	expect(markup).not.toContain('aria-label="Ask chopin"');
 	expect(markup).toContain("Message the team");
-	expect(markup).not.toContain("@Chopin");
+	expect(markup.toLowerCase()).not.toContain("@chopin");
+});
+
+test("alone in the document, the draft says it goes to chopin; with no agent it never does", () => {
+	let markup = render({ alone: true, chopin: CHOPIN });
+	expect(markup).toContain('data-placeholder="Message chopin"');
+	expect(markup).not.toContain("Message the team");
+	expect(markup).toContain('aria-label="Ask chopin"');
+	expect(render({ alone: true, agent: false })).toContain('data-placeholder="Message the team"');
 });
 
 test("a failed send alerts above the field and describes the draft", () => {
@@ -113,7 +117,7 @@ test("read-only and archived documents replace the draft and hide notices", () =
 test("shows one run control, and no connection state of its own", () => {
 	let markup = render({ run: { action: "stop", disabled: false, onClick: () => {} } });
 	expect(markup).toContain('aria-label="Stop generating"');
-	expect(markup).not.toContain('aria-label="Resume Chopin"');
+	expect(markup).not.toContain('aria-label="Resume chopin"');
 	// The document says when the connection is lost, once, at the top of its content.
 	expect(markup).not.toContain("composer-connection");
 	expect(markup).not.toContain("Reconnect");
@@ -178,7 +182,7 @@ test("Resume is a button of its own beside the round one", () => {
 		run: { action: "resume", disabled: false, onClick: () => {} },
 		sendDisabled: true,
 	});
-	expect(markup).toContain('aria-label="Resume Chopin"');
+	expect(markup).toContain('aria-label="Resume chopin"');
 	expect(roundButton(markup)).toContain('aria-label="Send message"');
 });
 
@@ -314,7 +318,7 @@ test("a banner alone describes the draft by its ids, with no notice strip of its
 
 test("a saved model's fallback notice is drawn beneath a banner as a status, and both describe the draft", () => {
 	let words = composerModelNotice(undefined, false, { model: "acme/large" })!;
-	expect(words.text).toBe("acme/large is no longer available, so Chopin used its default model.");
+	expect(words.text).toBe("acme/large is no longer available, so chopin used its default model.");
 	let banner = {
 		id: "lead",
 		node: createElement("div", { id: "lead", "data-banner": "" }, "No machine is connected."),
@@ -412,7 +416,7 @@ const DICTATION = {
 	active: false,
 	phase: "idle" as const,
 	seconds: 0,
-	tooltip: "Dictate (Alt+Shift+M). Speech is turned into words on this device.",
+	tooltip: "Dictate (Alt+Shift+M)",
 	announcement: "",
 	onToggle: () => {},
 	disabled: false,
@@ -424,9 +428,7 @@ test("offers the microphone only where speech can be turned into words, named as
 	let idle = render({ dictation: DICTATION });
 	expect(idle).toMatch(/<button[^>]*aria-label="Dictate"[^>]*aria-pressed="false"/);
 	expect(idle).toContain('data-slot="composer-voice-button"');
-	expect(idle).toContain(
-		'title="Dictate (Alt+Shift+M). Speech is turned into words on this device."',
-	);
+	expect(idle).toContain('title="Dictate (Alt+Shift+M)"');
 	expect(idle).toMatch(
 		/<p[^>]*aria-live="polite"[^>]*data-chat-dictation-announcement=""[^>]*role="status"/,
 	);

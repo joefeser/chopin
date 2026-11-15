@@ -14,6 +14,11 @@ export type SandboxSettings = {
 	hosts?: string[];
 	/** Directories agents may write beyond their worktree and own state. */
 	writable?: string[];
+	/**
+	 * Files and folders no agent may read or write, beyond `secretPaths`, even inside a `writable`
+	 * folder: a backend's own sign-in or tokens, say.
+	 */
+	hidden?: string[];
 };
 
 /**
@@ -147,29 +152,6 @@ export const HOST_GROUPS = {
 	"c-cpp": ["center2.conan.io"],
 	bazel: ["releases.bazel.build", "bcr.bazel.build", "mirror.bazel.build"],
 	nix: ["cache.nixos.org", "channels.nixos.org"],
-	/**
-	 * What formal verification needs beyond the registries: Lean's elan, toolchain releases,
-	 * Reservoir and Mathlib's build cache; the docs and installers of Verus, F*, Pulse, KaRaMeL,
-	 * LemmaScript, Rocq and Isabelle. Their binaries (Verus, Z3, cvc5, F*, elan, Velvet) are
-	 * GitHub releases, and opam, rustup, npm and NuGet are above.
-	 */
-	"formal-methods": [
-		"lean-lang.org",
-		"*.lean-lang.org",
-		"leanprover.github.io",
-		"leanprover-community.github.io",
-		"mathlib4.lean-cache.cloud",
-		"lakecache.blob.core.windows.net",
-		"verus-lang.github.io",
-		"aka.ms",
-		"fstar-lang.org",
-		"docs.lemmascript.org",
-		"rocq-prover.org",
-		"coq.inria.fr",
-		"isabelle.in.tum.de",
-	],
-	/** Research the agents do: pdd-kit's pldb MCP server, for programming-languages papers, and arXiv. */
-	research: ["pldb.kirancodes.me", "arxiv.org", "export.arxiv.org"],
 } as const satisfies Record<string, readonly string[]>;
 
 export type HostGroup = keyof typeof HOST_GROUPS;
@@ -337,8 +319,6 @@ export function agentStateDirectories(
 	} else if (program === "copilot") {
 		dirs.push(path.join(home, ".copilot"));
 		if (env.COPILOT_HOME && isAbsolute(env.COPILOT_HOME)) dirs.push(env.COPILOT_HOME);
-	} else if (program === "pdd-kit") {
-		dirs.push(path.join(home, ".pdd-kit"));
 	}
 	return dirs;
 }

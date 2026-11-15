@@ -5,6 +5,7 @@ import { Machines } from "../auth/machines";
 import { Sessions } from "../auth/session";
 import { GitHubError } from "../github/client";
 import { Router } from "../http/router";
+import { fixture } from "../images/raster.test-fixtures";
 import { MemoryStorage } from "../storage/memory/adapter";
 import { registerAttachmentRoutes } from "./routes";
 
@@ -317,6 +318,52 @@ describe("reading a file sent with a message", () => {
 			"cache-control": "private, max-age=31536000, immutable",
 		});
 		expect(response!.headers.get("content-disposition")).toStartWith("inline;");
+	});
+
+	it("serves a photo at Slack's thumbnail widths, and the original without one", async () => {
+		let { upload, read, send } = await setup({
+			maxBytes: 4_000_000,
+			maxCount: 5,
+			maxTotalBytes: 8_000_000,
+		});
+		let photo = await new Bun.Image(fixture("option-write-back.png")).resize(2400, 1200).jpeg({
+			quality: 90,
+		}).bytes();
+		await upload("octocat", photo, "name=whiteboard.jpg");
+		await send("attachment-1");
+		for (let [width, height] of [[480, 240], [1024, 512]] as const) {
+			let response = await read("hubot", `attachment-1?w=${width}`);
+			expect(response?.status).toBe(200);
+			expect(response!.headers.get("content-type")).toBe("image/jpeg");
+			expect(response!.headers.get("content-disposition")).toStartWith("inline;");
+			let copy = new Uint8Array(await response!.arrayBuffer());
+			expect(copy.byteLength).toBeLessThan(photo.byteLength);
+			let { width: drawn, height: tall } = await new Bun.Image(copy).metadata();
+			expect([drawn, tall]).toEqual([width, height]);
+		}
+		for (let query of ["", "?w=500", "?w=4096"]) {
+			let response = await read("hubot", `attachment-1${query}`);
+			expect(new Uint8Array(await response!.arrayBuffer()), query).toEqual(new Uint8Array(photo));
+		}
+		// A copy is read through the same check as the original.
+		expect((await read(undefined, "attachment-1?w=480"))?.status).toBe(404);
+	});
+
+	it("says what an image was before a smaller copy was sent, only of a larger image", async () => {
+		let { upload, storage, channel } = await setup();
+		let copied = await upload("octocat", PNG, "name=photo.png&original=23000000x12000x8000");
+		expect((await copied!.json()).attachment.original).toEqual({
+			size: 23_000_000,
+			width: 12000,
+			height: 8000,
+		});
+		for (let original of ["5x12000x8000", "23000000x0x8000", "big", "23000000x12000"]) {
+			let whole = await upload("octocat", PNG, `name=photo.png&original=${original}`);
+			expect((await whole!.json()).attachment, original).not.toHaveProperty("original");
+		}
+		let text = await upload("octocat", "notes", "name=notes.md&original=23000000x12000x8000");
+		expect((await text!.json()).attachment).not.toHaveProperty("original");
+		expect((await stored(storage, channel.id, "attachment-1"))?.original?.width).toBe(12000);
 	});
 
 	it("gives a text file as a download of plain text, even when it is a page", async () => {

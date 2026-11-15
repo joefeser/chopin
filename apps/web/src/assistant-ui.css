@@ -26,6 +26,21 @@
 /* Chopin is light only (`color-scheme: light`), so `dark:` never follows the system. */
 @custom-variant dark (&:is(.dark *));
 
+/*
+ * `group-hover:` as a descendant of the hovered group, with the same specificity as Tailwind's own.
+ * Tailwind writes it `&:is(:where(.group):hover *)`, and Chromium answers a `:hover *` anywhere in
+ * the page by restyling the whole subtree of every element the pointer enters or leaves: each row a
+ * pointer crossed in Chat, toolbar and all. A named group (`group-hover/<name>:`) is not generated;
+ * the one copy that writes one, the composer's `ComposerContext`, is not drawn.
+ */
+@custom-variant group-hover {
+	@media (hover: hover) {
+		:where(.group):hover & {
+			@slot;
+		}
+	}
+}
+
 @theme static {
 	--color-background: var(--background);
 	--color-foreground: var(--foreground);
@@ -48,13 +63,21 @@
 	/* The one raw palette colour the copies use (a dialog's scrim) is Chopin's ink. */
 	--color-black: var(--color-gray-900);
 	/*
-	 * The raw palette the composer names: its accent blue (caret, recording dot, upload bar, a drop
-	 * target's tint) is Chopin's petrol, its green check is Chopin's success and its reds are
-	 * Chopin's destructive. Chopin has no Tailwind palette, so none of these would draw otherwise.
+	 * The raw palette the composer, surfaces, context breakdown, message actions, agent handoff and
+	 * subagent list name: accent blue (caret, recording dot, upload bar, a drop target's tint, live
+	 * surfaces, a handoff in transit) is Chopin's petrol, and the blue a handoff writes its words in
+	 * is petrol's ink; green (the check a copy turns into) is Chopin's success, amber is Chopin's
+	 * warning and reds are Chopin's destructive. Chopin has no Tailwind palette, so none of these
+	 * would draw otherwise.
 	 */
+	--color-blue-300: var(--color-brand-ink);
 	--color-blue-400: var(--color-brand);
 	--color-blue-500: var(--color-brand);
+	--color-blue-700: var(--color-brand-ink);
 	--color-emerald-500: var(--color-success);
+	--color-amber-400: var(--color-warning);
+	--color-amber-500: var(--color-warning);
+	--color-amber-600: var(--color-warning-ink);
 	--color-red-400: var(--color-destructive);
 	--color-red-500: var(--color-destructive);
 	/* The red a copy draws its words in, such as a file's reason, is Chopin's danger text, which reads on a soft fill. */
@@ -83,6 +106,14 @@
 	--border: var(--color-edge);
 	--input: var(--color-edge);
 	--ring: var(--focus-ring-color);
+	/*
+	 * A copy's `dark:` words name the lighter steps a dark ground needs (a file's reason in
+	 * `red-400/80`, a full context window in `amber-400`); on this light ground they would fall to
+	 * 3.2:1 and 4.1:1, so they read the steps the light variants name. The same here as under
+	 * `.dark`, which reads this scope's tokens while Chopin has one theme.
+	 */
+	--color-red-400: var(--color-danger-text);
+	--color-amber-400: var(--color-warning-ink);
 }
 
 /*
@@ -108,4 +139,37 @@
 	--border: var(--color-edge);
 	--input: var(--color-edge);
 	--ring: var(--focus-ring-color);
+	/*
+	 * A copy's `dark:` words name the lighter steps a dark ground needs (a file's reason in
+	 * `red-400/80`, a full context window in `amber-400`); on this light ground they would fall to
+	 * 3.2:1 and 4.1:1, so they read the steps the light variants name.
+	 */
+	--color-red-400: var(--color-danger-text);
+	--color-amber-400: var(--color-warning-ink);
+}
+
+/*
+ * A copy's focus ring keeps its own width and is drawn in Chopin's focus colour at full strength.
+ * The copies fade it (`ring-foreground/20`, `ring-foreground/30`, `ring-ring/50`) to 1.6:1, 2:1 and
+ * 2.1:1 on the ground, under the 3:1 a focus indicator needs to be seen.
+ */
+:is([data-slot], [data-slot] *):focus-visible:not([data-chopin-control]) {
+	--tw-ring-color: var(--focus-ring-color);
+}
+
+/*
+ * The model selector's chevron is lucide's glyph: the trigger's ink faded by the copy's own
+ * `opacity-50` (3.6:1), not the icon role's grey faded again (1.9:1).
+ */
+[data-slot="model-selector-trigger"] > [data-nucleo-icon] {
+	color: currentColor;
+}
+
+/*
+ * A settled research handoff fades the agent that handed off. assistant-ui fades it to 45%, which
+ * leaves its name at 1.9:1; at 94% it keeps 4.5:1 on the field's fill (and its icon 3.5:1), with
+ * the arrow's colour still saying the handoff settled.
+ */
+[data-slot="agent-handoff"] .opacity-45 {
+	opacity: 0.94;
 }

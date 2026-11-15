@@ -1,6 +1,7 @@
 import { AgentApp, ndJsonStream, PROTOCOL_VERSION } from "@agentclientprotocol/sdk";
 import type { McpServer } from "@agentclientprotocol/sdk";
 import { spawn, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { access, writeFile } from "node:fs/promises";
 import { Readable, Writable } from "node:stream";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -48,6 +49,19 @@ let app = new AgentApp()
 				JSON.stringify({ prompt, worktrees: process.env.CHOPIN_RUN_WORKTREES ?? null }),
 			);
 		}
+		if (process.argv.includes("--hold")) {
+			// What it was given, by name, written where its run may write; then it holds its turn
+			// open until the test, which looks at every process's command line meanwhile, lets it go.
+			let names = (process.env.CHOPIN_TEST_HELD_NAMES ?? "").split(",").filter(Boolean);
+			await writeFile(
+				`${cwd}/held.json`,
+				JSON.stringify(Object.fromEntries(names.map(name => [name, process.env[name] ?? null]))),
+			);
+			while (!(await access(`${cwd}/release`).then(() => true, () => false))) {
+				await new Promise(resolve => setTimeout(resolve, 50));
+			}
+			return { stopReason: "end_turn" as const };
+		}
 		if (process.argv.includes("--github")) {
 			// What a build's agent pushes and opens pull requests with: gh's token, and Git's
 			// credentials for github.com, asked as `git push` would.
@@ -59,11 +73,39 @@ let app = new AgentApp()
 				cwd,
 				encoding: "utf8",
 			});
+			// A commit as the agent makes one, and who it says made it, signed or not.
+			let commit = spawnSync(
+				"git",
+				["-C", cwd, "commit", "-q", "--allow-empty", "-m", "Task one"],
+				{
+					encoding: "utf8",
+				},
+			);
+			let made = spawnSync("git", ["-C", cwd, "log", "-1", "--format=%an <%ae>|%cn <%ce>|%G?"], {
+				encoding: "utf8",
+			});
+			let read = (path: string | undefined) => {
+				try {
+					return path ? readFileSync(path, "utf8").trim() : null;
+				} catch {
+					return null;
+				}
+			};
 			await writeFile(
 				process.env.CHOPIN_TEST_GITHUB!,
 				JSON.stringify({
 					GH_TOKEN: process.env.GH_TOKEN ?? null,
 					GITHUB_TOKEN: process.env.GITHUB_TOKEN ?? null,
+					SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK ?? null,
+					GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? null,
+					starter: [
+						process.env.CHOPIN_STARTER_LOGIN,
+						process.env.CHOPIN_STARTER_NAME,
+						process.env.CHOPIN_STARTER_EMAIL,
+					],
+					githubFile: read(process.env.CHOPIN_GITHUB_TOKEN_FILE),
+					mcpFile: read(process.env.CHOPIN_MCP_TOKEN_FILE),
+					commit: commit.status === 0 ? made.stdout.trim() : commit.stderr.trim(),
 					credential: fill.status === 0 ? fill.stdout : null,
 					gh: gh.status,
 					// Where `git fetch` and `git push` would go for origin, under this environment.

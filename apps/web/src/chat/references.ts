@@ -1,4 +1,5 @@
 import { addressed, MENTION } from "@chopin/protocol/address";
+import { PLANNER_NAME } from "@chopin/editor/people";
 
 import type { Chat } from "@chopin/protocol";
 
@@ -186,7 +187,13 @@ function moved(reference: ReferenceDraft, change: number): ReferenceDraft {
 	return { ...reference, start: reference.start + change, end: reference.end + change };
 }
 
-/** Find the unfinished, whitespace-delimited reference token immediately before the caret. */
+/**
+ * The unfinished `#query` before the caret: the start of a reference to another document, or to a
+ * part of this one or a file of its repository. The `#` begins the text or follows whitespace, so a
+ * URL's fragment or `issue#12` is not one. The query may go on past a space, for the words of a
+ * title, a heading or a path, but stays on its line, holds no other `#` or `%`, and is at most 64
+ * characters.
+ */
 export function referenceTrigger(
 	text: string,
 	selectionStart: number,
@@ -196,28 +203,15 @@ export function referenceTrigger(
 		!Number.isSafeInteger(selectionStart)
 		|| !Number.isSafeInteger(selectionEnd)
 		|| selectionStart !== selectionEnd
-		|| selectionStart < 0
+		|| selectionStart <= 0
 		|| selectionStart > text.length
 	) return undefined;
-
-	let start = selectionStart;
-	while (start > 0 && !/\s/.test(text[start - 1]!)) start--;
-	let token = text.slice(start, selectionStart);
-	let marker = token[0];
-	if (marker !== "#") return undefined;
-	let query = token.slice(1);
-	if (
-		query.length > MAX_REFERENCE_QUERY
-		|| query.includes("#")
-		|| query.includes("%")
-	) return undefined;
-	return {
-		kind: "document",
-		marker,
-		query,
-		start,
-		end: selectionStart,
-	};
+	let line = text.lastIndexOf("\n", selectionStart - 1) + 1;
+	let start = text.lastIndexOf("#", selectionStart - 1);
+	if (start < line || (start > 0 && !/\s/.test(text[start - 1]!))) return undefined;
+	let query = text.slice(start + 1, selectionStart);
+	if (query.length > MAX_REFERENCE_QUERY || query.includes("%")) return undefined;
+	return { kind: "document", marker: "#", query, start, end: selectionStart };
 }
 
 export function referenceTriggerKey(trigger: ReferenceTrigger): string {
@@ -266,17 +260,6 @@ export function selectedReplacement(
 		}
 	}
 	return contiguousReplacement(previous, next);
-}
-
-export function beforeInputSelection(
-	start: number,
-	end: number,
-	inputType: string,
-	length: number,
-): { start: number; end: number } {
-	if (start === end && inputType === "deleteContentBackward") start = Math.max(0, start - 1);
-	if (start === end && inputType === "deleteContentForward") end = Math.min(length, end + 1);
-	return { start, end };
 }
 
 /** Preserve only references whose exact token remained wholly outside the edited range. */
@@ -343,7 +326,7 @@ export function insertReference(
 	return { text: next, references: [...shifted, reference], caret: end };
 }
 
-/** A part of the document, or a file, `@` can point at, with the words the token shows. */
+/** A part of the document, or a file, `#` can point at, with the words the token shows. */
 export type PointerTarget =
 	| { kind: "heading"; anchor: string; label: string }
 	| { kind: "decision"; decisionId: string; label: string }
@@ -369,8 +352,9 @@ function pointerRequest(
 }
 
 /**
- * Replace the typed `@query` with the part's own words as one chip (`%` for a research card), a
- * space after it, and the caret after that. A part already in the draft moves to its new place
+ * Replace the typed `#query` with the part's own words as one chip (`@` for a section, a Decision
+ * or a file, `%` for a research card, as the server reads them), a space after it, and the caret
+ * after that. A part already in the draft moves to its new place
  * rather than appearing twice, and a draft that holds the most references is left as it was.
  */
 export function insertPointer(
@@ -379,7 +363,7 @@ export function insertPointer(
 	trigger: { query: string; start: number; end: number },
 	target: PointerTarget,
 ): ReferenceInsertion {
-	if (text.slice(trigger.start, trigger.end) !== `@${trigger.query}` || !target.label) {
+	if (text.slice(trigger.start, trigger.end) !== `#${trigger.query}` || !target.label) {
 		return { text, references, caret: trigger.end };
 	}
 	let request = pointerRequest(target);
@@ -436,47 +420,6 @@ export function insertCommand(
 		}, ...kept],
 		caret: token.length + 1,
 	};
-}
-
-/**
- * What an edit touches once a chip is whole: a chip is one thing, so deleting at its edge, or any
- * of it, takes all of it, a selection that reaches into one takes the rest, and a caret inside
- * one (it can be put there with the mouse) goes to its end before anything is typed.
- */
-export function expandToChips(
-	references: ReadonlyArray<Pick<ReferenceDraft, "start" | "end">>,
-	start: number,
-	end: number,
-	inputType: string,
-): { start: number; end: number } {
-	let chips = [...references].sort((left, right) => left.start - right.start);
-	if (start === end) {
-		let deleting = inputType.startsWith("delete");
-		let backward = inputType.includes("Backward");
-		for (let chip of chips) {
-			if (deleting) {
-				if (
-					backward
-						? chip.start < start && start <= chip.end
-						: chip.start <= start && start < chip.end
-				) {
-					return { start: chip.start, end: chip.end };
-				}
-			} else if (chip.start < start && start < chip.end) {
-				return { start: chip.end, end: chip.end };
-			}
-		}
-		return { start, end };
-	}
-	for (let pass = 0; pass < 2; pass++) {
-		for (let chip of chips) {
-			if (chip.start < end && chip.end > start) {
-				start = Math.min(start, chip.start);
-				end = Math.max(end, chip.end);
-			}
-		}
-	}
-	return { start, end };
 }
 
 /** Whether the draft runs a command, which is only ever for the Planner. */
@@ -596,8 +539,8 @@ export function destinationCue(
 	let to = chatSendPayload(text, references, plannerEnabled, "", referencesEnabled)?.to;
 	if (!to) return undefined;
 	return to === "planner"
-		? { to, text: "Sends to Chopin, which will reply" }
-		: { to, text: "Sent to people here. Type @ to ask Chopin" };
+		? { to, text: `Sends to ${PLANNER_NAME}, which will reply` }
+		: { to, text: `Sent to people here. Type @ to ask ${PLANNER_NAME}` };
 }
 
 export function acknowledgeDraft(current: ComposerDraft, submitted: ComposerDraft): ComposerDraft {
@@ -609,7 +552,8 @@ export type SendFailure = { text: string; lost: boolean };
 
 export function sendFailure(error: unknown): SendFailure {
 	let detail = error instanceof Error ? error.message.trim() : "";
-	if (detail && (error as { code?: unknown }).code === "planner-not-attached") {
+	let code = (error as { code?: unknown } | null)?.code;
+	if (detail && (code === "planner-not-attached" || code === "planner-busy")) {
 		return { text: detail, lost: false };
 	}
 	if (!detail || /^(connection lost|disposed|not connected)$/i.test(detail)) {
@@ -721,108 +665,23 @@ function acceptedPersistedReferences(
 	return accepted.map(item => item.reference);
 }
 
-type DisplayUnit = { value: string; source: number; protected: boolean };
-
-function word(value: string | undefined): boolean {
-	return value !== undefined && /[A-Za-z0-9_]/.test(value);
-}
-
-function protectedRange(references: Chat.Reference[], start: number, end: number): boolean {
-	return references.some(reference => start < reference.end && end > reference.start);
-}
-
-function projectedDisplayUnits(source: string, references: Chat.Reference[]): DisplayUnit[] {
-	let units: DisplayUnit[] = [];
-	for (let offset = 0; offset < source.length; offset++) {
-		let mention = source.slice(offset, offset + MENTION.length);
-		if (
-			mention.toLowerCase() === MENTION
-			&& !protectedRange(references, offset, offset + MENTION.length)
-			&& (offset === 0 || !word(source[offset - 1]) && source[offset - 1] !== "@")
-			&& !word(source[offset + MENTION.length])
-		) {
-			offset += MENTION.length - 1;
-			// Whitespace is Markdown structure (indentation, code, hard breaks), so
-			// only the space left doubled by the removed mention is dropped.
-			let previous = units.at(-1);
-			if (previous && !previous.protected && /[^\S\n]/.test(previous.value)) {
-				while (
-					/[^\S\n]/.test(source[offset + 1] ?? "")
-					&& !protectedRange(references, offset + 1, offset + 2)
-				) offset++;
-			}
-			continue;
-		}
-		units.push({
-			value: source[offset]!,
-			source: offset,
-			protected: protectedRange(references, offset, offset + 1),
-		});
-	}
-
-	let collapsed = units;
-	while (collapsed.length > 0 && /\s/.test(collapsed[0]!.value)) collapsed.shift();
-	while (collapsed.length > 0 && /\s/.test(collapsed.at(-1)!.value)) collapsed.pop();
-
-	let displayed: DisplayUnit[] = [];
-	for (let index = 0; index < collapsed.length;) {
-		let current = collapsed[index]!;
-		if (
-			current.value === "@"
-			&& !current.protected
-			&& (index === 0 || !word(collapsed[index - 1]!.value)
-					&& collapsed[index - 1]!.value !== "@")
-		) {
-			let end = index + 1;
-			if (
-				end < collapsed.length && !collapsed[end]!.protected && /[A-Za-z0-9]/.test(
-					collapsed[end]!.value,
-				)
-			) {
-				end++;
-				while (
-					end < collapsed.length
-					&& !collapsed[end]!.protected
-					&& /[A-Za-z0-9-]/.test(collapsed[end]!.value)
-				) end++;
-				if (!word(collapsed[end]?.value)) {
-					for (let handle = index + 1; handle < end; handle++) {
-						displayed.push(
-							handle === index + 1
-								? { ...collapsed[handle]!, value: collapsed[handle]!.value.toUpperCase() }
-								: collapsed[handle]!,
-						);
-					}
-					index = end;
-					continue;
-				}
-			}
-		}
-		displayed.push(current);
-		index++;
-	}
-	return displayed;
-}
-
-/** Project display-only mentions while retaining authoritative source ranges for Markdown. */
+/**
+ * The message as it is drawn: its words as written, mentions included (each one a mention where it
+ * names someone, `message-mentions.ts`), without the whitespace around them, and the references that
+ * still cover exactly their words in it.
+ */
 export function referenceRenderModel(
 	source: string,
 	references: Chat.Reference[] = [],
 ): ReferenceRenderModel {
 	let accepted = acceptedPersistedReferences(source, references);
-	let units = projectedDisplayUnits(source, accepted);
-	let displayed = units.map(unit => unit.value).join("");
+	let leading = source.length - source.trimStart().length;
+	let displayed = source.trim();
 	let mapped: Chat.Reference[] = [];
 	for (let reference of accepted) {
-		let start = units.findIndex(unit => unit.source === reference.start);
-		let length = reference.end - reference.start;
-		if (
-			start < 0
-			|| units.slice(start, start + length).some((unit, index) =>
-				unit.source !== reference.start + index
-			)
-		) continue;
-		let end = start + length;
+		let start = reference.start - leading;
+		let end = reference.end - leading;
+		if (start < 0 || end > displayed.length) continue;
 		if (displayed.slice(start, end) !== source.slice(reference.start, reference.end)) continue;
 		mapped.push({ ...reference, start, end });
 	}

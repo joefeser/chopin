@@ -18,7 +18,7 @@ import { activeActorRoster, launchUrl } from "./demo-actor";
 import { motionContract } from "./motion-contract";
 import { useMenuDismissal } from "./menu-dismissal";
 import { motionImmediately } from "./motion-input";
-import { MenuItem } from "./menu-item";
+import { MenuItem, MenuSeparator } from "./menu-item";
 import { IconButton } from "./icon-button";
 import { useNavigationMenu } from "./navigation-shell";
 
@@ -106,6 +106,7 @@ export function DocumentActionsMenu(
 		iconButton = false,
 		onAction,
 		openDocument = false,
+		settings,
 		trigger,
 	}: {
 		align?: "start" | "end";
@@ -117,6 +118,12 @@ export function DocumentActionsMenu(
 		onAction: (action: DocumentAction) => void;
 		/** This menu is for the document open in this tab, so it can launch collaborator tabs. */
 		openDocument?: boolean;
+		/**
+		 * The document's own settings, as Notion's Full width, below its actions: rows that turn
+		 * something on and off and leave the menu open. A keyboard opening still lands on the first
+		 * action, Copy link. Not offered in a phone's sheet.
+		 */
+		settings?: ReactNode;
 		trigger: ReactNode;
 	},
 ) {
@@ -238,8 +245,8 @@ export function DocumentActionsMenu(
 	useEffect(() => {
 		if (!open) return;
 		let frame = requestAnimationFrame(() => {
-			let controls = panel.current?.querySelectorAll<HTMLButtonElement>("[role=menuitem]");
-			controls?.[initialItem.current]?.focus();
+			let controls = panel.current?.querySelectorAll<HTMLButtonElement>("[role^=menuitem]");
+			controls?.[initialItem.current < 0 ? controls.length - 1 : initialItem.current]?.focus();
 		});
 		return () => {
 			cancelAnimationFrame(frame);
@@ -299,7 +306,7 @@ export function DocumentActionsMenu(
 		if (phone) return;
 		if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
 		event.preventDefault();
-		openAt(event.key === "ArrowUp" ? items.length - 1 : 0);
+		openAt(event.key === "ArrowUp" ? -1 : 0);
 	};
 
 	return (
@@ -378,6 +385,12 @@ export function DocumentActionsMenu(
 								{item.label}
 							</MenuItem>
 						))}
+						{settings && (
+							<>
+								<MenuSeparator />
+								{settings}
+							</>
+						)}
 					</div>
 				</div>,
 				document.body,

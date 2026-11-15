@@ -11,7 +11,9 @@ import type {
 	HarnessV1StartOptions,
 } from "../../apps/server/src/harness/harness-v1";
 import { HEADING_TOOL_NAMES } from "../../apps/server/src/harness/tool-names";
+import { sessionContextOf } from "../../apps/server/src/chat/session-context";
 import { nameDocument } from "./fake-heading";
+import { READER_REPLY } from "./fixtures";
 import type { scopeSnapshot } from "../../apps/server/src/questions/decision-followup";
 
 type FakeHarnessSettings = {
@@ -45,6 +47,20 @@ const STEP_MS = 2_500;
 const INVESTIGATE_PROMPT = "INVESTIGATE-ANCHOR";
 const INVESTIGATE_TARGET = "Cold start";
 const CAPTURE_PROMPT = "ANCHORED-DECISIONS";
+const IMAGES_PROMPT = "GENERATE-IMAGES";
+const GENERATED = [
+	{ file: "the-cap.webp", mimeType: "image/webp", alt: "The cap is a balance of 100." },
+	{
+		file: "option-write-back.png",
+		mimeType: "image/png",
+		alt: "Write-back: write, cache, then database later",
+	},
+	{
+		file: "option-write-through.png",
+		mimeType: "image/png",
+		alt: "Write-through: write, cache, database",
+	},
+];
 const PROVISIONAL = "The first version remains provisional.";
 /**
  * A member message naming one way a reply ends without finishing: the model's own error, a
@@ -54,6 +70,20 @@ const PROVISIONAL = "The first version remains provisional.";
  */
 const FAIL_PROMPT = /FAIL-(MODEL|TIMEOUT|TOOL|REFUSED)/;
 const FAIL_ONCE_PROMPT = "FAIL-ONCE";
+/**
+ * `RETRY-CONTEXT-<n> <marker>` fails its first `n` turns as the model does, each after a partial
+ * reply, and then answers with what that turn was given: how many times its marker is in the
+ * instructions and the prompt together, and whether the failed attempts' partial reply or error
+ * are, so a Retry can be seen to give the model the message once and nothing of a failed attempt.
+ */
+const RETRY_CONTEXT_PROMPT = /RETRY-CONTEXT-(\d) (\S+)/;
+const RETRY_PARTIAL = "Partial draft before the failure.";
+const RETRY_ERROR = "503 Service Unavailable";
+const retryAttempts = new Map<string, number>();
+const THREAD_ECHO_PROMPT = "THREAD-ECHO";
+const USAGE_REPORT_PROMPT = "USAGE-REPORT";
+const USAGE_WARN_PROMPT = "USAGE-WARN";
+const COMPACT_TURN_PROMPT = "COMPACT-TURN";
 const failedOnce = new Set<string>();
 
 function checked<T>(name: string, result: { output: unknown; isError?: boolean }): T {
@@ -68,6 +98,8 @@ function promptText(prompt: HarnessV1PromptTurnOptions["prompt"]): string {
 	if (typeof prompt.content === "string") return prompt.content;
 	return prompt.content.map(part => part.type === "text" ? part.text : "").join("");
 }
+
+const CONTEXT_MARKER = "Durable conversation context follows:\n";
 
 function unsupported(capability: string): () => Promise<never> {
 	return async () => {
@@ -113,18 +145,26 @@ export function createFakeHarness(
 
 				async doPromptTurn(turn: HarnessV1PromptTurnOptions): Promise<HarnessV1PromptControl> {
 					let available = new Set(turn.tools.map(spec => spec.name));
-					let prompt = promptText(turn.prompt);
+					let { context: told, turn: prompt } = sessionContextOf(promptText(turn.prompt));
+					// What the room said: before the prompt of a fresh session, or in a command's instructions.
+					let context = told || turn.instructions || "";
 					// Automatic turns carry the latest human message in the session bootstrap.
 					let requested = prompt.includes("Respond to the current source message")
-						? turn.instructions?.split("\n").findLast(line => line.startsWith("@")) ?? prompt
+						? context.split("\n").findLast(line => line.startsWith("@")) ?? prompt
 						: prompt;
 					let heading = prompt.startsWith("[Background job: heading]\n");
 					let followup = prompt.startsWith("[Background job: decision-followup]\n");
+					let reader = turn.instructions?.includes("You have no tools") === true;
+					if (reader && available.size) {
+						throw new Error("e2e-fake reader turn received tools");
+					}
 					if (heading && available.size !== HEADING_TOOL_NAMES.length) {
 						throw new Error("e2e-fake heading job received tools outside its scope");
 					}
 					for (
-						let toolName of heading
+						let toolName of reader
+							? []
+							: heading
 							? HEADING_TOOL_NAMES
 							: followup
 							? ["read_decision_scope", "write_decision_scope"]
@@ -219,7 +259,25 @@ export function createFakeHarness(
 						}
 					};
 
-					if (heading) {
+					if (reader) {
+						void (async () => {
+							try {
+								await pause();
+								if (turn.abortSignal?.aborted) return;
+								let id = crypto.randomUUID();
+								turn.emit({ type: "text-start", id });
+								turn.emit({ type: "text-delta", id, delta: READER_REPLY });
+								turn.emit({ type: "text-end", id });
+								finish();
+								settled.resolve();
+							} catch (error) {
+								turn.emit({ type: "error", error });
+								settled.reject(error);
+							} finally {
+								turn.abortSignal?.removeEventListener("abort", onAbort);
+							}
+						})();
+					} else if (heading) {
 						void (async () => {
 							try {
 								await nameDocument(prompt, callTool);
@@ -265,6 +323,39 @@ export function createFakeHarness(
 							} catch (error) {
 								turn.emit({ type: "error", error });
 								settled.reject(error);
+							} finally {
+								turn.abortSignal?.removeEventListener("abort", onAbort);
+							}
+						})();
+					} else if (RETRY_CONTEXT_PROMPT.test(requested)) {
+						void (async () => {
+							let [, failures, marker] = RETRY_CONTEXT_PROMPT.exec(requested)!;
+							let attempt = (retryAttempts.get(marker!) ?? 0) + 1;
+							retryAttempts.set(marker!, attempt);
+							let given = `${turn.instructions ?? ""}\n${told}\n${prompt}`;
+							let id = crypto.randomUUID();
+							try {
+								turn.emit({ type: "text-start", id });
+								if (attempt <= Number(failures)) {
+									turn.emit({ type: "text-delta", id, delta: RETRY_PARTIAL });
+									turn.emit({ type: "text-end", id });
+									let error = new Error(`${RETRY_ERROR} (attempt ${attempt})`);
+									turn.emit({ type: "error", error });
+									settled.reject(error);
+									return;
+								}
+								let times = given.split(marker!).length - 1;
+								let seen = (words: string) =>
+									given.includes(words) ? "in context" : "not in context";
+								turn.emit({
+									type: "text-delta",
+									id,
+									delta: `Attempt ${attempt}: the message ${times} time(s); the partial reply `
+										+ `${seen(RETRY_PARTIAL)}; the error ${seen(RETRY_ERROR)}.`,
+								});
+								turn.emit({ type: "text-end", id });
+								finish();
+								settled.resolve();
 							} finally {
 								turn.abortSignal?.removeEventListener("abort", onAbort);
 							}
@@ -556,6 +647,147 @@ export function createFakeHarness(
 								turn.emit({ type: "text-delta", id, delta: "Proposed an investigation, " });
 								turn.emit({ type: "text-delta", id, delta: `${placement}.` });
 								turn.emit({ type: "text-end", id });
+								finish();
+								settled.resolve();
+							} catch (err) {
+								turn.emit({ type: "error", error: err });
+								settled.reject(err);
+							} finally {
+								turn.abortSignal?.removeEventListener("abort", onAbort);
+							}
+						})();
+					} else if (prompt.includes(THREAD_ECHO_PROMPT)) {
+						void (async () => {
+							try {
+								await callTool("read_plan");
+								let start = context.indexOf(CONTEXT_MARKER);
+								let contextBlock = start >= 0
+									? context.slice(start + CONTEXT_MARKER.length).split("\n\n")[0] ?? ""
+									: "";
+								let contextSummary = contextBlock
+									? contextBlock.split("\n").join(" ; ")
+									: "none";
+								let id = crypto.randomUUID();
+								turn.emit({ type: "text-start", id });
+								turn.emit({
+									type: "text-delta",
+									id,
+									delta: `Context seen: [${contextSummary}]`,
+								});
+								turn.emit({
+									type: "text-delta",
+									id,
+									delta: ` | Prompt: ${prompt.replace(/\s+/g, " ").trim()}`,
+								});
+								turn.emit({ type: "text-end", id });
+								finish();
+								settled.resolve();
+							} catch (err) {
+								turn.emit({ type: "error", error: err });
+								settled.reject(err);
+							} finally {
+								turn.abortSignal?.removeEventListener("abort", onAbort);
+							}
+						})();
+					} else if (
+						prompt.includes(USAGE_REPORT_PROMPT) || prompt.includes(USAGE_WARN_PROMPT)
+						|| prompt.includes(COMPACT_TURN_PROMPT)
+					) {
+						void (async () => {
+							try {
+								await callTool("read_plan");
+								if (prompt.includes(COMPACT_TURN_PROMPT)) {
+									turn.emit({ type: "raw", rawValue: { type: "compacting" } });
+									await new Promise<void>(resolve => setTimeout(resolve, 600));
+									if (turn.abortSignal?.aborted) return;
+									turn.emit({
+										type: "compaction",
+										trigger: "auto",
+										summary: "Summarized earlier goals and storage trade-offs.",
+										tokensBefore: 44_541,
+										tokensAfter: 12_100,
+									});
+								}
+								let warn = prompt.includes(USAGE_WARN_PROMPT);
+								let reportedUsage = warn
+									? {
+										inputTokens: {
+											total: 104_000,
+											noCache: 84_000,
+											cacheRead: 20_000,
+											cacheWrite: 0,
+										},
+										outputTokens: { total: 8_000, text: 8_000, reasoning: 0 },
+									}
+									: {
+										inputTokens: {
+											total: 36_000,
+											noCache: 24_000,
+											cacheRead: 12_000,
+											cacheWrite: 0,
+										},
+										outputTokens: { total: 6_000, text: 6_000, reasoning: 0 },
+									};
+								turn.emit({
+									type: "raw",
+									rawValue: { type: "context-window", contextWindow: 128_000 },
+								});
+								let id = crypto.randomUUID();
+								turn.emit({ type: "text-start", id });
+								turn.emit({
+									type: "text-delta",
+									id,
+									delta: prompt.includes(COMPACT_TURN_PROMPT)
+										? "Compacted context and ready to continue."
+										: "Reported context window usage.",
+								});
+								turn.emit({ type: "text-end", id });
+								turn.emit({
+									type: "finish-step",
+									finishReason: { unified: "stop", raw: undefined },
+									usage: reportedUsage,
+								});
+								turn.emit({
+									type: "finish",
+									finishReason: { unified: "stop", raw: undefined },
+									totalUsage: reportedUsage,
+								});
+								settled.resolve();
+							} catch (err) {
+								turn.emit({ type: "error", error: err });
+								settled.reject(err);
+							} finally {
+								turn.abortSignal?.removeEventListener("abort", onAbort);
+							}
+						})();
+					} else if (requested.includes(IMAGES_PROMPT)) {
+						void (async () => {
+							try {
+								if (!available.has("upload_plan_image")) {
+									throw new Error("e2e-fake harness expected host tool upload_plan_image");
+								}
+								let id = crypto.randomUUID();
+								turn.emit({ type: "text-start", id });
+								turn.emit({
+									type: "text-delta",
+									id,
+									delta: "I drew the cap and both write paths.",
+								});
+								turn.emit({ type: "text-end", id });
+								for (let picture of GENERATED) {
+									let bytes = await Bun.file(
+										new URL(`../fixtures/${picture.file}`, import.meta.url),
+									)
+										.bytes();
+									checked(
+										"upload_plan_image",
+										await callTool("upload_plan_image", undefined, {
+											data: Buffer.from(bytes).toString("base64"),
+											mimeType: picture.mimeType,
+											alt: picture.alt,
+										}),
+									);
+								}
 								finish();
 								settled.resolve();
 							} catch (err) {

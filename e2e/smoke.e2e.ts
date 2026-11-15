@@ -50,7 +50,6 @@ async function scriptPlanner(page: Page) {
 	let sends: { text: string; to: Chat.Destination }[] = [];
 	let turn = 0;
 	let busy = false;
-	let queued: Chat.Waiting[] = [];
 	let toolCount = 0;
 	let toolEntry = "";
 	let toolEntrySent = false;
@@ -107,19 +106,11 @@ async function scriptPlanner(page: Page) {
 				if (frame.kind === "chat:send") {
 					sends.push({ text: frame.text ?? "", to: frame.to! });
 					let id = `accepted-${sends.length}`;
-					let waiting = frame.to === "planner" && busy;
-					send?.({ kind: "chat:send", ts: 0, rid: frame.rid, id, queued: waiting });
+					send?.({ kind: "chat:send", ts: 0, rid: frame.rid, id });
 					if (frame.to === "planner") {
-						if (busy) {
-							queued = [...queued, {
-								id,
-								handle: "ana",
-								text: frame.text ?? "",
-							}];
-							send?.({ kind: "chat:queue", ts: 0, waiting: queued });
-							return;
-						}
 						announce(id, frame.text ?? "");
+						// A message sent while a turn runs is given to it, in the transcript at once.
+						if (busy) return;
 						start();
 						started.resolve();
 						return;
@@ -128,15 +119,8 @@ async function scriptPlanner(page: Page) {
 					return;
 				}
 				if (frame.kind === "chat:abort") {
-					let next = queued.shift();
-					if (next) {
-						send?.({ kind: "chat:queue", ts: 0, waiting: queued });
-						announce(next.id, next.text);
-						start();
-					} else {
-						busy = false;
-						send?.({ kind: "chat:state", ts: 0, busy: false });
-					}
+					busy = false;
+					send?.({ kind: "chat:state", ts: 0, busy: false });
 					return;
 				}
 			} catch {
@@ -270,7 +254,7 @@ test("an empty plan puts its muted prompt at the first writing position", async 
 	await page.setViewportSize({ width: 1800, height: 900 });
 	let editor = content(page);
 	let paragraph = editor.locator(":scope > p");
-	let prompt = page.getByText("Start writing, or ask Chopin to plan", { exact: true });
+	let prompt = page.getByText("Start writing, or ask chopin to plan", { exact: true });
 
 	// The prompt is a sibling overlay. The editable tree needs its own empty
 	// block, and the two must share one stable first writing position.
@@ -342,7 +326,7 @@ test("chat uses one room-message composer when the planner is off", async ({ joi
 	await expect(send).toHaveAttribute("title", "Send message");
 	await expect(chat.getByRole("button", { name: "Send message" })).toHaveCount(1);
 	await expect(chat.getByRole("button", { name: "Send to room" })).toHaveCount(0);
-	await expect(chat.getByRole("button", { name: "Ask Chopin" })).toHaveCount(0);
+	await expect(chat.getByRole("button", { name: "Ask chopin" })).toHaveCount(0);
 	await expect(chat.getByRole("button", { name: "Stop generating" })).toHaveCount(0);
 
 	await draft.fill("A room message");
@@ -443,7 +427,7 @@ test("chat disables Send once a lost socket outlasts a blip", async ({ join, pag
 	await expectChatValue(draft, "A draft left during reconnect.");
 });
 
-test("chat routes one Send action by @chopin without blocking room messages or its queue", async ({ join, page }) => {
+test("chat routes one Send action by @chopin without blocking room messages, and a message sent while it works is in the transcript at once", async ({ join, page }) => {
 	let planner = await scriptPlanner(page);
 	let chat = chatPane(await join("ana"));
 	let draft = chatInput(chat);
@@ -459,21 +443,20 @@ test("chat routes one Send action by @chopin without blocking room messages or i
 	);
 
 	await expectChatValue(draft, "");
-	// The chip is on only if it was asked for: a typed @chopin leaves none behind.
-	if (await chat.getByRole("group", { name: "Asking Chopin", exact: true }).count()) {
-		await draft.press("Backspace");
-	}
 	await draft.fill("Keep the release notes brief.");
 	await expect(send).toBeEnabled();
 	await send.click();
-	await draft.fill("@chopin Queue the rollback checks.");
+	await draft.fill("@chopin Check the rollback too.");
 	await send.click();
 	await expect.poll(planner.sends).toEqual([
 		{ text: "@chopin Start the migration.", to: "planner" },
 		{ text: "Keep the release notes brief.", to: "room" },
-		{ text: "@chopin Queue the rollback checks.", to: "planner" },
+		{ text: "@chopin Check the rollback too.", to: "planner" },
 	]);
-	await expect(chat.locator('[data-chat-state="queued"]')).toBeVisible();
+	// Given to the running turn: an ordinary message at once, never marked as waiting.
+	let steered = chat.locator("[data-chat-entry]").filter({ hasText: "Check the rollback too." });
+	await expect(steered).toHaveCount(1);
+	await expect(chat.locator('[data-chat-state="queued"]')).toHaveCount(0);
 
 	await fillChat(draft, "@chopin Keep\nthe new line.");
 	await draft.press("Shift+Enter");
@@ -485,13 +468,11 @@ test("chat routes one Send action by @chopin without blocking room messages or i
 	});
 
 	await chat.getByRole("button", { name: "Stop generating" }).click();
-	await expect(chat.locator('[data-chat-state="working"]')).toBeVisible();
-	let next = chat.locator("[data-chat-entry]").filter({ hasText: "Queue the rollback checks." });
+	await expect(chat.locator('[data-chat-state="working"]')).toHaveCount(0);
 	let later = chat.locator("[data-chat-entry]").filter({ hasText: /Keep\s+the new line/ });
-	await expect(next).toHaveCount(1);
-	await expect(next).not.toHaveAttribute("data-chat-state", "queued");
+	await expect(steered).toHaveCount(1);
 	await expect(later).toHaveCount(1);
-	await expect(later).toHaveAttribute("data-chat-state", "queued");
+	await expect(chat.locator('[data-chat-state="queued"]')).toHaveCount(0);
 });
 
 test("chat replaces the Planner working row with its response", async ({ join, page }) => {
@@ -574,7 +555,7 @@ test(
 		await planner.started;
 		await expect(chat.getByText("Getting oriented")).toBeVisible();
 		let live = chat.locator("[data-chat-work-announcer]");
-		await expect(live).toHaveText("Chopin has started.");
+		await expect(live).toHaveText("chopin has started.");
 		await live.evaluate(element => element.setAttribute("data-live-node", "retained"));
 
 		let read = planner.tool("read_plan", '{ "path": "<store.ts>" }');
@@ -582,7 +563,7 @@ test(
 		let disclosure = work.getByRole("button", { name: /Gathering context/ });
 		await expect(disclosure).toBeVisible();
 		await expect(disclosure).toHaveAttribute("aria-expanded", "false");
-		await expect(live).toHaveText("Chopin is gathering context.");
+		await expect(live).toHaveText("chopin is gathering context.");
 		await expect(live).toHaveAttribute("data-live-node", "retained");
 		let controlled = await disclosure.getAttribute("aria-controls");
 		await expect(chat.locator(`[id="${controlled}"]`)).toHaveCount(1);
@@ -602,7 +583,7 @@ test(
 
 		planner.finishTool(read, "done", "Found the storage adapter.");
 		await expect(work.getByText("Reviewing the next step")).toBeVisible();
-		await expect(live).toHaveText("Chopin is preparing to continue.");
+		await expect(live).toHaveText("chopin is preparing to continue.");
 		await expect(live).toHaveAttribute("data-live-node", "retained");
 		await expect(work.getByText("1 finished")).toBeVisible();
 		await expect(work.getByText("Found the storage adapter.")).toBeVisible();
@@ -613,7 +594,7 @@ test(
 
 		let edit = planner.tool("edit_plan", '{ "block": "persistence" }');
 		await expect(work.getByText("Making changes")).toBeVisible();
-		await expect(live).toHaveText("Chopin is making changes.");
+		await expect(live).toHaveText("chopin is making changes.");
 		await expect(live).toHaveAttribute("data-live-node", "retained");
 		await expect(chat.locator('[data-chat-state="working"]')).toHaveCount(1);
 		planner.finishTool(edit, "done", "Document updated.");
@@ -626,7 +607,7 @@ test(
 		await expect(chat.locator('[data-chat-state="working"]')).toHaveCount(0);
 		let finished = chat.getByRole("button", { name: /Used 2 tools/ });
 		await expect(finished).toHaveAttribute("aria-expanded", "true");
-		await expect(live).toHaveText("Chopin turn ended. Work details remain available.");
+		await expect(live).toHaveText("chopin turn ended. Work details remain available.");
 		await expect(live).toHaveAttribute("data-live-node", "retained");
 		await expect(chat.getByText("Document updated.")).not.toBeVisible();
 		await chat.screenshot({ path: testInfo.outputPath("work-completed.png") });
@@ -843,7 +824,7 @@ test("chat waits for fresh history after reconnect before projecting a stale tur
 });
 
 test(
-	"chat keeps a running turn and its queue readable together",
+	"chat keeps a running turn readable",
 	async ({ join, page }, testInfo) => {
 		await injectChatHistory(page, frame => ({
 			...frame,
@@ -879,10 +860,6 @@ test(
 					],
 				},
 			],
-			queued: [
-				{ id: "q1", handle: "ana", text: "@chopin" },
-				{ id: "q2", handle: "sam", text: "Check the rollback path too." },
-			],
 		}));
 
 		await join("ana");
@@ -893,17 +870,7 @@ test(
 		await expect(chat.getByText("Edit plan", { exact: true })).toHaveCount(0);
 		await expect(chat.getByRole("button", { name: "Stop generating" })).toHaveCount(0);
 
-		let mine = chat.locator("[data-chat-entry]").filter({
-			has: page.getByText("Ana", { exact: true }),
-		});
-		let theirs = chat.locator("[data-chat-entry]").filter({
-			hasText: "Check the rollback path too.",
-		});
-		await expect(mine).toHaveAttribute("data-chat-state", "queued");
-		await expect(mine.getByRole("button", { name: "Withdraw queued message" })).toBeVisible();
-		await expect(theirs.getByRole("button", { name: "Withdraw queued message" })).toHaveCount(0);
-
-		await testInfo.attach("running-turn-with-queue", {
+		await testInfo.attach("running-turn", {
 			body: await chat.screenshot(),
 			contentType: "image/png",
 		});
@@ -1037,7 +1004,7 @@ test(
 				{
 					id: "s2",
 					author: { kind: "system" },
-					text: "Chopin updated the passage for Rollback",
+					text: "chopin updated the passage for Rollback",
 					decision: { kind: "activity", questionnaireId: ulid(), label: "Rollback" },
 					ts: 1_700_000_004,
 				},
@@ -1047,9 +1014,9 @@ test(
 		let page = await join("ana");
 		let chat = chatPane(page);
 
-		await expect(chat.getByText("Maggie", { exact: true })).toHaveCount(1);
-		await expect(chat).toContainText("Can you draft the migration?");
-		await expect(chat).not.toContainText("@");
+		await expect(chat.getByText("maggie", { exact: true })).toHaveCount(1);
+		// A message is drawn as written, its mention included.
+		await expect(chat).toContainText("@chopin Can you draft the migration?");
 		await expect(chat.getByText("Read file", { exact: true })).toHaveCount(0);
 
 		let run = chat.getByRole("button", {
@@ -1080,8 +1047,8 @@ test(
 		await expect(icon).toHaveAttribute("data-state", "open");
 
 		await expect(chat.locator("[data-chat-system]")).toHaveCount(0);
-		await expect(chat).not.toContainText("Sam joined");
-		await expect(chat).not.toContainText("Chopin updated the passage");
+		await expect(chat).not.toContainText("sam joined");
+		await expect(chat).not.toContainText("chopin updated the passage");
 		await expect(chat.locator("[data-chat-scroll]")).toHaveCSS("text-align", "left");
 
 		await testInfo.attach("finished-turn-with-failure-open", {

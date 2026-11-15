@@ -23,8 +23,6 @@ function markup(sourceDestination?: ChatDestination, text = "A\u{1F9EA} pilot") 
 		active: true,
 		entries: [{ id: "saved", author: { kind: "member", handle: "ana" }, text, ts: 1 }],
 		handle: "ana",
-		onWithdraw: () => {},
-		queued: [],
 		sourceDestination,
 	}));
 }
@@ -47,10 +45,12 @@ test("only the destination message is marked, without a repeated caption", () =>
 test("source metadata preserves current Markdown rendering instead of flattening text", () => {
 	let result = markup(destination, "**A\u{1F9EA} pilot**");
 	expect(result).toContain('data-chat-raw="**A\u{1F9EA} pilot**"');
-	expect(result).toContain('<strong class="aui-md-strong">A\u{1F9EA} pilot</strong>');
+	expect(result).toContain(
+		'<strong class="aui-md-strong font-semibold">A<span class="chat-emoji">\u{1F9EA}</span> pilot</strong>',
+	);
 });
 
-function planner(entries: { id: string; text: string; to?: "planner" }[], queued = []) {
+function planner(entries: { id: string; text: string; to?: "planner" }[]) {
 	return renderToStaticMarkup(createElement(Transcript, {
 		active: true,
 		entries: entries.map(entry => ({
@@ -59,8 +59,6 @@ function planner(entries: { id: string; text: string; to?: "planner" }[], queued
 			...entry,
 		})),
 		handle: "ana",
-		onWithdraw: () => {},
-		queued,
 	}));
 }
 
@@ -72,12 +70,9 @@ test("a message sent to the Planner starts with an @chopin mention; room message
 	expect(planner([{ id: "m", text: "tighten it" }])).not.toContain("@chopin");
 });
 
-test("every message in a run and every queued item carries the mention, once", () => {
+test("every message in a run carries the mention, once", () => {
 	let entry = (id: string) => ({ id, text: id, to: "planner" as const });
-	let result = planner(
-		[entry("a"), entry("b")],
-		[{ id: "q", handle: "ana", text: "queued" }] as never,
-	);
+	let result = planner([entry("a"), entry("b"), entry("c")]);
 	expect(result.split('chat-mention">@chopin').length - 1).toBe(3);
 });
 

@@ -1,0 +1,255 @@
+import { expect, test } from "bun:test";
+import { renderToStaticMarkup } from "react-dom/server";
+
+import { ChatImage } from "./image";
+import { ImageGallery } from "./image-gallery";
+
+import type { ChatImageData } from "./image";
+
+function ascii(text: string): number[] {
+	return [...text].map(letter => letter.charCodeAt(0));
+}
+
+function be(value: number, length: number): number[] {
+	return Array.from(
+		{ length },
+		(_, index) => Math.floor(value / 256 ** (length - 1 - index)) & 0xff,
+	);
+}
+
+function png(width: number, height: number): string {
+	let bytes = [
+		0x89,
+		...ascii("PNG\r\n\x1a\n"),
+		...be(13, 4),
+		...ascii("IHDR"),
+		...be(width, 4),
+		...be(height, 4),
+		8,
+		2,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		0,
+		...be(2, 4),
+		...ascii("IDAT"),
+		0x78,
+		0x9c,
+		0,
+		0,
+		0,
+		0,
+	];
+	return `data:image/png;base64,${Buffer.from(bytes).toString("base64")}`;
+}
+
+function firstRender(image: ChatImageData): string {
+	return renderToStaticMarkup(<ChatImage image={image} />);
+}
+
+function frame(markup: string): { width?: string; height?: string; sized: boolean } {
+	let figure = /<figure[^>]*>/.exec(markup)![0];
+	return {
+		width: /--image-width:([0-9.]+)/.exec(figure)?.[1],
+		height: /--image-height:([0-9.]+)/.exec(figure)?.[1],
+		sized: figure.includes("data-sized"),
+	};
+}
+
+test("an image written into a message has its own shape in its frame at the first render, landscape or portrait", () => {
+	for (
+		let [width, height] of [[90, 30], [30, 90], [64, 64], [1000, 10]] as const
+	) {
+		let src = png(width, height);
+		let markup = firstRender({ src, alt: "A picture the author wrote" });
+
+		expect(frame(markup), `${width} by ${height}`).toEqual({
+			width: `${width}`,
+			height: `${height}`,
+			sized: true,
+		});
+		expect(markup).toContain('data-load="loading"');
+		expect(markup).toContain(`src="${src}"`);
+		expect(markup).toContain('alt="A picture the author wrote"');
+		expect(markup).toContain(">A picture the author wrote</span>");
+	}
+});
+
+test("a data address with parameters of its type is drawn, and has its own shape at the first render", () => {
+	let plain = png(90, 30);
+	let src = plain.replace("data:image/png;base64,", "data:image/png;charset=utf-8;base64,");
+	let markup = firstRender({ src, alt: "With a parameter" });
+
+	expect(frame(markup)).toEqual({ width: "90", height: "30", sized: true });
+	expect(markup).toContain(`src="${src}"`);
+	expect(markup).not.toContain("Image can’t be shown");
+});
+
+test("a data address whose type Markdown followed with percent-encoded white space is drawn as written, and has its own shape at the first render", () => {
+	let src = png(90, 30).replace("data:image/png;", "data:image/png%20;");
+	let markup = firstRender({ src, alt: "With a space" });
+
+	expect(frame(markup)).toEqual({ width: "90", height: "30", sized: true });
+	expect(markup).toContain(`src="${src}"`);
+	expect(markup).not.toContain("Image can’t be shown");
+});
+
+test("a data address with white space before its type, or with no type, is drawn as written, and has its own shape at the first render", () => {
+	let plain = png(90, 30);
+
+	for (
+		let src of [
+			plain.replace("data:image/png;", "data:%20image/png;"),
+			plain.replace("data:image/png;", "data:%09image/png%20;"),
+			plain.replace("data:image/png;", "data:;"),
+			plain.replace("data:image/png;", "data:;charset=utf-8;"),
+		]
+	) {
+		let markup = firstRender({ src, alt: "Without a type" });
+
+		expect(frame(markup), src).toEqual({ width: "90", height: "30", sized: true });
+		expect(markup, src).toContain(`src="${src}"`);
+		expect(markup, src).not.toContain("Image can’t be shown");
+	}
+	expect(firstRender({ src: "data:;base64,AAAA", alt: "No bytes of an image" })).toContain(
+		"Image can’t be shown",
+	);
+});
+
+test("a data address that starts its payload with much white space is drawn as written, and has its own shape at the first render", () => {
+	let plain = png(90, 30);
+
+	for (
+		let src of [
+			plain.replace("base64,", `base64,${"%20".repeat(40_000)}`),
+			plain.replace("data:image/png;", "data:;").replace("base64,", `base64,${" ".repeat(1_000)}`),
+			plain.replace("data:image/png;", "data:;").replace(
+				"base64,",
+				`base64,${"%20".repeat(40_000)}`,
+			),
+		]
+	) {
+		let markup = firstRender({ src, alt: "Spaced" });
+
+		expect(frame(markup), src.slice(0, 30)).toEqual({ width: "90", height: "30", sized: true });
+		expect(markup, src.slice(0, 30)).toContain(`src="${src}"`);
+		expect(markup, src.slice(0, 30)).not.toContain("Image can’t be shown");
+	}
+});
+
+test("a size the image part states wins over what the bytes of a data address say", () => {
+	let markup = firstRender({ src: png(90, 30), alt: "Stated", width: 30, height: 90 });
+
+	expect(frame(markup)).toEqual({ width: "30", height: "90", sized: true });
+	expect(frame(firstRender({ src: png(90, 30), width: 30 }))).toEqual({
+		width: "90",
+		height: "30",
+		sized: true,
+	});
+});
+
+test("an image whose shape cannot be known when it is first drawn keeps the fixed frame, and is not refused", () => {
+	let cases: ChatImageData[] = [
+		{ src: "https://example.invalid/wide.png", alt: "Another site" },
+		{ src: "/icons/icon-192.png", alt: "This site" },
+		{ src: "data:image/png;base64,AAAA", alt: "Not a PNG" },
+		{ src: "data:image/png;base64,", alt: "Empty" },
+		{ src: "data:image/webp,RIFF", alt: "Unusual" },
+		{ src: png(0, 30), alt: "No width" },
+	];
+
+	for (let image of cases) {
+		let markup = firstRender(image);
+
+		expect(frame(markup), image.src).toEqual({ sized: false });
+		expect(markup, image.src).toContain(`>${image.alt}</span>`);
+		expect(markup, image.src).toContain('data-load="loading"');
+	}
+	expect(firstRender(cases[2]!)).toContain('src="data:image/png;base64,AAAA"');
+	expect(firstRender({ src: "data:image/svg+xml;base64,PHN2Zy8+", alt: "Never" })).toContain(
+		"Image can’t be shown",
+	);
+});
+
+test("a gallery draws assistant-ui's square tile buttons inside image-gallery, with no rings or shadows", () => {
+	let markup = renderToStaticMarkup(
+		<ImageGallery
+			images={[{ src: png(90, 30), alt: "Wide" }, { src: png(30, 90), alt: "Tall" }]}
+		/>,
+	);
+	let tiles = markup.match(/<button[^>]*data-chat-image="tile"[^>]*>/g)!;
+
+	expect(markup).toContain('data-slot="image-gallery"');
+	expect(tiles).toHaveLength(2);
+	expect(tiles[0]).toContain('aria-label="Open image: Wide"');
+	expect(tiles[0]).toContain("aspect-square");
+	expect(tiles[0]).toContain("rounded-xl");
+	expect(tiles[1]).toContain('aria-label="Open image: Tall"');
+});
+
+function names(markup: string): string[] {
+	return (markup.match(/<[a-z][^>]*>/g) ?? []).flatMap(tag => {
+		let alt = tag.startsWith("<img ") ? /\balt="([^"]*)"/.exec(tag)?.[1] : undefined;
+		let label = /\brole="img"/.test(tag) ? /\baria-label="([^"]*)"/.exec(tag)?.[1] : undefined;
+		return alt ?? label ?? [];
+	});
+}
+
+test("an image that is not shown still gives its alt text to a screen reader, once", () => {
+	let cases: Array<[ChatImageData, string]> = [
+		[
+			{ src: "ftp://x/a.png", alt: "Bar chart of weekly signups" },
+			"Image can’t be shown: Bar chart of weekly signups",
+		],
+		[
+			{ src: "data:image/svg+xml;base64,PHN2Zy8+", alt: "A vector drawing", generated: true },
+			"Image can’t be shown: A vector drawing",
+		],
+		[{ src: "javascript:alert(1)" }, "Image can’t be shown: Image"],
+		[{ src: "/auth/logout", generated: true }, "Image can’t be shown: Generated image"],
+	];
+
+	for (let [image, name] of cases) {
+		let markup = firstRender(image);
+
+		expect(markup, image.src).not.toContain("<img");
+		expect(names(markup), image.src).toEqual([name]);
+		expect(markup, image.src).toContain(
+			`<span aria-hidden="true" class="chat-image-alt">${image.alt ?? name.split(": ")[1]}</span>`,
+		);
+	}
+});
+
+test("an image the page has not read yet is named by its alt text, and one that is drawn is named once, by its picture", () => {
+	let waiting = firstRender({ src: "/icons/icon-192.png", alt: "On this site" });
+
+	expect(waiting).not.toContain("<img");
+	expect(names(waiting)).toEqual(["On this site"]);
+
+	let drawn = firstRender({ src: png(90, 30), alt: "A picture the author wrote" });
+	expect(names(drawn)).toEqual(["A picture the author wrote"]);
+	expect(drawn).toContain(
+		'<span aria-hidden="true" class="chat-image-alt">A picture the author wrote</span>',
+	);
+});
+
+test("each gallery tile that is not shown is named by its alt text", () => {
+	let markup = renderToStaticMarkup(
+		<ImageGallery
+			images={[
+				{ src: "ftp://x/a.png", alt: "Unsupported address" },
+				{ src: png(30, 90), alt: "Fine" },
+				{ src: "data:image/svg+xml;base64,PHN2Zy8+", alt: "Scripted" },
+			]}
+		/>,
+	);
+
+	expect(names(markup)).toEqual([
+		"Image can’t be shown: Unsupported address",
+		"Fine",
+		"Image can’t be shown: Scripted",
+	]);
+});

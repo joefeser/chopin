@@ -17,6 +17,7 @@ type Measured = {
 	padding: Sides;
 	border: Sides;
 	radius: number;
+	radii: Sides;
 	gap: number;
 	fontSize: number;
 	lineHeight: number;
@@ -41,6 +42,12 @@ async function measure(element: Locator): Promise<Measured> {
 				style.borderLeftWidth,
 			].map(px),
 			radius: px(style.borderTopLeftRadius),
+			radii: [
+				style.borderTopLeftRadius,
+				style.borderTopRightRadius,
+				style.borderBottomRightRadius,
+				style.borderBottomLeftRadius,
+			].map(px),
 			gap: px(style.columnGap),
 			fontSize: px(style.fontSize),
 			lineHeight: px(style.lineHeight),
@@ -50,8 +57,11 @@ async function measure(element: Locator): Promise<Measured> {
 
 /** Every measured property that the element's own classes decide equals the class's pixels. */
 async function expectClassGeometry(element: Locator, label: string) {
-	let className = (await element.getAttribute("class")) ?? "";
-	let want = expected(className);
+	let [className, tagName] = await element.evaluate(node => [
+		node.getAttribute("class") ?? "",
+		node.tagName.toLowerCase(),
+	]);
+	let want = expected(className, tagName);
 	let got = await measure(element);
 	let at = `${label} (${className})`;
 	if (want.height !== undefined) expect(got.height, `${at} height`).toBeCloseTo(want.height, 1);
@@ -61,7 +71,13 @@ async function expectClassGeometry(element: Locator, label: string) {
 			.toBeCloseTo(side, 2);
 	}
 	expect(got.border, `${at} border widths`).toEqual(want.border);
-	if (want.radius === Infinity) expect(got.radius, `${at} radius`).toBeGreaterThan(1000);
+	if (want.radii) {
+		for (let corner of [0, 1, 2, 3] as const) {
+			if (want.radii[corner] === Infinity) {
+				expect(got.radii[corner], `${at} corner ${corner}`).toBeGreaterThan(1000);
+			} else expect(got.radii[corner], `${at} corner ${corner}`).toBeCloseTo(want.radii[corner], 2);
+		}
+	} else if (want.radius === Infinity) expect(got.radius, `${at} radius`).toBeGreaterThan(1000);
 	else expect(got.radius, `${at} radius`).toBeCloseTo(want.radius, 2);
 	if (want.gap !== undefined) expect(got.gap, `${at} gap`).toBeCloseTo(want.gap, 2);
 	if (want.fontSize !== undefined) {
@@ -78,12 +94,30 @@ const ROOTS = {
 		"model-selector-trigger",
 		"composer-menu",
 		"composer-menu-item",
-		"directive-text-chip",
 		"composer-attachments",
 		"composer-attachment",
 		"composer-voice",
 		"composer-voice-button",
 		"message-attachments",
+		"markdown-text",
+		"context-breakdown",
+		"image-root",
+		"image-preview",
+		"image-preview-error",
+		"image-generating",
+		"image-content-filter-error",
+		"image-filename",
+		"image-source",
+		"image-source-icon-fallback",
+		"image-source-label",
+		"image-actions",
+		"image-download",
+		"image-copy",
+		"image-regenerate",
+		"image-gallery",
+		"message-actions",
+		"agent-handoff",
+		"subagent-list",
 	],
 	open: [
 		"model-selector-content",
@@ -96,14 +130,48 @@ const ROOTS = {
 		"model-selector-item",
 		"model-selector-effort",
 	],
+	menu: [
+		"dropdown-menu-content",
+		"dropdown-menu-item",
+		"dropdown-menu-separator",
+	],
 } as const;
-/** What a staged chip's picture box and a sent file's tiles are, which the roots above hold. */
+/** What a staged chip's picture box, a sent file's tiles and a gallery's grid/tiles are. */
 const BOXES = [
 	'[data-slot="composer-attachment"] > span:first-child',
 	'[data-slot="message-attachments"] > *',
+	'[data-slot="image-gallery"] > div',
+	'[data-slot="image-gallery"] button',
 ] as const;
+const MARKDOWN_PARTS: readonly [label: string, select: (root: Locator) => Locator][] = [
+	["h1", root => root.locator(".aui-md-h1")],
+	["h2", root => root.locator(".aui-md-h2").first()],
+	["h3", root => root.locator(".aui-md-h3")],
+	["h4", root => root.locator(".aui-md-h4")],
+	["h5", root => root.locator(".aui-md-h5")],
+	["h6", root => root.locator(".aui-md-h6")],
+	["p", root => root.locator(".aui-md-p").first()],
+	["a", root => root.locator(".aui-md-a").first()],
+	["blockquote", root => root.locator(".aui-md-blockquote")],
+	["ul", root => root.locator(".aui-md-ul").first()],
+	["ol", root => root.locator(".aui-md-ol").first()],
+	["li", root => root.locator(".aui-md-li").first()],
+	["hr", root => root.locator(".aui-md-hr")],
+	["table-wrapper", root => root.locator(".aui-md-table-wrapper")],
+	["table", root => root.locator(".aui-md-table")],
+	["th", root => root.locator(".aui-md-th").nth(1)],
+	["td", root => root.locator(".aui-md-td").first()],
+	["tr", root => root.locator("tbody .aui-md-tr").nth(1)],
+	["strong", root => root.locator(".aui-md-strong")],
+	["sup", root => root.locator(".aui-md-sup")],
+	["inline-code", root => root.locator(".aui-md-inline-code")],
+	["code-header", root => root.locator(".aui-code-header-root")],
+	["code-language", root => root.locator(".aui-code-header-language")],
+	["copy-button", root => root.locator(".aui-button-icon")],
+	["pre", root => root.locator(".aui-md-pre")],
+];
 const TARGETS =
-	'[data-slot="model-selector-trigger"], [data-slot="model-selector-item"], [data-slot="composer-menu-item"], [role="radio"], [data-slot="composer-voice-button"], [data-slot="composer-attachment"] button:not([data-chopin-control]), [data-slot="message-attachments"] button';
+	'[data-slot="model-selector-trigger"], [data-slot="model-selector-item"], [data-slot="composer-menu-item"], [role="radio"], [data-slot="composer-voice-button"], [data-slot="composer-attachment"] button:not([data-chopin-control]), [data-slot="message-attachments"] button, [data-slot="markdown-text"] .aui-button-icon, [data-slot="markdown-text"] .aui-md-a, [data-slot="message-actions"] button, [data-slot="dropdown-menu-item"], [data-chat-reaction], [data-slot="image-download"], [data-slot="image-copy"], [data-slot="image-regenerate"], [data-slot="image-source-label"], [data-slot="image-gallery"] button';
 const slot = (page: Page, name: string) => page.locator(`[data-slot="${name}"]`);
 const effortRadios = (page: Page) => slot(page, "model-selector-effort").getByRole("radio");
 
@@ -120,25 +188,84 @@ async function openSelector(page: Page): Promise<Locator> {
 	return trigger;
 }
 
+async function openGalleryDialog(page: Page): Promise<Locator> {
+	let tile = plate(page, "assistant-ui").locator('[data-slot="image-gallery"] button').first();
+	await tile.scrollIntoViewIfNeeded();
+	await tile.click();
+	let dialog = slot(page, "dialog-content");
+	await expect(dialog).toBeVisible();
+	await expect.poll(() => dialog.evaluate(node => getComputedStyle(node).opacity)).toBe("1");
+	return dialog;
+}
+
+function restChrome(locator: Locator) {
+	return locator.evaluate(node => {
+		let style = getComputedStyle(node);
+		return {
+			border: [
+				style.borderTopWidth,
+				style.borderRightWidth,
+				style.borderBottomWidth,
+				style.borderLeftWidth,
+			].map(value => Number.parseFloat(value) || 0),
+			borderColor: style.borderTopColor,
+			shadow: style.boxShadow,
+			outline: style.outlineStyle,
+		};
+	});
+}
+
+async function openMenu(page: Page): Promise<Locator> {
+	let trigger = plate(page, "assistant-ui").getByRole("button", { name: "More actions" });
+	await trigger.scrollIntoViewIfNeeded();
+	await trigger.click();
+	await expect(slot(page, "dropdown-menu-content")).toBeVisible();
+	await expect.poll(() =>
+		slot(page, "dropdown-menu-content").evaluate(node => getComputedStyle(node).opacity)
+	).toBe("1");
+	return trigger;
+}
+
 test("a copied element is as many pixels as its Tailwind classes say, not as Chopin's scale would make it", async ({ page }) => {
 	let checked = 0;
+	await expect(plate(page, "assistant-ui").locator('[data-slot="image-preview-error"]'))
+		.toBeVisible();
 	for (let name of ROOTS.closed) {
-		let elements = plate(page, "assistant-ui").locator(`[data-slot="${name}"]`);
-		expect(await elements.count()).toBeGreaterThan(1);
+		// Chopin's message toolbar is the copied row restyled as Slack's box, measured below.
+		let elements = plate(page, "assistant-ui").locator(
+			`[data-slot="${name}"]:not(.chat-message-toolbar)`,
+		);
+		expect(await elements.count(), `${name} is drawn`).toBeGreaterThan(0);
 		for (let index = 0; index < await elements.count(); index++) {
 			await expectClassGeometry(elements.nth(index), name);
 			checked++;
 		}
 	}
-	// The box of a chip's icon, and the tiles of a sent message's files, which the roots hold.
 	for (let selector of BOXES) {
 		let boxes = plate(page, "assistant-ui").locator(selector);
-		expect(await boxes.count(), `${selector} is drawn`).toBeGreaterThan(1);
+		expect(await boxes.count(), `${selector} is drawn`).toBeGreaterThan(0);
 		for (let index = 0; index < await boxes.count(); index++) {
 			await expectClassGeometry(boxes.nth(index), selector);
 			checked++;
 		}
 	}
+	let markdown = plate(page, "assistant-ui").locator('[data-slot="markdown-text"]');
+	for (let [label, select] of MARKDOWN_PARTS) {
+		let part = select(markdown);
+		await expect(part, `markdown ${label} is drawn`).toBeVisible();
+		await expectClassGeometry(part, `markdown ${label}`);
+		checked++;
+	}
+	let copy = markdown.locator(".aui-button-icon");
+	await copy.scrollIntoViewIfNeeded();
+	await copy.hover();
+	await expect(slot(page, "tooltip-content")).toBeVisible();
+	await expect.poll(() =>
+		slot(page, "tooltip-content").evaluate(node => getComputedStyle(node).opacity)
+	).toBe("1");
+	await expectClassGeometry(slot(page, "tooltip-content"), "tooltip-content");
+	checked++;
+
 	await openSelector(page);
 	for (let name of ROOTS.open) {
 		let elements = slot(page, name);
@@ -154,27 +281,279 @@ test("a copied element is as many pixels as its Tailwind classes say, not as Cho
 		await expectClassGeometry(radios.nth(index), "effort radio");
 		checked++;
 	}
-	expect(checked).toBe(52);
+	await page.keyboard.press("Escape");
+
+	let dialog = await openGalleryDialog(page);
+	await expectClassGeometry(dialog, "dialog-content");
+	await expectClassGeometry(dialog.getByRole("button", { name: "Previous image" }), "previous");
+	await expectClassGeometry(dialog.getByRole("button", { name: "Next image" }), "next");
+	checked += 3;
+	await page.keyboard.press("Escape");
+	await openMenu(page);
+	for (let name of ROOTS.menu) {
+		let elements = slot(page, name);
+		expect(await elements.count(), `${name} is drawn`).toBeGreaterThan(0);
+		for (let index = 0; index < await elements.count(); index++) {
+			await expectClassGeometry(elements.nth(index), name);
+			checked++;
+		}
+	}
+	expect(checked).toBe(128);
+});
+
+test("handoff and subagent list keep assistant-ui's exact proportions", async ({ page }) => {
+	let handoff = plate(page, "assistant-ui").locator('[data-slot="agent-handoff"]').first();
+	await handoff.scrollIntoViewIfNeeded();
+	let pills = handoff.locator("> div").first().locator("> span");
+	expect(await pills.count()).toBe(2);
+	for (let index = 0; index < 2; index++) {
+		await expectClassGeometry(pills.nth(index), `handoff pill ${index}`);
+		let pill = await measure(pills.nth(index));
+		expect([pill.padding, pill.fontSize, pill.lineHeight]).toEqual([[4, 10, 4, 10], 12, 16]);
+		expect(pill.radius).toBeGreaterThan(1000);
+	}
+	let carried = await measure(handoff.locator("> div").nth(1).locator("> span").nth(1));
+	expect([carried.border, carried.padding[3], carried.fontSize]).toEqual([[0, 0, 0, 1], 10, 12]);
+
+	// Tailwind's `rounded-2xl` is 16px, which Chopin's theme drops altogether.
+	let subagents = plate(page, "assistant-ui").locator('[data-slot="subagent-list"]').nth(1);
+	await subagents.scrollIntoViewIfNeeded();
+	let cards = subagents.locator("> div");
+	expect(await cards.count()).toBe(3);
+	for (let index = 0; index < 3; index++) {
+		await expectClassGeometry(cards.nth(index), `subagent card ${index}`);
+		let card = await measure(cards.nth(index));
+		expect([card.radius, card.border, card.padding]).toEqual([
+			16,
+			[1, 1, 1, 1],
+			[10, 14, 10, 14],
+		]);
+		let bar = await measure(cards.nth(index).getByRole("progressbar"));
+		expect(bar.height).toBeCloseTo(3, 1);
+		expect(bar.radius).toBeGreaterThan(1000);
+	}
+});
+
+test("message-actions and dropdown-menu keep their registry geometry; Chopin's toolbar and reaction pills take Slack's", async ({ page }) => {
+	let rows = plate(page, "assistant-ui").locator('[data-slot="message-actions"]');
+	expect(await rows.count()).toBe(5);
+	let row = rows.first();
+	await row.scrollIntoViewIfNeeded();
+	let bar = await measure(row);
+	expect([bar.height, bar.padding, bar.border, bar.radius, bar.gap]).toEqual([
+		28,
+		[0, 0, 0, 0],
+		[0, 0, 0, 0],
+		0,
+		4,
+	]);
+	let chrome = await row.evaluate(node => {
+		let style = getComputedStyle(node);
+		return { outline: style.outlineStyle, shadow: style.boxShadow };
+	});
+	expect(chrome).toEqual({ outline: "none", shadow: "none" });
+
+	let buttons = row.getByRole("button");
+	expect(await buttons.count()).toBe(5);
+	for (let index = 0; index < 5; index++) {
+		let button = buttons.nth(index);
+		await expectClassGeometry(button, "message-actions button");
+		let box = await measure(button);
+		expect([box.width, box.height, box.padding, box.border]).toEqual([
+			28,
+			28,
+			[0, 0, 0, 0],
+			[0, 0, 0, 0],
+		]);
+		expect(box.radius).toBeGreaterThan(1000);
+		let icon = await measure(button.locator("svg").first());
+		expect([icon.width, icon.height]).toEqual([14, 14]);
+	}
+
+	// Slack's `c-message_actions__group`: 2px inside a rounded square with a hairline ring and a soft
+	// shadow, its `c-message_actions__button`s 32px squares with 4px corners and no gap between them.
+	let toolbar = plate(page, "assistant-ui").locator(".chat-message-toolbar");
+	await toolbar.scrollIntoViewIfNeeded();
+	let box = await measure(toolbar);
+	expect([box.height, box.padding, box.border, box.radius, box.gap]).toEqual([
+		36,
+		[2, 2, 2, 2],
+		[0, 0, 0, 0],
+		8,
+		0,
+	]);
+	let ring = await toolbar.evaluate(node => {
+		let style = getComputedStyle(node);
+		return { outline: style.outlineStyle, shadow: style.boxShadow !== "none" };
+	});
+	expect(ring).toEqual({ outline: "solid", shadow: true });
+	let tools = toolbar.getByRole("button");
+	expect(await tools.evaluateAll(all => all.map(node => node.getAttribute("aria-label")))).toEqual([
+		"Looks right",
+		"Explain this",
+		"Not quite",
+		"Add reaction",
+		"Reply in thread",
+		"Message actions",
+	]);
+	for (let index = 0; index < 6; index++) {
+		let tool = await measure(tools.nth(index));
+		expect([tool.width, tool.height, tool.radius], `toolbar button ${index}`).toEqual([32, 32, 4]);
+	}
+	for (let index = 3; index < 6; index++) {
+		let icon = await measure(tools.nth(index).locator("svg").first());
+		expect([icon.width, icon.height], `toolbar icon ${index}`).toEqual([20, 20]);
+	}
+
+	// Slack's `c-reaction`: a 24px pill, 6px each side, an emoji and its count 2px apart, with a ring.
+	let pills = plate(page, "assistant-ui").locator("[data-chat-reaction]");
+	expect(await pills.count()).toBe(2);
+	for (let index = 0; index < 2; index++) {
+		let pill = pills.nth(index);
+		let box = await measure(pill);
+		expect([box.height, box.padding[1], box.padding[3], box.border, box.gap]).toEqual([
+			24,
+			6,
+			6,
+			[0, 0, 0, 0],
+			2,
+		]);
+		expect(box.radius).toBeGreaterThan(1000);
+		expect(await pill.evaluate(node => getComputedStyle(node).outlineStyle)).toBe("solid");
+	}
+
+	await openMenu(page);
+	let popup = await measure(slot(page, "dropdown-menu-content"));
+	expect([popup.radius, popup.padding, popup.border]).toEqual([
+		8,
+		[4, 4, 4, 4],
+		[0, 0, 0, 0],
+	]);
+	let item = await measure(slot(page, "dropdown-menu-item").first());
+	expect([
+		item.height,
+		item.padding,
+		item.radius,
+		item.gap,
+		item.fontSize,
+		item.lineHeight,
+	]).toEqual([28, [4, 6, 4, 6], 6, 6, 14, 20]);
+	expect((await measure(slot(page, "dropdown-menu-separator"))).height).toBe(1);
 });
 
 test("assistant-ui's own radii, in pixels, where Chopin's scale differs", async ({ page }) => {
-	// Tailwind's `rounded-xl` is 12px and Chopin's is 10px: the popup and its list are the proof.
+	// Tailwind's `rounded-xl` is 12px and Chopin's is 10px, and `rounded-2xl` (16px, the context
+	// breakdown) is absent from Chopin's scale: the popup, its list, the code block header and body,
+	// the gallery tiles and the lightbox are the proof. The hand-adapted code header was 28px tall
+	// (9px shorter), with a 6px radius and 2px by 12px/4px padding; assistant-ui's is 37px tall
+	// (`py-1.5` + `size-6` + 1px top border), with 12px top corners and 6px by 14px padding.
+	let markdown = plate(page, "assistant-ui").locator('[data-slot="markdown-text"]');
+	let codeHeader = await measure(markdown.locator(".aui-code-header-root"));
+	expect(codeHeader.height).toBeCloseTo(37, 1);
+	expect(codeHeader.padding).toEqual([6, 14, 6, 14]);
+	expect(codeHeader.border).toEqual([1, 1, 0, 1]);
+	expect(codeHeader.radii).toEqual([12, 12, 0, 0]);
+	expect([codeHeader.fontSize, codeHeader.lineHeight]).toEqual([12, 16]);
+
+	let copyButton = await measure(markdown.locator(".aui-button-icon"));
+	expect([copyButton.width, copyButton.height]).toEqual([24, 24]);
+	expect(copyButton.padding).toEqual([4, 4, 4, 4]);
+	expect(copyButton.radius).toBe(8);
+
+	let pre = await measure(markdown.locator(".aui-md-pre"));
+	expect(pre.padding).toEqual([14, 14, 14, 14]);
+	expect(pre.border).toEqual([0, 1, 1, 1]);
+	expect(pre.radii).toEqual([0, 0, 12, 12]);
+	expect(pre.fontSize).toBe(13);
+
+	expect((await measure(markdown.locator(".aui-md-th").first())).radii).toEqual([8, 0, 0, 0]);
+	expect((await measure(markdown.locator(".aui-md-th").last())).radii).toEqual([0, 8, 0, 0]);
+	expect(
+		(await measure(markdown.locator("tbody .aui-md-tr").last().locator(".aui-md-td").first()))
+			.radii,
+	).toEqual([0, 0, 0, 8]);
+	let bottomRightCell = await measure(
+		markdown.locator("tbody .aui-md-tr").last().locator(".aui-md-td").last(),
+	);
+	expect(bottomRightCell.radii).toEqual([0, 0, 8, 0]);
+	expect(bottomRightCell.border).toEqual([0, 1, 1, 1]);
+
 	await openSelector(page);
 	expect((await measure(slot(page, "model-selector-content"))).radius).toBe(12);
 	expect((await measure(slot(page, "command").first())).radius).toBe(12);
 	expect((await measure(slot(page, "model-selector-item").first())).radius).toBe(8);
 	expect((await measure(effortRadios(page).first())).radius).toBe(6);
-	// And its type: `text-sm` is 14px on 20px, not Chopin's fluid step on 1.5.
+	expect((await measure(slot(page, "context-breakdown").first())).radius).toBe(16);
+	await page.keyboard.press("Escape");
+
+	let tile = plate(page, "assistant-ui").locator('[data-slot="image-gallery"] button').first();
+	expect((await measure(tile)).radius).toBe(12);
+	expect(
+		(await measure(plate(page, "assistant-ui").locator('[data-slot="image-root"]').first()))
+			.radius,
+	).toBe(8);
+	// And its type: `text-sm` is 14px on 20px, not Chopin's fluid step on 1.5; `text-xs` is 12px on 16px.
 	let trigger = await measure(plate(page, "assistant-ui").getByRole("combobox").first());
 	expect([trigger.fontSize, trigger.lineHeight]).toEqual([14, 20]);
 	expect([trigger.height, trigger.padding[1], trigger.padding[3]]).toEqual([36, 12, 12]);
+	let filename = await measure(
+		plate(page, "assistant-ui").locator('[data-slot="image-filename"]')
+			.first(),
+	);
+	expect([filename.fontSize, filename.lineHeight]).toEqual([12, 16]);
+});
+
+test("tile buttons, single-image actions and lightbox prev/next carry no resting rings, borders or shadows", async ({ page }) => {
+	let tiles = plate(page, "assistant-ui").locator('[data-slot="image-gallery"] button');
+	expect(await tiles.count()).toBe(6);
+	for (let index = 0; index < 6; index++) {
+		expect(await restChrome(tiles.nth(index)), `tile ${index}`).toMatchObject({
+			border: [0, 0, 0, 0],
+			shadow: "none",
+			outline: "none",
+		});
+	}
+
+	for (let name of ["image-download", "image-copy", "image-regenerate"]) {
+		let action = plate(page, "assistant-ui").locator(`[data-slot="${name}"]`);
+		let sized = await measure(action);
+		expect([sized.width, sized.height, sized.radius], name).toEqual([28, 28, 4]);
+		expect(await restChrome(action), name).toMatchObject({
+			border: [0, 0, 0, 0],
+			shadow: "none",
+			outline: "none",
+		});
+	}
+
+	let dialog = await openGalleryDialog(page);
+	for (let name of ["Previous image", "Next image"]) {
+		let arrow = dialog.getByRole("button", { name });
+		let sized = await measure(arrow);
+		expect([sized.width, sized.height], name).toEqual([32, 32]);
+		expect(sized.radius, name).toBeGreaterThan(1000);
+		expect(await restChrome(arrow), name).toMatchObject({
+			border: [0, 0, 0, 0],
+			shadow: "none",
+			outline: "none",
+		});
+	}
+	let close = dialog.locator('[data-slot="dialog-close"]');
+	let closeSize = await measure(close);
+	expect([closeSize.width, closeSize.height, closeSize.radius]).toEqual([28, 28, 6]);
+	// shadcn's ghost button reserves a 1px transparent border (`border border-transparent`).
+	expect(await restChrome(close)).toEqual({
+		border: [1, 1, 1, 1],
+		borderColor: "rgba(0, 0, 0, 0)",
+		shadow: "none",
+		outline: "none",
+	});
 });
 
 test("a coarse pointer grows only the hit area: the visible box, border, radius and type do not move", async ({ page }) => {
 	let trigger = await openSelector(page);
 	let targets = page.locator(TARGETS);
 	let count = await targets.count();
-	expect(count).toBeGreaterThan(8);
+	expect(count).toBeGreaterThan(14);
 	let fine = [];
 	for (let index = 0; index < count; index++) fine.push(await measure(targets.nth(index)));
 	// A fine pointer has no invisible target.
@@ -251,10 +630,10 @@ test("Chopin's global button behaviour does not reach a copy: its press, transit
 
 /**
  * The message box is Chopin's own, in Slack's proportions as built: an 8px box with a hairline, a
- * toolbar and a row of 28px ghost buttons with 16px icons, and a 28px rounded-square send. It is
+ * toolbar and a row of 28px ghost buttons with Slack's 18px icons, and a 28px rounded-square send. It is
  * measured where Chat draws it, on the chat plate of the audit.
  */
-test("the message box is an 8px box with a 1px border, 28px controls with 16px icons and a 28px rounded-square send, under both pointers", async ({ page }) => {
+test("the message box is an 8px box with a 1px border, 28px controls with 18px icons and a 28px rounded-square send, under both pointers", async ({ page }) => {
 	let composer = plate(page, "chat").locator(".chat-composer").first();
 	await composer.scrollIntoViewIfNeeded();
 	let box = composer.locator(".composer-surface");
@@ -285,7 +664,7 @@ test("the message box is an 8px box with a 1px border, 28px controls with 16px i
 				node => [node.getBoundingClientRect().width, node.getBoundingClientRect().height],
 			),
 			`icon ${index}`,
-		).toEqual([16, 16]);
+		).toEqual([18, 18]);
 	}
 	let send = composer.locator("[data-send-stop]");
 	let rounded = await measure(send);
@@ -316,6 +695,100 @@ test("the message box is an 8px box with a 1px border, 28px controls with 16px i
 });
 
 /**
+ * Where Chat docks it the box is set as Slack's message box (the maintainer's approved mock-up and
+ * Slack's `p-message_pane_input`): 16px from the pane's sides and foot, a 36px formatting strip, a
+ * row of 28px buttons 4px under the draft and 6px from the box's sides and foot, and one line of
+ * draft at rest, 8px above and below it and 12px in, in the message's own type. A hovered
+ * message's shade is the pane's whole width.
+ */
+test("the docked box is 16px from the pane's sides and foot with one line of draft 8px by 12px in, and a hovered row is shaded across the whole pane", async ({ page }) => {
+	let stage = plate(page, "chat").locator(".design-audit-chat-stage");
+	await stage.scrollIntoViewIfNeeded();
+	let pane = (await stage.locator(".workspace-chat-panel").boundingBox())!;
+	let box = (await stage.locator(".composer-surface").boundingBox())!;
+	expect(box.x - pane.x).toBe(16);
+	expect(pane.x + pane.width - (box.x + box.width)).toBe(16);
+	expect(pane.y + pane.height - (box.y + box.height)).toBe(16);
+
+	let draft = stage.locator(".composer-draft-input");
+	let typed = await draft.evaluate(node => {
+		let style = getComputedStyle(node);
+		let probe = document.createElement("span");
+		probe.style.fontSize = "var(--text-base)";
+		node.closest(".design-audit-chat-stage")!.append(probe);
+		let body = getComputedStyle(probe).fontSize;
+		probe.remove();
+		return {
+			padding: [style.paddingTop, style.paddingRight, style.paddingBottom, style.paddingLeft]
+				.map(value => Number.parseFloat(value)),
+			line: Number.parseFloat(style.lineHeight),
+			height: node.getBoundingClientRect().height,
+			fontSize: style.fontSize,
+			body,
+		};
+	});
+	expect(typed.padding).toEqual([8, 12, 8, 12]);
+	// One line with its padding, held on a whole pixel by the rounded minimum, or the line itself
+	// where that rounds down (layout snaps a box to sixty-fourths of a pixel).
+	expect(typed.height).toBe(
+		Math.max(Math.round(typed.line + 16), Math.round((typed.line + 16) * 64) / 64),
+	);
+	// The document body's role, which messages are written in.
+	expect(typed.fontSize).toBe(typed.body);
+
+	// The row is 4px under the draft and 6px from the box's sides and foot.
+	let row = await measure(stage.locator(".composer-row"));
+	expect(row.padding).toEqual([4, 6, 6, 6]);
+	let strip = stage.locator(".composer-format");
+	if (await strip.isVisible()) {
+		let format = await measure(strip);
+		expect(format.padding).toEqual([4, 6, 4, 6]);
+		expect(format.height).toBe(37);
+	}
+
+	// Scrolled to its end, the transcript's last entry ends 20px above the box.
+	let clearance = await stage.locator("[data-chat-scroll]").evaluate((node, top) => {
+		node.scrollTo({ top: node.scrollHeight });
+		let entries = [...node.querySelectorAll("[data-chat-stack] > *")].filter(entry =>
+			getComputedStyle(entry).position !== "absolute"
+			&& entry.getBoundingClientRect().height > 4
+		);
+		return top - entries.at(-1)!.getBoundingClientRect().bottom;
+	}, box.y);
+	expect(clearance).toBe(20);
+
+	// The hovered row's shade reaches both edges of the scroller, which spans the pane.
+	let scroller = stage.locator("[data-chat-scroll]");
+	let body = stage.locator(".chat-message-body").last();
+	await body.hover();
+	let shade = await body.evaluate(node => {
+		let style = getComputedStyle(node, "::before");
+		let box = node.getBoundingClientRect();
+		let left = box.left + Number.parseFloat(style.left);
+		let right = left + Number.parseFloat(style.width);
+		// What is drawn of it: as far as every box around it that clips it lets it reach.
+		for (let at = node.parentElement; at; at = at.parentElement) {
+			if (getComputedStyle(at).overflowX !== "visible") {
+				let clip = at.getBoundingClientRect();
+				left = Math.max(left, clip.left);
+				right = Math.min(right, clip.right);
+			}
+			if (at.matches("[data-chat-scroll]")) break;
+		}
+		return { left, width: right - left, radius: style.borderTopLeftRadius };
+	});
+	let lane = await scroller.evaluate(node => ({
+		left: node.getBoundingClientRect().left + node.clientLeft,
+		width: node.clientWidth,
+		outer: node.getBoundingClientRect().width,
+	}));
+	expect(lane.outer).toBe(pane.width);
+	expect(shade.left).toBe(lane.left);
+	expect(shade.width).toBe(lane.width);
+	expect(shade.radius).toBe("0px");
+});
+
+/**
  * The slots the box fills from the hooks: the `+` is one of its 28px ghost buttons, the files it
  * stages (assistant-ui's chips) and the voice it listens with sit inside the box above the text, and
  * the microphone (assistant-ui's own 32px round button) is in the bottom row with the other controls.
@@ -336,7 +809,7 @@ test("the + is a 28px ghost button in the row; the staged files and the voice ar
 	expect(sized.radius).toBe(6);
 	expect(
 		await plus.locator("svg").evaluate(node => [node.clientWidth, node.clientHeight]),
-	).toEqual([16, 16]);
+	).toEqual([18, 18]);
 	let at = (await plus.boundingBox())!;
 	expect(at.y).toBeGreaterThanOrEqual(row.y);
 	expect(at.y + at.height).toBeLessThanOrEqual(row.y + row.height);

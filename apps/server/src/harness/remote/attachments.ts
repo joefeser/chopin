@@ -110,6 +110,11 @@ export type PlannerAttachmentOptions = {
 	restoredRuns?: (channelId: string, outcome: RestoredRuns) => void;
 	/** Heard when a hand-over window ends without the client back, with what was missing. */
 	missed?: (channelId: string, cause: "login" | "client") => void;
+	/**
+	 * Opens a document, and keeps it open until the returned function is called, for a question
+	 * the client of a hold a restart rebuilt asks while nobody has the document open.
+	 */
+	openDocument?: (channelId: string) => Promise<() => void>;
 };
 
 /** What a document's members are told about its Planner: only the holder's login and state. */
@@ -164,13 +169,27 @@ export function notAttachedMessage(url: string, repository: string, machines = f
 }
 
 /**
- * What `@chopin` and `invoke_planner` say while the document's Planner is disconnected: it has
- * not stopped, the work is kept, and it carries on when the machine is back. It names only its
- * owner's login, never the machine.
+ * What `@chopin` and `invoke_planner` say while the document's Planner is disconnected: that the
+ * message was not sent, since nothing is kept for a machine that is away, and what to do. It does
+ * not speak of the machine's own work (that is kept, and the document says so where it shows the
+ * machine). It names only its owner's login, never the machine.
  */
 export function disconnectedMessage(login: string | undefined): string {
-	return `${login ? `@${login}'s machine` : "The machine"} is offline, so it can't reply now. `
-		+ "Your work is kept and picks up when it's back.";
+	return `${
+		login ? `@${login}'s machine` : "The machine"
+	} is offline, so this message wasn't sent. `
+		+ "Send it again when it's back.";
+}
+
+/**
+ * What `@chopin` and `invoke_planner` say while a process that has just taken over waits inside its
+ * hand-over window for the machine's connection to return: still connecting, so this message was
+ * not sent, and to send it again in a moment. It names only its owner's login, never the machine.
+ */
+export function reconnectingMessage(login: string | undefined): string {
+	return `Still connecting to ${
+		login ? `@${login}'s machine` : "the machine"
+	}, so this message wasn't sent. Send it again in a moment.`;
 }
 
 /**
@@ -180,9 +199,9 @@ export function disconnectedMessage(login: string | undefined): string {
  * document's machine button does, and names only its owner's login, never the machine.
  */
 export function startingMessage(login: string, failure?: Session.PlannerStartFailure): string {
+	// What was tried is never counted for a person: it connects, or it can't, and why.
 	if (failure) {
-		return `Can't connect to @${login}'s machine: ${failure.reason} `
-			+ `(${failure.attempts} attempts in a row). It keeps trying; try again once that is fixed.`;
+		return `Can't connect to @${login}'s machine: ${failure.reason}. Try again once that is fixed.`;
 	}
 	return `Still connecting to @${login}'s machine. Try again in a moment.`;
 }
@@ -232,6 +251,26 @@ export class PlannerAttachments {
 	/** Whether a client is attached to the document now, not merely holding it through a grace period. */
 	attached(channelId: string): boolean {
 		return this.#holds.get(channelId)?.link !== undefined;
+	}
+
+	/** Whether a hold's link was closed by a cut and its hand-over window is still open. */
+	reconnecting(channelId: string): boolean {
+		let hold = this.#holds.get(channelId);
+		return hold !== undefined && this.#inWindow(hold);
+	}
+
+	/**
+	 * What a Planner request is refused with while the document's machine is still connecting in its
+	 * hand-over window, or away (disconnected, or stepped away within its grace period); nothing when
+	 * it is neither.
+	 */
+	unavailable(channelId: string): string | undefined {
+		if (this.reconnecting(channelId)) return reconnectingMessage(this.holder(channelId));
+		let { state } = this.status(channelId);
+		if (state === "disconnected" || state === "held") {
+			return disconnectedMessage(this.holder(channelId));
+		}
+		return undefined;
 	}
 
 	/**
@@ -540,10 +579,12 @@ export class PlannerAttachments {
 				continue;
 			}
 			if (row.sessions.length > 0) {
+				let open = this.#options.openDocument;
 				hold.parked = AgentLink.rebuilt(row.channelId, row.sessions, {
 					lapse: () => this.#lapsed(hold, hold.parked!),
 					ended: () => this.#runs(hold, "ended"),
 					resumed: () => this.#runs(hold, "up"),
+					...(open ? { open: () => open(row.channelId) } : {}),
 				});
 			}
 			let length = row.handoverUntil
@@ -587,14 +628,21 @@ export class PlannerAttachments {
 	}
 
 	/**
-	 * Whether a hold a restart rebuilt still keeps sessions its client has not taken back, so the
-	 * workflow runs Chat stored for the document are live and not stopped when its Chat opens:
-	 * `live` through the hold's window, `down` once its client is known to be away.
+	 * Whether a hold a restart rebuilt still keeps sessions with work, so the workflow runs Chat
+	 * stored for the document are live and not stopped when its Chat opens: `live` through the
+	 * hold's window and once its client has taken them back, `down` while its client is known to be
+	 * away. A client that took them back keeps them on its link, where no turn of this process
+	 * retains them, so a document that opens after it resumed still shows its runs live.
 	 */
 	restoredWork(channelId: string): "live" | "down" | undefined {
 		let hold = this.#holds.get(channelId);
-		if (!hold?.restored || !hold.parked || hold.parked.snapshot().length === 0) return undefined;
-		return this.#inWindow(hold) ? "live" : "down";
+		if (!hold) return undefined;
+		if (hold.restored && hold.parked && hold.parked.snapshot().length > 0) {
+			return this.#inWindow(hold) ? "live" : "down";
+		}
+		if (hold.link?.keepsRebuilt) return "live";
+		if (hold.parked?.keepsRebuilt) return "down";
+		return undefined;
 	}
 
 	/**

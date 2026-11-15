@@ -1,3 +1,5 @@
+import { withReactions } from "./reactions";
+
 import type { Chat } from "@chopin/protocol";
 import type { CompletedWork } from "./model";
 
@@ -14,7 +16,8 @@ export type TranscriptAction =
 	| { kind: "delta"; id: string; text: string }
 	| { kind: "tool"; entryId: string; activity: Chat.Activity }
 	| { kind: "turn"; turn?: Chat.Turn }
-	| { kind: "removed"; id: string }
+	| { kind: "reactions"; id: string; reactions: Chat.Reaction[] }
+	| { kind: "removed"; ids: string[] }
 	| { kind: "responded" };
 
 /**
@@ -29,8 +32,20 @@ export function progressOf(
 	state: TranscriptState,
 	current: boolean,
 	quiet: boolean,
-): { working?: Chat.Turn; suspended?: CompletedWork } {
-	if (current || quiet) return { working: state.turn };
+): { working?: Chat.Turn; suspended?: CompletedWork; settled?: CompletedWork } {
+	if (current || quiet) {
+		if (!state.turn?.quiet) return { working: state.turn };
+		// Nothing left of a quiet turn is for people to watch: it is drawn as the turn that ended.
+		if (!state.activeAnchorId) return {};
+		return {
+			settled: {
+				turnId: state.turn.id,
+				entryOffset: state.turn.entryOffset,
+				endOffset: state.entries.length,
+				anchorId: state.activeAnchorId,
+			},
+		};
+	}
 	if (!state.turn || !state.activeAnchorId) return {};
 	return {
 		suspended: {
@@ -56,6 +71,19 @@ export function silentRestart(
 	spoken: boolean,
 ): boolean {
 	return !current && !spoken && (was || restarting);
+}
+
+/**
+ * Whether Chat offers Stop: while a turn people can watch runs, or while a quiet one runs and a
+ * message was just refused because of it, so the person can stop it to ask now.
+ */
+export function offersStop(busy: boolean, turn: Chat.Turn | undefined, refused: boolean): boolean {
+	return busy && (!turn?.quiet || refused);
+}
+
+/** The ended turns to draw, the quiet one still running among them. */
+export function shownWork(completed: CompletedWork[], settled?: CompletedWork): CompletedWork[] {
+	return settled ? [...completed, settled] : completed;
 }
 
 export let initialTranscript: TranscriptState = { entries: [], completedWork: [] };
@@ -153,24 +181,22 @@ export function transcriptReducer(
 					: finish(state, action.turn?.entryOffset ?? state.entries.length),
 			});
 		}
+		case "reactions":
+			return state.entries.some(entry => entry.id === action.id)
+				? { ...state, entries: withReactions(state.entries, action.id, action.reactions) }
+				: state;
 		case "removed": {
-			let index = state.entries.findIndex(entry => entry.id === action.id);
-			if (index < 0) return state;
-			// Everything after it moves up one place, and the turn and the finished work that
-			// count entries from the start move with it.
-			let earlier = (offset: number) => index < offset ? offset - 1 : offset;
-			return withAnchor({
+			// A failed attempt a Retry replaced: its entries go, and with them the work it showed.
+			let gone = new Set(action.ids);
+			if (!state.entries.some(entry => gone.has(entry.id))) return state;
+			return {
 				...state,
-				entries: state.entries.filter((_, at) => at !== index),
-				turn: state.turn
-					? { ...state.turn, entryOffset: earlier(state.turn.entryOffset) }
-					: undefined,
-				completedWork: state.completedWork.map(item => ({
-					...item,
-					entryOffset: earlier(item.entryOffset),
-					endOffset: index < item.endOffset ? item.endOffset - 1 : item.endOffset,
-				})),
-			});
+				entries: state.entries.filter(entry => !gone.has(entry.id)),
+				completedWork: state.completedWork.filter(item => !gone.has(item.anchorId)),
+				...(state.activeAnchorId && gone.has(state.activeAnchorId)
+					? { activeAnchorId: undefined }
+					: {}),
+			};
 		}
 		case "responded":
 			return state.turn && !state.turn.responded

@@ -19,6 +19,10 @@
 			"types": "./src/content-swap.tsx",
 			"default": "./src/content-swap.tsx"
 		},
+		"./code-tokens": {
+			"types": "./src/widgets/code-tokens.ts",
+			"default": "./src/widgets/code-tokens.ts"
+		},
 		"./count": {
 			"types": "./src/count.tsx",
 			"default": "./src/count.tsx"
@@ -31,13 +35,29 @@
 			"types": "./src/face.tsx",
 			"default": "./src/face.tsx"
 		},
+		"./follow-link": {
+			"types": "./src/follow-link.ts",
+			"default": "./src/follow-link.ts"
+		},
+		"./focus-return": {
+			"types": "./src/focus-return.ts",
+			"default": "./src/focus-return.ts"
+		},
 		"./image-lightbox": {
 			"types": "./src/widgets/image-lightbox.tsx",
 			"default": "./src/widgets/image-lightbox.tsx"
 		},
+		"./image-place": {
+			"types": "./src/widgets/image-place.ts",
+			"default": "./src/widgets/image-place.ts"
+		},
 		"./people": {
 			"types": "./src/people.ts",
 			"default": "./src/people.ts"
+		},
+		"./drag-cursor": {
+			"types": "./src/drag-cursor.ts",
+			"default": "./src/drag-cursor.ts"
 		},
 		"./pointer": {
 			"types": "./src/pointer.ts",

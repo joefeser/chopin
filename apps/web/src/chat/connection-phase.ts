@@ -1,13 +1,17 @@
 /**
- * The one connection banner's phases, as plain decisions.
+ * The page's connection phases, as plain decisions.
  *
  * Four exclusive phases, as assistant-ui's connection-state element names them: `online` (nothing
  * shown), `reconnecting` (attempts under way), `dropped` (a layer is down and waits for a retry
- * or for its machine) and `resumed` (it came back; said briefly, then gone). Several layers feed
- * them, in the order the page can act on them: the room's socket, the document and transcript
- * catching up on it, and the Planner's own connection. One fact is one banner: a lower layer is told
- * only while the one above it is fine, and a dropped link is the connection's to tell, never an
- * error's (see `failure.ts`).
+ * or for its machine) and `resumed` (it came back). Several layers feed them, in the order the page
+ * can act on them: the room's socket, the document and transcript catching up on it, and the
+ * Planner's own connection. One fact is one phase: a lower layer is told only while the one above
+ * it is fine, and a dropped link is the connection's to tell, never an error's (see `failure.ts`).
+ *
+ * Only one of them is ever drawn, and quietly, as Slack does: the room's socket lost for a while,
+ * as the thin offline bar (`offlineBar`). Catching up and coming back draw nothing, and the
+ * Planner's machine is presence on the machine button and on chopin, with its story in the
+ * button's menu. Every phase is still said once to a screen reader (`connectionSpeech`).
  *
  * Kept apart from React so the rules can be tested without a page, and so that none of them can
  * be misread in a deploy: a restart the page is waiting out in silence arrives here as a socket
@@ -17,7 +21,7 @@
 
 import { RETRY_AFTER_FAILURES } from "@chopin/editor";
 
-import { PLANNER_HOW_TO_FIX, plannerSentence } from "./planner-status";
+import { plannerSentence } from "./planner-status";
 import type { PlannerStatus } from "./planner-status";
 
 export type ConnectionPhase = "online" | "dropped" | "reconnecting" | "resumed";
@@ -25,9 +29,8 @@ export type ConnectionPhase = "online" | "dropped" | "reconnecting" | "resumed";
 /** Which layer a phase speaks of. */
 export type ConnectionLayer = "socket" | "sync" | "planner";
 
-export const OFFLINE_MESSAGE =
-	"You're offline. Your changes are kept and will sync when you reconnect.";
-const RECONNECTING_MESSAGE = "Reconnecting. Your changes are kept.";
+export const OFFLINE_MESSAGE = "You're offline. Your changes are kept.";
+export const RECONNECTING_MESSAGE = "Connecting\u2026 Your changes are kept.";
 const CATCHING_UP = "Catching up";
 const BACK_ONLINE = "Back online.";
 const KEPT_GOING = "Back. The reply kept going.";
@@ -41,11 +44,8 @@ const NOTHING_NEW = "Nothing new while it was away.";
 /** How long the resumed words stay before the banner goes. */
 export const RESUMED_MS = 4000;
 
-/**
- * What a banner's button asks for: `reconnect` the room's socket, `wake` a machine that cannot
- * start, or `choose` another machine, which retries nothing.
- */
-export type ConnectionAction = "reconnect" | "wake" | "choose";
+/** What the offline bar's button asks for: `reconnect` the room's socket at once. */
+export type ConnectionAction = "reconnect";
 
 export type ConnectionView =
 	| { phase: "online" }
@@ -55,10 +55,8 @@ export type ConnectionView =
 		text: string;
 		/** The Planner's status, where this phase tells it. */
 		plannerKind?: PlannerStatus["kind"];
-		/** The attempt in flight, or the next, where attempts are counted. */
-		attempt?: number;
-		detail?: readonly string[];
-		link?: { label: string; href: string };
+		/** How many times the person moved it to another machine: each move is news to hear. */
+		plannerMove?: number;
 	}
 	| {
 		phase: "dropped";
@@ -66,10 +64,10 @@ export type ConnectionView =
 		text: string;
 		/** The Planner's status, where this phase tells it. */
 		plannerKind?: PlannerStatus["kind"];
+		/** How many times the person moved it to another machine: each move is news to hear. */
+		plannerMove?: number;
 		/** What a person may ask for from here; absent where only the machine can act. */
 		action?: ConnectionAction;
-		detail?: readonly string[];
-		link?: { label: string; href: string };
 	}
 	| {
 		phase: "resumed";
@@ -111,13 +109,11 @@ export type ConnectionFacts = {
 	 * hidden for a person whose machine button tells it, so only this is a return.
 	 */
 	plannerAttached?: boolean;
-	/** The reconnect attempt that opened the socket, as the banner last counted it; unknown if none. */
-	reopened?: number;
 	/**
-	 * The viewer may choose the machine this document's Planner runs on, so a Planner that is away
-	 * can be offered a different one. Chopin cannot reconnect someone else's machine.
+	 * How many times the person moved the Planner to another machine. Connecting to the new one is
+	 * the same kind of state as connecting to the old, but it is what they asked for, so it is said.
 	 */
-	chooseMachine?: boolean;
+	plannerMove?: number;
 };
 
 /** What a loss that was shown leaves to say when it ends. */
@@ -139,9 +135,9 @@ export type ConnectionMemory = {
 export const INITIAL_MEMORY: ConnectionMemory = {};
 
 /**
- * The Planner's state where the banner tells it. A person with the machine button has no machine
- * to be told about on the banner: the button, bare of its dot, already says so, and `none` is
- * not something that changed. Every other state is news, for everyone.
+ * The Planner's state where the page speaks of it. A person with the machine button has no machine
+ * to be told about: the button, bare of its dot, already says so, and `none` is not something that
+ * changed. Every other state is news, for everyone.
  */
 export function plannerForBanner(
 	status: PlannerStatus | undefined,
@@ -207,39 +203,18 @@ function withAway(memory: ConnectionMemory, away: ConnectionMemory["away"]): Con
 	return away ? { ...rest, away } : rest;
 }
 
-function plannerView(status: PlannerStatus, chooseMachine = false): ConnectionView {
+function plannerView(status: PlannerStatus, move: number | undefined): ConnectionView {
 	let text = plannerSentence(status);
-	switch (status.kind) {
-		case "starting":
-			return {
-				phase: "reconnecting",
-				layer: "planner",
-				text,
-				plannerKind: status.kind,
-				...(status.attempt === undefined ? {} : { attempt: status.attempt }),
-			};
-		case "cant-start":
-			return {
-				phase: "dropped",
-				layer: "planner",
-				text,
-				plannerKind: status.kind,
-				action: "wake",
-				detail: [status.reason, status.detail],
-				link: { label: "How to fix", href: PLANNER_HOW_TO_FIX },
-			};
-		case "disconnected":
-		case "held":
-			return {
-				phase: "dropped",
-				layer: "planner",
-				text,
-				plannerKind: status.kind,
-				...(chooseMachine ? { action: "choose" as const } : {}),
-			};
-		case "none":
-			return { phase: "dropped", layer: "planner", text, plannerKind: status.kind };
-	}
+	let moved = move ? { plannerMove: move } : {};
+	return status.kind === "starting"
+		? {
+			phase: "reconnecting",
+			layer: "planner",
+			text,
+			plannerKind: status.kind,
+			...moved,
+		}
+		: { phase: "dropped", layer: "planner", text, plannerKind: status.kind, ...moved };
 }
 
 /**
@@ -283,13 +258,11 @@ export function connectionStep(
 				phase: "reconnecting",
 				layer: "socket",
 				text: RECONNECTING_MESSAGE,
-				attempt: facts.failures + 1,
 			},
 		};
 	}
 	if (memory.lost) {
-		// The socket is open again, and a shown loss ends once what it missed has arrived. The
-		// attempt that opened it is kept, as `failures` starts over with the open socket.
+		// The socket is open again, and a shown loss ends once what it missed has arrived.
 		if (!facts.synced || !facts.current) {
 			return {
 				memory: withAway(memory, away),
@@ -297,7 +270,6 @@ export function connectionStep(
 					phase: "reconnecting",
 					layer: "sync",
 					text: CATCHING_UP,
-					...(facts.reopened === undefined ? {} : { attempt: facts.reopened }),
 				},
 			};
 		}
@@ -335,7 +307,7 @@ export function connectionStep(
 	}
 	return {
 		memory: withAway(memory, away),
-		view: facts.planner ? plannerView(facts.planner, facts.chooseMachine) : { phase: "online" },
+		view: facts.planner ? plannerView(facts.planner, facts.plannerMove) : { phase: "online" },
 	};
 }
 
@@ -345,16 +317,31 @@ export function expireResumed(memory: ConnectionMemory): ConnectionMemory {
 	return memory.away ? { away: memory.away } : INITIAL_MEMORY;
 }
 
-/** Which layer a banner's button asks to retry, or nothing where it has no button. */
-export function retryLayer(view: ConnectionView): "socket" | "planner" | undefined {
-	if (view.phase !== "dropped") return undefined;
-	return view.action === "reconnect" ? "socket" : view.action === "wake" ? "planner" : undefined;
+/** What the offline bar draws: the room's socket lost for a while, and nothing else. */
+export type OfflineBar = {
+	phase: "reconnecting" | "dropped";
+	text: string;
+	/** Reconnect is offered only once automatic attempts have failed. */
+	action?: ConnectionAction;
+};
+
+/**
+ * The offline bar for a view, or nothing. Only the room's socket is drawn: catching up on it and
+ * coming back are quiet, as Slack's are, and the Planner's machine is presence elsewhere.
+ */
+export function offlineBar(view: ConnectionView): OfflineBar | undefined {
+	if (view.phase !== "reconnecting" && view.phase !== "dropped") return undefined;
+	if (view.layer !== "socket") return undefined;
+	return view.phase === "dropped" && view.action
+		? { phase: view.phase, text: view.text, action: view.action }
+		: { phase: view.phase, text: view.text };
 }
 
 /**
- * Whether the banner already says why a send could not go, so a message's own "Couldn't send"
- * gives way to it. Only the room's socket and sync do: a Planner that is away or absent is a
- * different fact, and a message the server turned down for good must still say so.
+ * Whether the room's own connection is the cause of a send that could not go, so a message's own
+ * "Couldn't send" gives way while it is lost, catching up or just back. Only the room's socket and
+ * sync do: a Planner that is away or absent is a different fact, and a message the server turned
+ * down for good must still say so.
  */
 export function silencesFailedSends(view: ConnectionView): boolean {
 	return view.phase !== "online" && view.layer !== "planner";
@@ -396,7 +383,7 @@ export function connectionSpeech(
 		};
 	}
 	let key = view.layer === "planner"
-		? `${view.phase}:${view.layer}:${view.plannerKind}`
+		? `${view.phase}:${view.layer}:${view.plannerKind}:${view.plannerMove ?? 0}`
 		: `${view.phase}:${view.layer}`;
 	if (view.layer !== "planner") {
 		return key === previous.key ? undefined : { spoken: { ...previous, key }, said: view.text };

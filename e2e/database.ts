@@ -268,6 +268,7 @@ async function seed(
 		transcript: state.transcript ?? [],
 		...(state.graph ? { graph: state.graph } : {}),
 		...(state.builds ? { builds: state.builds } : {}),
+		...(state.execution ? { execution: state.execution } : {}),
 		...(state.lifecycle ? { lifecycle: state.lifecycle } : {}),
 		...(state.workflowRuns ? { workflowRuns: state.workflowRuns } : {}),
 	};
@@ -296,6 +297,15 @@ async function seed(
 				)
 			`;
 		}
+	});
+}
+
+export async function readPlannerOwner(port: number, id: string): Promise<string | null> {
+	return sql(port, async database => {
+		let [row] = await database<{ owner: string | null }[]>`
+			SELECT owner_session_id AS owner FROM agent_state WHERE channel_id = ${id}
+		`;
+		return row?.owner ?? null;
 	});
 }
 

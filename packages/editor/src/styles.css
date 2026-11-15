@@ -33,7 +33,7 @@
 .plan-research-draft-host,
 .plan-research-draft {
 	width: 100%;
-	max-width: var(--document-prose-measure);
+	max-width: var(--plan-measure, var(--document-prose-measure));
 }
 
 .motion-research-draft {
@@ -166,14 +166,14 @@
 .plan-research-composer,
 .plan-research-tracked {
 	width: 100%;
-	max-width: var(--document-prose-measure);
+	max-width: var(--plan-measure, var(--document-prose-measure));
 }
 
-/* One surface: the composer is the field, so focus rings the whole card. */
+/* One surface: the composer is the field, so its edge is the control boundary and focus rings it. */
 .plan-research-composer {
 	position: relative;
 	display: grid;
-	border: var(--edge-width) solid var(--color-edge);
+	border: var(--edge-width) solid var(--color-control-boundary);
 	border-radius: var(--radius-lg);
 	background: var(--color-page);
 	box-shadow: var(--shadow-resting);
@@ -573,12 +573,13 @@
 }
 
 @container (max-width: 40rem) {
-	/* Anchor state keeps this lane stable when its marker leaves the viewport. */
+	/*
+	 * A writer's gutter holds the block handle's column beside the prose and, left of it, a resolved
+	 * decision's slim marker: 24px and 12px. Set while the document has one at all, so the lane stays
+	 * put when its marker leaves the viewport.
+	 */
 	.plan-document[data-plan-decision-lane] :is(.plan-content, .plan-preface) {
-		--plan-leading-gutter: max(
-			calc(var(--decision-marker-size) + var(--spacing) * 2),
-			var(--plan-gutter)
-		);
+		--plan-leading-gutter: max(calc(var(--spacing) * 9), var(--plan-gutter));
 	}
 
 	/* Wide authored surfaces keep their own visible, keyboard-operable lane. */
@@ -1600,14 +1601,16 @@
  * The drawer's progress is read only while a finger drags the sheet: it keeps
  * its last value when the sheet's detents change underneath it. With one detent
  * it runs from 0 open to 1 dismissed; with two, from 0 at the large detent to 1
- * at the medium one.
+ * at the medium one. The backdrop asks of its own siblings, never of `body`: a `:has()` on `body`
+ * made every change in the page that a `:has()` might care about restyle the whole page.
  */
-body:has(.plan-comment-sheet-popup[data-swiping]) .plan-comment-sheet-backdrop {
+.plan-comment-sheet-backdrop:has(~ .plan-comment-sheet-viewport
+	.plan-comment-sheet-popup[data-swiping]) {
 	opacity: calc(var(--backdrop-opacity) * (1 - var(--drawer-swipe-progress, 0)));
 }
 
-body:has(.plan-comment-sheet-popup[data-swiping])
-	.plan-comment-sheet-backdrop[data-plan-comment-sheet-detents] {
+.plan-comment-sheet-backdrop[data-plan-comment-sheet-detents]:has(~ .plan-comment-sheet-viewport
+	.plan-comment-sheet-popup[data-swiping]) {
 	opacity: calc(
 		var(--backdrop-opacity) +
 			(
@@ -1666,6 +1669,10 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 /* The finger owns the sheet while it drags; the spring takes over on release. */
 .plan-comment-sheet-popup[data-swiping] {
 	transition: none;
+}
+
+.plan-comment-sheet-popup[data-swiping] .plan-comment-sheet-head {
+	cursor: grabbing;
 }
 
 .plan-comment-sheet-grabber {
@@ -2312,15 +2319,15 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	overflow: visible;
 }
 
-/* The draft is content in progress, so the empty-document prompt would only overlap it. */
+/*
+ * The draft is content in progress, so the empty-document prompt would only overlap it. The draft
+ * marks the editor's wrapper (`data-plan-research-draft`) rather than the wrapper asking with
+ * `:has()`, which would restyle the whole document whenever a block was added or removed.
+ */
 .plan
-	.mdxeditor-root-contenteditable:has(.plan-content[contenteditable="true"]
-		> .plan-research-draft-host)
-	> .plan-content:not([contenteditable]) {
-	display: none;
-}
-
-.plan .plan-content:has(.plan-research-draft-host) ~ .plan-body-placeholder {
+	.mdxeditor-root-contenteditable[data-plan-research-draft]
+	> .plan-content:not([contenteditable]),
+.plan .mdxeditor-root-contenteditable[data-plan-research-draft] .plan-body-placeholder {
 	display: none;
 }
 
@@ -2418,8 +2425,15 @@ body:has(.plan-comment-sheet-popup[data-swiping])
  *
  * The colour is recorded beside the declaration because it is calibrated as
  * a rendered wash, not as an abstract percentage of a darker accent.
+ *
+ * Every mark is in an editor, so every rule is set on the editor's root, and
+ * its text takes it from there by highlight inheritance. A `::highlight()` any
+ * element could take was resolved for each element the page restyled, anywhere:
+ * a Chat row a pointer crossed resolved ten of them per element. Set under the
+ * root (`.plan-content ::highlight()`), a scroll or a view switch restyled the
+ * whole document instead.
  */
-::highlight(plan-related) {
+.plan-content::highlight(plan-related) {
 	/* #d8eaee */
 	background-color: var(--color-brand-wash);
 }
@@ -2429,17 +2443,17 @@ body:has(.plan-comment-sheet-popup[data-swiping])
  * its passage or chip is pointed at (and while a draft or a resolved marker
  * points at it), underlined while its card is open.
  */
-::highlight(plan-comment) {
+.plan-content::highlight(plan-comment) {
 	background-color: var(--color-comment-wash);
 }
 
-::highlight(plan-comment-hover),
-::highlight(plan-comment-pin),
-::highlight(plan-comment-resolved) {
+.plan-content::highlight(plan-comment-hover),
+.plan-content::highlight(plan-comment-pin),
+.plan-content::highlight(plan-comment-resolved) {
 	background-color: var(--color-comment-wash-strong);
 }
 
-::highlight(plan-comment-open) {
+.plan-content::highlight(plan-comment-open) {
 	background-color: var(--color-comment-wash-strong);
 	text-decoration-line: underline;
 	text-decoration-color: var(--color-comment-underline);
@@ -2448,7 +2462,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 }
 
 /* The passage a link is being added to, while its field holds the selection. */
-::highlight(plan-link-target) {
+.plan-content::highlight(plan-link-target) {
 	background-color: var(--color-brand-wash);
 }
 
@@ -2926,8 +2940,16 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	inset-block-end: -0.75rem;
 }
 
+/*
+ * A left corner reaches inward, not out: the gutter's column beside the image is the block handle's,
+ * so the corner's square stays on the corner and its reach ends where the handle's column does.
+ */
 .plan-content .plan-image-resize[data-corner$="left"] {
-	inset-inline-start: -0.75rem;
+	inset-inline-start: -0.25rem;
+}
+
+.plan-content .plan-image-resize[data-corner$="left"]::after {
+	inset-inline: 0 1rem;
 }
 
 .plan-content .plan-image-resize[data-corner$="right"] {
@@ -2995,57 +3017,6 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	justify-content: flex-end;
 	gap: 0.5rem;
 	margin-block-start: 0.25rem;
-}
-
-.plan-image-lightbox {
-	position: fixed;
-	inset: 0;
-	inline-size: 100%;
-	block-size: 100dvh;
-	max-inline-size: none;
-	max-block-size: none;
-	margin: 0;
-	padding: 4rem 1.5rem 1.5rem;
-	border: 0;
-	background: var(--color-text-primary);
-	color: var(--color-page);
-	font-family: var(--font-sans);
-}
-
-.plan-image-lightbox-toolbar {
-	position: absolute;
-	inset-block-start: 1rem;
-	inset-inline-end: 1rem;
-	display: flex;
-	gap: 0.5rem;
-}
-
-.plan-image-lightbox-scroll {
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	inline-size: 100%;
-	block-size: 100%;
-	overflow: auto;
-	overscroll-behavior: contain;
-}
-
-.plan-image-lightbox-scroll img {
-	display: block;
-	max-inline-size: 100%;
-	max-block-size: 100%;
-	object-fit: contain;
-}
-
-.plan-image-lightbox-scroll[data-zoomed] {
-	display: block;
-}
-
-.plan-image-lightbox-scroll[data-zoomed] img {
-	max-inline-size: none;
-	max-block-size: none;
-	block-size: auto;
-	margin-inline: auto;
 }
 
 /*
@@ -3996,14 +3967,14 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 }
 
 .plan-content .plan-code-chrome,
-.plan-content .plan-code-chrome .plan-code-toggle,
+.plan-content .plan-code-chrome :is(.plan-code-toggle, .plan-code-wrap),
 .plan-content .plan-code-chrome .plan-code-language [data-nucleo-icon] {
 	transition: opacity var(--duration-fast) var(--ease-out);
 }
 
 @media (prefers-reduced-motion: reduce) {
 	.plan-content .plan-code-chrome,
-	.plan-content .plan-code-chrome .plan-code-toggle,
+	.plan-content .plan-code-chrome :is(.plan-code-toggle, .plan-code-wrap),
 	.plan-content .plan-code-chrome .plan-code-language [data-nucleo-icon],
 	.plan-content .plan-diagram {
 		transition: none;
@@ -4039,7 +4010,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 		[aria-expanded="true"]), :has(.plan-code-chrome[data-editing])) {
 		/* Only a named language says something the rendering does not. */
 		& .plan-code-chrome:not([data-kind="code"]),
-		& .plan-code-toggle,
+		& :is(.plan-code-toggle, .plan-code-wrap),
 		& .plan-code-language [data-nucleo-icon] {
 			opacity: 0;
 		}
@@ -4083,13 +4054,15 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	}
 }
 
-.plan-content .plan-code-toggle[aria-expanded="true"] {
+.plan-content :is(.plan-code-toggle[aria-expanded="true"], .plan-code-wrap[aria-pressed="true"]) {
 	background: var(--color-brand-wash);
 	color: var(--color-brand);
 }
 
 /* A global icon colour rule would otherwise keep the icon grey. */
-.plan-content .plan-code-toggle[aria-expanded="true"] [data-nucleo-icon] {
+.plan-content
+	:is(.plan-code-toggle[aria-expanded="true"], .plan-code-wrap[aria-pressed="true"])
+	[data-nucleo-icon] {
 	color: inherit;
 }
 
@@ -4180,6 +4153,40 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	.planCode[data-plan-text]
 	[data-plan-source]:has(> br[data-lexical-managed-linebreak]:only-child)::before {
 	content: "Text";
+}
+
+/*
+ * Wrap lines, the block's own setting: long lines wrap at any width instead of scrolling, the
+ * coloured copy with the hanging indent it has on a phone, and the source as plain wrapped text.
+ */
+.plan-content .planCode[data-plan-wrap] .plan-code-view > diffs-container {
+	min-inline-size: 0;
+}
+
+.plan-content .planCode[data-plan-wrap] [data-plan-source] {
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
+}
+
+/*
+ * Wrapped lines reach the block's end, where nothing could scroll them out from under its
+ * controls, so where the controls float over the code they take a row of their own above it, as
+ * they already do on touch.
+ */
+@media (hover: hover) and (pointer: fine) {
+	.plan-content
+		.planCode[data-plan-wrap]:not([data-plan-presentation], [data-plan-language="wireframe"], [data-plan-text]) {
+		/* The controls' 40px row, less the 12px the code already starts below the block's edge. */
+		padding-block-start: calc(var(--spacing) * 7);
+
+		& .plan-code-chrome {
+			background: none;
+		}
+
+		& .plan-diff-chrome-room {
+			display: none;
+		}
+	}
 }
 
 /*
@@ -5102,7 +5109,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	text-overflow: ellipsis;
 }
 
-::highlight(plan-decided) {
+.plan-content::highlight(plan-decided) {
 	background-color: var(--color-success-wash);
 }
 /* Presence on a decision card: aligned to the 1.5rem mark beside the title. */
@@ -5144,7 +5151,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
  * Reader-local chrome drawn over the document like the comment layer, and
  * for the same reason: nothing here may move a collaborative line box.
  */
-::highlight(plan-decision) {
+.plan-content::highlight(plan-decision) {
 	background-color: var(--color-success-wash);
 }
 
@@ -5524,7 +5531,7 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	width: var(--plan-check-size);
 	height: var(--plan-check-size);
 	box-sizing: border-box;
-	border: 1px solid var(--color-control-edge);
+	border: 1px solid var(--color-control-boundary);
 	border-radius: var(--radius-sm);
 	background-color: var(--color-page);
 	box-shadow: var(--shadow-resting);
@@ -5603,8 +5610,11 @@ body:has(.plan-comment-sheet-popup[data-swiping])
 	animation: plan-bubble-enter var(--duration-fast) var(--ease-out);
 }
 
-/* An open comment card owns the reader's attention; a lingering selection's toolbar would cover it. */
-:root:has(.plan-comment-card.motion-comment-surface:not(.is-closing)) .plan-formatting-toolbar {
+/*
+ * An open comment card owns the reader's attention; a lingering selection's toolbar would cover it.
+ * The card marks the page (`data-plan-comment-card`) rather than the page asking with `:has()`.
+ */
+:root[data-plan-comment-card] .plan-formatting-toolbar {
 	display: none;
 }
 

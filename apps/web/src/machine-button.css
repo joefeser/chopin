@@ -42,42 +42,32 @@
 
 /*
  * The Planner's own state, where it is not simply attached. Away is the muted grey of an offline
- * machine and a warning is the warning role, each replacing the machine's green. Starting is a
- * thin petrol ring turning on the surface, so it reads as work under way and not as a state.
+ * machine and a warning is the warning role, each replacing the machine's green. Starting is the
+ * shared connecting dots (`connecting-indicator.css`) on a capsule cut from the surface, so it reads
+ * as work under way and not as a state.
  */
 .machine-glyph .machine-glyph-dot[data-planner="away"] {
 	background: var(--color-text-tertiary);
 }
 
+/* The warning icon role, not the paler graphic, so the dot keeps 3:1 against its ring. */
 .machine-glyph .machine-glyph-dot[data-planner="failing"] {
-	background: var(--color-warning-graphic);
+	background: var(--color-warning-icon);
 }
 
+/* Wider than a dot and as tall, so three dots fit where one sat; its name says it is starting. */
 .machine-glyph .machine-glyph-dot[data-planner="starting"] {
-	background: var(--machine-dot-ring);
-	/* Larger than a dot, so the ring has room to read as a ring. */
-	width: calc(var(--spacing) * 3);
-	height: calc(var(--spacing) * 3);
+	display: flex;
+	width: calc(var(--spacing) * 3.5);
 	right: calc(var(--spacing) * -1.5);
-	bottom: calc(var(--spacing) * -1.5);
+	background: var(--machine-dot-ring);
 }
 
-.machine-glyph .machine-glyph-dot[data-planner="starting"]::after {
-	content: "";
-	position: absolute;
-	inset: 0;
-	border-width: calc(var(--spacing) * 0.5);
-	border-style: solid;
-	border-color: var(--color-selected-strong);
-	border-top-color: var(--color-brand);
-	border-radius: var(--radius-full);
-}
-
-/* Reduced motion keeps the still ring: its tooltip and name say it is starting. */
-@media (prefers-reduced-motion: no-preference) {
-	.machine-glyph .machine-glyph-dot[data-planner="starting"]::after {
-		animation: button-loader-spin calc(var(--duration-base) * 4) linear infinite;
-	}
+/* The banner's dots, a little smaller, so the three keep a margin of the surface in the capsule. */
+.machine-glyph-dot[data-planner="starting"] > .connecting-indicator {
+	--connecting-dot: calc(var(--spacing) * 0.75);
+	width: 100%;
+	height: 100%;
 }
 
 /* The icon alone; its accessible name and tooltip say which machine. */
@@ -221,13 +211,12 @@
 }
 
 /*
- * What the Planner is doing, at the top of the menu: a title where it cannot start, then the
- * reason, what has been tried in quiet ink, and where to fix it. Inset as the menu's rows are, and
- * set apart from them by the menu's own divider.
+ * What the Planner is doing, at the top of the menu: one sentence, or the fix-it steps
+ * (`fix-steps.css`) where there is something to fix. Inset as the menu's rows are, and set apart
+ * from them by the menu's own divider. A menu that holds the steps is a little wider, so a command
+ * fits on its line.
  */
 .machine-planner {
-	display: grid;
-	gap: calc(var(--spacing) * 1.5);
 	padding: calc(var(--spacing) * 2) var(--menu-item-padding-inline-normal);
 	font-size: var(--text-sm);
 	line-height: var(--text-sm--line-height);
@@ -235,50 +224,15 @@
 	text-wrap: pretty;
 }
 
-.machine-planner p {
-	margin: 0;
+.machine-planner > div {
 	overflow-wrap: anywhere;
 }
 
-.machine-planner-title {
-	display: flex;
-	align-items: flex-start;
-	gap: calc(var(--spacing) * 1.5);
-	color: var(--color-text-primary);
-	font-weight: 600;
+.machine-menu[data-fix] {
+	width: min(23rem, calc(100vw - var(--spacing) * 4));
 }
 
-.machine-planner-title svg {
-	--color-icon: var(--color-warning-icon);
-}
-
-.machine-planner-detail {
-	color: var(--color-text-tertiary);
-	font-size: var(--text-xs);
-	line-height: var(--text-xs--line-height);
-}
-
-.machine-planner-link {
-	justify-self: start;
-	color: var(--color-brand-ink);
-	text-decoration: underline;
-	text-underline-offset: 0.2em;
-}
-
-/* On a phone's sheet, the rows' own inset and size. */
+/* On a phone's sheet, the rows' own inset. */
 .machine-sheet-group .machine-planner {
 	padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4);
-	font-size: var(--text-base);
-	line-height: var(--text-base--line-height);
-}
-
-.machine-sheet-group .machine-planner-detail {
-	font-size: var(--text-sm);
-	line-height: var(--text-sm--line-height);
-}
-
-.machine-sheet-group .machine-planner-link {
-	min-height: var(--control-target-coarse);
-	display: inline-flex;
-	align-items: center;
 }

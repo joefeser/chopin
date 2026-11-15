@@ -19,6 +19,7 @@ import {
 import { containsHit, passageHits } from "./comment-hits";
 import { CommentSheet, commentSheetHeading } from "./comment-sheet";
 import { useCommentSheetReveal } from "./comment-sheet-reveal";
+import { focusIsFree } from "./focus-return";
 import { $rangeOf } from "./marks";
 import { blockElement } from "./scroll";
 import { usePendingWork } from "./pending-work";
@@ -331,6 +332,9 @@ function useCommentPresence<T>(value: T | undefined, duration: number, immediate
 	};
 }
 
+/** How many comment cards are open, across every editor on the page. */
+let commentCards = 0;
+
 function CommentSurface(
 	{
 		compact,
@@ -348,6 +352,19 @@ function CommentSurface(
 	let measure = useRef(surface?.onMeasure);
 	measure.current = surface?.onMeasure;
 	let open = !!surface;
+	// An open card hides a lingering selection's toolbar (styles.css). The page is marked rather than
+	// asked with `:root:has()`, which restyled the whole page whenever an element came or went.
+	let card = !!surface?.className.split(" ").includes("plan-comment-card")
+		&& lifecycle.presence.phase !== "closing";
+	useLayoutEffect(() => {
+		if (!card) return;
+		let root = document.documentElement;
+		commentCards++;
+		root.setAttribute("data-plan-comment-card", "");
+		return () => {
+			if (--commentCards === 0) root.removeAttribute("data-plan-comment-card");
+		};
+	}, [card]);
 	// Content can grow after the card is placed, as when a long thread unfolds its replies,
 	// so the card is measured again and re-placed rather than running off the document.
 	useLayoutEffect(() => {
@@ -528,6 +545,16 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	}, [leave]);
 	let measure = () => {
 		if (!host) return;
+		// Reading geometry makes the browser lay the page out there and then, on every edit; with no
+		// open thread there is nothing to place, so nothing is read.
+		if (!state.threads.some(view => view.thread.status === "open")) {
+			if (placedRef.current.length === 0 && markersRef.current.length === 0) return;
+			placedRef.current = [];
+			markersRef.current = [];
+			setPlaced([]);
+			setMarkers([]);
+			return;
+		}
 		let page = rect(host.getBoundingClientRect());
 		let measured: MeasuredThread[] = [];
 
@@ -772,6 +799,8 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	let restoreOrigin = useCallback(() => {
 		let target = origin.current;
 		requestAnimationFrame(() => {
+			// Not over a control the person moved to while the card or its sheet left.
+			if (!focusIsFree(root.current, document.querySelector("[data-plan-comment-sheet]"))) return;
 			let fallback = editor.getRootElement();
 			(target?.isConnected ? target : fallback)?.focus();
 		});
@@ -1097,11 +1126,23 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		if (!height) return;
 		setCardHeights(current => current[id] === height ? current : { ...current, [id]: height });
 	};
-	let page = rect(host.getBoundingClientRect());
-	let editorRoot = editor.getRootElement();
-	let column = editorRoot ? proseColumn(editorRoot) : page;
-	let cardWidth = Math.min(320, host.clientWidth - 24);
+	// The layer's geometry is read only when something it draws needs it: a read in render lays the
+	// page out for each render, and the layer renders with every change to the document's comments.
+	let measured: { page: Rect; column: Rect; cardWidth: number; previewWidth: number } | undefined;
+	let geometry = () => {
+		if (measured) return measured;
+		let page = rect(host.getBoundingClientRect());
+		let editorRoot = editor.getRootElement();
+		measured = {
+			page,
+			column: editorRoot ? proseColumn(editorRoot) : page,
+			cardWidth: Math.min(320, host.clientWidth - 24),
+			previewWidth: Math.min(288, host.clientWidth * 0.8),
+		};
+		return measured;
+	};
 	let cardPlacement = (passage: Rect, id: string, align?: "passage") => {
+		let { cardWidth, column, page } = geometry();
 		let { side, ...style } = commentCardPoint(
 			passage,
 			column,
@@ -1112,7 +1153,6 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		);
 		return { side, style };
 	};
-	let previewWidth = Math.min(288, host.clientWidth * 0.8);
 	let compactKey: string | undefined;
 	let compactId: string | undefined;
 	let compactLabel: string | undefined;
@@ -1130,10 +1170,10 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 		? {
 			button: previewMarker.button,
 			id: `plan-comment-preview-${previewView.thread.id}`,
-			page,
+			page: geometry().page,
 			size: CHIP,
 			view: previewView,
-			width: previewWidth,
+			width: geometry().previewWidth,
 		}
 		: undefined;
 	let previewValue = placedPreview(previewRequest, previewMeasurement);
@@ -1295,6 +1335,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 				// Never taller than the first line, so a tap at the end of the second line reaches the text.
 				let height = coarse ? Math.min(TOUCH_TARGET, Math.max(CHIP, marker.line)) : CHIP;
 				// The touch area stays inside the document, so a chip in the padding keeps a full target.
+				let { column, page } = geometry();
 				let left = Math.max(
 					0,
 					Math.min(button.left - (width - button.width) / 2, page.width - width),
@@ -1339,7 +1380,7 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 							if (single) unhover(single.thread.id);
 							else lightMarker(undefined, []);
 							// A focused marker whose passage scrolled away hides once focus leaves it.
-							measure();
+							geometry();
 						}}
 						onClick={event => {
 							origin.current = event.currentTarget;
@@ -1455,7 +1496,10 @@ export function CommentLayer({ store }: { store: ThreadStore }) {
 	// Only the reader who resolved sees the toast, beneath the document they resolved it in.
 	// It is mounted only while it shows: the live region that announces it stays in the layer.
 	let toast = notice && createPortal(
-		<div className="plan-comment-toast-region" style={{ left: page.left + page.width / 2 }}>
+		<div
+			className="plan-comment-toast-region"
+			style={{ left: geometry().page.left + geometry().page.width / 2 }}
+		>
 			<div
 				className="plan-comment-toast"
 				key={notice.id}

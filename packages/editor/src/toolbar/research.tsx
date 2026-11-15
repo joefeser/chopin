@@ -34,6 +34,7 @@ import { useTransitionPresence } from "../transition-presence";
 import { ResearchComposer } from "../widgets/research";
 import { $topLevel } from "./block-target";
 import { $relativePosition } from "./position";
+import { PLANNER_NAME } from "../people";
 
 import type { Binding } from "@lexical/yjs";
 import type { LexicalEditor, LexicalNode } from "lexical";
@@ -70,7 +71,7 @@ const KINDS = {
 		place: "Place research",
 		composer: {
 			label: "Research question",
-			placeholder: "What should Chopin research?",
+			placeholder: `What should ${PLANNER_NAME} research?`,
 			submitLabel: "Start research",
 			discard: "Discard research",
 			discardLabel: "Discard research question",
@@ -390,6 +391,18 @@ export function ResearchComposerSurface(
 		}
 		place();
 	}, [detach, place, shown]);
+	// Hides the empty document's prompts while the draft is in the document (styles.css). A mark,
+	// not a `:has()` on the editor: that made each block added or removed restyle the document.
+	useLayoutEffect(() => {
+		let wrapper = editor.getRootElement()?.closest(".mdxeditor-root-contenteditable");
+		if (!host || !wrapper) return;
+		wrapper.setAttribute("data-plan-research-draft", kind);
+		return () => {
+			if (wrapper.getAttribute("data-plan-research-draft") === kind) {
+				wrapper.removeAttribute("data-plan-research-draft");
+			}
+		};
+	}, [editor, host, kind]);
 	useLayoutEffect(() => {
 		// Restore the caret after the closing draft becomes inert.
 		if (shown && !draft) editor.focus();

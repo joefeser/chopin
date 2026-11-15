@@ -14,6 +14,7 @@ import {
 	parseClientMessage,
 	usableCatalog,
 } from "@chopin/agent-link";
+import { untilUnpaused } from "../atomic/full";
 
 import type {
 	HarnessV1PromptControl,
@@ -34,7 +35,8 @@ import type {
 } from "@chopin/agent-link";
 import type { Chat as Wire } from "@chopin/protocol";
 import type { JsonValue, PlannerHeldSession } from "../../storage/model";
-import type { AskedInput, HumanInputStatus, InputMethod } from "../atomic/human-input";
+import type { PlannerRuns } from "../atomic/full";
+import type { AskedInput, HumanInput, HumanInputStatus, InputMethod } from "../atomic/human-input";
 import type { PlannerTurn } from "../turn-level";
 import type { RemotePlanner } from "./registry";
 
@@ -220,6 +222,8 @@ type Port = {
 		runId?: string,
 		sent?: (request: string) => void,
 	): Promise<void>;
+	/** Gives the client's running `turn` a person's message; rejects when it could not take it. */
+	steer(session: string, turn: string, prompt: string): Promise<void>;
 	forget(session: string): void;
 	/** Whether the client's work in `session` goes on past a restart: it is kept, not destroyed. */
 	kept(session: string): boolean;
@@ -301,7 +305,70 @@ export type RejoinHost = {
 	 * it. They are handed to the Planner as a turn, as a decision nobody waits on is.
 	 */
 	unsent(decisions: string[]): void;
+	/** Whether the document this host asks in is still open; absent, it is. */
+	live?(): boolean;
+	/**
+	 * Asks the document's members, as Decisions, a question a rebuilt session's client asks after
+	 * the restart. No turn of this process opened that session, so nothing else can.
+	 */
+	humanInput?(
+		hold: (workflowRunId: string, signal: AbortSignal) => Promise<void>,
+		report: (status: HumanInputStatus) => void,
+	): HumanInput;
+	/**
+	 * Shows what a rebuilt session's client reports of its workflow runs as the document's run
+	 * cards, `down` while its link has dropped again. Nothing in this process retains that session,
+	 * so its reports reach Chat only this way.
+	 */
+	runs?(session: string, runs: PlannerRuns, down: boolean): void;
 };
+
+/**
+ * What a session a restart rebuilt needs to reach its document: the host of the document's room
+ * while it is open, and a way to open it for as long as a question waits.
+ */
+export type RebuiltDocument = {
+	host?: RejoinHost;
+	/** Opens the document and keeps it open until the returned function is called. */
+	open?: () => Promise<() => void>;
+};
+
+const METHODS = ["questionnaire", "confirm", "select", "input", "editor"] as const;
+
+/**
+ * Decisions for a session a restart rebuilt. Each question opens the document, or keeps the open
+ * one, for as long as it waits, and is asked through the host of its room, so a question the
+ * client asks after the restart becomes a Decision as one asked before it did.
+ */
+function rebuiltInput(
+	planner: RemotePlanner,
+	document: RebuiltDocument,
+	report: (status: HumanInputStatus) => void,
+): HumanInput {
+	let live = () => {
+		let host = document.host;
+		return host?.humanInput && host.live?.() !== false ? host : undefined;
+	};
+	let through = async (ask: (input: HumanInput) => Promise<unknown>): Promise<unknown> => {
+		let release = document.open ? await document.open() : undefined;
+		try {
+			let host = live();
+			if (!host) throw new Error("Decisions are not available to this session.");
+			return await ask(
+				host.humanInput!((runId, signal) => untilUnpaused(planner, runId, signal), report),
+			);
+		} finally {
+			release?.();
+		}
+	};
+	return Object.fromEntries(
+		METHODS.map(method => [
+			method,
+			(...args: unknown[]) =>
+				through(input => (input[method] as (...args: unknown[]) => Promise<unknown>)(...args)),
+		]),
+	) as HumanInput;
+}
 
 /** One Planner session whose turns run in the attached client. */
 class RemoteSession {
@@ -345,7 +412,13 @@ class RemoteSession {
 
 	async start(): Promise<HarnessV1Session> {
 		let mode = this.planner.isolated ? "isolated" as const : "planner" as const;
-		if (!this.#port.send({ type: "start", session: this.id, mode })) {
+		let forkFrom = this.#port.features?.includes(AGENT_FEATURES.sessionForks)
+			? this.planner.forkFrom
+			: undefined;
+		let message = forkFrom
+			? { type: "fork" as const, session: this.id, mode, from: forkFrom }
+			: { type: "start" as const, session: this.id, mode };
+		if (!this.#port.send(message)) {
 			throw new Error("The agent connection is closed.");
 		}
 		await within(
@@ -353,6 +426,7 @@ class RemoteSession {
 			this.#port.timeoutMs,
 			"The machine did not start the session.",
 		);
+		if (forkFrom) this.planner.forkedNatively = true;
 		this.planner.control = (action, runId) => this.#command(action, runId);
 		this.planner.rootOf = runId => this.#roots.get(runId) ?? runId;
 		return this.#session();
@@ -551,6 +625,8 @@ class RemoteSession {
 	restore(stops: JsonValue[]): void {
 		this.#acknowledged = true;
 		this.planner.suspended = true;
+		// A workflow question names its root, so a paused root holds its answer, as after `start`.
+		this.planner.rootOf = runId => this.#roots.get(runId) ?? runId;
 		for (let stop of stops) {
 			let run = (stop as { run?: string | null } | null)?.run;
 			this.#hold("stop", typeof run === "string" ? run : undefined);
@@ -731,13 +807,27 @@ class RemoteSession {
 			}
 			case "error":
 				return turn.emit({ type: "error", error: new Error(part.error) });
+			case "compacting":
+				return turn.emit({ type: "raw", rawValue: { type: "compacting" } });
 			case "finish-step":
+				if (part.usage.contextWindow !== undefined) {
+					turn.emit({
+						type: "raw",
+						rawValue: { type: "context-window", contextWindow: part.usage.contextWindow },
+					});
+				}
 				return turn.emit({
 					type: "finish-step",
 					finishReason: finishReason(part.finishReason),
 					usage: usage(part.usage),
 				});
 			case "finish":
+				if (part.totalUsage.contextWindow !== undefined) {
+					turn.emit({
+						type: "raw",
+						rawValue: { type: "context-window", contextWindow: part.totalUsage.contextWindow },
+					});
+				}
 				return turn.emit({
 					type: "finish",
 					finishReason: finishReason(part.finishReason),
@@ -816,6 +906,17 @@ class RemoteSession {
 			async submitToolApproval() {
 				// The remote Planner asks no approvals; host tools are already allowed.
 			},
+			// Only a client that offered `steer-turn` is sent a `steer`, so only its turns take a message.
+			...(this.#port.features?.includes(AGENT_FEATURES.steerTurn)
+				? {
+					submitUserMessage: async (text: string) => {
+						if (turn.ended || turn.stopped || this.#current !== turn) {
+							throw new Error("The turn is not running.");
+						}
+						await this.#port.steer(this.id, turn.id, text);
+					},
+				}
+				: {}),
 			done: turn.settle.promise,
 		};
 	}
@@ -833,6 +934,10 @@ class RemoteSession {
 		let hostNames = offered.map(tool => tool.name);
 		let hostTools = this.planner.hostTools;
 		this.planner.hostTools = undefined;
+		let answers = this.#port.features?.includes(AGENT_FEATURES.retryTurn)
+			? this.planner.turnMessage
+			: undefined;
+		this.planner.turnMessage = undefined;
 		// The level is only ever one the client's own catalog listed for the model.
 		let thinkingLevel = this.#port.features?.includes(AGENT_FEATURES.capabilityCatalog)
 			? options.thinkingLevel
@@ -860,6 +965,9 @@ class RemoteSession {
 			...(options.instructions === undefined ? {} : { instructions: options.instructions }),
 			...(options.model ? { model: options.model } : {}),
 			...(thinkingLevel ? { thinkingLevel } : {}),
+			...(answers
+				? { message: answers.id, ...(answers.retry ? { retry: true as const } : {}) }
+				: {}),
 			tools: offered.map(tool => ({
 				name: tool.name,
 				...(tool.description === undefined ? {} : { description: tool.description }),
@@ -872,6 +980,7 @@ class RemoteSession {
 				: {}),
 		});
 		if (!sent) throw new Error("The agent connection could not carry this turn.");
+		this.planner.onRemoteTurn?.({ session: this.id, turn: turn.id });
 		this.planner.activeTools = hostNames;
 		this.#current = turn;
 		this.#listen(turn, options.abortSignal);
@@ -1002,6 +1111,7 @@ export class AgentLink {
 		this.#port = {
 			send: message => this.#send(message),
 			control: (session, action, runId, sent) => this.#control(session, action, runId, sent),
+			steer: (session, turn, prompt) => this.#steer(session, turn, prompt),
 			forget: session => {
 				this.#sessions.delete(session);
 				this.#cancelInputs(session);
@@ -1034,7 +1144,13 @@ export class AgentLink {
 	static rebuilt(
 		channelId: string,
 		held: PlannerHeldSession[],
-		hooks: { lapse(): void; ended(): void; resumed(): void },
+		hooks: {
+			lapse(): void;
+			ended(): void;
+			resumed(): void;
+			/** Opens the document for a question its client asks, until the returned function is called. */
+			open?: () => Promise<() => void>;
+		},
 	): AgentLink {
 		let link = new AgentLink({ send() {}, close() {} }, {
 			attach: async () => ({
@@ -1049,7 +1165,17 @@ export class AgentLink {
 		link.#lapse = hooks.lapse;
 		link.#rebuilt = hooks;
 		for (let item of held) {
-			let session = new RemoteSession(item.id, { channelId, isolated: false }, link.#port);
+			// No turn of this process opens the session, so it reaches its document through the room's
+			// host: what its client reports and asks after the restart is shown and asked as before.
+			let document: RebuiltDocument = hooks.open ? { open: hooks.open } : {};
+			let planner: RemotePlanner = { channelId, isolated: false, rebuilt: document };
+			planner.humanInput = report => rebuiltInput(planner, document, report);
+			let show = () => {
+				if (planner.runs) document.host?.runs?.(item.id, planner.runs, planner.suspended === true);
+			};
+			planner.onRuns = show;
+			planner.linkChanged = show;
+			let session = new RemoteSession(item.id, planner, link.#port);
 			session.restore(item.stops);
 			link.#sessions.set(item.id, session);
 			for (let owed of item.owed) {
@@ -1116,6 +1242,14 @@ export class AgentLink {
 	rejoinInputs(host: RejoinHost): void {
 		if (this.#successor) return this.#successor.rejoinInputs(host);
 		if (this.#state === "closed") return;
+		// A session the restart rebuilt asks and reports through this room from now on, and its
+		// cards show what its client last reported.
+		for (let session of this.#sessions.values()) {
+			let rebuilt = session.planner.rebuilt;
+			if (!rebuilt) continue;
+			rebuilt.host = host;
+			if (session.planner.runs) session.planner.onRuns?.(session.planner.runs);
+		}
 		for (let [request, input] of this.#inputs) {
 			if (!input.restored || input.joined === host) continue;
 			input.joined = host;
@@ -1155,6 +1289,23 @@ export class AgentLink {
 		}
 	}
 
+	/**
+	 * Whether the link holds a session a restart rebuilt that still has work: a live or paused run,
+	 * an open question, or no report yet of what it kept. Nothing in this process retains such a
+	 * session, so the run cards Chat stored are its own, and live, when the document opens.
+	 */
+	get keepsRebuilt(): boolean {
+		if (this.#successor) return this.#successor.keepsRebuilt;
+		if (this.#state === "closed") return false;
+		for (let session of this.#sessions.values()) {
+			if (!session.planner.rebuilt) continue;
+			let runs = session.planner.runs;
+			if (!runs || runs.active.length > 0 || runs.paused.length > 0) return true;
+			if (this.#waitingOn(session.id) > 0) return true;
+		}
+		return false;
+	}
+
 	/** Whether the client's work in `session` is kept when this link drops without being ended. */
 	#keeps(session: RemoteSession): boolean {
 		return this.resumable && session.resumable
@@ -1171,6 +1322,11 @@ export class AgentLink {
 	 */
 	get catalog(): CapabilityCatalog | undefined {
 		return this.#catalog;
+	}
+
+	/** Whether the client offered `steer-turn`: a message for a running turn can reach it. */
+	get steers(): boolean {
+		return this.#options.features?.includes(AGENT_FEATURES.steerTurn) === true;
 	}
 
 	/**
@@ -1251,8 +1407,25 @@ export class AgentLink {
 		try {
 			return await session.start();
 		} catch (error) {
-			// Withdraws any question the client asked while the session was starting.
 			await session.close();
+			// When a client refuses `fork` (e.g. parent session evicted), fall back to `start`.
+			if (
+				planner.forkFrom
+				&& this.#state === "attached"
+				&& error instanceof Error
+				&& error.message.startsWith("The machine refused the session:")
+			) {
+				planner.forkFrom = undefined;
+				planner.forkedNatively = false;
+				let fallback = new RemoteSession(sessionId, planner, this.#port);
+				this.#sessions.set(sessionId, fallback);
+				try {
+					return await fallback.start();
+				} catch (retryError) {
+					await fallback.close();
+					throw retryError;
+				}
+			}
 			throw error;
 		}
 	}
@@ -1761,6 +1934,26 @@ export class AgentLink {
 				if (this.#late.size > MAX_LATE_CONTROLS) this.#late.delete(this.#late.keys().next().value!);
 			}
 			throw error;
+		} finally {
+			this.#controls.delete(request);
+		}
+	}
+
+	/** A person's message for a running turn, answered by the client's `control-result`. */
+	async #steer(session: string, turn: string, prompt: string): Promise<void> {
+		let request = crypto.randomUUID();
+		let pending = Promise.withResolvers<void>();
+		this.#controls.set(request, pending);
+		if (!this.#send({ type: "steer", request, session, turn, prompt })) {
+			this.#controls.delete(request);
+			throw new Error("The agent connection is closed.");
+		}
+		try {
+			await within(
+				pending.promise,
+				this.#port.timeoutMs,
+				"The machine did not answer a message sent to its turn.",
+			);
 		} finally {
 			this.#controls.delete(request);
 		}

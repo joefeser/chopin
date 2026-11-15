@@ -37,6 +37,7 @@ export type { Issue, Options as ValidateOptions, Result as ValidateResult } from
 
 export {
 	$createPlanNodes,
+	$exportBlocks,
 	$exportPlan,
 	$exportPlanTree,
 	$importPlan,
@@ -79,11 +80,14 @@ export {
 	$isFootnoteReferenceNode,
 	$isImageNode,
 	$isMathNode,
+	CODE_WRAP,
 	CodeBlockNode,
+	codeWraps,
 	FootnoteDefinitionNode,
 	FootnoteReferenceNode,
 	ImageNode,
 	MathNode,
+	withCodeWrap,
 } from "./nodes/content";
 export { $createExperimentNode, $isExperimentNode, ExperimentNode } from "./nodes/experiment";
 export {

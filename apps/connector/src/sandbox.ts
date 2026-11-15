@@ -509,8 +509,16 @@ export function launchPolicy(
 		...repository ? [repository.commonDir] : [],
 		...checkout ? [checkout] : [],
 	];
+	// What the owner hides is in no grant, read or write, whatever holds it: the grants that hold
+	// one are listed around it, as for the state directory, and it is denied as well.
+	let concealed = (options.settings?.hidden ?? []).map(real);
+	let around = (paths: readonly string[]) =>
+		concealed.reduce(
+			(grants, path) => readGrantsAround(grants, path, disk, platform),
+			readGrantsAround(paths, hidden, disk, platform),
+		);
 	// What the owner adds is written around the state directory as well, never in it.
-	let added = readGrantsAround(options.settings?.writable ?? [], hidden, disk, platform).filter(
+	let added = around(options.settings?.writable ?? []).filter(
 		path => !theirs.some(kept => inside(real(path), kept, platform)),
 	);
 	let reopened = theirs.filter(kept =>
@@ -547,14 +555,14 @@ export function launchPolicy(
 	// MXC takes a path granted both ways as read-only, so a grant that is also writable is dropped.
 	let written = new Set(writable.map(real));
 	let readable = [
-		...readGrantsAround(roots, hidden, disk, platform),
+		...around(roots),
 		...(launch.own ?? []).filter(exists),
 		...person ? named(person) : [],
 		// The repository's git directory is read, whole, where only some roots are read (Windows).
 		...repository ? named(repository.commonDir) : [],
 	].filter(path => !written.has(real(path)));
 	let readonlyInside = [...git?.readonlyInside ?? [], ...reopened];
-	let denied = secretPaths(platform, home).filter(path => exists(path));
+	let denied = [...secretPaths(platform, home), ...concealed].filter(path => exists(path));
 	let env: Record<string, string | undefined> = { ...launch.env };
 	let pathKey = Object.keys(env).find(key => key.toUpperCase() === "PATH") ?? "PATH";
 	env[pathKey] = sandboxPath(env[pathKey], platform, real);
@@ -571,6 +579,54 @@ export function launchPolicy(
 		readonlyInside,
 		denied,
 		proxy,
+	};
+}
+
+/** The variable the launcher finds the launch's environment file by. */
+const ENVIRONMENT_FILE = "CHOPIN_LAUNCH_ENVIRONMENT";
+/** What a shell can export: other names stay on the command line, and none of ours is one. */
+const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** The proxy MXC points a launch at, which a variable of the person's must not replace. */
+const PROXY = /^(https?|ftp|all)_proxy$/i;
+
+/**
+ * The shell that starts every sandboxed launch on Linux and macOS: it exports the environment
+ * written to the file `CHOPIN_LAUNCH_ENVIRONMENT` names, deletes the file, then becomes the
+ * launch's own command. The file is in the launch's private temporary directory (mode 0600).
+ */
+export const LAUNCHER = `f=$${ENVIRONMENT_FILE}; unset ${ENVIRONMENT_FILE}; `
+	+ `set -a; . "$f" || exit 127; set +a; rm -f "$f"; exec "$@"`;
+
+/** A value as a POSIX shell reads it, quoted whole. */
+function shellQuote(value: string) {
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
+ * `policy` with its environment handed over in a file instead of on a command line. MXC starts a
+ * process with each variable on the sandbox tool's command line (`bwrap --setenv NAME VALUE`),
+ * which every process on the machine can read in `/proc/<pid>/cmdline` or `ps`; a launch's
+ * environment holds its credentials, a Planner's and a GitHub token among them, and the person's
+ * `--env` values. So on Linux and macOS the command line carries only the file's path, and
+ * `LAUNCHER` exports what is in the file before the command starts: the launch has every variable
+ * as before, readable by the person's own processes alone. The proxy MXC adds still wins. On
+ * Windows the policy is as it was: ProcessContainer passes the environment as an environment.
+ */
+export function sealedEnvironment(policy: Policy, folder: string): Policy {
+	if (policy.platform === "win32") return policy;
+	let file = join(folder, ".chopin-launch-environment");
+	let lines: string[] = [];
+	let shown: Record<string, string | undefined> = {};
+	for (let [name, value] of Object.entries(policy.env)) {
+		if (value === undefined || PROXY.test(name)) continue;
+		if (SHELL_NAME.test(name)) lines.push(`${name}=${shellQuote(value)}`);
+		else shown[name] = value;
+	}
+	writeFileSync(file, lines.join("\n") + "\n", { mode: 0o600 });
+	return {
+		...policy,
+		command: ["/bin/sh", "-c", LAUNCHER, "chopin-launch", ...policy.command],
+		env: { ...shown, PATH: policy.env.PATH, [ENVIRONMENT_FILE]: file },
 	};
 }
 
@@ -594,7 +650,9 @@ function spawnConfined(
 		if (removed.length) options.planted?.(removed);
 	};
 	cleared();
-	let request = mxcRequest(launchPolicy(engine, host, launch, options, proxy.url, temporary));
+	let request = mxcRequest(
+		sealedEnvironment(launchPolicy(engine, host, launch, options, proxy.url, temporary), temporary),
+	);
 	writeFileSync(file, JSON.stringify(request), { mode: 0o600 });
 	let child = spawn(executor, ["--config", file], {
 		stdio: [launch.stdin, "pipe", "pipe"],

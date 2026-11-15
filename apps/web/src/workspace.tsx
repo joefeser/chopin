@@ -1,9 +1,12 @@
 /** Three panes on one ground, with the document as the only raised surface. */
 
 import {
+	createContext,
+	useCallback,
 	useEffect,
 	useId,
 	useLayoutEffect,
+	useMemo,
 	useReducer,
 	useRef,
 	useState,
@@ -12,8 +15,9 @@ import {
 import { flushSync } from "react-dom";
 import { ContentSwapLayer } from "@chopin/editor/content-swap";
 import { useTransitionPresence } from "@chopin/editor/transition-presence";
-import { ArrowLeftIcon, ChevronIcon, ExpandIcon, MessageIcon } from "@chopin/icons";
+import { ArrowLeftIcon, ChevronIcon, DocumentIcon, ExpandIcon, MessageIcon } from "@chopin/icons";
 import { usePhone } from "@chopin/editor/pointer";
+import { PLANNER_NAME } from "@chopin/editor/people";
 
 import {
 	CHAT_CHOICE_STORAGE_KEY,
@@ -29,6 +33,14 @@ import {
 import { clampPane, ResizeHandle, usePaneWidth } from "./resizable-pane";
 import { createWorkspaceSpace, workspaceSizing } from "./workspace-sizing";
 import "./workspace-sizing.css";
+import {
+	CHAT_MIN_WITH_THREAD,
+	THREAD_MAX,
+	THREAD_MIN,
+	THREAD_PANE_STORAGE_KEY,
+	threadSplitSizing,
+} from "./chat/threads/split-layout";
+import "./chat/threads/split-layout.css";
 import { motionContract } from "./motion-contract";
 import { motionImmediately } from "./motion-input";
 import { sidebarMoving, usePaneMotion, usePaneSettledWidth } from "./pane-motion";
@@ -53,6 +65,20 @@ import type {
 } from "./workspace-model";
 
 export type Pane = "chat";
+
+export type WorkspaceThreadBridge = {
+	mode: WorkspaceMode;
+	phone: boolean;
+	threadWidth: number;
+	maximumThread: number;
+	onCommitThreadWidth: (width: number) => void;
+	onResizeThreadWidth: (delta: number) => void;
+	onShowThreadWidth: (width: number | undefined) => void;
+	setThreadOpen: (open: boolean) => void;
+	registerCloseThread: (close: (() => void) | undefined) => void;
+};
+
+export const WorkspaceThreadContext = createContext<WorkspaceThreadBridge | undefined>(undefined);
 
 const CHAT_PANE = {
 	initial: 500,
@@ -90,22 +116,33 @@ export function useWorkspaceLayout() {
 	useLayoutEffect(() => {
 		let element = frame.current;
 		if (!element) return;
+		// A change seen while the sidebar moves is measured once a transition ends. Only then: every
+		// transition on the page ends here, a Chat row's fade on each row a pointer crosses, and each
+		// measure asks for the page's layout.
+		let deferred = true;
 		let measure = () => {
-			if (sidebarMoving()) return;
+			if (sidebarMoving()) {
+				deferred = true;
+				return;
+			}
+			deferred = false;
 			let width = element.clientWidth;
 			space.set(width);
 			setNarrow(workspaceSizing(width, 500).mode === "compact");
 			measured();
 		};
+		let settled = () => {
+			if (deferred) measure();
+		};
 		measure();
 		let observer = new ResizeObserver(measure);
 		observer.observe(element);
-		document.addEventListener("transitionend", measure);
-		document.addEventListener("transitioncancel", measure);
+		document.addEventListener("transitionend", settled);
+		document.addEventListener("transitioncancel", settled);
 		return () => {
 			observer.disconnect();
-			document.removeEventListener("transitionend", measure);
-			document.removeEventListener("transitioncancel", measure);
+			document.removeEventListener("transitionend", settled);
+			document.removeEventListener("transitioncancel", settled);
 		};
 	}, [space]);
 	// A phone keeps one destination at a time even when landscape gives it a wide window.
@@ -212,7 +249,7 @@ export function SurfaceToggle(
 	},
 ) {
 	let status = activity.busy
-		? "Chopin working"
+		? `${PLANNER_NAME} working`
 		: activity.unread > 0
 		? `${activity.unread} unread`
 		: undefined;
@@ -305,23 +342,120 @@ export function Workspace(
 		...CHAT_PANE,
 		storageKey: profile.persistPaneSize ? CHAT_PANE.storageKey : undefined,
 	});
+	let [threadOpen, setThreadOpen] = useState(false);
+	let closeThreadRef = useRef<(() => void) | undefined>(undefined);
+	let registerCloseThread = useCallback((fn: (() => void) | undefined) => {
+		closeThreadRef.current = fn;
+	}, []);
+	let [preferredThread, setPreferredThreadState] = useState<number | undefined>(() => {
+		if (!profile.persistPaneSize) return undefined;
+		try {
+			let raw = localStorage.getItem(THREAD_PANE_STORAGE_KEY);
+			if (raw === null) return undefined;
+			let parsed = Number(raw);
+			return Number.isFinite(parsed) ? clampPane(parsed, THREAD_MIN, THREAD_MAX) : undefined;
+		} catch {
+			return undefined;
+		}
+	});
+	let commitPreferredThread = useCallback(
+		(width: number) => {
+			let clamped = clampPane(width, THREAD_MIN, THREAD_MAX);
+			flushSync(() => setPreferredThreadState(clamped));
+			if (profile.persistPaneSize) {
+				try {
+					localStorage.setItem(THREAD_PANE_STORAGE_KEY, String(clamped));
+				} catch {
+					// Storage disabled.
+				}
+			}
+		},
+		[profile.persistPaneSize],
+	);
 	let shared = useWorkspaceSpace(space, available);
-	let { chat: chatWidth, maximum } = workspaceSizing(shared, preferredWidth);
+	let presentation = presentWorkspace(state, mode, view);
+	let splitActive = mode === "split" && threadOpen && presentation.chatVisible;
+	let split = threadSplitSizing({
+		available: shared,
+		preferredChat: preferredWidth,
+		preferredThread,
+		threadOpen: splitActive,
+	});
+	let chatWidth = split.combined;
+	let maximum = split.maximumCombined;
+	let minCombined = splitActive ? CHAT_MIN_WITH_THREAD + THREAD_MIN : CHAT_PANE.min;
 	let resizeChat = (delta: number) => {
-		let next = clampPane(chatWidth + delta, CHAT_PANE.min, maximum);
-		resizePreferred(next - preferredWidth);
+		let next = clampPane(chatWidth + delta, minCombined, maximum);
+		if (splitActive) {
+			setPreferred(Math.max(CHAT_MIN_WITH_THREAD, next - split.thread));
+		} else {
+			resizePreferred(next - preferredWidth);
+		}
 	};
 	let root = useRef<HTMLDivElement>(null);
 	let chatPanel = useRef<HTMLElement>(null);
 	let chatBody = useRef<HTMLDivElement>(null);
-	// Split Chat's width is `--chat-width` on the pane (`.is-open`) and on its body, in theme.css.
+	// Split Chat's width is `--chat-width` on the pane (`.is-open`) and on its body, in theme.css. It is
+	// set on those two and inherited by nothing (split-layout.css): on the workspace's root, each change
+	// of it (a thread opening or closing, a drag ending, Chat shown again) restyled the whole page.
+	let chatWidthStyle = { "--chat-width": `${chatWidth}px` } as CSSProperties;
 	let showChatWidth = (width: number | undefined) => {
 		for (let element of [chatPanel.current, chatBody.current]) {
 			if (width === undefined) element?.style.removeProperty("width");
 			else element?.style.setProperty("width", `${width}px`);
 		}
 	};
-	let presentation = presentWorkspace(state, mode, view);
+	let onShowThreadWidth = useCallback(
+		(width: number | undefined) => {
+			let threadEl = chatBody.current?.querySelector<HTMLElement>(".chat-split-thread");
+			if (width === undefined) {
+				threadEl?.style.removeProperty("width");
+				showChatWidth(undefined);
+				return;
+			}
+			threadEl?.style.setProperty("width", `${width}px`);
+			if (!split.documentCollapsed) {
+				let previewCombined = clampPane(
+					Math.max(CHAT_MIN_WITH_THREAD, preferredWidth) + width,
+					CHAT_MIN_WITH_THREAD + THREAD_MIN,
+					split.maximumCombined,
+				);
+				showChatWidth(previewCombined);
+			}
+		},
+		[preferredWidth, split.documentCollapsed, split.maximumCombined],
+	);
+	let onResizeThreadWidth = useCallback(
+		(delta: number) => {
+			commitPreferredThread(
+				clampPane(split.thread + delta, THREAD_MIN, split.maximumThread),
+			);
+		},
+		[commitPreferredThread, split.maximumThread, split.thread],
+	);
+	let threadBridge = useMemo<WorkspaceThreadBridge>(
+		() => ({
+			mode,
+			phone,
+			threadWidth: split.thread,
+			maximumThread: split.maximumThread,
+			onCommitThreadWidth: commitPreferredThread,
+			onResizeThreadWidth,
+			onShowThreadWidth,
+			setThreadOpen,
+			registerCloseThread,
+		}),
+		[
+			mode,
+			phone,
+			split.thread,
+			split.maximumThread,
+			commitPreferredThread,
+			onResizeThreadWidth,
+			onShowThreadWidth,
+			registerCloseThread,
+		],
+	);
 	let nested = workspacePresentation.type === "parent-with-child"
 		? workspacePresentation
 		: undefined;
@@ -459,7 +593,9 @@ export function Workspace(
 	return (
 		<div
 			className="workspace-root flex h-full flex-col overflow-hidden bg-ground"
+			data-document-collapsed={split.documentCollapsed || undefined}
 			data-document-expanded={presentation.documentExpanded || undefined}
+			data-thread-open={splitActive || undefined}
 			data-workspace-bar={topBar.hidden ? "hidden" : undefined}
 			data-workspace-mode={mode}
 			data-workspace-phone={phone || undefined}
@@ -468,7 +604,6 @@ export function Workspace(
 			data-workspace-title={topBar.titleHidden ? "hidden" : undefined}
 			data-workspace-travel={travel.back ? "back" : undefined}
 			ref={root}
-			style={mode === "split" ? { "--chat-width": `${chatWidth}px` } as CSSProperties : undefined}
 		>
 			{/* Split has no ground header: the title lives on the sheet, so expanding never hides it. */}
 			{phone
@@ -494,6 +629,26 @@ export function Workspace(
 				/>
 			)}
 
+			{mode === "split" && split.documentCollapsed && (
+				<div className="workspace-collapsed-document-bar shrink-0" data-collapsed-document-bar="">
+					<div className="workspace-collapsed-document-title">
+						{title}
+					</div>
+					{presence}
+					<button
+						aria-label="Show document"
+						className="btn btn-sm btn-secondary shrink-0"
+						data-collapsed-document-open=""
+						onClick={() =>
+							closeThreadRef.current?.()}
+						type="button"
+					>
+						<DocumentIcon aria-hidden="true" size={14} />
+						<span>Document</span>
+					</button>
+				</div>
+			)}
+
 			{pageNoticePlace(mode) === "above-panes" && notice}
 			<div
 				ref={frame}
@@ -508,7 +663,7 @@ export function Workspace(
 				<div
 					className="workspace-document-stack relative flex min-w-0 flex-1"
 					data-child-motion={nested ? (lift ? "lift" : "zoom") : undefined}
-					hidden={documentPresence.phase === "closed"}
+					hidden={documentPresence.phase === "closed" || split.documentCollapsed}
 				>
 					<main
 						aria-hidden={!presentation.documentVisible || undefined}
@@ -649,6 +804,7 @@ export function Workspace(
 									className="workspace-document-layer min-h-0"
 									immediately={immediately}
 									motion={contentSwapMotion}
+									retain
 								>
 									<section
 										aria-labelledby={ids.heading.plan}
@@ -666,6 +822,7 @@ export function Workspace(
 									className="workspace-document-layer min-h-0"
 									immediately={immediately}
 									motion={contentSwapMotion}
+									retain
 								>
 									<section
 										aria-labelledby={ids.heading.decisions}
@@ -681,6 +838,7 @@ export function Workspace(
 										className="workspace-document-layer min-h-0"
 										immediately={immediately}
 										motion={contentSwapMotion}
+										retain
 									>
 										<section
 											aria-labelledby={ids.heading.build}
@@ -703,7 +861,14 @@ export function Workspace(
 						</div>
 					)}
 				</div>
-				{/* `hidden` preserves pane state and subscriptions after its closing transition. */}
+				{
+					/*
+					`hidden` preserves pane state and subscriptions after its closing transition. Split Chat
+					instead stays in the page, skipped (`data-chat-closed`, workspace-sizing.css), and is never
+					inert: taking it out and making it inert restyled all of it each time the document was
+					expanded or collapsed. Skipped, nothing in it is drawn, focused or exposed.
+				*/
+				}
 				{chat && (
 					<aside
 						aria-hidden={chatInactive || undefined}
@@ -713,10 +878,11 @@ export function Workspace(
 						} ${chatPresence.className} relative flex min-w-0 flex-col overflow-hidden ${
 							mode === "split" ? "" : "bg-chat-pane"
 						}`}
+						data-chat-closed={(mode === "split" && chatPresence.phase === "closed") || undefined}
 						data-pane-moving={chatTrack.moving || undefined}
-						hidden={chatPresence.phase === "closed"}
+						hidden={mode !== "split" && chatPresence.phase === "closed"}
 						id={ids.pane.chat}
-						inert={chatInactive}
+						inert={mode !== "split" && chatInactive}
 						onKeyDown={event => {
 							if (event.key === "Escape" && mode !== "split") {
 								event.preventDefault();
@@ -726,19 +892,30 @@ export function Workspace(
 						}}
 						onTransitionEnd={chatTrack.onTransitionEnd}
 						ref={chatPanel}
-						style={mode === "split" ? undefined : { width: "100%" }}
+						style={mode === "split" ? chatWidthStyle : { width: "100%" }}
 					>
 						<h2 className="sr-only" id={ids.heading.chat} tabIndex={-1}>
 							Chat
 						</h2>
-						<div className="workspace-chat-body relative min-h-0 flex-1" ref={chatBody}>
-							{presentation.separatorVisible && (
+						<div
+							className="workspace-chat-body relative min-h-0 flex-1"
+							ref={chatBody}
+							style={mode === "split" ? chatWidthStyle : undefined}
+						>
+							{presentation.separatorVisible && !split.documentCollapsed && (
 								<ResizeHandle
 									label="Resize chat"
 									max={maximum}
-									min={CHAT_PANE.min}
+									min={minCombined}
 									// The width is in state before the pane stops carrying it itself, so the two never differ.
-									onCommit={width => flushSync(() => setPreferred(width))}
+									onCommit={width =>
+										flushSync(() => {
+											if (splitActive) {
+												setPreferred(Math.max(CHAT_MIN_WITH_THREAD, width - split.thread));
+											} else {
+												setPreferred(width);
+											}
+										})}
 									onRelease={() => showChatWidth(undefined)}
 									onResize={resizeChat}
 									// A drag sets the widths the variable gives, on the two elements that take it, and
@@ -749,7 +926,9 @@ export function Workspace(
 									width={chatWidth}
 								/>
 							)}
-							{chat}
+							<WorkspaceThreadContext.Provider value={threadBridge}>
+								{chat}
+							</WorkspaceThreadContext.Provider>
 						</div>
 					</aside>
 				)}

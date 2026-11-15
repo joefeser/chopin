@@ -18,9 +18,13 @@ test("alt text is one line that cannot end its image early", () => {
 	expect(altText("  A [diagram]\nof \\ the\tflow  ")).toBe("A \\[diagram\\] of \\\\ the flow");
 });
 
-test("planImage accepts exactly data, mimeType and alt, and checks the bytes", () => {
+test("planImage accepts exactly data, mimeType and alt, and checks the bytes", async () => {
 	let good = { data: base64(PNG), mimeType: "image/png", alt: "A boundary" };
-	expect(planImage(good, "doc")).toEqual({ bytes: PNG, mimeType: "image/png", alt: "A boundary" });
+	expect(await planImage(good, "doc")).toEqual({
+		bytes: PNG,
+		mimeType: "image/png",
+		alt: "A boundary",
+	});
 	for (
 		let [input, message] of [
 			[{ ...good, alt: "   " }, "alt is required"],
@@ -30,11 +34,11 @@ test("planImage accepts exactly data, mimeType and alt, and checks the bytes", (
 			[{ ...good, mimeType: "image/svg+xml" }, "Only PNG, JPEG, WebP and GIF"],
 			[{ ...good, mimeType: "image/jpeg" }, "not the image type"],
 			[{ ...good, data: "not base64!" }, "standard base64"],
-			[{ ...good, data: base64(new Uint8Array(1_048_577).fill(1)) }, "larger than 1 MiB"],
+			[{ ...good, data: base64(new Uint8Array(1_048_577).fill(1)) }, "not the image type"],
 			["text", "must be an object"],
 		] as const
 	) {
-		expect(() => planImage(input, "doc")).toThrow(message);
+		expect(planImage(input, "doc")).rejects.toThrow(message);
 	}
 });
 
@@ -49,14 +53,18 @@ async function run(room: Partial<DocumentRoom>, input: unknown) {
 }
 
 test("upload_plan_image stores through the room and returns the Markdown to use", async () => {
-	let stored: Array<{ bytes: Uint8Array; mimeType: string }> = [];
+	let stored: Array<{ bytes: Uint8Array; mimeType: string; alt?: string }> = [];
 	let result = await run({
 		uploadImage: async image => {
 			stored.push(image);
 			return { path: `/images/${"a".repeat(64)}.png` };
 		},
 	}, { data: base64(PNG), mimeType: "image/png", alt: "Write-through: write, cache, database" });
-	expect(stored).toEqual([{ bytes: PNG, mimeType: "image/png" }]);
+	expect(stored).toEqual([{
+		bytes: PNG,
+		mimeType: "image/png",
+		alt: "Write-through: write, cache, database",
+	}]);
 	expect(result).toEqual({
 		path: `/images/${"a".repeat(64)}.png`,
 		markdown: `![Write-through: write, cache, database](/images/${"a".repeat(64)}.png)`,

@@ -10,3 +10,117 @@
 .workspace-root[data-workspace-mode="split"] .workspace-chat-panel {
 	flex-shrink: 0;
 }
+
+/* Split Chat, closed, stays in the page with no width, skipped: see `data-chat-closed` in workspace.tsx. */
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel[data-chat-closed] {
+	content-visibility: hidden;
+}
+
+/*
+ * Leaving, split Chat takes no pointer through a cover over it rather than `pointer-events: none`,
+ * an inherited property whose change restyled every element of the Chat as the document expanded.
+ */
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel.is-closing {
+	pointer-events: auto;
+}
+
+.workspace-root[data-workspace-mode="split"] .workspace-chat-panel.is-closing::after {
+	content: "";
+	position: absolute;
+	inset: 0;
+	z-index: 100;
+}
+
+/*
+ * The document's views keep a closed view in the page (`ContentSwapLayer`'s `retain`): skipped, so
+ * nothing in it is drawn, focused, found or exposed, and taking no pointer, as a leaving view takes
+ * none (`.is-closing`). It keeps its place in the stack, so the views paint in the order they always
+ * have; on a phone with reduced motion a closed view is a transparent box over the open one.
+ */
+.workspace-document-layer[data-content-swap-state="closed"] {
+	content-visibility: hidden;
+	pointer-events: none;
+}
+
+/*
+ * The direction a view slides when the workspace travels back, read only by the sliding views
+ * (`.motion-content-swap` in theme.css, `.motion-tab-slide` in phone-workspace.css) and set on them
+ * alone. Inherited from the workspace's root, as it was, each change of travel restyled every
+ * element in the workspace, and every element of a closed view when it was shown again.
+ */
+@property --swap-direction {
+	syntax: "<number>";
+	inherits: false;
+	initial-value: 1;
+}
+
+.workspace-root[data-workspace-travel="back"] :is(.motion-content-swap, .motion-tab-slide) {
+	--swap-direction: -1;
+}
+
+/*
+ * Split Chat lies on the ground from the sidebar's edge (or the window's) to the document's sheet,
+ * and a shown row is shaded across all of it, as Slack shades its message pane. The pane keeps its
+ * box and its track; its clip lets it draw into the frame's gutter before it (theme.css). Each
+ * transcript reaches into the gutter beside it and into the 8px before the sheet, and its rows keep
+ * their 20px gutter inside that, so the text stays where it was (overlay-scrollbar.css).
+ *
+ * The 8px before the sheet is where Resize chat is taken: rows are shaded across it, and the thumb
+ * stays clear of it, where it was. While a thread is open they are the thread's, and main Chat ends
+ * at the thread's divider. Only the transcript's box, its stack and its thumb's lane change when a
+ * thread opens, never the messages in them.
+ */
+.workspace-root[data-workspace-mode="split"] .chat-split-main .chat-scroll-host {
+	margin-inline: calc(-1 * (var(--spacing) * 3 + env(safe-area-inset-left)))
+		calc(var(--spacing) * -2);
+}
+
+.workspace-root[data-workspace-mode="split"] .chat-split-main [data-chat-stack] {
+	padding-inline: calc(var(--spacing) * 8 + env(safe-area-inset-left)) calc(var(--spacing) * 7);
+}
+
+.workspace-root[data-workspace-mode="split"] .chat-split-thread .chat-scroll-host {
+	margin-inline-end: calc(var(--spacing) * -2);
+}
+
+.workspace-root[data-workspace-mode="split"] .chat-split-thread [data-chat-stack] {
+	padding-inline-end: calc(var(--spacing) * 7);
+}
+
+.workspace-root[data-workspace-mode="split"] .chat-scroll-track {
+	inset-inline-end: calc(var(--spacing) * 2);
+}
+
+.workspace-root[data-workspace-mode="split"][data-thread-open] .chat-split-main .chat-scroll-host {
+	margin-inline-end: 0;
+}
+
+.workspace-root[data-workspace-mode="split"][data-thread-open] .chat-split-main [data-chat-stack] {
+	padding-inline-end: calc(var(--spacing) * 5);
+}
+
+.workspace-root[data-workspace-mode="split"][data-thread-open] .chat-split-main .chat-scroll-track {
+	inset-inline-end: 0;
+}
+
+/*
+ * With the document folded to its bar there is no sheet: the thread ends at its own panel's edge,
+ * where its header's rule ends, and so does its thumb.
+ */
+.workspace-root[data-workspace-mode="split"][data-document-collapsed]
+	.chat-split-thread
+	.chat-scroll-host {
+	margin-inline-end: 0;
+}
+
+.workspace-root[data-workspace-mode="split"][data-document-collapsed]
+	.chat-split-thread
+	[data-chat-stack] {
+	padding-inline-end: calc(var(--spacing) * 5);
+}
+
+.workspace-root[data-workspace-mode="split"][data-document-collapsed]
+	.chat-split-thread
+	.chat-scroll-track {
+	inset-inline-end: 0;
+}

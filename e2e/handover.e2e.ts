@@ -24,6 +24,7 @@ import {
 } from "../packages/protocol/connector";
 import { CONNECTOR_PROTOCOL } from "../apps/connector/src/version";
 import { finishTurn, resumeAfterRestart } from "../apps/server/src/testing/agent-link";
+import { sessionContextOf } from "../apps/server/src/chat/session-context";
 import {
 	BUDGET_MS,
 	GRACE_MS,
@@ -35,13 +36,7 @@ import {
 import { backgroundBrowser } from "./background-browser";
 import { reconnectGaps, reconnectProblems } from "./reconnect-gaps";
 import { chatInput, expectChatValue, fillChat } from "./chat-input";
-import {
-	createChannel,
-	readSource,
-	registerTestDatabase,
-	seedChannel,
-	seedLinkedChildChannel,
-} from "./database";
+import { createChannel, readSource, registerTestDatabase, seedChannel } from "./database";
 import { startHoldingProxy } from "./holding-proxy";
 import { expectPlannerAttached, machineButton, strip } from "./planner-status";
 import { RELEASE } from "./release";
@@ -294,9 +289,6 @@ async function watch(page: Page): Promise<void> {
 				}`;
 			let composer = document.querySelector(".chat-composer");
 			let field = composer?.querySelector("[aria-label='Message']");
-			// Who the message is for is the person's own state: the @Chopin chip comes on when they ask
-			// Chopin and stays, and the sparkle that puts it on is spent while it is. A deploy changes neither.
-			let asking = !!composer?.querySelector("[aria-label='Asking Chopin']");
 			return {
 				"Build plan": [
 					...document.querySelectorAll(".build-plan, .build-capsule, .build-status-link"),
@@ -309,14 +301,11 @@ async function watch(page: Page): Promise<void> {
 						[...composer.querySelectorAll("button")]
 							// Send follows what is typed, and Stop and Resume follow whether a turn is running.
 							.filter(button =>
-								!/^(Send message|Stop generating|Resume Chopin|Remove Chopin)$/.test(
+								!/^(Send message|Stop generating|Resume chopin)$/.test(
 									button.getAttribute("aria-label") ?? "",
 								)
 							)
-							.map(button => {
-								let said = state(button);
-								return asking && said === "Ask Chopin (not available)" ? "Ask Chopin" : said;
-							}).join(" | ")
+							.map(state).join(" | ")
 					}`
 					: "absent",
 				"document": document.querySelector(".plan-content")?.getAttribute("contenteditable")
@@ -325,8 +314,8 @@ async function watch(page: Page): Promise<void> {
 					[...document.querySelectorAll(".plan-comment-composer")].map(card =>
 						`${
 							(card.querySelector(".plan-comment-address-box") as HTMLInputElement | null)?.checked
-								? "sent to Chopin"
-								: "not sent to Chopin"
+								? "sent to chopin"
+								: "not sent to chopin"
 						}: ${(card.querySelector("textarea") as HTMLTextAreaElement | null)?.value ?? ""}`
 					).join(" | ") || "none",
 			};
@@ -422,7 +411,7 @@ async function watch(page: Page): Promise<void> {
 			let spoken = document.querySelector("[data-connection-status]")?.textContent?.trim();
 			if (spoken) {
 				say(
-					/^(You're offline|Reconnecting|Back online|Catching up|Back\.)/.test(spoken)
+					/^(You're offline|Connecting\u2026|Back online|Catching up|Back\.)/.test(spoken)
 						? `offline status ${spoken}`
 						: `machine said ${spoken}`,
 				);
@@ -431,6 +420,9 @@ async function watch(page: Page): Promise<void> {
 			if (document.querySelector("[data-chat-failed]")) say("a message says it could not be sent");
 			let notice = document.querySelector(".chat-composer .composer-notice")?.textContent?.trim();
 			if (notice) say(`composer strip ${notice}`);
+			// chopin's row to this person alone, for a message it could not take.
+			let note = document.querySelector("[data-quiet-note] .quiet-note-text")?.textContent?.trim();
+			if (note) say(`chopin note ${note}`);
 			if (document.querySelector("[data-agent-offline]")) say("build says the agent is offline");
 			let button = document.querySelector(".machine-button");
 			if (button && probe.machine) {
@@ -559,13 +551,23 @@ function chat(page: Page): Locator {
 	return page.getByRole("complementary", { name: "Chat", exact: true });
 }
 
-function message(page: Page, text: string): Locator {
-	return chat(page).locator("[data-chat-message-id]").filter({ hasText: text });
-}
-
 function replies(page: Page, text: string): Locator {
 	return chat(page).getByText(text, { exact: true });
 }
+
+/**
+ * What a person sent to Chopin, as the Chat shows it, led by its mention: not the Planner's own
+ * lines, which may repeat it, mentions and all.
+ */
+function message(page: Page, text: string): Locator {
+	return chat(page).locator("[data-chat-message-id]")
+		.filter({ has: page.locator("[data-chat-mention-lead]") })
+		.filter({ hasText: text });
+}
+
+/** What a message says once the server refused it, or the browser still holds it. */
+const failure = (page: Page, text: string) => message(page, text).locator("[data-chat-failed]");
+const sending = (page: Page) => chat(page).locator("[data-chat-delivery]");
 
 /**
  * Two servers over one database and a proxy in front of them, with a person's tab open on a
@@ -708,9 +710,11 @@ async function pair(page: Page, label: string): Promise<Machine> {
 async function backend(
 	token: string,
 	document: string,
-	options: { onTurn?: () => void; resumeAfter?: Promise<unknown> } = {},
+	options: { onTurn?: () => void; resumeAfter?: Promise<unknown>; steers?: boolean } = {},
 ) {
 	let prompts: Array<{ tag: string; prompt: string; at: number; child?: string }> = [];
+	/** What its running turns were given by a person, by the tag the message carries. */
+	let steered: Array<{ tag: string; prompt: string; turn: string }> = [];
 	let held = Promise.withResolvers<void>();
 	let resumes: Array<{ attempts: number; at: number }> = [];
 	let closes: Array<{ code: number; reconnectWithinMs?: number; at: number }> = [];
@@ -721,7 +725,9 @@ async function backend(
 	let outcomes: Array<{ status: string; value?: unknown; at: number }> = [];
 	let handlers: AgentHandlers = {
 		async turn(context: TurnContext) {
-			let prompt = context.message.prompt;
+			// What a fresh session is told of the room comes before the turn's own prompt; the turn
+			// answers its own prompt.
+			let { turn: prompt } = sessionContextOf(context.message.prompt);
 			// Chopin's own upkeep of the document runs through the same Planner; it is not a message.
 			if (prompt.startsWith("[Background job")) {
 				context.emit({ type: "stream-start", modelId: "scripted" });
@@ -739,6 +745,13 @@ async function backend(
 				if (context.signal.aborted) return context.end("aborted");
 			}
 			context.emit({ type: "stream-start", modelId: "scripted" });
+			// What the turn was given while it ran, read at its next step.
+			for (let given of steered.filter(given => given.turn === context.message.turn)) {
+				let id = `read-${given.tag}`;
+				context.emit({ type: "text-start", id });
+				context.emit({ type: "text-delta", id, delta: `Read ${given.tag}` });
+				context.emit({ type: "text-end", id });
+			}
 			// A message about an open child names it, and the turn reads the child through its tools.
 			let child = /child id (\S+?)\)/.exec(prompt)?.[1];
 			if (child) {
@@ -774,6 +787,29 @@ async function backend(
 			}
 			finishTurn(context);
 		},
+		// Without it the client offers no way to take a message while a turn runs.
+		...(options.steers
+			? {
+				steer(message) {
+					let tag = [...message.prompt.matchAll(/\[([a-z]\d+)\]/g)].at(-1)?.[1] ?? "?";
+					steered.push({ tag, prompt: message.prompt, turn: message.turn });
+				},
+			}
+			: {}),
+	};
+	/** Turns in flight, and when the machine last did anything: Chopin's own upkeep counts. */
+	let working = 0;
+	let lastActive = performance.now();
+	let turn = handlers.turn;
+	handlers.turn = async context => {
+		working++;
+		lastActive = performance.now();
+		try {
+			await turn(context);
+		} finally {
+			working--;
+			lastActive = performance.now();
+		}
 	};
 	let state = {
 		client: await connectAgent({ url: ORIGIN, token, document, handlers }),
@@ -798,6 +834,7 @@ async function backend(
 				});
 				state.client = resumed.client;
 				resumes.push({ attempts: resumed.attempts, at: performance.now() });
+				lastActive = performance.now();
 			} catch (error) {
 				// A link Chopin ended for good (the machine was disconnected) has nothing to resume.
 				if (!flags.ended) errors.push(String(error));
@@ -807,6 +844,12 @@ async function backend(
 	})();
 	return {
 		prompts,
+		steered,
+		/**
+		 * How long the machine has had nothing to do: no turn in flight, its own upkeep (a title for
+		 * the document, which runs once it is attached) included, since it last had, or resumed.
+		 */
+		idleFor: () => working > 0 ? 0 : performance.now() - lastActive,
 		resumes,
 		closes,
 		errors,
@@ -992,6 +1035,8 @@ async function arrange(
 		source?: string;
 		seed?: (room: string) => Promise<void>;
 		resumeAfter?: Promise<unknown>;
+		/** Whether its machine takes a message while a turn runs (it offers `steer-turn`). */
+		steers?: boolean;
 	} = {},
 ) {
 	let world = await overlap(page, options.source);
@@ -1005,16 +1050,15 @@ async function arrange(
 	await page.reload();
 	await ready(page);
 	let button = machineButton(page);
-	// While the machine is connected to, the one banner at the composer says so, in the Planner's
-	// layer; the button is named for the machine alone.
-	await expect(button).toHaveAccessibleName(`Runs on ${MACHINE}`);
-	await expect(strip(page)).toHaveAttribute("data-layer", "planner");
-	await expect(strip(page)).toContainText(`Connecting to ${MACHINE}`);
+	// While the machine is connected to, the button says so, in its name; Chat draws nothing.
+	await expect(button).toHaveAccessibleName(`Runs on ${MACHINE}. Connecting to ${MACHINE}`);
+	await expect(strip(page)).toHaveCount(0);
 	expect((await machine.poll([])).planners).toEqual([
 		{ id: room, url: expect.stringContaining(ORIGIN) },
 	]);
 	let planner = await backend(await machine.credential(room), room, {
 		resumeAfter: options.resumeAfter,
+		steers: options.steers,
 	});
 	closers.push(() => planner.detach());
 	await expect(button).toHaveAccessibleName(`Runs on ${MACHINE}`);
@@ -1030,19 +1074,6 @@ async function arrange(
 	page.on("load", () => loads.count++);
 	await startWatching(page, `Runs on ${MACHINE}`);
 	return { world, room, machine, planner, connection, button, loads };
-}
-
-/** How the saved Planner requests of the document ended, by the text they carried or the thread. */
-async function turns(database: string, room: string) {
-	let sql = new SQL(database);
-	try {
-		return await sql<{ kind: string; state: string; text: string }[]>`
-			SELECT kind, state, text FROM planner_deferred_turns WHERE document_id = ${room}
-			ORDER BY created_at, seq
-		`;
-	} finally {
-		await sql.close();
-	}
 }
 
 test("a deploy under an open tab with a connected machine shows nothing, reloads nothing and loses nothing", async ({ page }) => {
@@ -1134,385 +1165,283 @@ async function lostConnection(page: Page): Promise<void> {
 		.toBe(true);
 }
 
-test("what a person sends the Planner before, during and after a deploy, in the chat and in a comment, is answered once, in order, after it", async ({ browser, page }) => {
-	test.setTimeout(180_000);
-	let { world, room, planner, connection, loads } = await arrange(page);
-	// A teammate has the document open too, with no machine button of their own: whatever is said
-	// about the machine is said to them on the composer's edge.
-	let teammate = await browser.newContext();
-	closers.push(() => teammate.close());
-	let other = await teammate.newPage();
-	await watch(other);
-	await authenticate(other, "hubot", ORIGIN);
-	await other.goto(`${ORIGIN}${roomPath(room)}`);
-	await ready(other);
-	await expectPlannerAttached(other);
-	await startWatching(other);
+/** The tags of the messages people sent to Chopin, in the order the Chat shows them. */
+async function sentTags(page: Page): Promise<string[]> {
+	let texts = await chat(page).locator("[data-chat-message-id]")
+		.filter({ has: page.locator("[data-chat-mention-lead]") }).allTextContents();
+	return texts.map(text => /\[([a-z]\d+)\]/.exec(text)?.[1] ?? "?");
+}
+
+const tagsOf = (prompts: Array<{ tag: string }>) => prompts.map(prompt => prompt.tag);
+
+/**
+ * Until the machine has had nothing to do for a while. Chopin's own upkeep of the document (a
+ * title for it) runs on the machine once it is attached, and a message sent while that runs is
+ * refused, as one sent to a turn that cannot take it, so a test that means to start a turn waits.
+ */
+async function quiet(planner: { idleFor(): number }): Promise<void> {
+	await until("the machine to have nothing to do", () => planner.idleFor() > 2_000, 30_000);
+}
+
+/** The states of the Planner requests an earlier release saved for the document, in the order it saved them. */
+async function rowStates(database: string, room: string): Promise<string[]> {
+	let sql = new SQL(database);
+	try {
+		let rows = await sql<{ state: string }[]>`
+			SELECT state FROM planner_deferred_turns WHERE document_id = ${room} ORDER BY seq
+		`;
+		return rows.map(row => row.state);
+	} finally {
+		await sql.close();
+	}
+}
+
+/** A request an earlier release was holding for a machine when the deploy began, as it saved one. */
+async function holdRow(database: string, room: string, text: string): Promise<void> {
+	let sql = new SQL(database);
+	try {
+		await sql`
+			INSERT INTO planner_deferred_turns (
+				id, document_id, request_id, kind, handle, user_id, text, references_json, state,
+				created_at, fencing
+			) VALUES (
+				${crypto.randomUUID()}, ${room}, ${crypto.randomUUID()}, 'composer', ${HANDLE},
+				'earlier-release', ${text}, '[]'::jsonb, 'waiting', now(), 1
+			)
+		`;
+	} finally {
+		await sql.close();
+	}
+}
+
+/**
+ * What the page said of a deploy that was meant to be invisible: nothing, but for the one message
+ * it could not send, which says why above the composer and keeps the draft. The machine was shown
+ * attached throughout.
+ */
+async function expectOnlyRefusals(page: Page, loads: { count: number }, expectedBanner?: string) {
+	let seen = await probe(page);
+	expect(seen.violations, seen.timeline.join("\n")).toEqual(
+		expectedBanner ? [`chopin note ${expectedBanner}`] : [],
+	);
+	expect(seen.planner.filter(state => state !== "attached")).toEqual([]);
+	expect(seen.resets).toEqual([]);
+	expect(loads.count).toBe(0);
+}
+
+test("messages sent before, during and after the machine's hand-over window each end as started, given to the running turn or refused, and none is lost or left at Sending", async ({ browser, page }) => {
+	test.setTimeout(240_000);
+	let back = Promise.withResolvers<void>();
+	let { world, room, planner, loads } = await arrange(page, {
+		resumeAfter: back.promise,
+		steers: true,
+	});
 	let keys = keyboard();
-	let input = chatInput(page);
-	let marks = (text: string, mark: string) => message(page, text).getByRole("img", { name: mark });
 
-	// A turn is running, and a second message waits behind it, when the deploy starts.
-	await say(page, keys, "[m1] hold me, and answer when I say");
+	// Before the deploy: the first message starts a turn, and the second, sent while it runs, is
+	// given to it.
+	await say(page, keys, "[m1] hold me");
 	await until("the first turn to start", () => planner.prompts.length === 1);
-	await say(page, keys, "[m2] this one waits behind it");
-	await expect(marks("[m2]", "Sent")).toBeVisible();
+	await say(page, keys, "[m2] sent while the turn runs, before the deploy");
+	await until("the second message to reach the turn", () => planner.steered.length === 1);
 
-	let typed = typing(page, keys);
+	// During the old process's wait for that turn it is still serving, and still gives it a message.
 	let deploy = beginDeploy(world);
 	await deploy.told;
-	// During the turn wait, the old process is still serving and still taking requests: it keeps
-	// each as a saved row and starts none.
 	await say(page, keys, "[m3] sent while the old process waits for the turn");
-	await expect(marks("[m3]", "Sent")).toBeVisible();
-	await keys.run(async () => {
-		// Not `startCommentToChopin`: it waits for every animation to stop, and the one that shows
-		// Chopin working on a reply does not while a turn runs.
-		await content(page).locator("p", { hasText: "A second paragraph" }).first().selectText();
-		await page.getByRole("button", { name: "Comment on this passage", exact: true }).click();
-		let card = page.getByRole("dialog", { name: "New comment" });
-		await card.getByRole("checkbox", { name: "Send to Chopin" }).check();
-		await card.getByRole("textbox", { name: "Comment" }).fill("[c1] Can you shorten this?");
-		await card.getByRole("button", { name: "Post comment", exact: true }).click();
-		await expect(card).toHaveCount(0);
-	}, true);
-	expect(planner.prompts.map(prompt => prompt.tag)).toEqual(["m1"]);
-	// Its thread shows Chopin on it, though the turn waits for the machine to come back.
-	await keys.run(async () => {
-		await page.getByRole("button", { name: /^Comment on “.*”\. / }).click();
-		let thread = page.getByRole("dialog", { name: "Comment thread" });
-		await expect(thread.getByRole("status")).toHaveText("Chopin is working on it");
-		await page.keyboard.press("Escape");
-		await expect(thread).toHaveCount(0);
-	}, true);
-	let draft = "@chopin [m4] typed before the cut and sent after it";
-	await keys.run(() => fillChat(input, draft), true);
+	await until("the third message to reach the turn", () => planner.steered.length === 2);
 
-	// The turn ends: the old process lets go, and the page has lost its connection to it.
+	// The turn ends, the old process lets go, and the page has lost its connection to it. The
+	// person writes again: only this browser has it, and it says so.
 	planner.release();
 	await deploy.released;
 	await lostConnection(page);
-	await keys.run(() => input.press("Enter"), true);
-	let kept = "A draft, not sent, kept to the end";
-	await keys.run(() => fillChat(input, kept), true);
+	await say(page, keys, "[m4] sent while the page is between processes");
+	await expect(message(page, "[m4]")).toHaveCount(1);
 	let done = await deploy.finish();
-	await typed.stop();
 	expect(done.exit, world.a.log.text).toBe(0);
-	await expectGap(done, page, other);
+	await expectGap(done, page);
 
-	// Every message answered, once, and in the order it was accepted.
-	for (let tag of ["m1", "m2", "m3", "m4"]) {
-		await expect(replies(page, `Reply ${tag}`)).toHaveCount(1);
-		await expect(marks(`[${tag}]`, "Delivered")).toBeVisible();
-		await expect(marks(`[${tag}]`, "Sent")).toHaveCount(0);
+	// The new process has the lease and the machine is shown attached, but its client has not
+	// resumed, inside its window: the browser sent the message again, and it was refused saying
+	// still connecting, with the typed text kept in the draft and nothing kept on the server. chopin
+	// says so to this person alone, in its quiet row at the end of the transcript.
+	let banner = chat(page).locator("[data-quiet-note]");
+	let inWindowWords =
+		`Still connecting to @${HANDLE}'s machine, so this message wasn't sent. Send it again in a moment.`;
+	await expect(banner).toContainText(inWindowWords);
+	await expectChatValue(chatInput(page), "@chopin [m4] sent while the page is between processes");
+	await expect(message(page, "[m4]")).toHaveCount(0);
+	expect(planner.prompts.map(prompt => prompt.tag)).toEqual(["m1"]);
+	expect(planner.resumes).toEqual([]);
+
+	// The machine is back, inside the window, and a message sent now starts a turn.
+	back.resolve();
+	await until("the Planner to resume", () => planner.resumes.length > 0, WINDOW_MS);
+	await quiet(planner);
+	await say(page, keys, "[m5] sent once the machine is back");
+	await expect(replies(page, "Reply m5")).toHaveCount(1);
+	await expect(banner).toHaveCount(0);
+
+	// Each one's end, in the Chat and at the machine: started (m1, m5), given to the running turn,
+	// which read it (m2, m3), or refused with its draft kept (m4). None twice, none at Sending, none waiting.
+	await expect(replies(page, "Reply m1")).toHaveCount(1);
+	await expect(replies(page, "Read m2")).toHaveCount(1);
+	await expect(replies(page, "Read m3")).toHaveCount(1);
+	await expect(replies(page, "Reply m4")).toHaveCount(0);
+	await expect(message(page, "[m4]")).toHaveCount(0);
+	for (let tag of ["m1", "m2", "m3", "m5"]) {
+		await expect(message(page, `[${tag}]`)).toHaveCount(1);
+		await expect(failure(page, `[${tag}]`)).toHaveCount(0);
 	}
-	// The thread was Chopin's to answer all along, and now holds its reply, once.
-	await keys.run(async () => {
-		await page.getByRole("button", { name: /^Comment on “.*”\. / }).click();
-		let thread = page.getByRole("dialog", { name: "Comment thread" });
-		await expect(thread.getByText("Reply c1", { exact: true })).toHaveCount(1);
-		await expect(thread.getByText("Chopin is working on it")).toHaveCount(0);
-		await page.keyboard.press("Escape");
-		await expect(thread).toHaveCount(0);
-	}, true);
-	await expect.poll(() => planner.prompts.map(prompt => prompt.tag)).toEqual([
-		"m1",
-		"m2",
-		"m3",
-		"c1",
-		"m4",
-	]);
-	await Bun.sleep(500);
-	expect(planner.prompts).toHaveLength(5);
-	// Every request has a row, saved before it was acknowledged, the first included, and each ended:
-	// none is left waiting, started, interrupted or cancelled.
-	await expect.poll(async () =>
-		(await turns(world.database, room)).every(row => row.state === "ended")
-	)
-		.toBe(true);
-	let rows = await turns(world.database, room);
-	expect(rows.map(row => row.kind)).toEqual([
-		"composer",
-		"composer",
-		"composer",
-		"comment",
-		"composer",
-	]);
-	expect(
-		rows.filter(row => row.kind === "composer").map(row => /\[(m\d)\]/.exec(row.text)?.[1]),
-	).toEqual(["m1", "m2", "m3", "m4"]);
+	await expect(sending(page)).toHaveCount(0);
+	await expect(chat(page).locator('[data-chat-state="queued"]')).toHaveCount(0);
+	await Bun.sleep(1_000);
+	expect(tagsOf(planner.prompts)).toEqual(["m1", "m5"]);
+	expect(tagsOf(planner.steered)).toEqual(["m2", "m3"]);
+	expect(planner.errors).toEqual([]);
+	await expectOnlyRefusals(page, loads, inWindowWords);
 
-	// A tab opened afterwards reads the same history from the server: each reply once.
+	// The refused message was never kept: a tab opened afterwards has the other four, once, and
+	// the server holds no row for any of them.
 	let later = await browser.newContext();
 	closers.push(() => later.close());
 	let fresh = await later.newPage();
 	await authenticate(fresh, "hubot", ORIGIN);
 	await fresh.goto(`${ORIGIN}${roomPath(room)}`);
 	await ready(fresh);
-	for (let tag of ["m1", "m2", "m3", "m4"]) {
-		await expect(replies(fresh, `Reply ${tag}`)).toHaveCount(1);
-		await expect(message(fresh, `[${tag}]`)).toHaveCount(1);
-	}
-
-	// Nothing was shown, and nothing was lost, doubled or reloaded.
-	let seen = await probe(page);
-	expect(seen.restarting.length).toBeGreaterThan(0);
-	expect(seen.violations, seen.timeline.join("\n")).toEqual([]);
-	let teammates = await probe(other);
-	expect(teammates.violations, teammates.timeline.join("\n")).toEqual([]);
-	expect(teammates.planner.filter(state => state !== "attached")).toEqual([]);
-	expect(planner.errors).toEqual([]);
-	for (let tag of ["m1", "m2", "m3", "m4"]) {
-		await expect(replies(other, `Reply ${tag}`)).toHaveCount(1);
-	}
-	expect(seen.resets).toEqual([]);
-	expect(loads.count).toBe(0);
-	expect(connection.withdrawn).toEqual([]);
-	expect(await page.evaluate(() => (window as unknown as { tab?: string }).tab)).toBe("kept");
-	await expectChatValue(input, kept);
-	await expect.poll(() => readSource(PROXY_PORT, room), { timeout: 20_000 }).toContain(
-		`w${typed.words - 1}`,
-	);
-	let words = [...(await readSource(PROXY_PORT, room)).matchAll(/\bw(\d+)\b/g)].map(match =>
-		Number(match[1])
-	);
-	expect(words).toEqual(Array.from({ length: typed.words }, (_, index) => index));
+	await expect.poll(() => sentTags(fresh)).toEqual(["m1", "m2", "m3", "m5"]);
+	expect(await rowStates(world.database, room)).toEqual([]);
 });
 
-test("a message sent from an open child while a deploy waits for a turn keeps the child it was about, and is answered once after it", async ({ page }) => {
-	test.setTimeout(180_000);
-	let childId = crypto.randomUUID();
-	let title = "Hand-over child";
-	let { world, planner, loads } = await arrange(page, {
-		seed: async room => {
-			await seedLinkedChildChannel(
-				PROXY_PORT,
-				room,
-				childId,
-				title,
-				`# ${title}\n\nA finding to keep.\n`,
+for (let steers of [true, false]) {
+	test(`a turn running when the deploy begins is not cut off or run twice, and a message sent to it ${steers ? "reaches it" : "is refused with words, kept nowhere, and starts a turn when sent again"}`, async ({ page }) => {
+		test.setTimeout(180_000);
+		let { world, room, planner, loads } = await arrange(page, { steers });
+		let keys = keyboard();
+
+		await say(page, keys, "[m1] hold me");
+		await until("the first turn to start", () => planner.prompts.length === 1);
+		// The old process has heard SIGTERM and waits for the turn, still serving.
+		let deploy = beginDeploy(world);
+		await deploy.told;
+		await say(page, keys, "[m2] sent to the turn the old process waits for");
+		let busyWords =
+			"chopin can't take messages while it works on this machine. Stop it to ask now.";
+		let banner = chat(page).locator("[data-quiet-note]");
+		if (steers) {
+			await until("the message to reach the turn", () => planner.steered.length === 1);
+			await expect(message(page, "[m2]")).toHaveCount(1);
+			await expect(failure(page, "[m2]")).toHaveCount(0);
+		} else {
+			await expect(banner).toContainText(busyWords);
+			await expectChatValue(
+				chatInput(page),
+				"@chopin [m2] sent to the turn the old process waits for",
 			);
-		},
+			await expect(message(page, "[m2]")).toHaveCount(0);
+			expect(planner.steered).toEqual([]);
+		}
+		// Still running: the old process has not cut it off, and it has not begun again.
+		await Bun.sleep(1_000);
+		expect(planner.closes).toEqual([]);
+		expect(tagsOf(planner.prompts)).toEqual(["m1"]);
+
+		planner.release();
+		let done = await deploy.finish();
+		expect(done.exit, world.a.log.text).toBe(0);
+		await expectGap(done, page);
+		await until("the Planner to resume", () => planner.resumes.length > 0, WINDOW_MS);
+
+		// It ended cleanly: one reply, read what it was given, and no notice of being stopped.
+		await expect(replies(page, "Reply m1")).toHaveCount(1);
+		await expect(replies(page, "Read m2")).toHaveCount(steers ? 1 : 0);
+		await expect(chat(page).getByText(/stopped|cut off|interrupted|did not read/i)).toHaveCount(0);
+		await expect(message(page, "[m2]")).toHaveCount(steers ? 1 : 0);
+		await Bun.sleep(1_000);
+		expect(tagsOf(planner.prompts)).toEqual(["m1"]);
+		expect(tagsOf(planner.steered)).toEqual(steers ? ["m2"] : []);
+		expect(await rowStates(world.database, room)).toEqual([]);
+
+		if (!steers) {
+			// Nothing was kept on the server, and the typed text stayed in the draft through the
+			// deploy: pressing Enter sends it, and the new process answers it once.
+			await expectChatValue(
+				chatInput(page),
+				"@chopin [m2] sent to the turn the old process waits for",
+			);
+			await quiet(planner);
+			await keys.run(() => chatInput(page).press("Enter"), true);
+			await expect(replies(page, "Reply m2")).toHaveCount(1);
+			await expect(banner).toHaveCount(0);
+			await expectChatValue(chatInput(page), "");
+			expect(tagsOf(planner.prompts)).toEqual(["m1", "m2"]);
+		}
+		await expect(sending(page)).toHaveCount(0);
+		expect(planner.errors).toEqual([]);
+		await expectOnlyRefusals(page, loads, steers ? undefined : busyWords);
 	});
+}
+
+test("once the new release has the lease the transcript holds no waiting or ghost message, a request an earlier release left open is closed unread, and a new @Chopin message starts a turn", async ({ browser, page }) => {
+	test.setTimeout(180_000);
+	let { world, room, planner, loads } = await arrange(page, { steers: true });
 	let keys = keyboard();
-	let marks = (text: string, mark: string) => message(page, text).getByRole("img", { name: mark });
-	await page.reload();
-	await ready(page);
-	loads.count = 0;
-	await page.getByRole("link", { name: `#${title}`, exact: true }).click();
-	let surface = page.getByRole("region", { name: `Child document: ${title}` });
-	await expect(surface.locator(`[data-workspace-room="${childId}"]`)).toBeVisible();
-	await startWatching(page, `Runs on ${MACHINE}`);
 
 	await say(page, keys, "[m1] hold me");
 	await until("the first turn to start", () => planner.prompts.length === 1);
+	await say(page, keys, "[m2] given to the turn before the deploy");
+	await until("the second message to reach the turn", () => planner.steered.length === 1);
+	// What the release before this one was holding for a machine when the deploy began.
+	await holdRow(world.database, room, "@chopin [h1] held by the release before");
+	expect(await rowStates(world.database, room)).toEqual(["waiting"]);
+
 	let deploy = beginDeploy(world);
 	await deploy.told;
-	await say(page, keys, "[m2] about the open child");
-	await expect(marks("[m2]", "Sent")).toBeVisible();
 	planner.release();
-	let done = await deploy.finish();
-	expect(done.exit, world.a.log.text).toBe(0);
-	await expectGap(done, page);
-
-	await expect(replies(page, "Reply m1")).toHaveCount(1);
-	await expect(replies(page, "Reply m2")).toHaveCount(1);
-	await expect(marks("[m2]", "Delivered")).toBeVisible();
-	await expect.poll(() => planner.prompts.map(prompt => prompt.tag)).toEqual(["m1", "m2"]);
-	// The turn that waited a deploy out was told which child the person had open, as one that
-	// had not waited would be, and could read it in the new process.
-	let second = planner.prompts[1]!;
-	expect(second.prompt).toContain(`The member is viewing the child document "${title}"`);
-	expect(second.prompt).toContain(`child id ${childId}`);
-	expect(second.child ?? "").toContain("A finding to keep.");
-	expect(planner.errors).toEqual([]);
-
-	let seen = await probe(page);
-	expect(seen.violations, seen.timeline.join("\n")).toEqual([]);
-	expect(loads.count).toBe(0);
-	await expect(surface.locator(`[data-workspace-room="${childId}"]`)).toBeVisible();
-});
-
-/**
- * The lock every fenced write of the writer lease takes (`#assertLease` in the PostgreSQL
- * adapter): `hold` takes it, so that a process that has to write next stands where it is. Taken
- * when the old process's cut begins, it stops that process at the commit of its cut, after it has
- * stopped taking requests and while every socket is still open, as the cut stands for a few
- * milliseconds when nothing is held. It is connected first, so that `hold` is one round trip.
- */
-async function holdWrites(database: string) {
-	let sql = new SQL(database, { max: 1 });
-	await sql`SELECT 1`;
-	return {
-		async hold() {
-			await sql`SELECT pg_advisory_lock(2043237433, hashtext('chopin:writer'))`;
-		},
-		async release() {
-			try {
-				await sql`SELECT pg_advisory_unlock(2043237433, hashtext('chopin:writer'))`;
-			} finally {
-				await sql.close();
-			}
-			return performance.now();
-		},
-	};
-}
-
-test("messages sent without a pause while the old process is cutting, with its sockets still open, are never marked Couldn't send, and are each delivered once, in order, with one reply", async ({ page }) => {
-	test.setTimeout(180_000);
-	let { world, room, planner, loads } = await arrange(page);
-	let keys = keyboard();
-	let marks = (text: string, mark: string) => message(page, text).getByRole("img", { name: mark });
-
-	// A person who keeps sending, one message after another, while `phase.sending` is on.
-	let sent: Array<{ tag: string; at: number }> = [];
-	let phase = { sending: true, finished: false };
-	let streaming = (async () => {
-		for (let number = 1; !phase.finished && number <= 80;) {
-			if (!phase.sending) {
-				await page.waitForTimeout(10);
-				continue;
-			}
-			let tag = `s${number++}`;
-			await say(page, keys, `[${tag}] one after another`);
-			sent.push({ tag, at: performance.now() });
-			await page.waitForTimeout(20);
-		}
-	})();
-	await until("the first messages to be answered", () => planner.prompts.length >= 2, 30_000);
-	// Idle before the deploy: every message answered, so that no turn is left to wait for.
-	phase.sending = false;
-	await until(
-		"every message so far to be answered",
-		async () =>
-			planner.prompts.length === sent.length
-			&& (await turns(world.database, room)).every(row => row.state === "ended"),
-	);
-
-	let writes = await holdWrites(world.database);
-	// Let go of the lock however the test ends, so that a process stood at its cut can exit.
-	closers.push(async () => void await writes.release());
-	let deploy = beginDeploy(world);
-	let leaseReleased = false;
-	void deploy.released.then(() => {
-		leaseReleased = true;
-	}, () => {});
-	// Not before the cut begins. The old process first settles, still serving: it commits and
-	// checkpoints every document, and a commit's checkpoint is made 500 ms after it
-	// (`scheduleCheckpoint`), so a message answered less than that before SIGTERM leaves a write
-	// that stops on the lock, before the listener, and the process never stops listening. Readiness
-	// going off is the cut's first step, after every write before it and with the whole unready
-	// window still to run, so the next write the process makes is the cut's own.
-	await until(
-		"the old process to begin its cut",
-		async () => (await text(slotUrl("a", "/api/health/ready")))?.[1] === "draining",
-	);
-	await writes.hold();
-	// The old process stops taking requests, then stands at the commit of its cut. Its sockets are
-	// open, and the page keeps on pressing Enter.
-	await until("the old process to stop listening", async () => (await live("a")) === undefined);
-	let fromAt = performance.now();
-	phase.sending = true;
-	await Bun.sleep(1_500);
-	// The cut stood still all that time: a lock taken after the window would have let it by.
-	expect(leaseReleased, "the old process released the lease while its writes were held").toBe(
-		false,
-	);
-	let toAt = await writes.release();
-	let done = await deploy.finish();
-	await until(
-		"messages to have followed the release",
-		async () => sent.some(message => message.at > done.releasedAt + 500),
-		30_000,
-	);
-	phase.finished = true;
-	await streaming;
-	expect(done.exit, world.a.log.text).toBe(0);
-	await expectGap(done, page);
-	let atTheCut = sent.filter(message => message.at >= fromAt && message.at <= toAt);
-	console.log(
-		`${sent.length} messages; ${atTheCut.length} pressed while the cut stood still, `
-			+ `${sent.filter(message => message.at > done.releasedAt).length} after the release; `
-			+ world.a.log.text.split("\n").filter(line => /cut finished/.test(line)).join(""),
-	);
-	expect(atTheCut.length).toBeGreaterThanOrEqual(1);
-
-	// Each answered once and marked delivered, none marked as one that could not be sent.
-	for (let { tag } of sent) {
-		await expect(replies(page, `Reply ${tag}`)).toHaveCount(1);
-		await expect(marks(`[${tag}]`, "Delivered")).toBeVisible();
-		await expect(marks(`[${tag}]`, "Sent")).toHaveCount(0);
-		await expect(message(page, `[${tag}]`).locator("[data-chat-failed]")).toHaveCount(0);
-	}
-	// Given to the machine once each, in the order they were pressed.
-	await expect.poll(() =>
-		planner.prompts.map(prompt => prompt.tag).filter(tag => /^s\d+$/.test(tag))
-	).toEqual(sent.map(message => message.tag));
-	await Bun.sleep(500);
-	expect(planner.prompts.filter(prompt => /^s\d+$/.test(prompt.tag))).toHaveLength(sent.length);
-	await expect.poll(async () =>
-		(await turns(world.database, room)).every(row => row.state === "ended")
-	).toBe(true);
-	expect((await turns(world.database, room)).filter(row => row.kind === "composer")).toHaveLength(
-		sent.length,
-	);
-
-	let seen = await probe(page);
-	expect(seen.restarting.length).toBeGreaterThan(0);
-	expect(seen.violations, seen.timeline.join("\n")).toEqual([]);
-	expect(seen.resets).toEqual([]);
-	expect(loads.count).toBe(0);
-	expect(planner.errors).toEqual([]);
-});
-
-test("a message sent while the machine is away through a deploy shows Sent, never an error, and is Delivered once, with one reply, when its Planner is back", async ({ page }) => {
-	test.setTimeout(180_000);
-	let back = Promise.withResolvers<void>();
-	let { world, room, planner, loads } = await arrange(page, { resumeAfter: back.promise });
-	let keys = keyboard();
-	let input = chatInput(page);
-	let marks = (text: string, mark: string) => message(page, text).getByRole("img", { name: mark });
-
-	let deploy = beginDeploy(world);
 	await deploy.released;
-	await lostConnection(page);
-	// The page has lost its connection, the machine is not back, and the person writes to it.
-	await say(page, keys, "[m1] sent while the machine is away through the deploy");
-	await expectChatValue(input, "");
-	await expect(message(page, "[m1]")).toHaveCount(1);
 	let done = await deploy.finish();
 	expect(done.exit, world.a.log.text).toBe(0);
 	await expectGap(done, page);
+	await until("the Planner to resume", () => planner.resumes.length > 0, WINDOW_MS);
+	await expectPlannerAttached(page);
 
-	// The new process has it, saved: Sent, not Delivered, and nothing about the machine is said,
-	// while its Planner is expected back within its window.
-	await expect(marks("[m1]", "Sent")).toBeVisible();
-	await Bun.sleep(1_000);
-	await expect(marks("[m1]", "Sent")).toBeVisible();
-	await expect(marks("[m1]", "Delivered")).toHaveCount(0);
-	expect(planner.prompts).toEqual([]);
-	await expect(page.locator(".chat-composer .composer-notice")).toHaveCount(0);
-	expect((await turns(world.database, room)).map(row => row.state)).toEqual(["waiting"]);
-
-	back.resolve();
-	await expect(marks("[m1]", "Delivered")).toBeVisible();
-	await expect(replies(page, "Reply m1")).toHaveCount(1);
-	await expect(marks("[m1]", "Sent")).toHaveCount(0);
-	await Bun.sleep(500);
-	expect(planner.prompts.map(prompt => prompt.tag)).toEqual(["m1"]);
-	await expect.poll(async () => (await turns(world.database, room)).map(row => row.state)).toEqual([
-		"ended",
+	// The release that took the lease closed the row, without a turn: it is not waiting, and it
+	// never reached the machine.
+	await expect.poll(() => rowStates(world.database, room), { timeout: 20_000 }).toEqual([
+		"cancelled",
 	]);
-	let resumed = planner.resumes.at(-1)!;
-	console.log(
-		`the Planner was back ${Math.round(resumed.at - planner.closes[0]!.at)} ms after the close`,
-	);
+	expect(world.b.log.text).toContain("1 message(s) an earlier release held for a Planner");
 
-	let seen = await probe(page);
-	expect(seen.violations, seen.timeline.join("\n")).toEqual([]);
-	expect(seen.planner.filter(state => state !== "attached")).toEqual([]);
-	expect(loads.count).toBe(0);
+	// The transcript has what was said, once, and nothing waiting, sending or unsent, in the tab
+	// that lived through the deploy and in one opened after it, which are the same.
+	let later = await browser.newContext();
+	closers.push(() => later.close());
+	let fresh = await later.newPage();
+	await authenticate(fresh, "hubot", ORIGIN);
+	await fresh.goto(`${ORIGIN}${roomPath(room)}`);
+	await ready(fresh);
+	for (let view of [page, fresh]) {
+		await expect.poll(() => sentTags(view)).toEqual(["m1", "m2"]);
+		await expect(replies(view, "Reply m1")).toHaveCount(1);
+		await expect(replies(view, "Read m2")).toHaveCount(1);
+		await expect(chat(view).getByText("[h1]", { exact: false })).toHaveCount(0);
+		await expect(chat(view).locator("[data-chat-failed]")).toHaveCount(0);
+		await expect(chat(view).locator('[data-chat-state="queued"]')).toHaveCount(0);
+		await expect(sending(view)).toHaveCount(0);
+	}
+
+	// A new message to Chopin starts a turn of its own, once.
+	await quiet(planner);
+	await say(page, keys, "[m3] a new message after the hand-over");
+	await expect(replies(page, "Reply m3")).toHaveCount(1);
+	await expect(replies(fresh, "Reply m3")).toHaveCount(1);
+	await Bun.sleep(1_000);
+	expect(tagsOf(planner.prompts)).toEqual(["m1", "m3"]);
+	expect(tagsOf(planner.steered)).toEqual(["m2"]);
+	expect(planner.prompts.some(prompt => prompt.prompt.includes("[h1]"))).toBe(false);
 	expect(planner.errors).toEqual([]);
+	await expectOnlyRefusals(page, loads);
 });
 
 test("a Decision answered while the old process waits for the turn that asked it reaches that turn once, and starts no second one after the deploy", async ({ page }) => {
@@ -1586,7 +1515,7 @@ test("a comment being written across a deploy keeps its words and its offer to s
 		return page.getByRole("dialog", { name: "New comment" });
 	};
 	let card = await draft(1);
-	await expect(card.getByRole("checkbox", { name: "Send to Chopin" })).toBeChecked();
+	await expect(card.getByRole("checkbox", { name: "Send to chopin" })).toBeChecked();
 	await card.getByRole("textbox", { name: "Comment" }).fill("half a thought");
 	let loads = { count: 0 };
 	page.on("load", () => loads.count++);
@@ -1599,7 +1528,7 @@ test("a comment being written across a deploy keeps its words and its offer to s
 	await expectGap(done, page);
 
 	await expect(card.getByRole("textbox", { name: "Comment" })).toHaveValue("half a thought");
-	await expect(card.getByRole("checkbox", { name: "Send to Chopin" })).toBeChecked();
+	await expect(card.getByRole("checkbox", { name: "Send to chopin" })).toBeChecked();
 	let seen = await probe(page);
 	expect(seen.violations, seen.timeline.join("\n")).toEqual([]);
 	expect(seen.planner.filter(state => state !== "attached")).toEqual([]);
@@ -1607,7 +1536,7 @@ test("a comment being written across a deploy keeps its words and its offer to s
 	// The offer itself: a comment started after the deploy is addressed to Chopin by default.
 	await card.getByRole("textbox", { name: "Comment" }).press("Escape");
 	await expect(card).toHaveCount(0);
-	await expect((await draft(2)).getByRole("checkbox", { name: "Send to Chopin" })).toBeChecked();
+	await expect((await draft(2)).getByRole("checkbox", { name: "Send to chopin" })).toBeChecked();
 	expect(loads.count).toBe(0);
 	expect(planner.errors).toEqual([]);
 });
@@ -1835,7 +1764,7 @@ test("a hidden tab that was frozen and gets its connection back later than the g
 	await page.bringToFront();
 	await expect.poll(() => page.evaluate(() => document.visibilityState)).toBe("visible");
 	await expect(page.locator('[data-connection-banner][data-layer="socket"]')).toBeVisible({
-		timeout: 10_000,
+		timeout: 20_000,
 	});
 	await own.context.setOffline(false);
 });
@@ -1887,7 +1816,7 @@ test("a Decision answered after a deploy, for a Planner whose client does not co
 	expect(later.prompts[0]!.prompt).toContain("saved answer");
 	expect(later.prompts[0]!.prompt).toContain('Chosen option (data): "Yes"');
 	await expect(replies(page, "Reply ?")).toHaveCount(1);
-	await expect(chat(page).getByText('Mona answered "Ship it?"', { exact: true })).toHaveCount(1);
+	await expect(chat(page).getByText('mona answered "Ship it?"', { exact: true })).toHaveCount(1);
 	await expect(chat(page).getByText("couldn't", { exact: false })).toHaveCount(0);
 	let seen = await probe(page);
 	expect(seen.violations, seen.timeline.join("\n")).toEqual([]);

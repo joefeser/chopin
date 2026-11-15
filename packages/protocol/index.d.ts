@@ -99,6 +99,8 @@ export declare namespace Session {
 		/** Repository mutation capability, independent of document archival. */
 		canManage: boolean;
 		archivedAt?: string;
+		/** Full width, the document's own layout setting: every block uses the sheet's width. */
+		fullWidth?: boolean;
 		backgroundJobs: boolean;
 		webResearch: boolean;
 		chatReferences: boolean;
@@ -110,9 +112,10 @@ export declare namespace Session {
 		attachments?: AttachmentSettings;
 		/**
 		 * Set where the deployment configured a transcription model for dictation, naming the
-		 * provider it sends audio to. Absent by default: no audio is ever sent to the server.
+		 * provider it sends audio to and the longest recording it takes, in bytes. Where it is set,
+		 * every browser dictates through it. Absent by default: no audio is ever sent to the server.
 		 */
-		transcription?: { provider: string };
+		transcription?: { provider: string; maxBytes: number };
 		/**
 		 * The build of the client this server serves: the entry script its page names. A tab whose own
 		 * build, sent as the socket's `build` query parameter, differs knows a newer server answered.
@@ -131,6 +134,8 @@ export declare namespace Session {
 		description?: string;
 		canManage: boolean;
 		archivedAt?: string;
+		/** Full width, the document's own layout setting. Absent: the readable column. */
+		fullWidth?: boolean;
 	};
 
 	/** Repository or document permission changed while the socket was open. */
@@ -159,7 +164,17 @@ export declare namespace Session {
 		| { state: "attached"; login: string }
 		| { state: "held"; login: string; until: string }
 		| { state: "disconnected"; login: string }
-		| { state: "starting"; login: string; failure?: PlannerStartFailure; attempt?: number }
+		| {
+			state: "starting";
+			login: string;
+			/**
+			 * The id of the machine asked to start it, so a page that lists that machine names it from
+			 * this word alone, with no second read of the list in between.
+			 */
+			machine?: string;
+			failure?: PlannerStartFailure;
+			attempt?: number;
+		}
 		| { state: "none" };
 
 	/**
@@ -168,6 +183,11 @@ export declare namespace Session {
 	 * with credentials masked and the home directory as `~`. `attempts` counts the launches
 	 * in a row that exited before staying up and `at` is when the last one did (ISO 8601).
 	 * The connector is retrying until the Planner attaches, which clears it.
+	 *
+	 * For a machine whose connector cannot say (releases before 0.0.23 have no such report), or that
+	 * has not answered at all, Chopin tells what it saw itself: `reason` is then Chopin's own
+	 * words, which name the release to update, `attempts` counts the launches it saw end (none
+	 * while only waiting: 0) and `at` is when the last one began, or when the waiting did.
 	 */
 	export type PlannerStartFailure = {
 		attempts: number;
@@ -215,24 +235,20 @@ export declare namespace Session {
 		 * Set for a refusal the client presents in full rather than as a generic
 		 * failure. `planner-not-attached`: a Planner request under `HARNESS=remote`
 		 * to a document no client is attached to; `message` says how to attach one.
-		 * `planner-queue-full`: too many requests wait behind the Planner's running turn right now
-		 * (never said of a machine that is away, which keeps every request). The request itself is
-		 * fine and is sent again, with the same request id, once some have been answered.
+		 * `planner-busy`: a message to the Planner while its turn runs, and the harness cannot take
+		 * input mid-run (or the running turn is a background job's): it is refused, never held, and
+		 * `message` says to stop the turn to ask now. Final.
 		 * `temporarily-unavailable`: a refusal of a `chat:send` for a passing reason (storage busy,
-		 * the room changing, too many sends being handled for a machine that is there, a lookup of a
-		 * reference or of the open child that failed). The message is fine and is sent again, with
-		 * the same request id, and is kept once and delivered once even if an earlier attempt was
-		 * saved before its answer was lost. Any
-		 * refusal of a send without a code or with `planner-not-attached` is final.
-		 * `message-not-deletable`: the answer to a `chat:delete` that is final: the machine already
-		 * took the message, or it is not the sender's. Any other refusal of a delete is for a passing
-		 * reason, and the delete is asked again.
+		 * the room changing, too many sends being handled, a lookup of a reference or of the open
+		 * child that failed, a turn only beginning or finishing). The message is fine and is sent
+		 * again, with the same request id, and is kept once even if an earlier attempt was saved
+		 * before its answer was lost. Any refusal of a send without a code, or with
+		 * `planner-not-attached` or `planner-busy`, is final.
 		 */
 		code?:
 			| "planner-not-attached"
-			| "planner-queue-full"
-			| "temporarily-unavailable"
-			| "message-not-deletable";
+			| "planner-busy"
+			| "temporarily-unavailable";
 	};
 
 	/** Liveness, and the smallest thing that proves request correlation works. */

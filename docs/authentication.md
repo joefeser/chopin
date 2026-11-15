@@ -49,8 +49,11 @@ Metadata:        Read-only (automatic)
 
 ### Who writes to repositories
 
-The server never writes to a repository. Machines push as their owner; see
-[Which GitHub account pushes](chopin-cli.md#which-github-account-pushes).
+The server never writes to a repository. Work on a paired machine pushes and
+opens pull requests as the App's bot. The server mints it a one-hour installation
+token for one repository with the App's private key, after checking that the
+person the work is for can push there.
+[GitHub App identity](github-app-identity.md) sets this up.
 
 ### Organization admission
 
@@ -58,14 +61,14 @@ Organization admission also needs the `Members: Read-only` organization
 permission. Install the App on every allowed organization and have its owner
 approve it.
 
-Chopin uses no App ID, private key, JWT, installation access token, or webhook
-secret. It acts as each signed-in user, with their App user access token,
-so repository-role checks and Copilot entitlement stay theirs. That token is also
+For signed-in people, Chopin acts as each user, with their App user access
+token, so repository-role checks and Copilot entitlement stay theirs. That token is also
 what Chopin sends to GitHub's Copilot MCP endpoint for the Planner's pull request
 tools and for public web search in `/research`. GitHub does not document which tokens
 that endpoint accepts for `web_search`; see
 [Troubleshooting](self-hosting.md#troubleshooting) if `/research` reports a refused
-credential or no web search.
+credential or no web search. Chopin uses the App's private key only to mint
+machine tokens, and uses no webhook secret.
 
 Configure Chopin with the App's slug and OAuth client credentials. A minimal
 production environment contains:
@@ -312,6 +315,18 @@ lookup. An MCP-created document for a repository outside the App installation is
 not available through browser routes, WebSockets, or the hosted agent until
 the installation includes that repository. See [Local agent MCP](local-agent-mcp.md).
 
+Work on a paired machine uses `/mcp` with a Chopin credential instead: an MCP
+token (`chopin_mcp_…`) the connector mints from the launch's own credential at
+`POST /api/connector/mcp-token` and gives the launch and every process it starts
+in `CHOPIN_MCP_TOKEN_FILE`. A Planner's token acts as the machine's owner for its
+document and that document's children, and lasts as long as the Planner
+credential it was minted from. A run's token acts as the person who started the
+run, for the run's document, for an hour. Either ends at once when its Planner
+stops on the machine or its run ends. It reads the repository with the machine's
+own grant, lists only its documents, and cannot create one. `/mcp` refuses the
+launch's own Planner and run credentials, which can open the agent link or report
+the run, and GitHub App installation tokens, which reach only GitHub.
+
 `upload_image` follows the MCP rule for writing: the bearer needs push or
 administration access to the document's repository. Serving the uploaded image
 at `/images/<sha256>.<ext>` follows the browser rule instead: it needs a browser
@@ -498,7 +513,7 @@ ownership are unchanged; only authorship changes. The connection's `handle`
 becomes the roster ID (never a GitHub login, because a colon is not valid in
 one) and every handler derives chat, comment, and decision authorship from it,
 ignoring client-supplied authors. Chat retry fingerprints include the actor,
-queued messages are withdrawn only by their author, and questionnaires keep one
+and questionnaires keep one
 shared draft and one winning submission. Stored fictional authors are plain
 strings, so they survive restart and are never resolved as GitHub users.
 

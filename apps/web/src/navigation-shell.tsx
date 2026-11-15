@@ -894,6 +894,11 @@ export function NavigationShell(
 		if (!link || link.hasAttribute("download") || (link.target && link.target !== "_self")) return;
 		let destination = new URL(link.href, location.href);
 		if (destination.origin !== location.origin) return;
+		// A section of this page is the page's own to follow (`section-links.ts`), loaded with it.
+		if (
+			destination.hash && destination.pathname === location.pathname
+			&& destination.search === location.search
+		) return;
 		if (
 			destination.pathname !== "/"
 			&& !/^\/(?:channels|connect|documents|machines|repositories)(?:\/|$)/.test(

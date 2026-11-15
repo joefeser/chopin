@@ -11,6 +11,11 @@ export type GitHubUser = {
 	avatarUrl: string;
 };
 
+export type GitHubCollaborator = {
+	login: string;
+	avatarUrl: string;
+};
+
 export type GitHubOrganizationMembership = {
 	state: "active" | "pending";
 	role: "admin" | "member" | "billing_manager";
@@ -160,6 +165,14 @@ export interface GitHub {
 	): Promise<InstalledRepository | undefined>;
 	/** The commit a repository's branch points at; optional for GitHubs that never start work. */
 	branchHead?(token: string, owner: string, name: string, branch: string): Promise<string>;
+	/** Whether a repository on GitHub has a commit; optional for GitHubs that never start work. */
+	hasCommit?(token: string, owner: string, name: string, sha: string): Promise<boolean>;
+	/** The human collaborators who can read a repository; optional where collaborators are not listed. */
+	repositoryCollaborators?(
+		token: string,
+		owner: string,
+		name: string,
+	): Promise<GitHubCollaborator[]>;
 	invalidate(token: string): void;
 }
 
@@ -698,6 +711,19 @@ export class GitHubClient implements GitHub, GitHubReferenceSource {
 		return sha;
 	}
 
+	async hasCommit(token: string, owner: string, name: string, sha: string): Promise<boolean> {
+		let url = new URL(
+			`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/commits/${
+				encodeURIComponent(sha)
+			}`,
+			this.#endpoints.api,
+		);
+		// GitHub answers 422 for a SHA it has no commit for, and 404 for a repository it hides.
+		let response = await this.#request(url, token, undefined, [404, 422]);
+		if (!response.ok) return false;
+		return record(await body(response))?.sha === sha;
+	}
+
 	/**
 	 * The files of a branch: the blobs of its tree, as GitHub lists them, and whether it cut the
 	 * list short. A branch name is encoded as one path segment.
@@ -725,6 +751,50 @@ export class GitHubClient implements GitHub, GitHubReferenceSource {
 			if (item?.type === "blob" && typeof item.path === "string") paths.push(item.path);
 		}
 		return { paths, truncated: tree.truncated === true };
+	}
+
+	/**
+	 * The human collaborators who can read a repository, with their GitHub avatars, bounded to three
+	 * pages so a giant organization repository never stalls a mention menu.
+	 */
+	async repositoryCollaborators(
+		token: string,
+		owner: string,
+		name: string,
+	): Promise<GitHubCollaborator[]> {
+		let path = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/collaborators`;
+		let collaborators: GitHubCollaborator[] = [];
+		let seen = new Set<string>();
+		let page: number | undefined = 1;
+		let visited = new Set<number>();
+		while (page && !visited.has(page) && visited.size < 3) {
+			visited.add(page);
+			let url = new URL(path, this.#endpoints.api);
+			url.searchParams.set("per_page", "100");
+			url.searchParams.set("page", String(page));
+			let response = await this.#request(url, token);
+			let list = await body(response);
+			if (!Array.isArray(list)) {
+				throw new GitHubError("GitHub returned an invalid collaborator list");
+			}
+			for (let entry of list) {
+				let item = record(entry);
+				if (
+					!item
+					|| typeof item.login !== "string"
+					|| typeof item.avatar_url !== "string"
+					|| item.type === "Bot"
+				) continue;
+				let permissions = record(item.permissions);
+				if (permissions && permissions.pull === false) continue;
+				let key = item.login.toLowerCase();
+				if (seen.has(key)) continue;
+				seen.add(key);
+				collaborators.push({ login: item.login, avatarUrl: item.avatar_url });
+			}
+			page = nextPage(response.headers.get("link"), this.#endpoints.api, path);
+		}
+		return collaborators;
 	}
 
 	async repositoryAccess(
@@ -888,7 +958,13 @@ export class GitHubClient implements GitHub, GitHubReferenceSource {
 		return body(await this.#request(new URL(path, this.#endpoints.api), token));
 	}
 
-	async #request(url: URL, token: string, ifNoneMatch?: string): Promise<Response> {
+	async #request(
+		url: URL,
+		token: string,
+		ifNoneMatch?: string,
+		/** Statuses returned to the caller rather than thrown. */
+		answered: number[] = [],
+	): Promise<Response> {
 		let response: Response;
 		try {
 			let headers = new Headers({
@@ -906,7 +982,9 @@ export class GitHubClient implements GitHub, GitHubReferenceSource {
 		} catch {
 			throw new GitHubError("GitHub API is unavailable");
 		}
-		if (response.status === 304 && ifNoneMatch) return response;
+		if (response.status === 304 && ifNoneMatch || answered.includes(response.status)) {
+			return response;
+		}
 		if (!response.ok) {
 			let rateLimited = await isRateLimited(response);
 			let status = rateLimited

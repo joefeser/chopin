@@ -5,7 +5,7 @@ import { MAX_LINK_MESSAGE_BYTES, MAX_LINK_NOTE_LENGTH, parseClientMessage } from
 
 import type { ServerWebSocket } from "bun";
 import type { AgentHandlers, HostToolResult, TurnContext } from "./client";
-import type { ClientMessage, ServerMessage } from "./protocol";
+import type { ClientMessage, ClientMessageOf, ServerMessage } from "./protocol";
 
 let stops: Array<() => unknown> = [];
 afterEach(async () => {
@@ -99,6 +99,19 @@ const turn = (id: string) => ({
 	prompt: "p",
 	tools: [{ name: "read_plan" }],
 });
+
+const imageBlock = (data: string, alt: string, mimeType = "image/png") => ({
+	type: "image",
+	data,
+	mimeType,
+	alt,
+});
+
+function resultOf(message: ClientMessageOf<"part">): { content: unknown[]; isError?: boolean } {
+	let { part } = message;
+	if (part.type !== "tool-result") throw new Error("not a result");
+	return (typeof part.result === "string" ? JSON.parse(part.result) : part.result) as never;
+}
 
 describe("Agent connection client", () => {
 	it("opens /api/v1/agent offering chopin.agent.v1, with the bearer", async () => {
@@ -476,6 +489,238 @@ describe("Agent connection client", () => {
 		expect((await server.next("control-result")).message).toHaveLength(MAX_LINK_NOTE_LENGTH);
 		expect(client.send({ type: "runs", session: "s", active: [], paused: [], cards: [] }))
 			.toBe(true);
+	});
+
+	it("offers steer-turn only to a client that can steer, and gives a steer to the running turn", async () => {
+		let plain = fakeServer();
+		await connect(plain, { turn() {} });
+		expect(plain.asked[0]).not.toContain("steer-turn");
+
+		let server = fakeServer({ features: ["steer-turn"] });
+		let steered: string[] = [];
+		let holding = Promise.withResolvers<TurnContext>();
+		let client = await connect(server, {
+			async turn(context) {
+				holding.resolve(context);
+				await new Promise(resolve => context.signal.addEventListener("abort", resolve));
+			},
+			steer(message) {
+				steered.push(message.prompt);
+			},
+		});
+		expect(server.asked[0]).toContain("steer-turn");
+		expect(client.features).toEqual(["steer-turn"]);
+		server.send(turn("running"));
+		await holding.promise;
+		server.send({
+			type: "steer",
+			request: "r1",
+			session: "s",
+			turn: "running",
+			prompt: "@bo: Also X",
+		});
+		expect(await server.next("control-result")).toEqual({
+			type: "control-result",
+			request: "r1",
+			ok: true,
+		});
+		expect(steered).toEqual(["@bo: Also X"]);
+	});
+
+	it("answers a steer for a turn that has ended, or that its handler refuses, with ok false", async () => {
+		let server = fakeServer({ features: ["steer-turn"] });
+		let steered: string[] = [];
+		await connect(server, {
+			turn(context) {
+				context.end("finished");
+			},
+			steer(message) {
+				steered.push(message.prompt);
+				throw new Error("The model is between steps.");
+			},
+		});
+		server.send(turn("over"));
+		await server.next("turn-end");
+		server.send({ type: "steer", request: "late", session: "s", turn: "over", prompt: "too late" });
+		expect(await server.next("control-result")).toEqual({
+			type: "control-result",
+			request: "late",
+			ok: false,
+			message: "The turn has ended.",
+		});
+		expect(steered).toEqual([]);
+	});
+
+	it("leaves out of a result too large for one message the images that do not fit, largest first, and says how big each was", async () => {
+		let server = fakeServer();
+		let content = [
+			{ type: "text", text: "Drew three" },
+			imageBlock("A".repeat(600_000), "small"),
+			imageBlock("A".repeat(1_400_000), "large"),
+			imageBlock("A".repeat(700_000), "middle"),
+		];
+		let results = [{ content }, JSON.stringify({ content })];
+		await connect(server, {
+			turn(context) {
+				for (let result of results) {
+					context.emit({ type: "tool-result", toolCallId: "c", toolName: "draw", result });
+				}
+			},
+		});
+		server.send(turn("big"));
+		let [object, text] = [await server.next("part"), await server.next("part")];
+		for (let sent of [object, text]) {
+			expect(JSON.stringify(sent).length).toBeLessThanOrEqual(MAX_LINK_MESSAGE_BYTES);
+		}
+		for (let sent of [object, text]) {
+			expect(resultOf(sent).content).toEqual([
+				content[0],
+				content[1],
+				{ type: "image", data: "", mimeType: "image/png", alt: "large", tooLarge: 1_050_000 },
+				content[3],
+			]);
+		}
+		expect(typeof (text.part as { result: unknown }).result).toBe("string");
+		expect(typeof (object.part as { result: unknown }).result).toBe("object");
+	});
+
+	it("says how big an image was exactly, whether its base64 was padded or not", async () => {
+		let server = fakeServer();
+		let filler = "A".repeat(1_299_996);
+		let sizes = [
+			["B".repeat(1_299_998), 974_998],
+			["B".repeat(1_299_999), 974_999],
+			[`${"B".repeat(1_299_999)}=`, 974_999],
+			[`${"B".repeat(1_299_998)}==`, 974_998],
+			["B".repeat(1_300_000), 975_000],
+		] as const;
+		await connect(server, {
+			turn(context) {
+				for (let [data] of sizes) {
+					context.emit({
+						type: "tool-result",
+						toolCallId: "c",
+						toolName: "draw",
+						result: {
+							content: [data, filler, filler].map(block => imageBlock(block, "x")),
+						},
+					});
+				}
+			},
+		});
+		server.send(turn("sizes"));
+		for (let [data, size] of sizes) {
+			let sent = resultOf((await server.next("part")) as ClientMessageOf<"part">);
+			let [first, ...rest] = sent.content as Array<Record<string, unknown>>;
+			expect(first, `${data.length}`).toMatchObject({ data: "", tooLarge: size });
+			expect(Buffer.from(data, "base64").length, `${data.length}`).toBe(size);
+			expect(rest.filter(block => block.data === ""), `${data.length}`).toHaveLength(1);
+		}
+	});
+
+	it("leaves out as many images as it takes, and sends a result that fits as it was", async () => {
+		let server = fakeServer();
+		let data = `${"B".repeat(1_299_998)}==`;
+		let fits = { content: [{ type: "image", data: "C".repeat(1_000), mimeType: "image/png" }] };
+		await connect(server, {
+			turn(context) {
+				context.emit({
+					type: "tool-result",
+					toolCallId: "c",
+					toolName: "draw",
+					result: {
+						content: ["first", "second", "third"].map(alt => imageBlock(data, alt, "image/jpeg")),
+						isError: false,
+					},
+				});
+				context.emit({ type: "tool-result", toolCallId: "d", toolName: "draw", result: fits });
+			},
+		});
+		server.send(turn("many"));
+		let { part } = await server.next("part");
+		let result = part.type === "tool-result"
+			? part.result as {
+				content: Array<Record<string, unknown>>;
+				isError: boolean;
+			}
+			: undefined;
+		expect(result?.isError).toBe(false);
+		expect(result?.content.map(block => block.data === "")).toEqual([false, true, true]);
+		expect(result?.content.map(block => block.tooLarge)).toEqual([undefined, 974_998, 974_998]);
+		let unchanged = await server.next("part");
+		expect(unchanged.part).toMatchObject({ result: fits });
+	});
+
+	it("sends a photo too large for a frame as a smaller copy, in order, before the turn ends", async () => {
+		let server = fakeServer();
+		let photo = await new Bun.Image(
+			new Uint8Array(
+				await Bun.file(new URL("../../../e2e/fixtures/option-write-back.png", import.meta.url))
+					.arrayBuffer(),
+			),
+		).resize(3000, 1500).png({ compressionLevel: 0 }).bytes();
+		let data = Buffer.from(photo).toString("base64");
+		expect(data.length).toBeGreaterThan(MAX_LINK_MESSAGE_BYTES);
+		await connect(server, {
+			turn(context) {
+				context.emit({
+					type: "tool-result",
+					toolCallId: "c",
+					toolName: "draw",
+					result: { content: [{ type: "text", text: "Drew it" }, imageBlock(data, "Wide")] },
+				});
+				context.emit({ type: "text-delta", id: "t", delta: "after" });
+			},
+		});
+		server.send(turn("photo"));
+		let sent = await server.next("part");
+		expect(JSON.stringify(sent).length).toBeLessThanOrEqual(MAX_LINK_MESSAGE_BYTES);
+		let [text, image] = resultOf(sent).content as Array<Record<string, unknown>>;
+		expect(text).toEqual({ type: "text", text: "Drew it" });
+		expect(image).toMatchObject({ type: "image", mimeType: "image/webp", alt: "Wide" });
+		expect(image!.tooLarge).toBeUndefined();
+		let copy = await new Bun.Image(Buffer.from(image!.data as string, "base64")).metadata();
+		expect(copy.width / copy.height).toBeCloseTo(2, 1);
+		expect((await server.next("part")).part).toMatchObject({ type: "text-delta", delta: "after" });
+		expect(await server.next("turn-end")).toMatchObject({ turn: "photo", status: "finished" });
+	});
+
+	it("still fails a result it cannot fit by leaving images out, as it always did", async () => {
+		let server = fakeServer();
+		let failures: string[] = [];
+		await connect(server, {
+			turn(context) {
+				for (
+					let result of [
+						{ content: [{ type: "text", text: "x".repeat(MAX_LINK_MESSAGE_BYTES) }] },
+						"x".repeat(MAX_LINK_MESSAGE_BYTES),
+						{
+							content: [{ type: "text", text: "x".repeat(MAX_LINK_MESSAGE_BYTES) }, {
+								type: "image",
+								data: "A".repeat(1_000),
+								mimeType: "image/png",
+							}],
+						},
+					]
+				) {
+					try {
+						context.emit({
+							type: "tool-result",
+							toolCallId: "c",
+							toolName: "draw",
+							result: result as never,
+						});
+					} catch (error) {
+						failures.push((error as Error).message);
+					}
+				}
+			},
+		});
+		server.send(turn("huge"));
+		await server.next("turn-end");
+		expect(failures).toEqual(
+			Array(3).fill("The message exceeds the agent connection's size limit."),
+		);
 	});
 
 	it("settles requests made once the link has closed instead of leaving them pending", async () => {

@@ -34,8 +34,10 @@ export type ConnectSettings = {
 	env?: Record<string, string>;
 	/** `--keep-runs`: how many finished runs' worktrees to keep, 0 for all; absent keeps 15. */
 	keepRuns?: number;
-	/** `--require-sandbox`, `--no-sandbox`, `--sandbox-host` and `--sandbox-write`. */
+	/** `--require-sandbox`, `--no-sandbox`, `--sandbox-host`, `--sandbox-write` and `--sandbox-hide`. */
 	sandbox?: SandboxSettings;
+	/** `--no-planner-spare`: false, and no spare Planners start; absent runs them. */
+	plannerSpare?: false;
 };
 
 /**

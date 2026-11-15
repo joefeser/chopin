@@ -9,9 +9,11 @@ import {
 
 import { ownOrigin } from "../auth/config";
 import { documentUrl } from "../channels/document-url";
+import { CANNOT_STEER } from "../chat/steering";
 import { notAttachedMessage } from "../harness/remote/attachments";
 import { deterministicChannelId, isChannelId } from "../channels/id";
 import { documentSlug } from "../channels/slug";
+import { claimsMcpToken } from "../experiments/mcp-token";
 import { GitHubError } from "../github/client";
 import * as Plan from "../plan/service";
 import * as Rooms from "../rooms";
@@ -22,11 +24,12 @@ import { approveExternal } from "../coordination/approve";
 import { StorageError } from "../storage/errors";
 import { implementationLifecycle } from "../tasks/lifecycle";
 import { unapprovedContext } from "../tasks/open-decisions";
+import { planSourceFor, withPlanSource } from "../tasks/plan-source";
 import { imagePath } from "../images/format";
 
 import type { Server } from "bun";
 import type { HostedAuth } from "../auth/routes";
-import type { GitHubUser } from "../github/client";
+import type { GitHubUser, Repository as GitHubRepository } from "../github/client";
 import type { AuthenticatedSession } from "../auth/session";
 import type { HostedRepository } from "../agent/repository";
 import type {
@@ -37,6 +40,7 @@ import type {
 	ImplementationInput,
 	InvokePlannerError,
 	McpOptions,
+	RecordPlanSourceInput,
 	RenameDocumentInput,
 } from "../mcp";
 import type { UpdateClient, UpdateDocumentInput } from "./update";
@@ -46,11 +50,22 @@ import type { ClaimResult, Graph, Run } from "../tasks/graphs";
 import type { Lifecycle } from "../tasks/lifecycle";
 import type { SocketData } from "../wire";
 import type { VisualAdmission } from "../agent/visual-admission";
+import type { PlanSource } from "../tasks/plan-source";
 
 export type HostedCaller = {
 	oauthToken: string;
 	user: GitHubUser;
 	signal?: AbortSignal;
+	/**
+	 * A launch's MCP token: the documents it may reach, in one repository, and how that
+	 * repository's access is read (with the machine's own grant) instead of `oauthToken`.
+	 */
+	launch?: {
+		repository(owner: string, name: string): Promise<GitHubRepository | undefined>;
+		/** Whether the repository on GitHub has the commit, read with the machine's own grant. */
+		hasCommit(owner: string, name: string, sha: string): Promise<boolean>;
+		allows(channel: ChannelRecord): boolean;
+	};
 };
 
 export type PlannerInvocation = {
@@ -78,6 +93,8 @@ export type HostedCallbacks = {
 	onChannelCreated?: (channel: ChannelRecord) => void;
 	onDocumentPersisted?: (target: Plan.DocumentTarget) => void;
 	invokePlanner?: (input: PlannerInvocation) => Promise<InvokePlannerError | undefined>;
+	/** The caller an MCP token names while its launch is live; see `experiments/mcp-token.ts`. */
+	launchCaller?: (token: string) => Promise<HostedCaller | undefined>;
 	/** What `planner-not-attached` says for a document, at its URL; how to attach one by default. */
 	plannerNotAttached?: (channelId: string, url: string, repository: string) => Promise<string>;
 	/** Hand a Planner-left-open decision's external answer to the Planner, as the room's own Save does. */
@@ -180,7 +197,12 @@ function exposed(
 		activity: lifecycle?.activity,
 		history: lifecycle?.history ?? [],
 		...unapprovedContext(state.records ?? []),
+		...withSource(planSourceFor(state.planSources ?? [], version.planRevision)),
 	};
+}
+
+function withSource(planSource: PlanSource | undefined) {
+	return planSource ? { planSource } : {};
 }
 
 function claimResult(value: ClaimResult) {
@@ -198,6 +220,7 @@ async function directRepositoryFor(
 	name: string,
 ) {
 	try {
+		if (caller.launch) return await caller.launch.repository(owner, name);
 		return await auth.github.repository(caller.oauthToken, owner, name);
 	} catch (err) {
 		if (err instanceof GitHubError && (err.status === 403 || err.status === 404)) {
@@ -209,9 +232,17 @@ async function directRepositoryFor(
 
 /**
  * The document a locator names, by id, legacy channel URL, or document URL,
- * with the caller's own repository access; "forbidden" when it cannot read it.
+ * with the caller's own repository access; "forbidden" when it cannot read it,
+ * or when the caller is a launch whose documents do not include it.
  */
 export async function locateDocument(auth: LocatorAuth, caller: HostedCaller, locator: string) {
+	let located = await locateAny(auth, caller, locator);
+	return typeof located === "object" && caller.launch && !caller.launch.allows(located.channel)
+		? "forbidden" as const
+		: located;
+}
+
+async function locateAny(auth: LocatorAuth, caller: HostedCaller, locator: string) {
 	let path: URL | undefined;
 	try {
 		path = new URL(locator, auth.config.origin);
@@ -453,6 +484,7 @@ export function hosted(
 								?? notAttachedMessage(url, fullName),
 						};
 					}
+					if (code === "planner-busy") return { kind: "refused", code, message: CANNOT_STEER };
 					if (code) return { kind: "refused", code };
 					return { kind: "invoked", document: { ...summary(channel), url } };
 				},
@@ -462,6 +494,13 @@ export function hosted(
 			let match = request.headers.get("authorization")?.match(BEARER);
 			if (!match) return undefined;
 			let oauthToken = match[1]!;
+			if (claimsMcpToken(oauthToken)) {
+				let caller = await callbacks.launchCaller?.(oauthToken);
+				return caller && { ...caller, signal: request.signal };
+			}
+			// A GitHub App installation token reaches GitHub only, never Chopin's tools; a launch's own
+			// Planner or build credential reaches its link or its run, never `/mcp`.
+			if (oauthToken.startsWith("ghs_") || oauthToken.startsWith("chopin_")) return undefined;
 			try {
 				return { oauthToken, user: await auth.admission.user(oauthToken), signal: request.signal };
 			} catch (err) {
@@ -485,7 +524,9 @@ export function hosted(
 						cursor,
 						includeArchived,
 					);
-					documents.push(...page.channels.map(summary));
+					documents.push(
+						...page.channels.filter(channel => caller.launch?.allows(channel) ?? true).map(summary),
+					);
 					cursor = page.next;
 				} while (cursor);
 				return documents;
@@ -626,6 +667,8 @@ export function hosted(
 			async create(caller, input) {
 				let parts = input.repository.split("/");
 				if (parts.length !== 2 || !parts[0] || !parts[1]) return { kind: "forbidden" };
+				// A launch reaches only the documents it was started for, never a new one.
+				if (caller.launch) return { kind: "forbidden" };
 				let repository = await directRepository(caller, parts[0], parts[1]);
 				if (!repository || (!repository.permissions.push && !repository.permissions.admin)) {
 					return { kind: "forbidden" };
@@ -1010,6 +1053,40 @@ export function hosted(
 			: {}),
 		...(persistence
 			? {
+				planSources: {
+					async record(caller: HostedCaller, input: RecordPlanSourceInput) {
+						let access = await writableChannel(caller, input.id);
+						if (access.kind !== "allowed") return access;
+						let { channel } = access;
+						if (channel.archivedAt) return { kind: "archived" as const };
+						let { revision, branch, commit } = input;
+						let owner = channel.repositoryOwner;
+						let name = channel.repositoryName;
+						let present = caller.launch
+							? await caller.launch.hasCommit(owner, name, commit)
+							: await auth.github.hasCommit?.(caller.oauthToken, owner, name, commit);
+						if (!present) return { kind: "unavailable-commit" as const };
+						return serializeDocument(channel.id, () =>
+							withPlan(channel.id, async plan => {
+								if (revision > plan.revision) {
+									return { kind: "revision-conflict" as const, revision: plan.revision };
+								}
+								let source = { revision, branch, commit };
+								let next = withPlanSource(plan.planSources, source);
+								if (next.changed) {
+									let previous = plan.planSources;
+									plan.planSources = next.sources;
+									try {
+										await Plan.persistExclusive(plan);
+									} catch (err) {
+										plan.planSources = previous;
+										throw err;
+									}
+								}
+								return { kind: "recorded" as const, source };
+							}));
+					},
+				},
 				implementations: {
 					async readImplementation(caller: HostedCaller, id: string) {
 						let located = await locatedChannel(caller, id);
@@ -1027,6 +1104,7 @@ export function hosted(
 									...(live.graph ? { graph: live.graph } : {}),
 									...(live.execution ? { execution: live.execution } : {}),
 									lifecycle: live.lifecycle,
+									planSources: live.planSources,
 								}));
 						}
 						let stored = await auth.storage.collaboration.load(channel.id, auth.clock());

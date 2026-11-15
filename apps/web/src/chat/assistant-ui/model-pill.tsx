@@ -1,11 +1,11 @@
 /**
  * The composer's model pill: a small ghost button that names the model that will run and, in
- * lighter ink, its level, and opens assistant-ui's Model selector, copied unmodified and driven by
- * Chopin's catalog and choice through props (`modelSelection`). `useModelChoice` owns the choice and
- * the wire.
+ * lighter ink, the level it runs at, and opens assistant-ui's Model selector, copied unmodified and
+ * driven by Chopin's catalog and choice through props (`modelSelection`). `useModelChoice` owns the
+ * choice and the wire.
  */
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useRef, useState } from "react";
 
 import { ChevronIcon } from "@chopin/icons";
 import {
@@ -18,18 +18,56 @@ import {
 	ModelSelectorRoot,
 	ModelSelectorSearch,
 } from "@/components/assistant-ui/elements/model-selector";
-import { PopoverTrigger } from "@/components/ui/popover";
+import { Popover, PopoverTrigger } from "@/components/ui/popover";
 import {
 	chooseLevel,
 	chooseModel,
 	fallbackNotice,
+	pendingLabel,
 	triggerLabel,
 	triggerText,
 	triggerTitle,
 } from "../model-picker-state";
 import { modelSelection } from "./model-options";
+import { ScrollThumb } from "./scroll-thumb";
 
-import type { ModelControl } from "../use-model-choice";
+import type { ModelControl, PendingModel } from "../use-model-choice";
+
+/**
+ * The pill while the document's machine starts its Planner and has yet to say which models it runs:
+ * the same pill in the same place, with the saved choice's words (or _Model_), in quieter ink that
+ * breathes while the machine connects (still under reduced motion), so the composer is
+ * whole from the start and the real pill takes its place without moving anything. The machine's
+ * connecting dots stay on its own button, never in Chat. Nothing opens yet, so it is disabled for
+ * assistive technology and draws no hover; its name says what it waits for.
+ */
+export function ModelPillPending({ model }: { model: PendingModel }) {
+	let label = pendingLabel(model);
+	// The real pill's own trigger, the copied popover's, under a popover that never opens: the pill
+	// is then the trigger the real one is, with the type scale its slot gives it (`geometry.css`),
+	// so the two are one size, and it names the popup it will open once the models are in.
+	return (
+		<Popover onOpenChange={() => {}} open={false}>
+			<PopoverTrigger
+				render={
+					<button
+						aria-busy="true"
+						aria-disabled="true"
+						aria-label={label}
+						className="btn btn-sm btn-ghost composer-model-pill"
+						data-press="none"
+						title={label}
+						type="button"
+					>
+						<span className="composer-model-name">{model.name}</span>
+						{model.level && <span className="composer-model-level">{model.level}</span>}
+						<ChevronIcon aria-hidden="true" className="composer-model-chevron" size={12} />
+					</button>
+				}
+			/>
+		</Popover>
+	);
+}
 
 export function ModelPill({ control }: { control: ModelControl }) {
 	let { catalog, choice, choose, modelName } = control;
@@ -48,11 +86,15 @@ export function ModelPill({ control }: { control: ModelControl }) {
 	let { groups, value, effort, modelOf, levelOf } = modelSelection(catalog, choice);
 	let { name, level } = triggerText(catalog, choice);
 	let notice = fallbackNotice(catalog, choice, modelName);
+	let levels = useLevelLane(value, effort);
 	return (
 		<ModelSelectorRoot
 			effort={effort ?? ""}
 			models={groups.flatMap(group => group.options)}
-			onEffortChange={step => choose(chooseLevel(catalog, choice, levelOf(step)))}
+			onEffortChange={step => {
+				let level = levelOf(step);
+				if (level !== undefined) choose(chooseLevel(catalog, choice, level));
+			}}
 			onOpenChange={setOpen}
 			onValueChange={option => choose(chooseModel(catalog, choice, modelOf(option)))}
 			open={open}
@@ -77,21 +119,117 @@ export function ModelPill({ control }: { control: ModelControl }) {
 			<ModelSelectorContent
 				alignOffset={offset}
 				aria-label="Model and reasoning"
+				className="composer-model-selector"
 				searchable
 				side="top"
 			>
 				<ModelSelectorSearch aria-label="Search models" placeholder="Search models…" />
 				{notice && <p className="px-3 py-2 text-xs text-text-tertiary" role="status">{notice}</p>}
-				<ModelSelectorList>
-					<ModelSelectorEmpty>No matching models.</ModelSelectorEmpty>
-					{groups.map(group => (
-						<ModelSelectorGroup heading={group.name} key={group.id}>
-							{group.options.map(option => <ModelSelectorItem key={option.id} model={option} />)}
-						</ModelSelectorGroup>
-					))}
-				</ModelSelectorList>
-				<ModelSelectorEffort className="flex-wrap" />
+				<div className="composer-model-list">
+					<ModelSelectorList>
+						<ModelSelectorEmpty>No matching models.</ModelSelectorEmpty>
+						{groups.map(group => (
+							<ModelSelectorGroup heading={group.name} key={group.id}>
+								{group.options.map(option => <ModelSelectorItem key={option.id} model={option} />)}
+							</ModelSelectorGroup>
+						))}
+					</ModelSelectorList>
+					<ScrollThumb axis="y" find={listOf} />
+				</div>
+				<div className="composer-model-levels" ref={levels.ref}>
+					<ModelSelectorEffort className="composer-model-effort" data-more={levels.more} />
+					<ScrollThumb axis="x" find={laneOf} />
+				</div>
 			</ModelSelectorContent>
 		</ModelSelectorRoot>
 	);
+}
+
+/** The copied list, which scrolls the models. */
+function listOf(host: HTMLElement) {
+	return host.querySelector<HTMLElement>("[data-slot='model-selector-list']");
+}
+
+/** The Thinking row's levels, one lane that scrolls sideways. */
+function laneOf(host: HTMLElement) {
+	return host.querySelector<HTMLElement>(
+		"[data-slot='model-selector-effort'] > [role='radiogroup']",
+	);
+}
+
+type More = "start" | "end" | "both";
+
+/**
+ * The Thinking row's levels as one lane that scrolls sideways when they are wider than the popover
+ * (an agent can report six levels besides the model's own): a wheel turned over the row moves it,
+ * touch pans it, the focus the arrow keys move brings a level into view, and the chosen level is
+ * in view whenever the popover opens or the choice changes. `more` names the side that still
+ * hides levels, which `composer.css` fades as a wide table's is, and `ScrollThumb` draws its
+ * scrollbar. The lane is the element's own radio group, reached from a wrapper that draws no box,
+ * so the copy keeps its bytes.
+ */
+function useLevelLane(model: string, effort: string | undefined) {
+	let [node, setNode] = useState<HTMLDivElement | null>(null);
+	let [more, setMore] = useState<More | undefined>();
+	let placed = useRef(false);
+	let ref = useCallback((wrapper: HTMLDivElement | null) => {
+		setNode(wrapper);
+		if (!wrapper) return;
+		let lane = () => wrapper.querySelector<HTMLElement>("[role='radiogroup']");
+		let measure = () => {
+			let group = lane();
+			setMore(group ? hidden(group) : undefined);
+		};
+		// React listens to wheels passively, so only a listener of its own may keep the page still.
+		let wheel = (event: WheelEvent) => {
+			let group = lane();
+			if (!group || event.ctrlKey) return;
+			let delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+			let room = delta < 0
+				? group.scrollLeft
+				: group.scrollWidth - group.clientWidth - group.scrollLeft;
+			if (delta === 0 || room < 1) return;
+			event.preventDefault();
+			let step = event.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : 1;
+			group.scrollBy({ left: delta * step, behavior: "instant" });
+		};
+		let resize = new ResizeObserver(measure);
+		let group = lane();
+		if (group) resize.observe(group);
+		wrapper.addEventListener("wheel", wheel, { passive: false });
+		wrapper.addEventListener("scroll", measure, { capture: true, passive: true });
+		return () => {
+			resize.disconnect();
+			wrapper.removeEventListener("wheel", wheel);
+			wrapper.removeEventListener("scroll", measure, { capture: true });
+			placed.current = false;
+			setNode(null);
+			setMore(undefined);
+		};
+	}, []);
+	useLayoutEffect(() => {
+		let group = node?.querySelector<HTMLElement>("[role='radiogroup']");
+		let chosen = group?.querySelector<HTMLElement>("[role='radio'][aria-checked='true']");
+		if (!group || !chosen) return;
+		// The edge a fade covers is kept clear: `scroll-padding-inline` is the fade's width.
+		let pad = parseFloat(getComputedStyle(group).scrollPaddingInlineStart) || 0;
+		// The lane is positioned, so this is the level's place in it, whatever its scroll and however
+		// far the popover's entrance has scaled it.
+		let start = chosen.offsetLeft;
+		let end = start + chosen.offsetWidth;
+		let left = group.scrollLeft;
+		if (start - pad < left) left = start - pad;
+		else if (end + pad > left + group.clientWidth) left = end + pad - group.clientWidth;
+		let still = !placed.current || matchMedia("(prefers-reduced-motion: reduce)").matches;
+		placed.current = true;
+		group.scrollTo({ left: Math.max(0, left), behavior: still ? "instant" : "smooth" });
+		setMore(hidden(group));
+	}, [node, model, effort]);
+	return { ref, more };
+}
+
+function hidden(group: HTMLElement): More | undefined {
+	let before = group.scrollLeft > 1;
+	let after = group.scrollWidth - group.clientWidth - group.scrollLeft > 1;
+	return before && after ? "both" : before ? "start" : after ? "end" : undefined;
 }

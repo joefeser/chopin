@@ -32,6 +32,9 @@ export const WIRE = {
 	restartNotice: "restart-notice",
 	capabilityCatalog: "capability-catalog",
 	attachments: "attachments",
+	sessionForks: "session-forks",
+	steerTurn: "steer-turn",
+	retryTurn: "retry-turn",
 	/** How often a client retries a `resume` refused with `retry`, after a `restarting` notice. */
 	restartResumeRetryMs: 250,
 } as const;
@@ -72,11 +75,22 @@ export type HostToolResult = { output: unknown; isError: boolean };
 export type AgentHandlers = {
 	/** Throw to refuse the session. */
 	start?(message: ServerMessageOf<"start">): void | Promise<void>;
+	/**
+	 * With `session-forks`: branch `message.session` from `message.from`. Throw to refuse the
+	 * fork (`start-failed`), such as when the source session is no longer held.
+	 */
+	fork?(message: ServerMessageOf<"fork">): void | Promise<void>;
 	/** Ends the turn as finished when it resolves without calling `end`, failed when it rejects. */
 	turn(context: TurnContext): void | Promise<void>;
 	destroy?(message: ServerMessageOf<"destroy">): void;
 	/** Stop or resume the session's workflow runs; throw to report that it could not. */
 	control?(message: ServerMessageOf<"stop"> | ServerMessageOf<"resume">): void | Promise<void>;
+	/**
+	 * Gives a person's message to the turn that is running, to read at its next step. Throw to say
+	 * the turn could not take it. Having it asks for `steer-turn`; a turn that has already ended is
+	 * answered without calling it.
+	 */
+	steer?(message: ServerMessageOf<"steer">): void | Promise<void>;
 };
 
 export type AgentOptions = {
@@ -111,6 +125,16 @@ export type AgentOptions = {
 	 * sent.
 	 */
 	attachments?: boolean;
+	/**
+	 * Asks for `session-forks` when `handlers.fork` is supplied, unless `false`.
+	 */
+	sessionForks?: boolean;
+	/**
+	 * Asks for `retry-turn`: a turn then names the Chat message it answers
+	 * (`TurnContext.message.message`), and one that runs a failed message again carries `retry`, so
+	 * the client can drop what the earlier turns for that message left in what it keeps.
+	 */
+	retryTurns?: boolean;
 };
 
 /** A question this client asked and still waits on, which a later link may carry on. */
@@ -232,6 +256,9 @@ export function linkSocket(
 	resumable = false,
 	catalog = false,
 	attachments = false,
+	sessionForks = false,
+	steering = false,
+	retryTurns = false,
 ): WebSocket {
 	return new (WebSocket as unknown as HeaderWebSocket)(url, {
 		headers: {
@@ -242,6 +269,9 @@ export function linkSocket(
 				...(resumable ? [WIRE.resumableSessions, WIRE.restartNotice] : []),
 				...(catalog ? [WIRE.capabilityCatalog] : []),
 				...(attachments ? [WIRE.attachments] : []),
+				...(sessionForks ? [WIRE.sessionForks] : []),
+				...(steering ? [WIRE.steerTurn] : []),
+				...(retryTurns ? [WIRE.retryTurn] : []),
 			].join(", "),
 		},
 		protocols: [WIRE.subprotocol],
@@ -251,6 +281,118 @@ export function linkSocket(
 type RunsReport = { active: string[]; paused: string[]; cards: LinkRun[] };
 
 const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
+
+function decodedBytes(data: string): number {
+	let clean = data.replace(/\s+/g, "").replace(/={1,2}$/, "");
+	return Math.max(1, Math.floor(clean.length * 3 / 4));
+}
+
+type ImageAt = { index: number; data: string; mimeType: unknown };
+
+/** A tool result's content blocks and how to put changed ones back into its message. */
+function imageBlocks(message: ClientMessageOf<"part">) {
+	let { part } = message;
+	if (part.type !== "tool-result") return undefined;
+	let asText = typeof part.result === "string";
+	let result: unknown = part.result;
+	if (typeof result === "string") {
+		try {
+			result = JSON.parse(result);
+		} catch {
+			return undefined;
+		}
+	}
+	let content = (result as { content?: unknown } | null)?.content;
+	if (!result || typeof result !== "object" || !Array.isArray(content)) return undefined;
+	let blocks: unknown[] = [...content];
+	let images: ImageAt[] = blocks.flatMap((block, index) => {
+		let { type, data, mimeType } = (block ?? {}) as Record<string, unknown>;
+		return type === "image" && typeof data === "string" ? [{ index, data, mimeType }] : [];
+	}).sort((a, b) => b.data.length - a.data.length || b.index - a.index);
+	let rebuild = (next: unknown[]): ClientMessageOf<"part"> => {
+		let sent = { ...result as object, content: next };
+		return {
+			...message,
+			part: { ...part, result: asText ? JSON.stringify(sent) : sent } as typeof part,
+		};
+	};
+	return { blocks, images, rebuild };
+}
+
+/** Whether a part over a frame would fit once its images were made smaller or left out. */
+function fitsWithoutImages(message: ClientMessageOf<"part">): boolean {
+	if (bytes(message) <= WIRE.maxMessageBytes) return true;
+	let found = imageBlocks(message);
+	if (!found?.images.length) return false;
+	let stripped = found.blocks.map(block =>
+		found.images.some(image => found.blocks[image.index] === block)
+			? { ...block as object, data: "", tooLarge: Number.MAX_SAFE_INTEGER }
+			: block
+	);
+	return bytes(found.rebuild(stripped)) <= WIRE.maxMessageBytes;
+}
+
+/** The image made small enough to be `budget` bytes, where this runtime can decode it (Bun). */
+async function smaller(
+	data: string,
+	mimeType: unknown,
+	budget: number,
+): Promise<{ data: string; mimeType: string } | undefined> {
+	let Image = (globalThis as { Bun?: { Image?: typeof Bun.Image } }).Bun?.Image;
+	if (!Image || budget <= 0) return undefined;
+	let jpeg = mimeType === "image/jpeg";
+	try {
+		let bytes = new Uint8Array(Buffer.from(data, "base64"));
+		let { width, height } = await new Image(bytes).metadata();
+		for (
+			let side = Math.min(Math.max(width, height), 4096);
+			side >= 128;
+			side = Math.floor(side * 0.75)
+		) {
+			let resized = new Image(bytes, { maxPixels: 268_402_689 }).resize(side, side, {
+				fit: "inside",
+				withoutEnlargement: true,
+			});
+			let out = await (jpeg ? resized.jpeg({ quality: 80 }) : resized.webp({ quality: 80 }))
+				.bytes();
+			if (out.byteLength <= budget) {
+				return {
+					data: Buffer.from(out).toString("base64"),
+					mimeType: jpeg ? "image/jpeg" : "image/webp",
+				};
+			}
+		}
+	} catch {}
+	return undefined;
+}
+
+/**
+ * A tool result that fits one frame. An image too large for it is sent as a smaller copy of
+ * itself (Chat stores and shows that copy), and only where none can be made is its data left out
+ * and `tooLarge` said instead, largest first.
+ */
+export async function fitImages(
+	message: ClientMessageOf<"part">,
+): Promise<ClientMessageOf<"part">> {
+	if (bytes(message) <= WIRE.maxMessageBytes) return message;
+	let found = imageBlocks(message);
+	if (!found) return message;
+	let { blocks, images, rebuild } = found;
+	for (let { index, data, mimeType } of images) {
+		let without = rebuild(
+			blocks.map((block, at) => at === index ? { ...block as object, data: "" } : block),
+		);
+		// What is left of the frame, less the encoding's own overhead, in decoded bytes.
+		let budget = Math.floor((WIRE.maxMessageBytes - bytes(without) - 1024) * 3 / 4);
+		let copy = await smaller(data, mimeType, budget);
+		blocks[index] = copy
+			? { ...blocks[index] as object, ...copy }
+			: { ...blocks[index] as object, data: "", tooLarge: decodedBytes(data) };
+		let fitted = rebuild(blocks);
+		if (bytes(fitted) <= WIRE.maxMessageBytes) return fitted;
+	}
+	return message;
+}
 
 /**
  * `runs` messages that each fit a frame: every one a complete report, with the delta cards'
@@ -294,6 +436,8 @@ type TurnState = {
 	controller: AbortController;
 	ended: boolean;
 	calls: Map<string, (result: HostToolResult) => void>;
+	/** A part being made to fit a frame, which what the turn sends next waits for. */
+	outbox?: Promise<unknown>;
 };
 
 function hostFailure(message: string): HostToolResult {
@@ -324,12 +468,16 @@ function settleCalls(turn: TurnState, message: string): void {
 /** Attaches to one document as its Planner and serves the server's requests. */
 export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 	let resumable = options.resumable !== false || options.resume !== undefined;
+	let sessionForks = options.sessionForks ?? options.handlers.fork !== undefined;
 	let socket = linkSocket(
 		agentUrl(options.url),
 		options.token,
 		resumable,
 		options.capabilities !== undefined,
 		options.attachments === true,
+		sessionForks,
+		options.handlers.steer !== undefined,
+		options.retryTurns === true,
 	);
 	let turns = new Map<string, TurnState>();
 	let asks = new Map<string, PendingAsk>();
@@ -371,12 +519,30 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 			signal: state.controller.signal,
 			emit: part => {
 				if (state.ended) return;
-				send({
+				let made: ClientMessageOf<"part"> = {
 					type: "part",
 					session: message.session,
 					turn: message.turn,
 					part: part.type === "error" ? { ...part, error: note(part.error) } : part,
-				});
+				};
+				if (!state.outbox && !fitsWithoutImages(made)) {
+					// Too large even without its images: it fails here, as it always has.
+					send(made);
+					return;
+				}
+				if (!state.outbox && bytes(made) <= WIRE.maxMessageBytes) {
+					send(made);
+					return;
+				}
+				// Made smaller off this call, so the parts after it wait their turn behind it.
+				let outbox: Promise<unknown> = (state.outbox ?? Promise.resolve())
+					.then(() => fitImages(made))
+					.then(send)
+					.catch(() => {})
+					.finally(() => {
+						if (state.outbox === outbox) state.outbox = undefined;
+					});
+				state.outbox = outbox;
 			},
 			offerTools: names =>
 				send({
@@ -388,6 +554,9 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 			callHostTool: (toolName, input) => {
 				if (state.ended || state.controller.signal.aborted) {
 					return Promise.resolve(hostFailure("The turn has ended."));
+				}
+				if (state.outbox) {
+					return state.outbox.then(() => context.callHostTool(toolName, input));
 				}
 				let toolCallId = `host-${++calls}-${crypto.randomUUID()}`;
 				let result = Promise.withResolvers<HostToolResult>();
@@ -417,13 +586,16 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				state.ended = true;
 				turns.delete(key);
 				settleCalls(state, "The turn has ended.");
-				send({
-					type: "turn-end",
-					session: message.session,
-					turn: message.turn,
-					status,
-					...(text === undefined ? {} : { message: note(text) }),
-				});
+				let finish = () =>
+					send({
+						type: "turn-end",
+						session: message.session,
+						turn: message.turn,
+						status,
+						...(text === undefined ? {} : { message: note(text) }),
+					});
+				if (state.outbox) void state.outbox.then(finish).catch(() => {});
+				else finish();
 			},
 		};
 		Promise.resolve()
@@ -460,11 +632,48 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 					});
 				}
 				return;
+			case "fork":
+				try {
+					if (!options.handlers.fork) {
+						throw new Error("This Planner does not support session forks.");
+					}
+					await options.handlers.fork(message);
+					sessions.add(message.session);
+					send({ type: "started", session: message.session });
+				} catch (error) {
+					send({
+						type: "start-failed",
+						session: message.session,
+						message: reason(error),
+					});
+				}
+				return;
 			case "turn":
 				return runTurn(message);
 			case "abort":
 				turns.get(`${message.session}/${message.turn}`)?.controller.abort();
 				return;
+			case "steer": {
+				let running = turns.get(`${message.session}/${message.turn}`);
+				try {
+					if (
+						!options.handlers.steer || !running || running.ended
+						|| running.controller.signal.aborted
+					) {
+						throw new Error("The turn has ended.");
+					}
+					await options.handlers.steer(message);
+					send({ type: "control-result", request: message.request, ok: true });
+				} catch (error) {
+					send({
+						type: "control-result",
+						request: message.request,
+						ok: false,
+						message: reason(error),
+					});
+				}
+				return;
+			}
 			case "host-tool-result": {
 				let calls = turns.get(`${message.session}/${message.turn}`)?.calls;
 				calls?.get(message.toolCallId)?.({

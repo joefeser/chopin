@@ -46,7 +46,7 @@
 				1
 			]
 		],
-		"sourceHash": "099ee516920e9e9f999b28cc1f8dd0b3b2a853697aa1b07429d0ffadb229cc64"
+		"sourceHash": "8d2723a8a500e9e64abe5ab124351882491d4ccb66ce61cc2ecf14d2bd573954"
 	},
 	{
 		"file": "packages/editor/src/content-swap.tsx",
@@ -60,7 +60,7 @@
 				1
 			]
 		],
-		"sourceHash": "099ee516920e9e9f999b28cc1f8dd0b3b2a853697aa1b07429d0ffadb229cc64"
+		"sourceHash": "8d2723a8a500e9e64abe5ab124351882491d4ccb66ce61cc2ecf14d2bd573954"
 	},
 	{
 		"file": "packages/editor/src/static-plan-editor.tsx",
@@ -116,7 +116,7 @@
 				1
 			]
 		],
-		"sourceHash": "ee95ee327039ab440bfdc4484ecc59b5e852689fc5bc641e6d48889ff05eef81"
+		"sourceHash": "231616fc46f8ab74c12eb62ee9f619ac2db50e09aa629f40be1adb577cb66b0d"
 	},
 	{
 		"file": "packages/editor/src/toolbar/bubble.tsx",
@@ -186,7 +186,7 @@
 				4
 			]
 		],
-		"sourceHash": "0c6320c0c396562d88ceb7661b868fe53435a0a576f7fb66dce36f3ee607aef7"
+		"sourceHash": "12e7f09fb6178d07df7b543160d3d003a7ea9cebac46e3cde741d966d3d8436d"
 	},
 	{
 		"file": "packages/editor/src/widgets/research-motion.tsx",
@@ -228,7 +228,7 @@
 				1
 			]
 		],
-		"sourceHash": "89297a705c3d7ec8edb4ffc3e8cef460f029e5a6ff192f6ce6cf35d90d550e83"
+		"sourceHash": "1f26c615a2aad52d944fbaacaae30fa875c2c97f89f0741add21e24dfc5820ca"
 	},
 	{
 		"file": "packages/editor/src/comment-layer.tsx",
@@ -256,7 +256,7 @@
 				1
 			]
 		],
-		"sourceHash": "89297a705c3d7ec8edb4ffc3e8cef460f029e5a6ff192f6ce6cf35d90d550e83"
+		"sourceHash": "1f26c615a2aad52d944fbaacaae30fa875c2c97f89f0741add21e24dfc5820ca"
 	},
 	{
 		"file": "packages/editor/src/table/rails.tsx",
@@ -312,7 +312,7 @@
 				1
 			]
 		],
-		"sourceHash": "fadeb29730d5f0d73a55912d6f82d1e91cedab3675ec341f9320849e4702b184"
+		"sourceHash": "977020fe63e762f69ea5d091a1ce56f8ebcbb21c9c9378ddae6972ac25465cb3"
 	},
 	{
 		"file": "packages/editor/src/disclosure-motion.tsx",
@@ -375,7 +375,7 @@
 				2
 			]
 		],
-		"sourceHash": "8f2c86101f0b9b3e6ab670ffe4441818004a4577411505740d50cb2edcbc0ae5"
+		"sourceHash": "a557103c3f6921c513f535e1008fd28e489b92057232d371b046f0e6968d0109"
 	},
 	{
 		"file": "packages/editor/src/collaboration.tsx",
@@ -396,7 +396,7 @@
 				1
 			]
 		],
-		"sourceHash": "abe90d6bc426ffea321f1c207d1e394e51101de33dd1b23f12ee78c681b58cea"
+		"sourceHash": "711738471d9ff7f1c93994cdd916065a6dfdd0dd036f77a1d4666ef5041cc756"
 	},
 	{
 		"file": "packages/editor/src/widgets/questionnaire.tsx",
@@ -431,7 +431,7 @@
 				1
 			]
 		],
-		"sourceHash": "1c2de106f9d7e5a9cb293eeeefcdb3ab1c9f36b4654762ad74e56a36611fc76f"
+		"sourceHash": "06e3398adb7a425325413fc996a759d89aafd704a020d968c3b6d1cfeb1934b5"
 	},
 	{
 		"file": "packages/editor/src/changes.ts",
@@ -494,7 +494,7 @@
 				1
 			]
 		],
-		"sourceHash": "499f583aad21a7b4c8eafef3c907763da7c7c8ce5e17b852c7c93ba48158c28d"
+		"sourceHash": "09db52646b02c05b60c932b2a4a998482ab8a46daa4fc2be7e9d2be90ea020d0"
 	},
 	{
 		"file": "packages/editor/src/resolved-layer.tsx",
@@ -508,7 +508,7 @@
 				1
 			]
 		],
-		"sourceHash": "499f583aad21a7b4c8eafef3c907763da7c7c8ce5e17b852c7c93ba48158c28d"
+		"sourceHash": "09db52646b02c05b60c932b2a4a998482ab8a46daa4fc2be7e9d2be90ea020d0"
 	},
 	{
 		"file": "packages/editor/src/blank-behind-decisions.tsx",
@@ -522,6 +522,6 @@
 				1
 			]
 		],
-		"sourceHash": "ce7f083aa724fe35556fd776d794c9abe28b56c402e7859ba65dcc9f0298efd6"
+		"sourceHash": "ca3079df45b0542042c236184992204ea52b4c7f508e706ad6f60e44812c19c4"
 	}
 ]

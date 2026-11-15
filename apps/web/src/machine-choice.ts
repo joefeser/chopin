@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { switchFor, switchSaved } from "./chat/machine-switch";
 import { machines as liveMachines, newestFirst, ownerHint } from "./machine-summary";
 import { sameJson } from "./same-json";
 
+import type { MachineSwitch } from "./chat/machine-switch";
 import type { Machine, TeammateMachine } from "./machine-summary";
 import type { Session } from "@chopin/protocol";
 
@@ -57,6 +59,11 @@ export type MachineChoiceState = {
 	machines: ChoosableMachine[];
 	/** Who runs the document's Planner; null or absent when Chopin runs no Planners on machines. */
 	planner?: PlannerRunner | null;
+	/**
+	 * The document's creator chose a machine, and that is where its Planner runs whatever this
+	 * person chooses: their choice runs their own builds and runs. Absent for the creator.
+	 */
+	creatorDecides?: boolean;
 };
 
 export type MachineState = "connected" | "offline" | "reauthorize";
@@ -148,11 +155,13 @@ export function plannerLastSeen(state: MachineChoiceState | undefined): string |
  * one; undefined where the status says whose machine it is by login. `null` says nothing is said
  * yet: while the person's machines are loading; while the list is older than the socket's word
  * (`current` is false: it was read before the word came, so it describes the Planner as it was, and
- * may name a machine it has since left, or one the document no longer runs on); while the list
- * names a machine the document does not run on (a teammate's, or another of the person's own) for
- * a Planner the person's own account is the one starting or dropping; and while the list describes
- * another account's Planner than the page's socket does (its login, or the viewer's own where the
- * machine is theirs). In each the two disagree, and the list is what is out of date.
+ * may name a machine it has since left, or one the document no longer runs on; a choice being
+ * saved leaves it false for the same reason); while the list names a machine the document does not
+ * run on (a teammate's, or another of the person's own) for a Planner the person's own account is
+ * the one starting or dropping; and while the list describes another account's Planner than the
+ * page's socket does (its login, or the viewer's own where the machine is theirs). In each the two
+ * disagree, and the list is what is out of date. Where the creator's choice decides, the list is
+ * not about the Planner's machine at all, so it is never read for one.
  */
 export function plannerMachineName(
 	state: MachineChoiceState | undefined,
@@ -163,6 +172,29 @@ export function plannerMachineName(
 ): string | null | undefined {
 	if (!state) return loading ? null : undefined;
 	if (planner?.state !== "starting" && planner?.state !== "disconnected") return undefined;
+	// The creator's choice decides where it runs, and the list tells nothing of that machine: the
+	// word's own login names it, however old the list is, and a choice made here changes nothing.
+	if (state.creatorDecides) return undefined;
+	// A word that says which machine starts it is the authority on which machine it describes. The
+	// document's own machine is named from it alone, however old the list's other news is, and a word
+	// about another machine is never named as the document's own, however new the list is: a list
+	// read after the person or Default machine moved the document describes the new machine while
+	// the word may still describe the old one, whose failure would otherwise be told as the new
+	// machine's. Anything else follows the list, as a word that names no machine does.
+	let named = planner.state === "starting" ? planner.machine : undefined;
+	let shown = shownMachine(state);
+	if (named && shown?.id === named) return shown.label;
+	let listed = listedName(state, planner, viewer, current);
+	return named && shown && listed === shown.label ? null : listed;
+}
+
+/** What the list says of a word's machine, for a word that does not name the shown machine. */
+function listedName(
+	state: MachineChoiceState,
+	planner: Session.PlannerAttachment & { login: string },
+	viewer: string,
+	current: boolean,
+): string | null | undefined {
 	if (!current) return null;
 	let name = plannerRunsOn(state);
 	if (name !== undefined) {
@@ -283,6 +315,14 @@ export type MachineChoice = {
 	read: number;
 	/** A choice is being saved. */
 	saving: boolean;
+	/** How many choices have been made since the document opened: each is news to what the status says. */
+	chosen: number;
+	/** The Planner moving to the machine just chosen, told as one transition (`machine-switch.ts`). */
+	switching?: MachineSwitch;
+	/** How many switches have begun since the document opened: each is said once. */
+	moves: number;
+	/** The status has the server's word after the switch: it is over. */
+	endSwitch: (change: MachineSwitch) => void;
 	/** Why the last choice was refused. */
 	error?: string;
 	choose: (machine: string | null) => Promise<void>;
@@ -322,6 +362,9 @@ export async function setShared(machine: string, shared: boolean): Promise<boole
 export function useMachineChoice(room: string, enabled: boolean): MachineChoice {
 	let [{ state, read }, setHeld] = useState<Held>({ read: 0 });
 	let [saving, setSaving] = useState(false);
+	let [chosen, setChosen] = useState(0);
+	let [switching, setSwitching] = useState<MachineSwitch>();
+	let [moves, setMoves] = useState(0);
 	let [error, setError] = useState<string>();
 	let generation = useRef(0);
 	// Where the read answered last began; the hold follows it only when it says something new.
@@ -343,6 +386,9 @@ export function useMachineChoice(room: string, enabled: boolean): MachineChoice 
 	useEffect(() => {
 		answeredAt.current = 0;
 		setHeld({ read: 0 });
+		setChosen(0);
+		setSwitching(undefined);
+		setMoves(0);
 		if (!enabled) return;
 		refresh();
 		let timer = window.setInterval(refresh, REFRESH_MS);
@@ -376,8 +422,13 @@ export function useMachineChoice(room: string, enabled: boolean): MachineChoice 
 	let choose = async (machine: string | null) => {
 		let mine = ++generation.current;
 		let began = nextReading();
+		let change = switchFor(state, machine, began, shownMachine(state)?.id);
 		setSaving(true);
 		setError(undefined);
+		// What follows a choice is what the person asked for, said at once from the click.
+		setChosen(count => count + 1);
+		setSwitching(change);
+		if (change) setMoves(count => count + 1);
 		// Shown at once; the server's answer replaces it.
 		setHeld(held => held.state ? { ...held, state: { ...held.state, choice: machine } } : held);
 		try {
@@ -388,16 +439,24 @@ export function useMachineChoice(room: string, enabled: boolean): MachineChoice 
 					body: JSON.stringify({ machine }),
 				}),
 			);
+			// Saved is saved, whether this answer or a read that began after it is the one held.
+			if (change && !switchSaved(change, value)) {
+				setSwitching(current => current === change ? undefined : current);
+			}
 			if (mine === generation.current) {
 				answeredAt.current = began;
 				setHeld({ state: value, read: began });
 			}
 		} catch (failure) {
 			setError(failure instanceof Error ? failure.message : "Chopin couldn’t save that choice");
+			setSwitching(current => current === change ? undefined : current);
 			refresh();
 		} finally {
 			setSaving(false);
 		}
 	};
-	return { state, read, saving, error, choose, refresh };
+	let endSwitch = useCallback((change: MachineSwitch) => {
+		setSwitching(current => current === change ? undefined : current);
+	}, []);
+	return { state, read, saving, chosen, switching, moves, endSwitch, error, choose, refresh };
 }

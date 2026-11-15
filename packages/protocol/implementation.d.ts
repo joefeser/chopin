@@ -4,6 +4,8 @@ import type { Plan } from "./plan";
 type KIND<K extends string> = Frame & { kind: K };
 
 export type CheckoutContext = { repository: string; branch?: string; commit: string };
+/** Where a plan revision's files were pushed: a branch and the commit on it that holds them. */
+export type PlanSource = { revision: number; branch: string; commit: string };
 export type BuildRequest = {
 	id: string;
 	retryOf?: string;
@@ -21,6 +23,11 @@ export type BuildRequest = {
 	machineService?: true;
 	repositoryId: string;
 	checkout: CheckoutContext;
+	/**
+	 * The commit holding the plan's files that the Planner pushed for plan revision `revision`,
+	 * which `checkout` starts from; absent when the build started from the builder's checkout.
+	 */
+	planSource?: PlanSource;
 	planRevision: number;
 	graphVersion: number;
 	graphRevision: number;
@@ -35,6 +42,8 @@ export type BuildRequest = {
 	activity?: { text: string; at: string };
 	/** A human Stop suppresses automatic work for edits up through this document revision. */
 	stoppedAtRevision?: number;
+	/** The login of the person who pressed Stop in Chopin, for builds stopped since it was recorded. */
+	stoppedBy?: string;
 	/** The connector's key for the report that set `state`, so a retry of it is recognized. */
 	reportKey?: string;
 	/**
@@ -55,7 +64,13 @@ export type LiveSnapshot = {
 	/** The builder's checkout; sent only to the builder. */
 	checkout?: CheckoutContext;
 	baseRevision: number;
+	/** The pull requests builds keep up to date: open ones, as far as Chopin knows. */
 	pullRequests: string[];
+	/**
+	 * Pull requests a person closed or merged on GitHub. Builds never push to them again; their
+	 * work goes on new pull requests.
+	 */
+	closedPullRequests?: Array<{ url: string; state: "closed" | "merged"; at: string }>;
 	/** Tasks the first build stopped short of; the next rebuild finishes them. */
 	outstanding?: string[];
 	/**
@@ -176,7 +191,8 @@ export type ImplementationSnapshot = {
  * Opening Build asks for them. The request starts a Planner turn without a
  * member message: Chat records only a system notice of who asked, as it does
  * for an accepted comment. One request per document is live at a time;
- * asking again while it is queued or running returns it.
+ * asking again while it is running returns it. A request made while another turn runs is
+ * refused, not held.
  */
 export declare namespace Implementation {
 	export type Incoming = Request<Draft>;
@@ -196,7 +212,7 @@ export declare namespace Implementation {
 	export type Drafted = KIND<"implementation:draft"> & {
 		id: string;
 		planRevision: number;
-		state: "queued" | "running" | "ended";
+		state: "running" | "ended";
 		existing: boolean;
 	};
 
@@ -204,7 +220,7 @@ export declare namespace Implementation {
 	export type Drafting = KIND<"implementation:drafting"> & {
 		id: string;
 		planRevision: number;
-		state: "queued" | "running" | "ended";
+		state: "running" | "ended";
 	};
 
 	/** Broadcast when a document's build readiness judgement changes; read the snapshot again. */

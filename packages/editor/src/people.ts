@@ -1,3 +1,5 @@
+import type { PLANNER_NAME as NAME } from "@chopin/protocol/planner-name";
+
 export type FaceProfile = { name: string; avatar: string };
 
 const DEMO_PREFIX = "demo:";
@@ -13,7 +15,15 @@ export function isDemoHandle(handle: string): boolean {
 	return handle.startsWith(DEMO_PREFIX);
 }
 
-/** What a person is called: a roster name for a demo actor, otherwise the handle. */
+/**
+ * The Planner's name wherever it takes part, acts or is addressed; `@chopin/protocol/planner-name`
+ * is its source, and the type holds this copy to it. It is written here rather than re-exported
+ * because this module is in the page's first script, and a re-export would give the name a chunk of
+ * its own that every lazy surface naming the agent loads first.
+ */
+export const PLANNER_NAME: typeof NAME = "chopin";
+
+/** What a person is called: a roster name for a demo actor, otherwise the handle as written. */
 export function personName(handle: string): string {
 	let profile = profiles.get(handle);
 	if (profile) return profile.name;

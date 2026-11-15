@@ -11,6 +11,10 @@ export type JobTurn = {
 	prompt: string;
 	done: (outcome: JobOutcome) => void;
 	settled?: boolean;
+	/** A person's message cut its turn short; it runs again unless its own tool already wrote. */
+	preempted?: true;
+	/** What its own tool recorded before its turn was cut short. */
+	output?: string;
 };
 
 export function jobReason(error: unknown): string {
@@ -34,9 +38,8 @@ export function safeProjection<Args extends unknown[]>(project: (...args: Args) 
 	};
 }
 
-export function createJobQueue({ queued, state, startRun, MAX_QUEUE }: {
+export function createJobQueue({ state, startRun, MAX_QUEUE }: {
 	MAX_QUEUE: number;
-	queued: (chat: Chat, server: Server<SocketData>, room: string) => void;
 	state: (chat: Chat, server: Server<SocketData>, room: string) => void;
 	startRun: (
 		context: Room,
@@ -51,7 +54,7 @@ export function createJobQueue({ queued, state, startRun, MAX_QUEUE }: {
 	) => void;
 }) {
 	function cancelQueuedJobs(context: Announcer, reason: string): number {
-		let { chat, server, room } = context;
+		let { chat } = context;
 		let retained: Waiting[] = [];
 		let cancelled = 0;
 		for (let waiting of chat.waiting) {
@@ -66,10 +69,7 @@ export function createJobQueue({ queued, state, startRun, MAX_QUEUE }: {
 			cancelled++;
 			finishJob(chat.handoffJob, { status: "failed", reason: jobReason(reason) });
 		}
-		if (cancelled > 0) {
-			chat.waiting = retained;
-			queued(chat, server, room);
-		}
+		if (cancelled > 0) chat.waiting = retained;
 		return cancelled;
 	}
 
@@ -95,7 +95,6 @@ export function createJobQueue({ queued, state, startRun, MAX_QUEUE }: {
 				});
 			}
 		}
-		queued(chat, server, room);
 		state(chat, server, room);
 	}
 
@@ -106,7 +105,7 @@ export function createJobQueue({ queued, state, startRun, MAX_QUEUE }: {
 		claimantSessionId: string | undefined,
 		signal?: AbortSignal,
 	): Promise<JobOutcome> {
-		let { chat, config, room, server } = context;
+		let { chat, config } = context;
 		if (!config.agent) {
 			return Promise.resolve({ status: "skipped", reason: "The Planner is off (AGENT=off)." });
 		}
@@ -133,7 +132,6 @@ export function createJobQueue({ queued, state, startRun, MAX_QUEUE }: {
 			}
 			chat.waiting = chat.waiting.filter(item => item.job !== turn);
 			finishJob(turn, cancelled);
-			queued(chat, server, room);
 		}
 		signal?.addEventListener("abort", cancel, { once: true });
 		if (chat.busy || chat.starting) {
@@ -151,7 +149,6 @@ export function createJobQueue({ queued, state, startRun, MAX_QUEUE }: {
 				sessionId: claimantSessionId,
 				job: turn,
 			});
-			queued(chat, server, room);
 		} else {
 			startRun(context, "chopin", prompt, undefined, claimantSessionId, false, undefined, [], turn);
 		}

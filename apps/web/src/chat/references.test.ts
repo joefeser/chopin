@@ -4,12 +4,10 @@ import {
 	acknowledgeDraft,
 	addressedOutsideReferences,
 	addressesPlanner,
-	beforeInputSelection,
 	boundedChatError,
 	chatSendPayload,
 	contiguousReplacement,
 	destinationCue,
-	expandToChips,
 	insertCommand,
 	insertPointer,
 	insertReference,
@@ -48,11 +46,11 @@ function select(text: string, target: ReferenceTarget, references: ReferenceDraf
 	return insertReference(text, references, trigger, target);
 }
 
-describe("choosing a part of the document or a file with @", () => {
+describe("choosing a part of the document or a file with #", () => {
 	let heading = { kind: "heading" as const, anchor: "site-1", label: "Site 1: harbour" };
 
 	test("puts its own words in the draft as one chip with a space after it, and the caret after that", () => {
-		let text = "Rewrite @sit";
+		let text = "Rewrite #sit";
 		let result = insertPointer(text, [], { query: "sit", start: 8, end: 12 }, heading);
 		expect(result.text).toBe("Rewrite @Site 1: harbour ");
 		expect(result.caret).toBe(result.text.length);
@@ -62,7 +60,7 @@ describe("choosing a part of the document or a file with @", () => {
 	});
 
 	test("opens a research card with a % and takes the space already there", () => {
-		let result = insertPointer("See @re later", [], { query: "re", start: 4, end: 7 }, {
+		let result = insertPointer("See #re later", [], { query: "re", start: 4, end: 7 }, {
 			kind: "research",
 			workspaceId: "w1",
 			label: "Release",
@@ -79,14 +77,14 @@ describe("choosing a part of the document or a file with @", () => {
 	});
 
 	test("moves a part already in the draft to its new place, and keeps others where their words are", () => {
-		let first = insertPointer("@a", [], { query: "a", start: 0, end: 2 }, heading);
-		let second = insertPointer(`${first.text}and @f`, first.references, {
+		let first = insertPointer("#a", [], { query: "a", start: 0, end: 2 }, heading);
+		let second = insertPointer(`${first.text}and #f`, first.references, {
 			query: "f",
 			start: first.text.length + 4,
 			end: first.text.length + 6,
 		}, { kind: "file", path: "src/a.ts", label: "src/a.ts" });
 		expect(second.references.map(reference => reference.kind)).toEqual(["heading", "file"]);
-		let again = insertPointer(`${second.text}see @s`, second.references, {
+		let again = insertPointer(`${second.text}see #s`, second.references, {
 			query: "s",
 			start: second.text.length + 4,
 			end: second.text.length + 6,
@@ -96,7 +94,7 @@ describe("choosing a part of the document or a file with @", () => {
 	});
 
 	test("leaves the draft as it was when its range is not the typed query, or ten references are held", () => {
-		expect(insertPointer("@x", [], { query: "y", start: 0, end: 2 }, heading).text).toBe("@x");
+		expect(insertPointer("#x", [], { query: "y", start: 0, end: 2 }, heading).text).toBe("#x");
 		let full: ReferenceDraft[] = Array.from({ length: 10 }, (_, index) => ({
 			kind: "file",
 			path: `f${index}`,
@@ -104,7 +102,7 @@ describe("choosing a part of the document or a file with @", () => {
 			end: index * 4 + 3,
 			token: `@f${index}`,
 		}));
-		let text = "@f0 @f1 @f2 @f3 @f4 @f5 @f6 @f7 @f8 @f9 @q";
+		let text = "@f0 @f1 @f2 @f3 @f4 @f5 @f6 @f7 @f8 @f9 #q";
 		let result = insertPointer(
 			text,
 			full,
@@ -205,11 +203,21 @@ describe("typed reference triggers", () => {
 		expect(referenceTrigger("Line one\n#release:v2", 20)?.query).toBe("release:v2");
 	});
 
-	test("ignores URLs, embedded markers, whitespace queries, and selections", () => {
-		for (let value of ["https://example.com/#release", "issue#12", "100%ready", "#two words"]) {
+	test("ignores URLs, embedded markers, other lines and selections", () => {
+		for (let value of ["https://example.com/#release", "issue#12", "100%ready", "#one\ntwo"]) {
 			expect(referenceTrigger(value, value.length)).toBeUndefined();
 		}
 		expect(referenceTrigger("#release", 0, 4)).toBeUndefined();
+		expect(referenceTrigger("#release", 0)).toBeUndefined();
+	});
+
+	test("goes on past a space or a slash, for the words of a title, a heading or a path", () => {
+		expect(referenceTrigger("Rewrite #Site 1: harbour", 24)).toMatchObject({
+			query: "Site 1: harbour",
+			start: 8,
+			end: 24,
+		});
+		expect(referenceTrigger("Look at #src/chat/a.ts", 22)?.query).toBe("src/chat/a.ts");
 	});
 
 	test("bounds the active query", () => {
@@ -335,7 +343,7 @@ describe("textarea replacement reconciliation", () => {
 			.toEqual([]);
 	});
 
-	test("uses beforeinput selection to drop whole replacements and composition overlap", () => {
+	test("uses the selection an edit replaced to drop whole replacements", () => {
 		let text = "Use #Plan now";
 		let reference = documentDraft(text, "#Plan");
 		let pasted = "Pasted #Plan";
@@ -348,10 +356,6 @@ describe("textarea replacement reconciliation", () => {
 			start: 0,
 			end: text.length,
 		})).toEqual([]);
-		expect(beforeInputSelection(4, 4, "deleteContentBackward", text.length)).toEqual({
-			start: 3,
-			end: 4,
-		});
 	});
 });
 
@@ -367,11 +371,11 @@ describe("composer destination cue", () => {
 	test("says a message without @chopin stays in the room, and one with it goes to the Planner", () => {
 		expect(destinationCue("should we ask about auth first?", [], true)).toEqual({
 			to: "room",
-			text: "Sent to people here. Type @ to ask Chopin",
+			text: "Sent to people here. Type @ to ask chopin",
 		});
 		expect(destinationCue("@chopin draft the auth section", [], true)).toEqual({
 			to: "planner",
-			text: "Sends to Chopin, which will reply",
+			text: "Sends to chopin, which will reply",
 		});
 	});
 
@@ -701,32 +705,5 @@ describe("focus", () => {
 		});
 		expect(chatSendPayload("@chopin tighten it", [], false, REQUEST_ID, true, CHILD)?.focus)
 			.toBeUndefined();
-	});
-});
-
-describe("a chip is edited whole", () => {
-	let chips = [{ start: 4, end: 11 }, { start: 12, end: 16 }];
-
-	test("deleting at its edge, or inside it, takes all of it, and only in the direction it is deleted", () => {
-		expect(expandToChips(chips, 11, 11, "deleteContentBackward")).toEqual({ start: 4, end: 11 });
-		expect(expandToChips(chips, 8, 8, "deleteContentBackward")).toEqual({ start: 4, end: 11 });
-		expect(expandToChips(chips, 4, 4, "deleteContentForward")).toEqual({ start: 4, end: 11 });
-		expect(expandToChips(chips, 4, 4, "deleteContentBackward")).toEqual({ start: 4, end: 4 });
-		expect(expandToChips(chips, 11, 11, "deleteContentForward")).toEqual({ start: 11, end: 11 });
-		expect(expandToChips(chips, 12, 12, "deleteWordForward")).toEqual({ start: 12, end: 16 });
-	});
-
-	test("a selection that reaches into one takes the whole of it, as far as the next", () => {
-		expect(expandToChips(chips, 8, 14, "deleteContentBackward")).toEqual({ start: 4, end: 16 });
-		expect(expandToChips(chips, 0, 5, "insertText")).toEqual({ start: 0, end: 11 });
-		expect(expandToChips(chips, 0, 3, "insertText")).toEqual({ start: 0, end: 3 });
-		expect(expandToChips(chips, 11, 12, "deleteContentBackward")).toEqual({ start: 11, end: 12 });
-	});
-
-	test("typing with the caret inside one goes after it, and typing at its edges is untouched", () => {
-		expect(expandToChips(chips, 6, 6, "insertText")).toEqual({ start: 11, end: 11 });
-		expect(expandToChips(chips, 11, 11, "insertText")).toEqual({ start: 11, end: 11 });
-		expect(expandToChips(chips, 4, 4, "insertText")).toEqual({ start: 4, end: 4 });
-		expect(expandToChips([], 3, 3, "deleteContentBackward")).toEqual({ start: 3, end: 3 });
 	});
 });

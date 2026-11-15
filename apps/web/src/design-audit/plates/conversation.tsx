@@ -1,17 +1,23 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
 
+import { withChopinMention } from "../../chat/ask-chopin";
 import { ChatComposer } from "../../chat/composer";
 import { ConnectionBannerView } from "../../chat/connection-banner";
 import { connectionStep, INITIAL_MEMORY } from "../../chat/connection-phase";
 import { ErrorState } from "../../chat/error-state";
 import { failureView } from "../../chat/failure";
-import { plannerGlyph, plannerStatus } from "../../chat/planner-status";
+import { plannerGlyph, plannerStatus, PRESENCE_WORDS } from "../../chat/planner-status";
+import { ChopinMark } from "@chopin/editor";
+import { QuietNote } from "../../chat/quiet-note";
 import { MachineGlyph, PlannerNote } from "../../machine-button";
+import { machineFix } from "../../machine-fix";
 import { boundedChatError } from "../../chat/references";
 import { mentionCandidates } from "../../chat/mentions";
 import { Transcript } from "../../chat/transcript";
 import { AuditPlate, StateLabel } from "../frame";
+
+import "../../chat/presence-dot.css";
 
 import type { Chat, Session } from "@chopin/protocol";
 import type { FileView } from "../../chat/attachments/files";
@@ -64,7 +70,6 @@ type Specimen =
 	& {
 		sending?: boolean;
 		text?: string;
-		chopin?: boolean;
 		/** Images and files are taken: the + attaches, and these are staged above the text. */
 		files?: FileView[];
 		/** Speech can be turned into words: the microphone, and the voice while it listens. */
@@ -109,7 +114,6 @@ const STAGED: FileView[] = [
 /** The live composer, holding its own draft so the specimen can be typed into. */
 export function ComposerSpecimen(
 	{
-		chopin = false,
 		banner,
 		dictation,
 		files,
@@ -121,16 +125,13 @@ export function ComposerSpecimen(
 	}: Specimen,
 ) {
 	let [draft, setDraft] = useState(text);
-	let [chip, setChip] = useState(chopin);
 	let draftable = !unavailable;
 	return (
 		<ChatComposer
 			agent
 			chopin={{
-				chip,
 				disabled: !draftable || sending,
-				onAdd: () => setChip(true),
-				onRemove: () => setChip(false),
+				onAsk: () => setDraft(value => withChopinMention(value, []).text),
 			}}
 			banner={banner}
 			dictation={dictation
@@ -138,7 +139,7 @@ export function ComposerSpecimen(
 					active: dictation === "listening",
 					phase: dictation === "listening" ? "listening" : "idle",
 					seconds: 65,
-					tooltip: "Dictate (Alt+Shift+M). Speech is turned into words on this device.",
+					tooltip: "Dictate (Alt+Shift+M)",
 					announcement: "",
 					disabled: !draftable || sending,
 					onToggle: () => {},
@@ -159,7 +160,7 @@ export function ComposerSpecimen(
 			notice={notice}
 			onSubmit={() => {}}
 			references={{ disabled: false, onMentionDocs: () => setDraft(value => `${value}#`) }}
-			format={{ shown: true, disabled: !draftable, onToggle: () => {}, onFormat: () => {} }}
+			format={{ shown: true, disabled: !draftable, onToggle: () => {} }}
 			mention={{ disabled: !draftable, onMention: () => setDraft(value => `${value}@`) }}
 			run={run}
 			sendDisabled={!draftable || sending || !draft.trim()}
@@ -189,26 +190,14 @@ const WELL = {
 	planner: undefined,
 } as const;
 
-function connection(facts: Partial<Parameters<typeof connectionStep>[1]>, resumed = false) {
-	let lost = connectionStep(INITIAL_MEMORY, { ...WELL, turn: "audit-turn", ...facts });
-	if (!resumed) return lost.view;
-	return connectionStep(
-		connectionStep(INITIAL_MEMORY, { ...WELL, turn: "audit-turn", socket: "lost" }).memory,
-		{
-			...WELL,
-			turn: "audit-turn",
-			messages: 15,
-		},
-	).view;
+function connection(facts: Partial<Parameters<typeof connectionStep>[1]>) {
+	return connectionStep(INITIAL_MEMORY, { ...WELL, turn: "audit-turn", ...facts }).view;
 }
 
-/**
- * The one banner above the composer, in each phase: the room's connection, the document catching
- * up, the machine's own connection, and a failed reply. Each shows nothing while all is well.
- */
-let BANNERS: { label: string; node: ReactNode }[] = [
+/** The offline bar, the one connection state drawn, once the room's socket has been lost a while. */
+let OFFLINE_BARS: { label: string; node: ReactNode }[] = [
 	{
-		label: "Reconnecting, with its attempt",
+		label: "Offline bar: connecting",
 		node: (
 			<ConnectionBannerView
 				onRetry={undefined}
@@ -217,7 +206,7 @@ let BANNERS: { label: string; node: ReactNode }[] = [
 		),
 	},
 	{
-		label: "Dropped, Reconnect",
+		label: "Offline bar: offline, Reconnect",
 		node: (
 			<ConnectionBannerView
 				onRetry={() => {}}
@@ -225,62 +214,36 @@ let BANNERS: { label: string; node: ReactNode }[] = [
 			/>
 		),
 	},
+];
+
+/**
+ * chopin's ephemeral rows, the last of the transcript, when a message to it could not be taken.
+ * Nobody here has the machine's name, so its owner's login is all that names it.
+ */
+let NOTES: { label: string; node: ReactNode }[] = [
 	{
-		label: "Back, the reply kept going",
-		node: <ConnectionBannerView onRetry={undefined} view={connection({}, true)} />,
-	},
-	// Nobody here has the machine's name, so its owner's login is all that names it.
-	{
-		label: "Connecting to the machine",
+		label: "chopin couldn't take it: only visible to you, How to fix",
 		node: (
-			<ConnectionBannerView
-				onRetry={undefined}
-				view={connection({ planner: plannerStatus(STARTING) })}
+			<QuietNote
+				fix={machineFix(plannerStatus(FAILING), { mine: false, choose: true, place: "note" })}
+				text="Can't connect to @mona's machine: exit 1. Try again once that is fixed."
+				ts={1_787_913_720}
 			/>
 		),
 	},
 	{
-		label: "Can't connect to the machine, reason and Try again",
+		label: "chopin busy: only visible to you",
 		node: (
-			<ConnectionBannerView
-				onRetry={() => {}}
-				view={connection({ planner: plannerStatus(FAILING) })}
+			<QuietNote
+				text="chopin can't take messages while it works on this machine. Stop it to ask now."
+				ts={1_787_913_720}
 			/>
 		),
 	},
-	{
-		label: "Machine offline",
-		node: (
-			<ConnectionBannerView
-				onRetry={undefined}
-				view={connection({ planner: plannerStatus({ state: "disconnected", login: "mona" }) })}
-			/>
-		),
-	},
-	{
-		label: "Machine stepped away",
-		node: (
-			<ConnectionBannerView
-				onRetry={undefined}
-				view={connection({
-					planner: plannerStatus({
-						state: "held",
-						login: "mona",
-						until: "2026-11-04T18:31:00.000Z",
-					}),
-				})}
-			/>
-		),
-	},
-	{
-		label: "No machine connected",
-		node: (
-			<ConnectionBannerView
-				onRetry={undefined}
-				view={connection({ planner: plannerStatus({ state: "none" }) })}
-			/>
-		),
-	},
+];
+
+/** What rests above the composer: a failed reply. The machine's state is never drawn here. */
+let BANNERS: { label: string; node: ReactNode }[] = [
 	{
 		label: "Reply failed, Retry",
 		node: <FailureSpecimen failure={{ kind: "error", detail: "429 Too Many Requests" }} retry />,
@@ -316,8 +279,9 @@ function FailureSpecimen(
 
 /**
  * The machine button's dot and the top of its menu, as the state of the document's machine changes
- * them. Each dot comes from the same `plannerGlyph` as the real button: a healthy machine leaves
- * its own green, and no machine connected has no dot at all, never that green.
+ * them: one sentence, or the fix-it steps where there is something to fix. Each dot comes from the
+ * same `plannerGlyph` as the real button: a healthy machine leaves its own green, and no machine
+ * connected has no dot at all, never that green.
  */
 let PRESENCE = [
 	{ label: "Connected: the machine's own dot", planner: undefined },
@@ -334,7 +298,7 @@ let PRESENCE = [
 export function ConversationPlate() {
 	return (
 		<AuditPlate
-			description="Member, Chopin, tool activity, queued work, composer, and error states."
+			description="Member, Chopin, tool activity, composer, and error states."
 			item="chat"
 			title="Conversation"
 		>
@@ -346,12 +310,6 @@ export function ConversationPlate() {
 								active
 								entries={CHAT_ENTRIES}
 								handle={HANDLE}
-								onWithdraw={() => {}}
-								queued={[{
-									id: "audit-queued",
-									handle: HANDLE,
-									text: "Also check the compact layout.",
-								}]}
 							/>
 							<ComposerSpecimen />
 						</div>
@@ -360,8 +318,8 @@ export function ConversationPlate() {
 			</div>
 			<div className="workspace-root bg-chat-pane design-audit-composer-states">
 				<div>
-					<StateLabel>Talking to Chopin</StateLabel>
-					<ComposerSpecimen chopin text="Review the spacing" />
+					<StateLabel>Talking to chopin</StateLabel>
+					<ComposerSpecimen text="@chopin Review the spacing" />
 				</div>
 				<div>
 					<StateLabel>Sending</StateLabel>
@@ -378,6 +336,18 @@ export function ConversationPlate() {
 						text="Can we tighten the header?"
 					/>
 				</div>
+				{NOTES.map(({ label, node }) => (
+					<div key={label}>
+						<StateLabel>{label}</StateLabel>
+						{node}
+					</div>
+				))}
+				{OFFLINE_BARS.map(({ label, node }) => (
+					<div key={label}>
+						<StateLabel>{label}</StateLabel>
+						{node}
+					</div>
+				))}
 				{BANNERS.map(({ label, node }) => (
 					<div key={label}>
 						<StateLabel>{label}</StateLabel>
@@ -397,7 +367,7 @@ export function ConversationPlate() {
 					<ComposerSpecimen dictation="listening" text="Ship the cap" />
 				</div>
 				<div>
-					<StateLabel>Chopin working</StateLabel>
+					<StateLabel>chopin working</StateLabel>
 					<ComposerSpecimen run={{ action: "stop", disabled: false, onClick: () => {} }} />
 				</div>
 				<div>
@@ -418,7 +388,27 @@ export function ConversationPlate() {
 								machine={{ service: false, connected: true, reauthorize: false }}
 								planner={plannerGlyph(planner)}
 							/>
-							{planner && <PlannerNote status={planner} />}
+							{planner && (
+								<PlannerNote
+									fix={planner.kind === "none"
+										? undefined
+										: machineFix(planner, { mine: true, choose: true, place: "menu" })}
+									status={planner}
+								/>
+							)}
+						</div>
+					</div>
+				))}
+			</div>
+			<div className="design-audit-planner-presence">
+				{(["active", "connecting", "failing", "away"] as const).map(presence => (
+					<div key={presence}>
+						<StateLabel>{`chopin in the @ menu: ${PRESENCE_WORDS[presence]}`}</StateLabel>
+						<div className="design-audit-planner-glyph">
+							<span aria-hidden="true" className="presence-host">
+								<ChopinMark circle />
+								<span className="presence-dot" data-presence={presence} />
+							</span>
 						</div>
 					</div>
 				))}

@@ -26,6 +26,7 @@ import type { Component } from "@chopin/dialect/dialect";
 import type { PlannerWorkspace } from "../harness/atomic/workspace";
 import { READ_BYTES } from "../document-reading";
 import { COACHING } from "./coaching";
+import { NAMES_AS_WRITTEN } from "./identity";
 import { DIAGRAM_AUTHORING, ROUTED_DIAGRAM_AUTHORING } from "./visual-authoring";
 
 export { DIAGRAM_AUTHORING };
@@ -137,6 +138,8 @@ row flush h=xl
 export const PROMPT = `You are the planner. You produce and maintain the plan — the shared document
 the team works from. You do not implement.
 
+${NAMES_AS_WRITTEN}
+
 ${COACHING}
 
 For evidence requiring local code execution or a member's configured tools, use
@@ -174,7 +177,9 @@ dependencies only. Tasks with no dependency are independent roots and can run
 in parallel; a dependency means the later task cannot be safely completed
 first. Add, replace, reorder and remove definitions only through the graph
 tool. Never edit plan prose while preparing implementation, and never approve,
-lock or start implementation — those are decisions and actions for people.
+lock or start implementation — those are decisions and actions for people. A
+person's Build plan press is the approval: it approves the saved draft and starts
+it, so never tell people that saved tasks still need approval.
 
 Background work is separate from this conversation. Use
 \`list_background_jobs\` and \`read_background_job\` only when a later user request makes
@@ -337,7 +342,9 @@ ${WIREFRAME_AUTHORING}
 Always name a fence's language — \`ts\`, \`python\`, \`sh\` — because the
 language is what colours it, and an unnamed fence is rendered as the grey text
 it claims to be. Add \`title="path/to/file.ts"\` after the language when the
-snippet comes from a file the reader can go and open.
+snippet comes from a file the reader can go and open. A \`wrap\` after the
+language means a reader chose to wrap that block's long lines; keep it, and
+every other word of the info string, when you edit the fence.
 
 A \`${DIFF_LANGUAGE}\` fence renders as a diff, which is how to show a change
 rather than describe one. Write a complete unified patch: the \`---\` and
@@ -445,7 +452,12 @@ you do not implement the plan yourself. If a member asks to implement it
 now, rather than prepare its task graph, your \`intercom\` tool can reach other sessions on this
 machine: one working in a checkout of ${repository}, such as a session that handed you this
 document, can take the request along with what it needs to find this document. Tell the member
-where the work continues, or that no session could take it.`;
+where the work continues, or that no session could take it.
+
+An \`intercom\` ask returns once it is delivered and waits only a few seconds for the reply. A
+reply that comes after your turn ends waits unread until your next turn, so when you need
+another session's answer to tell the member, such as checking on a workflow run, ask with
+\`wait: { kind: "foreground", budgetMs: 600000 }\`.`;
 	return [prompt, visual, reading, place, questions, surface, implementing, bootstrap].filter(
 		Boolean,
 	).join(

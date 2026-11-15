@@ -14,7 +14,7 @@ import {
 	MAX_REQUEST_BYTES,
 	MAX_TITLE_LENGTH,
 	prepare,
-	REPOSITORY_PATH_PATTERN,
+	REPOSITORY_PATH,
 } from "./mcp/create";
 import { prepareUpdate } from "./mcp/update";
 import { MAX_IMAGE_DATA_LENGTH, MAX_IMAGE_REQUEST_BYTES, prepareImage } from "./mcp/image";
@@ -22,6 +22,7 @@ import { IMAGE_TYPES } from "./images/format";
 import { isLifecycleTool, LIFECYCLE_TOOLS, lifecycleCall } from "./mcp/lifecycle";
 import { normalizedTitle } from "./channels/title";
 import { documentText, NOTE_BYTES, READING_IN_PARTS, ReadRangeError } from "./document-reading";
+import { planSourceSchema } from "./tasks/plan-source";
 
 import type { Brief, CreateDocumentInput } from "./mcp/create";
 import type { UpdateDocument } from "./mcp/update";
@@ -70,6 +71,8 @@ export type Implementation = {
 	history: ImplementationLifecycle["history"];
 	/** Decisions still open, for the agent to build on its best judgment; absent when none is. */
 	unapprovedDecisions?: NonNullable<ReturnType<typeof unapprovedContext>>["unapprovedDecisions"];
+	/** Where the graph's plan revision's files were pushed, which a build of it starts from. */
+	planSource?: { revision: number; branch: string; commit: string };
 };
 
 export type ImplementationInput = {
@@ -272,7 +275,7 @@ export type InvokePlannerError =
 	| "planner-owner-unavailable"
 	| "checkout-unverified"
 	| "planner-unavailable"
-	| "planner-queue-full"
+	| "planner-busy"
 	| "system-turn-forbidden"
 	| "system-turn-limited";
 
@@ -280,6 +283,21 @@ export type InvokePlanner<Caller> = {
 	invoke(caller: Caller, input: InvokePlannerInput): Promise<
 		| { kind: "invoked"; document: DocumentSummary & { url: string } }
 		| { kind: "refused"; code: InvokePlannerError; message?: string }
+	>;
+};
+
+export type RecordPlanSourceInput = {
+	id: string;
+	revision: number;
+	branch: string;
+	commit: string;
+};
+
+export type RecordPlanSource<Caller> = {
+	record(caller: Caller, input: RecordPlanSourceInput): Promise<
+		| { kind: "recorded"; source: { revision: number; branch: string; commit: string } }
+		| { kind: "revision-conflict"; revision: number }
+		| { kind: "unavailable-commit" | "archived" | "forbidden" | "unavailable" }
 	>;
 };
 
@@ -314,6 +332,7 @@ export type McpOptions<Caller> = {
 	restore?: RestoreDocument<Caller>;
 	invoke?: InvokePlanner<Caller>;
 	upload?: UploadImage<Caller>;
+	planSources?: RecordPlanSource<Caller>;
 	implementations?: Implementations<Caller>;
 	coordination?: Coordination<Caller>;
 	sessions?: McpSessions<Caller>;
@@ -397,7 +416,7 @@ const IMPLEMENTATION = {
 		planRevision: { type: "integer", minimum: 0 },
 		graphVersion: { type: "integer", minimum: 1 },
 		graphRevision: { type: "integer", minimum: 1 },
-		repository: { type: "string", pattern: REPOSITORY_PATH_PATTERN },
+		repository: REPOSITORY_PATH,
 		branch: { type: "string", minLength: 1, maxLength: 255 },
 		commit: { type: "string", minLength: 1, maxLength: 64 },
 	},
@@ -421,7 +440,7 @@ export const TOOLS: Tool[] = [
 		inputSchema: {
 			type: "object",
 			properties: {
-				repository: { type: "string", pattern: REPOSITORY_PATH_PATTERN },
+				repository: REPOSITORY_PATH,
 				includeArchived: { type: "boolean", default: false },
 			},
 			required: ["repository"],
@@ -478,7 +497,7 @@ export const TOOLS: Tool[] = [
 			type: "object",
 			properties: {
 				idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
-				repository: { type: "string", pattern: REPOSITORY_PATH_PATTERN },
+				repository: REPOSITORY_PATH,
 				baseBranch: { type: "string", minLength: 1, maxLength: 255 },
 				baseCommit: { type: "string", minLength: 1, maxLength: 64 },
 				title: { type: "string", maxLength: MAX_TITLE_LENGTH },
@@ -719,7 +738,7 @@ export const TOOLS: Tool[] = [
 								"planner-owner-unavailable",
 								"checkout-unverified",
 								"planner-unavailable",
-								"planner-queue-full",
+								"planner-busy",
 								"system-turn-forbidden",
 								"system-turn-limited",
 							],
@@ -734,7 +753,8 @@ export const TOOLS: Tool[] = [
 	},
 	{
 		name: "upload_image",
-		description: "Upload a PNG, JPEG, WebP or GIF image of at most 1 MiB to a Chopin document "
+		description: "Upload a PNG, JPEG, WebP or GIF image of at most 16 MiB (one over 1 MiB is "
+			+ "stored as a smaller copy) to a Chopin document "
 			+ "and return its path and Markdown. Place the Markdown in the document with "
 			+ "update_document. Only people who can read the document can load the image; "
 			+ "uploading the same bytes again returns the same path.",
@@ -751,7 +771,7 @@ export const TOOLS: Tool[] = [
 					type: "string",
 					contentEncoding: "base64",
 					maxLength: MAX_IMAGE_DATA_LENGTH,
-					description: "Standard base64 image bytes, at most 1 MiB decoded.",
+					description: "Standard base64 image bytes, at most 16 MiB decoded.",
 				},
 				mimeType: { type: "string", enum: [...IMAGE_TYPES] },
 			},
@@ -777,6 +797,71 @@ export const TOOLS: Tool[] = [
 					"too-large",
 					"unsupported-type",
 					"signature-mismatch",
+				]),
+			],
+		},
+	},
+	{
+		name: "record_plan_source",
+		description: "Record where a document revision's files are on GitHub: a branch you pushed "
+			+ "to the document's repository and the commit on it that holds them. A build of that "
+			+ "revision, or a later one with no newer record, starts from this commit instead of the "
+			+ "builder's checkout. Push the commit first: Chopin checks GitHub has it. Recording "
+			+ "another commit for the same revision replaces it.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				id: {
+					type: "string",
+					minLength: 1,
+					maxLength: MAX_DOCUMENT_LOCATOR_LENGTH,
+					pattern: "\\S",
+				},
+				revision: {
+					type: "integer",
+					minimum: 0,
+					description: "The document revision the files belong to; at most its current one.",
+				},
+				branch: {
+					type: "string",
+					minLength: 1,
+					maxLength: 255,
+					description: "A branch name, without refs/heads/.",
+				},
+				commit: { type: "string", pattern: "^[0-9a-f]{40}$" },
+			},
+			required: ["id", "revision", "branch", "commit"],
+			additionalProperties: false,
+		},
+		outputSchema: {
+			type: "object",
+			oneOf: [
+				{
+					type: "object",
+					properties: {
+						recorded: { type: "boolean", const: true },
+						revision: { type: "integer", minimum: 0 },
+						branch: { type: "string" },
+						commit: { type: "string" },
+					},
+					required: ["recorded", "revision", "branch", "commit"],
+					additionalProperties: false,
+				},
+				{
+					type: "object",
+					properties: {
+						code: { type: "string", const: "revision-conflict" },
+						revision: { type: "integer", minimum: 0 },
+					},
+					required: ["code", "revision"],
+					additionalProperties: false,
+				},
+				outcome([
+					"invalid-plan-source",
+					"plan-source-unavailable",
+					"document-archived",
+					"document-unavailable",
+					"repository-forbidden",
 				]),
 			],
 		},
@@ -1141,6 +1226,7 @@ function serviceInstructions(tools: Tool[]): string | undefined {
 		|| tool.name === "restore_document"
 		|| tool.name === "invoke_planner"
 		|| tool.name === "upload_image"
+		|| tool.name === "record_plan_source"
 	);
 	let implementation = tools
 		.filter(tool =>
@@ -1213,6 +1299,7 @@ export function handler<Caller>(
 		&& (tool.name !== "restore_document" || restoring)
 		&& (tool.name !== "invoke_planner" || options.invoke)
 		&& (tool.name !== "upload_image" || options.upload)
+		&& (tool.name !== "record_plan_source" || options.planSources)
 		&& (!["read_implementation", "start_implementation"].includes(tool.name)
 			|| options.implementations)
 		&& (!isLifecycleTool(tool.name) || options.implementations?.reportLifecycle)
@@ -1462,7 +1549,7 @@ export function handler<Caller>(
 						}, true));
 				}
 				if (tool.name === "upload_image" && options.upload) {
-					let prepared = prepareImage(tool.arguments);
+					let prepared = await prepareImage(tool.arguments);
 					if (!prepared) {
 						return notification
 							? undefined
@@ -1479,6 +1566,40 @@ export function handler<Caller>(
 					}
 					return respond(text({
 						code: outcome.kind === "archived"
+							? "document-archived"
+							: outcome.kind === "forbidden"
+							? "repository-forbidden"
+							: "document-unavailable",
+					}, true));
+				}
+				if (tool.name === "record_plan_source" && options.planSources) {
+					let { id, revision, branch, commit, ...extra } = tool.arguments;
+					if (
+						Object.keys(extra).length || !isLocator(id) || !Number.isSafeInteger(revision)
+						|| (revision as number) < 0 || typeof branch !== "string"
+						|| typeof commit !== "string"
+					) {
+						return notification
+							? undefined
+							: error(
+								call.id,
+								-32602,
+								"record_plan_source requires an id, revision, branch and commit",
+							);
+					}
+					let source = planSourceSchema.safeParse({ revision, branch, commit });
+					if (!source.success) return respond(text({ code: "invalid-plan-source" }, true));
+					let outcome = await options.planSources.record(caller, { id, ...source.data });
+					if (outcome.kind === "recorded") {
+						return respond(text({ recorded: true, ...outcome.source }));
+					}
+					if (outcome.kind === "revision-conflict") {
+						return respond(text({ code: outcome.kind, revision: outcome.revision }, true));
+					}
+					return respond(text({
+						code: outcome.kind === "unavailable-commit"
+							? "plan-source-unavailable"
+							: outcome.kind === "archived"
 							? "document-archived"
 							: outcome.kind === "forbidden"
 							? "repository-forbidden"

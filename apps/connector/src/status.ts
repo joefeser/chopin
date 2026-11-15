@@ -1,10 +1,10 @@
 import type { SandboxReport } from "@chopin/protocol/connector";
 import { sandboxLabel } from "@chopin/protocol/connector";
 import { type ConnectSettings, readConfig } from "./config";
-import { machineLabel, machineToken, SELF } from "./machine";
+import { machineGitHubCheck, machineLabel, machineToken, SELF } from "./machine";
 import { CONNECTOR_HEADERS, jsonObject, refusal } from "./mcp";
 import { logPath, type ServiceHost, type ServiceStatus, serviceStatus } from "./service";
-import { appCannotPush } from "./github-token";
+import { githubRefusal } from "./github-token";
 import { CONNECTOR_PROTOCOL, VERSION } from "./version";
 import { join } from "node:path";
 import { clones } from "./checkouts";
@@ -14,6 +14,7 @@ import {
 	plannerWorktrees,
 	processStart,
 	runs,
+	type SpareState,
 	type StartFailure,
 } from "./workspace";
 
@@ -84,10 +85,12 @@ export type StatusReport = {
 			Omit<StartFailure, "at" | "retryAt"> & { at: string; retryAt?: string }
 		>;
 		/**
-		 * The repositories Chopin's GitHub App can't push to, so the machine's Planner commands and
-		 * runs use its own GitHub login there.
+		 * Its spare Planners, one per registered checkout's repository: `state` is `starting`,
+		 * `ready` (since it printed ready), `unsupported` (the Planner command never took spare
+		 * mode, since then) or `off` (`--no-planner-spare`); `command` names the Planner command's
+		 * program. `since` is ISO 8601.
 		 */
-		githubCannotPush?: string[];
+		spares?: Array<Omit<SpareState, "since"> & { since: string }>;
 	}>;
 	service: ServiceStatus | { state: "unknown"; detail: string };
 	/** Whether agents run in the system's process sandbox, and if not, why and the one fix. */
@@ -112,6 +115,13 @@ export type StatusReport = {
 	checkouts: Record<string, string>;
 	/** The clones made on demand in `<base>/repos/<owner>/<repo>` for every other repository. */
 	clones: Array<{ repository: string; path: string }>;
+	/**
+	 * Whether Chopin would give this machine a GitHub token for each registered checkout's
+	 * repository, asked without one being made: `ok`, why not (`repository-forbidden`,
+	 * `app-cannot-push`, `no-grant`, …), or `unknown` when Chopin couldn't be asked. Nothing that
+	 * Chopin refuses runs there: the machine never uses its own GitHub login.
+	 */
+	github: Record<string, string>;
 };
 
 const CHECK_MS = 3000;
@@ -188,6 +198,8 @@ export async function collectStatus(options: {
 	let found = await runs(directory, processStart(host.platform, host.run));
 	let kept = found.filter(run => !run.active && run.worktree);
 	let bytes = await diskUsage(kept.map(run => join(directory, "runs", run.attempt)));
+	let checkouts = held.find(item => item.running && item.checkouts)?.checkouts
+		?? registered(config.service?.settings ?? config.connect);
 	return {
 		version: VERSION,
 		protocol: CONNECTOR_PROTOCOL,
@@ -204,13 +216,20 @@ export async function collectStatus(options: {
 			...(item.planners ? { planners: item.planners } : {}),
 			...(item.plannerCommand ? { canRunPlanners: true as const } : {}),
 			...(item.chosen ? { chosenPlanners: item.chosen } : {}),
-			...(item.githubCannotPush ? { githubCannotPush: item.githubCannotPush } : {}),
 			...(item.failures
 				? {
 					failures: item.failures.map(({ at, retryAt, ...failure }) => ({
 						...failure,
 						at: new Date(at).toISOString(),
 						...(retryAt ? { retryAt: new Date(retryAt).toISOString() } : {}),
+					})),
+				}
+				: {}),
+			...(item.spares
+				? {
+					spares: item.spares.map(({ since, ...spare }) => ({
+						...spare,
+						since: new Date(since).toISOString(),
 					})),
 				}
 				: {}),
@@ -227,9 +246,25 @@ export async function collectStatus(options: {
 			...(bytes === undefined ? {} : { bytes }),
 		},
 		plannerWorktrees: await plannerWorktrees(directory),
-		checkouts: held.find(item => item.running && item.checkouts)?.checkouts
-			?? registered(config.service?.settings ?? config.connect),
+		checkouts,
 		clones: await clones(directory),
+		github: Object.fromEntries(
+			await Promise.all(
+				Object.keys(checkouts).filter(Boolean).map(async repository =>
+					[
+						repository,
+						token && machine.accepted
+							? await machineGitHubCheck(
+								server,
+								token,
+								repository,
+								AbortSignal.timeout(options.timeoutMs ?? CHECK_MS),
+							)
+							: "unknown",
+					] as const
+				),
+			),
+		),
 	};
 }
 
@@ -277,6 +312,24 @@ function failing(failure: Failure, now: number) {
 }
 
 /** `bytes` as a person reads a size. */
+/** One status line for a repository's spare Planner. */
+function spareLine(spare: Omit<SpareState, "since"> & { since: string }, now: number) {
+	let since = Math.max(0, Math.round((now - Date.parse(spare.since)) / 60_000));
+	let ago = since < 1
+		? "just now"
+		: since < 120
+		? `${since} min ago`
+		: `${Math.round(since / 60)} h ago`;
+	let state = {
+		starting: "starting",
+		ready: `ready (since ${ago}${spare.command ? `, ${spare.command}` : ""})`,
+		unsupported: `not taken: the Planner command didn't start as a spare (found ${ago}); `
+			+ "new documents' Planners start as before",
+		off: "off (--no-planner-spare)",
+	}[spare.state];
+	return `Spare Planner for ${spare.repository}: ${state}`;
+}
+
 function size(bytes: number) {
 	if (bytes < 1024 ** 2) return `${Math.round(bytes / 1024)} kB`;
 	if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
@@ -321,7 +374,6 @@ export function formatStatus(report: StatusReport, now = Date.now()) {
 					item.version ? `, chopin ${item.version}` : ""
 				}${item.service ? ", the service" : ""})`,
 				...(agent ? [`  Agent${failing(agent, now)}`] : []),
-				...(item.githubCannotPush ?? []).map(repository => `  ${appCannotPush(repository)}`),
 				...(item.canRunPlanners
 					? ["  Can run Planners for documents that choose this machine"]
 					: []),
@@ -335,6 +387,7 @@ export function formatStatus(report: StatusReport, now = Date.now()) {
 						failure ? failing(failure, now) : ""
 					}`;
 				}),
+				...(item.spares ?? []).map(spare => `  ${spareLine(spare, now)}`),
 			]
 			: [
 				`stale lock${
@@ -351,9 +404,15 @@ export function formatStatus(report: StatusReport, now = Date.now()) {
 	let worktrees = report.plannerWorktrees.map(item =>
 		`${item.path} (${item.repository}, document ${item.document})`
 	);
-	let checkouts = Object.entries(report.checkouts).map(([repository, path]) =>
-		repository ? `${repository} at ${path}` : path
-	);
+	let checkouts = Object.entries(report.checkouts).map(([repository, path]) => {
+		let github = report.github?.[repository];
+		let refused = github && github !== "ok" && github !== "unknown"
+			? `; ${
+				githubRefusal(github, repository).replace(", so nothing ran", ", so nothing runs there")
+			}`
+			: "";
+		return `${repository ? `${repository} at ${path}` : path}${refused}`;
+	});
 	let cloned = report.clones.map(item => `${item.repository} at ${item.path}`);
 	return [
 		`chopin ${report.version} (connector protocol ${report.protocol})`,

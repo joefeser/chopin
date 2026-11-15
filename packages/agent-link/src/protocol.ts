@@ -62,6 +62,30 @@ export const AGENT_FEATURES = {
 	 * where the model the turn names reports `image` among its `inputTypes`.
 	 */
 	attachments: "attachments",
+	/**
+	 * A thread started from a Chat message asks the client to fork the Planner session at that
+	 * message (`fork`), keeping the messages, tool results, compaction state and session memory
+	 * up to that turn, and multiplexing the forked session over the same connection. Without the
+	 * feature, or when `fork` is answered with `start-failed`, the server opens an ordinary
+	 * `start` session seeded with the transcript up to the root message.
+	 */
+	sessionForks: "session-forks",
+	/**
+	 * A person's message sent while a turn runs reaches that turn as a `steer`, to read at its next
+	 * step, answered with `control-result`. Without the feature the server never sends one, and a
+	 * message sent while this client works is refused rather than held.
+	 */
+	steerTurn: "steer-turn",
+	/**
+	 * A turn a person's Chat message began names that message in `message`. When a turn failed and
+	 * its sender pressed Retry, the turn that runs it again carries the same `message` and
+	 * `retry: true`, and its prompt is the message as first given: the client drops from what it
+	 * keeps everything the earlier turns for that message added (their prompt, the model's partial
+	 * reply, tool calls and results, and the error) and runs this one as the message's only turn.
+	 * Without the feature a turn carries neither field; the server still gives a retried turn a
+	 * fresh session whose `instructions` hold neither the message nor the failed attempt.
+	 */
+	retryTurn: "retry-turn",
 } as const;
 
 /** How often a client that offered `restart-notice` retries a `resume` refused with `retry`. */
@@ -136,6 +160,7 @@ const usage = z.strictObject({
 		text: count.optional(),
 		reasoning: count.optional(),
 	}),
+	contextWindow: count.optional(),
 });
 
 /**
@@ -181,6 +206,14 @@ export const streamPartSchema = z.discriminatedUnion("type", [
 	}),
 	z.strictObject({ type: z.literal("finish-step"), finishReason, usage }),
 	z.strictObject({ type: z.literal("finish"), finishReason, totalUsage: usage }),
+	z.strictObject({ type: z.literal("compacting") }),
+	z.strictObject({
+		type: z.literal("compaction"),
+		trigger: z.enum(["manual", "auto"]),
+		summary: text,
+		tokensBefore: count.optional(),
+		tokensAfter: count.optional(),
+	}),
 	z.strictObject({ type: z.literal("error"), error: note }),
 ]);
 
@@ -312,6 +345,33 @@ export const toolErrorSchema = z.strictObject({
 		kind: identifier.optional(),
 		message: note.min(1),
 	}),
+});
+
+/**
+ * An image a tool made, as one block of its result's `content`, the shape MCP and Atomic tools
+ * return: base64 `data` and its `mimeType`, with optional `alt` (what it shows, in words) and
+ * `caption`, kept as given. Chopin stores each block it can host (a PNG, JPEG, WebP, GIF, AVIF, BMP
+ * or ICO whose bytes are that type, of any size a message holds) as one of the document's images
+ * and shows it in Chat as a generated image; a block it cannot host is shown as a plain reason
+ * beside the images (`Chat.Entry.refusedImages`), and every `text` block stays only in the tool's
+ * own row.
+ * A client whose result would not fit one message sends a smaller copy of the image, and only
+ * where it cannot make one the block with an empty `data` and `tooLarge`, the bytes it would
+ * have taken, and Chat says so. Extra keys, and an `alt` or
+ * `caption` that is not text, are ignored. Like `toolErrorSchema` this
+ * is a recognised convention: any JSON is still a result.
+ */
+export const toolImageSchema = z.object({
+	type: z.literal("image"),
+	data: z.string(),
+	mimeType: z.string(),
+	alt: z.string().optional().catch(undefined),
+	caption: z.string().optional().catch(undefined),
+	tooLarge: z.number().int().positive().optional().catch(undefined),
+});
+
+export const toolContentSchema = z.object({
+	content: z.array(z.unknown()),
 });
 
 const option = z.strictObject({
@@ -550,6 +610,15 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 		mode: z.enum(["planner", "isolated"]),
 	}),
 	z.strictObject({
+		type: z.literal("fork"),
+		session: id,
+		mode: z.enum(["planner", "isolated"]),
+		from: z.strictObject({
+			session: id,
+			turn: id.optional(),
+		}),
+	}),
+	z.strictObject({
 		type: z.literal("turn"),
 		session: id,
 		turn: id,
@@ -571,10 +640,27 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 		 * order they were sent. Absent when it had none, and always for a client that did not ask.
 		 */
 		attachments: z.array(turnAttachment).max(MAX_TURN_ATTACHMENTS).optional(),
+		/**
+		 * With `retry-turn`: the Chat message this turn answers, by its id. Absent for a turn no
+		 * person's message began (a background job, an instruction the server wrote), and always for
+		 * a client that did not ask.
+		 */
+		message: id.optional(),
+		/**
+		 * With `retry-turn`, and only with `message`: this turn runs `message` again after an
+		 * earlier turn for it failed. Drop everything the earlier turns for `message` added before
+		 * running it.
+		 */
+		retry: z.literal(true).optional(),
 		tools: z.array(toolSpec).max(MAX_TOOLS),
 		responseFormat: responseFormat.optional(),
 	}),
 	z.strictObject({ type: z.literal("abort"), session: id, turn: id }),
+	/**
+	 * With `steer-turn`: a person's message for the turn that is running, to read at its next
+	 * step. The client answers with `control-result`, `ok: false` when the turn has ended.
+	 */
+	z.strictObject({ type: z.literal("steer"), request: id, session: id, turn: id, prompt: text }),
 	z.strictObject({
 		type: z.literal("host-tool-result"),
 		session: id,
@@ -609,6 +695,7 @@ export type ClientMessage = z.infer<typeof clientMessageSchema>;
 export type ServerMessage = z.infer<typeof serverMessageSchema>;
 export type StreamPart = z.infer<typeof streamPartSchema>;
 export type ToolError = z.infer<typeof toolErrorSchema>;
+export type ToolImage = z.infer<typeof toolImageSchema>;
 export type InputCall = z.infer<typeof inputSchema>;
 export type InputMethod = InputCall["method"];
 export type LinkRun = z.infer<typeof runSchema>;

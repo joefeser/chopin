@@ -77,6 +77,8 @@ function setup(overrides: {
 		signal: AbortSignal,
 		lifecycle: DispatchLifecycle,
 	) => Promise<boolean>;
+	settled?: () => void;
+	changed?: () => void;
 } = {}) {
 	let clock = new ManualClock();
 	let admissions: string[] = [];
@@ -89,6 +91,8 @@ function setup(overrides: {
 		clock,
 		soloMs: overrides.soloMs,
 		groupMs: overrides.groupMs,
+		...(overrides.settled ? { settled: overrides.settled } : {}),
+		...(overrides.changed ? { changed: overrides.changed } : {}),
 		admit(value) {
 			admissions.push(value);
 			return overrides.admit?.(value) ?? "ready";
@@ -462,4 +466,76 @@ test("duplicate source IDs do not replace or restart an opportunity", async () =
 	await h.clock.advance(60_000);
 	expect(h.judgments).toEqual(["original"]);
 	expect(h.dispatches).toEqual(["original:respond"]);
+});
+
+test("holds a message from when it arrives until its reply ends, or until the judge declines it, and says once when it lets go", async () => {
+	let reply = deferred<boolean>();
+	let settled = 0;
+	let h = setup({
+		soloMs: 10,
+		settled: () => settled++,
+		dispatch: (_value, _move, _signal, lifecycle) => {
+			lifecycle.started();
+			return reply.promise;
+		},
+	});
+	expect(h.schedule.holds()).toBe(false);
+	receive(h, "first", "ana");
+	expect(h.schedule.holds()).toBe(true);
+	await h.clock.advance(10);
+	expect(h.dispatches).toEqual(["first:respond"]);
+	expect(h.schedule.holds()).toBe(true);
+	expect(settled).toBe(0);
+	reply.resolve(true);
+	await h.clock.advance(1);
+	expect(h.schedule.holds()).toBe(false);
+	expect(settled).toBe(1);
+
+	let declined = setup({ soloMs: 10, settled: () => settled++, judge: async () => undefined });
+	receive(declined, "second", "ana");
+	expect(declined.schedule.holds()).toBe(true);
+	await declined.clock.advance(10);
+	expect(declined.dispatches).toEqual([]);
+	expect(declined.schedule.holds()).toBe(false);
+	expect(settled).toBe(2);
+});
+
+test("the people in the conversation are who spoke in the last two minutes and who is typing, each once", async () => {
+	let changes = 0;
+	let h = setup({ soloMs: 10, judge: async () => undefined, changed: () => changes++ });
+	expect(h.schedule.people()).toEqual(new Set());
+	receive(h, "first", "ana");
+	// Two tabs of one person are one person.
+	h.schedule.typing("ana-tab", "ana", true);
+	h.schedule.typing("ana-other-tab", "ana", true);
+	expect(h.schedule.people()).toEqual(new Set(["ana"]));
+	h.schedule.typing("bo-tab", "bo", true);
+	expect(h.schedule.people()).toEqual(new Set(["ana", "bo"]));
+	expect(changes).toBeGreaterThan(0);
+
+	// A typing lease runs out by itself, and the schedule says so when it does.
+	changes = 0;
+	await h.clock.advance(TYPING_LEASE_MS);
+	expect(h.schedule.people()).toEqual(new Set(["ana"]));
+	expect(changes).toBeGreaterThan(0);
+
+	// Someone who spoke stays in the conversation for two minutes, even after they leave.
+	receive(h, "second", "bo");
+	h.schedule.depart("bo-tab");
+	expect(h.schedule.people()).toEqual(new Set(["ana", "bo"]));
+	changes = 0;
+	await h.clock.advance(120_000);
+	expect(h.schedule.people()).toEqual(new Set());
+	expect(changes).toBeGreaterThan(0);
+
+	// chopin's reply ends the conversation's earlier speakers, as it ends their group.
+	receive(h, "third", "ana");
+	receive(h, "fourth", "bo");
+	changes = 0;
+	h.schedule.replied();
+	expect(h.schedule.people()).toEqual(new Set());
+	expect(changes).toBe(1);
+
+	h.schedule.close();
+	expect(h.clock.pendingTimers).toBe(0);
 });

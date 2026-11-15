@@ -33,7 +33,7 @@ test("closing resolves queued and active jobs, and the queue has a bound", async
 	expect(full.chat.waiting).toHaveLength(20);
 });
 
-test("ephemeral state and queue broadcast failures cannot strand a job", async () => {
+test("an ephemeral state broadcast failure cannot strand a job, and a job waiting behind a turn fails when the document closes", async () => {
 	let direct = harness();
 	direct.breakFrame("chat:state");
 	let running = Chat.job(direct.context, JOB, "prompt", "session");
@@ -44,7 +44,6 @@ test("ephemeral state and queue broadcast failures cannot strand a job", async (
 
 	let queued = harness();
 	queued.chat.busy = true;
-	queued.breakFrame("chat:queue");
 	let waiting = Chat.job(queued.context, JOB, "prompt", "session");
 	expect(queued.chat.waiting).toHaveLength(1);
 	await Chat.close(queued.chat);
@@ -74,4 +73,23 @@ test("a final persist failure settles the job and releases the queue", async () 
 	});
 	expect(state.chat.busy).toBe(false);
 	expect(state.chat.waiting).toEqual([]);
+});
+
+test("a background job's turn is quiet, so Chat draws nothing for it and offers no Stop", async () => {
+	let h = harness();
+	let running = Chat.job(h.context, JOB, "prompt", "session");
+	await until(() => h.prompts.length === 1);
+	let states = h.frames.filter(frame => frame.kind === "chat:state") as Array<
+		{ busy: boolean; turn?: { quiet?: boolean } }
+	>;
+	expect(states.at(-1)?.busy).toBe(true);
+	expect(states.at(-1)?.turn?.quiet).toBe(true);
+	await runJobTool(h.chat, "refine_decision", async () => ({ output: {} }));
+	h.emit("session.idle");
+	expect(await running).toEqual({ status: "done", output: "{}" });
+	let ended = h.frames.filter(frame => frame.kind === "chat:state").at(-1) as
+		| { busy: boolean; turn?: unknown }
+		| undefined;
+	expect(ended).toMatchObject({ busy: false });
+	expect(ended?.turn).toBeUndefined();
 });

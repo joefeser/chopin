@@ -85,7 +85,7 @@ detached worktree and preserves existing local edits. Its local state defaults t
 with `--base-dir`, `CHOPIN_HOME` or `CHOPIN_CONNECTOR_STATE_DIR`. Worktrees are retained there for inspection.
 Remove an unwanted worktree with Git's normal `worktree remove` command.
 
-Manual investigations can upload up to three distinct screenshots, at most 1 MiB each.
+Manual investigations can upload up to three distinct screenshots; one over 1 MiB is stored as a smaller copy.
 The agent saves PNG, JPEG or WebP files in its worktree and calls `upload_image_file({path})`.
 The connector refuses paths outside that worktree, including symlinks. The agent embeds the
 returned hosted paths as Markdown images in the submitted report. The run-scoped server tool
@@ -246,7 +246,7 @@ back ends as **your local agent disconnected** when the window passes, once
 someone opens the document or the agent calls Chopin. The window, the agent's
 `unavailable` answers and the machine taking the build back follow the same
 rule, so they never disagree. A build that ended before the restart stays ended
-(`build-inactive`).
+(`build-inactive`, or `build-stopped` with who stopped it when a person pressed Stop).
 
 A build claimed by an older connector, or by a server without this change,
 cannot go on, as Chopin cannot find it again: the connector stops its agent with
@@ -359,7 +359,7 @@ spike's agent wrote from collaborators' text; the instruction treats it as data,
 but operators should weigh that exposure before enabling `LIVE_SPIKES` there.
 
 A spike run's MCP tools are `read_investigation`, `upload_investigation_image`
-(at most three distinct images, each at most 1 MiB) and `submit_spike_result`
+(at most three distinct images; one over 1 MiB is stored as a smaller copy) and `submit_spike_result`
 (a headline, three to six findings, a recommendation and the uploaded image
 paths, which the server turns into the report). It cannot submit an
 investigation or experiment result. The connector adds a local

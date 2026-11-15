@@ -89,7 +89,6 @@ it("restores an MCP-created plan with its creation metadata", async () => {
 		source: "# Created\n",
 		revision: 0,
 		creation,
-		records: [],
 		openQuestions: [],
 	});
 });
@@ -131,7 +130,6 @@ it("normalizes legacy paired creation metadata when restoring a plan", async () 
 		source: "# Created\n",
 		revision: 0,
 		creation,
-		records: [],
 		openQuestions: [],
 	});
 });

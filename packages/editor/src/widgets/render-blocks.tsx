@@ -59,12 +59,14 @@ import {
 	mergeRegister,
 } from "lexical";
 import { $isTableCellNode, $isTableRowNode } from "@lexical/table";
-import { $isCodeBlockNode, $isMathNode } from "@chopin/dialect";
+import { $isCodeBlockNode, $isMathNode, codeWraps, withCodeWrap } from "@chopin/dialect";
 
 import { enclosing, remember } from "../collapse";
+import { $liveRangeSelection } from "../live-selection";
 import { widgets$ } from "../widget-options";
 import { describeDiagramError, kindOf, languageOptions, plainText, titleOf } from "./code";
 import { CodeView } from "./code-view";
+import { CopyCode } from "./code-copy";
 import { fitsLegibly } from "./diagram-fit";
 import { DiagramSheet, ExpandDiagram, FitDiagram } from "./diagram-sheet";
 import { usePhone } from "../pointer";
@@ -73,7 +75,7 @@ import { useNearAtMount, useNearViewport } from "./near-viewport";
 import { registerPreviewSelection } from "./preview-selection";
 import { diffSourceLine, lastLineStart, offsetOfLine } from "./source-offset";
 import { hiddenSides, scrollEdges } from "./tab-edges";
-import { CodeIcon, WarningIcon } from "@chopin/icons";
+import { CodeIcon, WarningIcon, WrapIcon } from "@chopin/icons";
 
 import type { ElementNode, LexicalCommand, LexicalEditor, LexicalNode } from "lexical";
 import type { Wireframe as WireframeTree } from "@chopin/diagrams/wireframe";
@@ -183,7 +185,8 @@ function renders(
 	if (block.kind === "seecode") return spec !== undefined;
 	if (block.kind === "wireframe") return drawing?.source === block.source;
 	if (block.kind === "math" || block.kind === "mermaid") return !!html;
-	return block.kind === "code" || block.kind === "diff";
+	// Code is coloured in place (`code-paint-plugin.tsx`), so only a patch has a second reading.
+	return block.kind === "diff";
 }
 
 function collect(editor: LexicalEditor): Block[] {
@@ -320,6 +323,36 @@ function Language(
 	}
 
 	return <LanguageMenu onChange={set} options={options} value={block.language} />;
+}
+
+/**
+ * Wrap lines, as Notion has it: a setting of the block, written into its fence as `wrap`, so every
+ * reader sees the block wrap. Code that scrolls is offered it; a fence nobody named already wraps
+ * its source, and a phone wraps code anyway.
+ */
+function Wrap({ block, editor }: { block: Block; editor: LexicalEditor }) {
+	let wraps = codeWraps(block.meta);
+	let toggle = useCallback(() => {
+		editor.update(() => {
+			let node = $getNodeByKey(block.key);
+			if (!$isCodeBlockNode(node)) return;
+			node.setMeta(withCodeWrap(node.getMeta(), !codeWraps(node.getMeta())));
+		});
+	}, [editor, block.key]);
+	return (
+		<button
+			type="button"
+			aria-pressed={wraps}
+			onClick={toggle}
+			// As the source toggle: a click must not drop a caret into the source first.
+			onMouseDown={event => event.preventDefault()}
+			aria-label="Wrap lines"
+			className="plan-code-wrap btn btn-icon btn-ghost"
+			data-tooltip="Wrap lines"
+		>
+			<WrapIcon aria-hidden="true" size={16} />
+		</button>
+	);
 }
 
 function Toggle({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
@@ -469,7 +502,7 @@ function Preview(
 	 * A layout effect, because opening a block and putting the caret in its
 	 * source happen in one gesture, and a caret cannot land in a hidden box.
 	 *
-	 * Code and diffs swap: their preview is the same text, coloured, so
+	 * Diffs swap: their preview is the same patch, drawn, so
 	 * showing both would put every line on screen twice. A drawing is a
 	 * different reading of its source, and stays above it while it is edited.
 	 */
@@ -504,6 +537,21 @@ function Preview(
 		else delete element.dataset.planText;
 		if (wireframe && editing) element.dataset.planEditing = "";
 		else delete element.dataset.planEditing;
+		/*
+		 * Code is read where it is written, so for someone who cannot put a caret in it the lines
+		 * themselves are the scroll lane a keyboard has to reach, as the drawn copy was. Only then:
+		 * inside an editable root a focusable box would take focus from the caret.
+		 */
+		let source = element.querySelector<HTMLElement>("[data-plan-source]");
+		if (source && block.kind === "code" && (disabled || reading)) {
+			source.tabIndex = 0;
+			source.setAttribute("role", "group");
+			source.setAttribute("aria-label", "Code");
+		} else if (source?.hasAttribute("tabindex")) {
+			source.removeAttribute("tabindex");
+			source.removeAttribute("role");
+			source.removeAttribute("aria-label");
+		}
 	});
 
 	let host = element?.querySelector<HTMLElement>("[data-plan-preview]");
@@ -524,6 +572,9 @@ function Preview(
 	}, [block.key, hidable, onHidable]);
 
 	let title = block.kind !== "diff" ? titleOf(block.meta) : undefined;
+	let phone = usePhone();
+	let wrappable = !disabled && !phone
+		&& (block.kind === "code" || block.kind === "diff" || plainText(block.language));
 
 	// These portals are siblings, so their stable keys also need distinct roles.
 	return (
@@ -556,14 +607,17 @@ function Preview(
 					{
 						// Tab indents code, so the way out has to be said
 						// where someone is typing it. A block with a preview
-						// returns to it on Escape, and Tab leaves from there.
+						// returns to it on Escape, and Tab leaves from there;
+						// any other leaves for the block after it.
 						editing && !disabled && block.kind !== "math" && (
 							<span className="text-xs text-text-tertiary">
-								{hidable ? "Esc to preview" : "Esc then Tab to leave"}
+								{hidable ? "Esc to preview" : "Esc to leave"}
 							</span>
 						)
 					}
+					{wrappable && <Wrap block={block} editor={editor} />}
 					{hidable && !reading && <Toggle collapsed={collapsed} onToggle={onToggle} />}
+					{named && <CopyCode source={block.source} />}
 					{title && <span className="plan-code-title">{title}</span>}
 					{named && <Language block={block} editor={editor} disabled={disabled} />}
 				</div>,
@@ -776,7 +830,7 @@ function Rendered(
 	if (error) return <div data-plan-error="">{error}</div>;
 	if (!block.source.trim()) return null;
 
-	if (block.kind === "code" || block.kind === "diff") {
+	if (block.kind === "diff") {
 		return (
 			<CodeView
 				kind={block.kind}
@@ -1170,7 +1224,13 @@ export function PreviewPlugin() {
 			let node = $getNodeByKey(block.key);
 			let preview = editor.getElementByKey(block.key);
 			if (block.kind === "math") node?.selectNext(0, 0);
-			else $setSelection(null);
+			else {
+				$setSelection(null);
+				// Moving focus to the preview below makes Lexical leave the DOM selection alone on
+				// commit; without clearing it here, a press's pending selectionchange puts the caret
+				// straight back into the source and reopens it.
+				root()?.ownerDocument.getSelection()?.removeAllRanges();
+			}
 			flushSync(() =>
 				setShown(prev => {
 					let next = { ...prev };
@@ -1320,8 +1380,8 @@ export function PreviewPlugin() {
 				KEY_ESCAPE_COMMAND,
 				event => {
 					if (latest.current.disabled) return false;
-					let selection = $getSelection();
-					if (!$isRangeSelection(selection) || !selection.isCollapsed()) return false;
+					let selection = $liveRangeSelection(editor);
+					if (!selection || !selection.isCollapsed()) return false;
 					let key = enclosing(selection.anchor.getNode());
 					let block = key ? blockAt(editor.getElementByKey(key)) : undefined;
 					if (!block || !latest.current.hidable.has(block.key)) return false;
@@ -1398,8 +1458,8 @@ export function PreviewPlugin() {
 		let collapsed = !current.current[key];
 		if (!collapsed) {
 			editor.update(() => {
-				let selection = $getSelection();
-				if (!$isRangeSelection(selection)) return;
+				let selection = $liveRangeSelection(editor);
+				if (!selection) return;
 				if (enclosing(selection.anchor.getNode()) !== key) return;
 				$getNodeByKey(key)?.selectNext(0, 0);
 			});

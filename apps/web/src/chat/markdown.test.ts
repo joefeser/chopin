@@ -3,8 +3,9 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { RepositoryLinksProvider } from "@chopin/editor";
 
+import { defaultComponents, MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
+import { markdownClass } from "./assistant-ui/markdown-classes.test-fixtures";
 import { inlineText } from "./inline-text";
-import { MarkdownText } from "../markdown-text/markdown-text";
 import { InlineMarkdown, MessageMarkdown, sameMessageMarkdown } from "./markdown";
 import { referenceRenderModel } from "./references";
 
@@ -30,6 +31,12 @@ let PARTICIPANT_MESSAGE = [
 	"# Ordinary message text",
 	"",
 	"![remote](https://example.invalid/pixel.png)",
+].join("\n");
+
+/** Raw HTML is never drawn, whatever it holds. */
+let RAW_HTML_MESSAGE = [
+	"# Ordinary message text",
+	"",
 	'<img src="https://example.invalid/raw.png" alt="raw">',
 ].join("\n");
 
@@ -52,6 +59,18 @@ function reference(source: string, token: string, id = "reference-one"): Chat.Re
 	};
 }
 
+const P_CLASS = markdownClass("p");
+const STRONG_CLASS = markdownClass("strong");
+const A_CLASS = markdownClass("a");
+const CODE_CLASS = markdownClass("code");
+const UL_CLASS = markdownClass("ul");
+const OL_CLASS = markdownClass("ol");
+const LI_CLASS = markdownClass("li");
+const QUOTE_CLASS = markdownClass("blockquote");
+const TABLE_CLASS = /^<div[^>]*><table class="([^"]+)"/.exec(
+	renderToStaticMarkup(createElement(defaultComponents.table!)),
+)![1]!;
+
 function markdown(source: string, references?: Chat.Reference[]): string {
 	return renderToStaticMarkup(createElement(MessageMarkdown, { source, references }));
 }
@@ -59,66 +78,72 @@ function markdown(source: string, references?: Chat.Reference[]): string {
 test("Chat Markdown admits formatting without document features", () => {
 	let markup = markdown(PARTICIPANT_MESSAGE);
 
-	expect(markup).toContain('<strong class="aui-md-strong">Bold</strong>');
+	expect(markup).toContain(`<strong class="${STRONG_CLASS}">Bold</strong>`);
 	expect(markup).toContain("<em>italic</em>");
-	expect(markup).toContain('<ul class="aui-md-ul">');
-	expect(markup).toContain('<li class="aui-md-li">first</li>');
-	expect(markup).toContain('<ol class="aui-md-ol">');
-	expect(markup).toContain('<li class="aui-md-li">one</li>');
-	expect(markup).toContain('<blockquote class="aui-md-blockquote">');
+	expect(markup).toContain(`<ul class="${UL_CLASS}">`);
+	expect(markup).toContain(`<li class="${LI_CLASS}">first</li>`);
+	expect(markup).toContain(`<ol class="${OL_CLASS}">`);
+	expect(markup).toContain(`<li class="${LI_CLASS}">one</li>`);
+	expect(markup).toContain(`<blockquote class="${QUOTE_CLASS}">`);
 	expect(markup).toContain("quoted");
 	expect(markup).toContain('href="https://example.com"');
 	expect(markup).toContain('target="_blank"');
 	expect(markup).toContain(
-		'<p class="aui-md-p">Use <code class="aui-md-inline-code">bun test</code>.</p>',
+		`<p class="${P_CLASS}">Use <code class="${CODE_CLASS}">bun test</code>.</p>`,
 	);
 	expect(markup).toContain('<code class="language-ts">let answer = 42;');
 	expect(markup).toContain("Ordinary message text");
 	expect(markup).not.toMatch(H1);
-	expect(markup).not.toContain("<img");
+	expect(markup).toContain(
+		'<img src="https://example.invalid/pixel.png" alt="remote" class="block h-auto w-full object-contain invisible" decoding="async" loading="lazy" referrerPolicy="no-referrer"/>',
+	);
+	expect(markup).toContain('<span aria-hidden="true" class="chat-image-alt">remote</span>');
 
 	expect(markdown("Planner wrote **strongly**.")).toContain(
-		'<strong class="aui-md-strong">strongly</strong>',
+		`<strong class="${STRONG_CLASS}">strongly</strong>`,
 	);
 });
 
 test("the check that Chat draws no h1 recognises an h1 that carries a class", () => {
 	let drawn = renderToStaticMarkup(createElement(MarkdownText, { text: "# Title" }));
 	// MarkdownText draws a heading as an h1 with its class, which "<h1>" alone would never match.
-	expect(drawn).toContain('<h1 class="aui-md-h1">Title</h1>');
+	expect(drawn).toContain(
+		'<h1 class="aui-md-h1 mt-5 mb-2 scroll-m-20 text-xl font-semibold first:mt-0 last:mb-0">Title</h1>',
+	);
 	expect(drawn).not.toContain("<h1>");
 	expect(drawn).toMatch(H1);
 	expect(H1.test("<h1>")).toBe(true);
 	// Chat's message draws the same source as a line of text.
 	expect(markdown("# Title")).not.toMatch(H1);
-	expect(markdown("# Title")).toContain('<p class="aui-md-p">Title</p>');
+	expect(markdown("# Title")).toContain(`<p class="${P_CLASS}">Title</p>`);
 });
 
 test("Chat reads GitHub's tables, strikethrough and task lists, and only those", () => {
 	let markup = markdown(
 		"| A | B |\n| - | - |\n| 1 | 2 |\n\n~~gone~~ and ~one~ and about ~5 minutes, ~10 at most\n\n- [x] done\n- [ ] open",
 	);
-	expect(markup).toContain('<table class="aui-md-table">');
+	expect(markup).toContain(`<table class="${TABLE_CLASS}">`);
 	expect(markup).toContain("<del>gone</del>");
 	// One tilde is not strikethrough: it is the text a person typed.
 	expect(markup).toContain("~one~ and about ~5 minutes, ~10 at most");
 	expect(markup.match(/<input [^>]*type="checkbox"/g)).toHaveLength(2);
 	// A box is named, so a reader of the screen hears what it is before the item's words.
 	expect(markup.match(/<input aria-label="Task"/g)).toHaveLength(2);
-	expect(markup).toContain('<li class="aui-md-li task-list-item">');
+	expect(markup).toContain(`<li class="${LI_CLASS} task-list-item">`);
 });
 
-test("a footnote, a bare address and a www link stay the plain text they were in Chat", () => {
+test("a web address written out is a link, as in Slack; a footnote, a www address and an email stay text", () => {
 	let markup = markdown(
 		"Claim[^1] and see https://example.com/page, www.example.com or ana@example.com.\n\n[^1]: The note.",
 	);
-	expect(markup).not.toContain("<a");
+	expect(markup.match(/<a /g)).toHaveLength(1);
+	expect(markup).toContain(
+		`see <a class="${A_CLASS}" href="https://example.com/page" rel="noopener noreferrer" target="_blank">https://example.com/page</a>, www.example.com or ana@example.com.`,
+	);
 	expect(markup).not.toContain("<sup");
 	expect(markup).not.toContain("<section");
 	expect(markup).not.toContain("footnote");
-	expect(markup).toContain(
-		"Claim[^1] and see https://example.com/page, www.example.com or ana@example.com.",
-	);
+	expect(markup).toContain("Claim[^1] and see ");
 	expect(markup).toContain("[^1]: The note.");
 	// A link someone wrote is still a link.
 	expect(markdown("[the page](https://example.com/page)")).toContain(
@@ -126,15 +151,479 @@ test("a footnote, a bare address and a www link stay the plain text they were in
 	);
 });
 
+test("a web address in code, or one with another scheme, is never a link", () => {
+	let markup = markdown(
+		"`https://code.example` and javascript:alert(1) and data:text/html,x\n\n```\nhttps://block.example\n```",
+	);
+	expect(markup).not.toContain("<a");
+	expect(markup).toContain("javascript:alert(1)");
+	expect(markup).toContain("https://code.example");
+	expect(markup).toContain("https://block.example");
+});
+
+test("a web address keeps a mention and a typed reference beside it as they were", () => {
+	let source = "@ana see https://example.com/x and #Score";
+	let markup = markdown(source, [reference(source, "#Score")]);
+	expect(markup).toContain('href="https://example.com/x"');
+	expect(markup).toContain('data-chat-reference="document"');
+});
+
+test("raw HTML in a Chat message is never drawn, an image tag included", () => {
+	let markup = markdown(RAW_HTML_MESSAGE);
+
+	expect(markup).toContain("Ordinary message text");
+	expect(markup).not.toContain("<h1>");
+	expect(markup).not.toContain("<img");
+	expect(markup).toContain("&lt;img src=");
+});
+
+test("every Markdown image draws where it is written, in order, and none is merged or dropped", () => {
+	let markup = markdown(
+		"First ![one](https://example.invalid/a.png) then ![two](https://example.invalid/a.png)\n\n![](https://example.invalid/b.png)",
+	);
+
+	expect(markup.match(/<img /g)).toHaveLength(3);
+	expect(markup.indexOf('alt="one"')).toBeLessThan(markup.indexOf('alt="two"'));
+	expect(markup.indexOf('alt="two"')).toBeLessThan(markup.indexOf('alt="Image"'));
+	expect(markup).not.toMatch(/<p[\s>][^]*<figure/);
+	expect(markup).toContain('<div class="chat-markdown-paragraph">First <figure');
+	expect(markup).toContain('<span aria-hidden="true" class="chat-image-alt">Image</span>');
+});
+
+function tiles(markup: string): string[] {
+	return [...markup.matchAll(/<img src="([^"]*)" alt="([^"]*)"/g)].map(
+		found => `${found[2]}|${found[1]}`,
+	);
+}
+
+test("images written side by side in one paragraph are one compact gallery, in the order they were written", () => {
+	for (
+		let separator of [" ", "  ", "\n", " \n ", "  \n", "\\\n"]
+	) {
+		let markup = markdown(
+			`![One](https://example.invalid/1.png)${separator}![Two](https://example.invalid/2.png)${separator}![Three](https://example.invalid/3.png)`,
+		);
+		let name = JSON.stringify(separator);
+		expect(markup.match(/data-chat-image-gallery/g), name).toHaveLength(1);
+		expect(markup.match(/data-chat-image="tile"/g), name).toHaveLength(3);
+		expect(markup, name).not.toContain('data-chat-image="single"');
+		expect(tiles(markup), name).toEqual([
+			"One|https://example.invalid/1.png",
+			"Two|https://example.invalid/2.png",
+			"Three|https://example.invalid/3.png",
+		]);
+		for (let alt of ["One", "Two", "Three"]) {
+			expect(markup, name).toContain(`aria-label="Open image: ${alt}"`);
+		}
+	}
+});
+
+test("images in consecutive paragraphs of their own are one gallery, and a paragraph of several is part of it", () => {
+	let markup = markdown(
+		"![One](https://example.invalid/1.png)\n\n![Two](https://example.invalid/2.png) ![Three](https://example.invalid/3.png)\n\n![Four](https://example.invalid/4.png)",
+	);
+
+	expect(markup.match(/data-chat-image-gallery/g)).toHaveLength(1);
+	expect(tiles(markup).map(item => item.split("|")[0])).toEqual(["One", "Two", "Three", "Four"]);
+	expect(markup).not.toContain('data-chat-image="single"');
+});
+
+test("the words around a gallery stay where they were written, and the images are not moved", () => {
+	let markup = markdown(
+		"Before ![One](https://example.invalid/1.png) ![Two](https://example.invalid/2.png) after.\n\nNext paragraph.",
+	);
+
+	expect(markup.match(/data-chat-image-gallery/g)).toHaveLength(1);
+	expect(markup).toContain(
+		'<div class="chat-markdown-paragraph">Before <div data-slot="image-gallery"',
+	);
+	expect(markup.indexOf("Before")).toBeLessThan(markup.indexOf("data-chat-image-gallery"));
+	expect(markup.indexOf("data-chat-image-gallery")).toBeLessThan(markup.indexOf(" after."));
+	expect(markup.indexOf(" after.")).toBeLessThan(
+		markup.indexOf(`<p class="${P_CLASS}">Next paragraph.</p>`),
+	);
+	expect(markup).not.toMatch(/<p[\s>][^]*<div data-slot="image-gallery"/);
+});
+
+test("images with words or a paragraph of words between them are not made a gallery", () => {
+	for (
+		let source of [
+			"![One](https://example.invalid/1.png) and ![Two](https://example.invalid/2.png)",
+			"![One](https://example.invalid/1.png)\n\nBetween.\n\n![Two](https://example.invalid/2.png)",
+			"![One](https://example.invalid/1.png) *Between* ![Two](https://example.invalid/2.png)",
+			"Words ![One](https://example.invalid/1.png)\n\n![Two](https://example.invalid/2.png)",
+			"- ![One](https://example.invalid/1.png)\n- ![Two](https://example.invalid/2.png)",
+		]
+	) {
+		let markup = markdown(source);
+		expect(markup, source).not.toContain("data-chat-image-gallery");
+		expect(markup.match(/data-chat-image="single"/g), source).toHaveLength(2);
+		expect(tiles(markup).map(item => item.split("|")[0]), source).toEqual(["One", "Two"]);
+	}
+});
+
+test("a gallery keeps a repeated image, an image without alt text and the reason one cannot be shown", () => {
+	let markup = markdown(
+		"![Same](https://example.invalid/a.png) ![Same](https://example.invalid/a.png) ![](https://example.invalid/b.png) ![nope](javascript:alert(1)) ![svg](data:image/svg+xml;base64,PHN2Zy8+)",
+	);
+
+	// Slack's grid holds four, and the last says how many more the viewer has.
+	expect(markup.match(/data-chat-image-gallery/g)).toHaveLength(1);
+	expect(markup.match(/data-chat-image="tile"/g)).toHaveLength(4);
+	expect(markup).toContain('data-shape="quad"');
+	expect(tiles(markup)).toEqual([
+		"Same|https://example.invalid/a.png",
+		"Same|https://example.invalid/a.png",
+		"Image|https://example.invalid/b.png",
+	]);
+	expect(markup.match(/data-chat-image-broken="unavailable"/g)).toHaveLength(1);
+	expect(markup).toContain('aria-label="Image can’t be shown: nope"');
+	expect(markup).toContain(">+1<");
+	expect(markup).not.toContain("javascript:");
+	expect(markup).not.toContain("svg+xml");
+});
+
+test("every image written together is one gallery, four tiles and the rest behind +N, and raw HTML between them is still never drawn", () => {
+	let markup = markdown(
+		`${
+			Array.from({ length: 8 }, (_, index) =>
+				`![Pic ${index + 1}](https://example.invalid/${index + 1}.png)`)
+				.join(" ")
+		}\n\n<img src="https://example.invalid/raw.png" alt="raw">`,
+	);
+
+	expect(markup.match(/data-chat-image-gallery/g)).toHaveLength(1);
+	expect(markup.match(/data-chat-image="tile"/g)).toHaveLength(4);
+	expect(tiles(markup).map(item => item.split("|")[0])).toEqual(
+		Array.from({ length: 4 }, (_, index) => `Pic ${index + 1}`),
+	);
+	expect(markup).toContain(">+4<");
+	// The tag is the text it was written as, never an image.
+	expect(markup).not.toContain('src="https://example.invalid/raw.png"');
+	expect(markup).toContain("&lt;img src=");
+});
+
+test("images lifted out of one link, or written in a list item or a quotation, are grouped where they are", () => {
+	let linked = markdown(
+		"[![One](https://example.invalid/1.png) ![Two](https://example.invalid/2.png)](https://example.com)",
+	);
+	expect(linked.match(/data-chat-image-gallery/g)).toHaveLength(1);
+	expect(linked).toContain('href="https://example.com"');
+	expect(linked).not.toMatch(/<a [^>]*>[^]*<figure/);
+
+	for (
+		let source of [
+			"- ![One](https://example.invalid/1.png) ![Two](https://example.invalid/2.png)",
+			"> ![One](https://example.invalid/1.png)\n>\n> ![Two](https://example.invalid/2.png)",
+		]
+	) {
+		let markup = markdown(source);
+		expect(markup.match(/data-chat-image-gallery/g), source).toHaveLength(1);
+		expect(markup.match(/data-chat-image="tile"/g), source).toHaveLength(2);
+	}
+});
+
+function insideLink(markup: string): boolean {
+	return /<a [^>]*>(?:(?!<\/a>)[^])*<figure/.test(markup);
+}
+
+test("images written as references are a gallery with the ones written in line, in the order written, wherever their definitions are", () => {
+	for (
+		let source of [
+			"![One][a] ![Two][b] ![Three](https://example.invalid/3.png)\n\n[a]: https://example.invalid/1.png\n[b]: https://example.invalid/2.png",
+			"[a]: https://example.invalid/1.png\n\n![One][a] ![Two][B]\n![Three][]\n\n[b]: https://example.invalid/2.png\n[three]: https://example.invalid/3.png",
+			"![One][a]\n\n[a]: https://example.invalid/1.png\n\n![Two][b]\n\n[b]: https://example.invalid/2.png\n\n![Three](https://example.invalid/3.png)",
+			"![One](https://example.invalid/1.png) ![Two][b] ![Three][three]\n\n[b]: https://example.invalid/2.png\n[three]: https://example.invalid/3.png",
+		]
+	) {
+		let markup = markdown(source);
+		expect(markup.match(/data-chat-image-gallery/g), source).toHaveLength(1);
+		expect(markup.match(/data-chat-image="tile"/g), source).toHaveLength(3);
+		expect(markup, source).not.toContain('data-chat-image="single"');
+		expect(tiles(markup), source).toEqual([
+			"One|https://example.invalid/1.png",
+			"Two|https://example.invalid/2.png",
+			"Three|https://example.invalid/3.png",
+		]);
+	}
+});
+
+test("a reference image is the image its first definition says, as a single or in a gallery, and one with no definition stays the words it was", () => {
+	let alone = markdown(
+		"![One][a]\n\n[a]: https://example.invalid/first.png\n[a]: https://example.invalid/second.png",
+	);
+	expect(tiles(alone)).toEqual(["One|https://example.invalid/first.png"]);
+	expect(alone).toContain('data-chat-image="single"');
+
+	let unsafe = markdown(
+		"![Fine][a] ![Nope][bad]\n\n[a]: https://example.invalid/1.png\n[bad]: javascript:alert(1)",
+	);
+	expect(unsafe.match(/data-chat-image="tile"/g)).toHaveLength(2);
+	expect(unsafe).toContain('data-chat-image-broken="unavailable"');
+	expect(unsafe).not.toContain("javascript:");
+
+	let missing = markdown("![One][a] ![Two][nothing]\n\n[a]: https://example.invalid/1.png");
+	expect(missing).not.toContain("data-chat-image-gallery");
+	expect(tiles(missing)).toEqual(["One|https://example.invalid/1.png"]);
+	expect(missing).toContain("![Two][nothing]");
+});
+
+test("an image inside a link is drawn where it was written among the link's words, and never inside the link", () => {
+	let between = markdown(
+		"[Before ![d](https://example.invalid/u.png) after](https://example.com/t)",
+	);
+	expect(insideLink(between)).toBe(false);
+	expect(between.indexOf(">Before ")).toBeLessThan(between.indexOf("<figure"));
+	expect(between.indexOf("<figure")).toBeLessThan(between.indexOf("> after<"));
+	expect(between.split(`<a class="${A_CLASS}" href="https://example.com/t"`)).toHaveLength(3);
+	expect(between).toContain('target="_blank">Before </a>');
+	expect(between).toContain('target="_blank"> after</a>');
+
+	let nested = markdown(
+		"[**Before ![d](https://example.invalid/u.png) after**](https://example.com/t)",
+	);
+	expect(insideLink(nested)).toBe(false);
+	expect(nested).toContain(`<strong class="${STRONG_CLASS}">Before </strong></a>`);
+	expect(nested).toContain(`<strong class="${STRONG_CLASS}"> after</strong></a>`);
+	expect(nested.indexOf("Before")).toBeLessThan(nested.indexOf("<figure"));
+	expect(nested.indexOf("<figure")).toBeLessThan(nested.indexOf("after"));
+});
+
+test("an image alone in emphasis in a link, or in a link written as a reference, is drawn outside it, and the link keeps its words", () => {
+	for (
+		let source of [
+			"[**![logo](https://example.invalid/l.png)**](https://example.com/t)",
+			"[*![logo](https://example.invalid/l.png)*](https://example.com/t)",
+			"[![logo](https://example.invalid/l.png)][target]\n\n[target]: https://example.com/t",
+			"[![logo][img]][target]\n\n[img]: https://example.invalid/l.png\n[target]: https://example.com/t",
+		]
+	) {
+		let markup = markdown(source);
+		expect(insideLink(markup), source).toBe(false);
+		expect(markup.match(/<figure/g), source).toHaveLength(1);
+		expect(markup, source).toContain('<img src="https://example.invalid/l.png" alt="logo"');
+		expect(markup, source).toContain(
+			`<a class="${A_CLASS}" href="https://example.com/t" rel="noopener noreferrer" target="_blank">logo</a>`,
+		);
+	}
+});
+
+test("a link containing only an empty-alt image is named by its title or destination", () => {
+	for (
+		let [source, href, name] of [
+			[
+				'[![](https://example.invalid/i.png)](https://docs.example.com/guide?q=1#top "Guide title")',
+				"https://docs.example.com/guide?q=1#top",
+				"Guide title",
+			],
+			[
+				"[![](https://example.invalid/i.png)](https://docs.example.com/guide?q=1#top)",
+				"https://docs.example.com/guide?q=1#top",
+				"docs.example.com/guide",
+			],
+			[
+				'[![](https://example.invalid/i.png)][ref]\n\n[ref]: https://docs.example.com/guide?q=1#top "Reference title"',
+				"https://docs.example.com/guide?q=1#top",
+				"Reference title",
+			],
+			[
+				"[![](https://example.invalid/i.png)][ref]\n\n[ref]: https://docs.example.com/guide?q=1#top",
+				"https://docs.example.com/guide?q=1#top",
+				"docs.example.com/guide",
+			],
+			["[![](https://example.invalid/i.png)](/docs/guide?q=1)", "/docs/guide?q=1", "/docs/guide"],
+			["[![](https://example.invalid/i.png)]()", "", "Current page"],
+			[
+				"[![ ](https://example.invalid/i.png)](https://docs.example.com/guide)",
+				"https://docs.example.com/guide",
+				"docs.example.com/guide",
+			],
+		] as const
+	) {
+		let markup = markdown(source);
+		expect(insideLink(markup), source).toBe(false);
+		expect(markup, source).toContain(`href="${href.replaceAll("&", "&amp;")}"`);
+		expect(markup, source).toContain(`aria-label="${name}"`);
+	}
+});
+
+test("a Markdown image's title is its caption on a single image, and a gallery keeps its tiles in order", () => {
+	let single = markdown('![alt text](https://example.invalid/u.png "The title of it")');
+	expect(single).toContain('<figcaption class="chat-image-text">The title of it</figcaption>');
+
+	let gallery = markdown(
+		'![One](https://example.invalid/1.png "First caption") ![Two](https://example.invalid/2.png) ![Three][c]\n\n[c]: https://example.invalid/3.png "Third caption"',
+	);
+	expect(gallery.match(/data-chat-image="tile"/g)).toHaveLength(3);
+	expect(tiles(gallery)).toEqual([
+		"One|https://example.invalid/1.png",
+		"Two|https://example.invalid/2.png",
+		"Three|https://example.invalid/3.png",
+	]);
+	expect(markdown("![alt](https://example.invalid/u.png)")).not.toContain("chat-image-text");
+});
+
+test("an image whose address is not one Chat loads shows its alt text and is never requested", () => {
+	for (
+		let src of [
+			"/auth/logout",
+			"javascript:alert(1)",
+			"data:image/svg+xml;base64,PHN2Zy8+",
+			"data:text/html;base64,PGI+",
+		]
+	) {
+		let markup = markdown(`![where it was](${src})`);
+		expect(markup, src).not.toContain("<img");
+		expect(markup, src).toContain('data-chat-image-broken="unavailable"');
+		expect(markup, src).toContain(">where it was</span>");
+	}
+	expect(markdown(`![mine](/images/${"a".repeat(64)}.png)`)).not.toContain("<img");
+});
+
+test("an image on this site that is not an upload waits to be read, and is never handed to the browser's own request", () => {
+	for (let src of ["/icons/icon-192.png", "icons/icon-192.png", "./a.png", "/authors/a.png"]) {
+		let markup = markdown(`![on this site](${src})`);
+		expect(markup, src).not.toContain("<img");
+		expect(markup, src).not.toContain(src);
+		expect(markup, src).toContain('data-load="loading"');
+		expect(markup, src).toContain('data-chat-image="single"');
+		expect(markup, src).not.toContain("data-chat-image-broken");
+		expect(markup, src).toContain(">on this site</span>");
+	}
+});
+
+test("a raster image written into a message is drawn as written, whatever raster format it is", () => {
+	for (
+		let src of [
+			"data:image/png;base64,iVBORw0KGgo=",
+			"data:image/avif;base64,AAAAHGZ0eXBhdmlm",
+			"data:image/bmp;base64,Qk0=",
+			"data:image/x-icon;base64,AAABAAEA",
+		]
+	) {
+		let markup = markdown(`![a dot](${src})`);
+		expect(tiles(markup), src).toEqual([`a dot|${src}`]);
+		expect(markup, src).toContain('decoding="async" loading="lazy" referrerPolicy="no-referrer"');
+	}
+});
+
+test("a raster image whose type is followed by a space or a tab in an angle-bracketed address is drawn as Markdown encoded it, and SVG or HTML written the same way is not", () => {
+	for (
+		let [written, src] of [
+			["data:image/png ;base64,iVBORw0KGgo=", "data:image/png%20;base64,iVBORw0KGgo="],
+			["data:image/png\t;base64,iVBORw0KGgo=", "data:image/png%09;base64,iVBORw0KGgo="],
+			["DATA:IMAGE/PNG  ;BASE64,iVBORw0KGgo=", "DATA:IMAGE/PNG%20%20;BASE64,iVBORw0KGgo="],
+		]
+	) {
+		let markup = markdown(`![a dot](<${written}>)`);
+		expect(tiles(markup), written).toEqual([`a dot|${src}`]);
+		expect(markup, written).toContain(
+			'decoding="async" loading="lazy" referrerPolicy="no-referrer"',
+		);
+	}
+	for (
+		let written of [
+			"data:image/svg+xml ;base64,PHN2Zy8+",
+			"data:image/svg+xml\t;base64,PHN2Zy8+",
+			"data:text/html ;base64,PGI+",
+			"data:image/png x;base64,iVBORw0KGgo=",
+		]
+	) {
+		let markup = markdown(`![where it was](<${written}>)`);
+		expect(markup, written).not.toContain("<img");
+		expect(markup, written).toContain('data-chat-image-broken="unavailable"');
+		expect(markup, written).toContain(">where it was</span>");
+	}
+});
+
+test("a raster image written with white space before its type, or with no type, is drawn as Markdown made the address, and SVG or HTML written the same way is not", () => {
+	let png = "iVBORw0KGgo=";
+	for (
+		let [written, src] of [
+			[`data: image/png;base64,${png}`, `data:%20image/png;base64,${png}`],
+			[`data:\timage/png ;base64,${png}`, `data:%09image/png%20;base64,${png}`],
+			[`data:;base64,${png}`, `data:;base64,${png}`],
+			[`data:;charset=utf-8;base64,${png}`, `data:;charset=utf-8;base64,${png}`],
+			[`data: ;base64,${png}`, `data:%20;base64,${png}`],
+			["data:,%89PNG%0D%0A%1A%0A", "data:,%89PNG%0D%0A%1A%0A"],
+		]
+	) {
+		let markup = markdown(`![a dot](<${written}>)`);
+		expect(tiles(markup), written).toEqual([`a dot|${src}`]);
+		expect(markup, written).toContain(
+			'decoding="async" loading="lazy" referrerPolicy="no-referrer"',
+		);
+	}
+	let svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>');
+	for (
+		let written of [
+			"data: image/svg+xml;base64,PHN2Zy8+",
+			"data:\timage/svg+xml;base64,PHN2Zy8+",
+			"data: text/html;base64,PGI+",
+			`data:;base64,${svg.toString("base64")}`,
+			`data:,${encodeURIComponent(svg.toString())}`,
+			"data:;base64,AAAA",
+			"data:,",
+		]
+	) {
+		let markup = markdown(`![where it was](<${written}>)`);
+		expect(markup, written).not.toContain("<img");
+		expect(markup, written).toContain('data-chat-image-broken="unavailable"');
+		expect(markup, written).toContain(">where it was</span>");
+	}
+});
+
+test("a raster image with no type and much white space before its base64 is drawn as Markdown made the address, and SVG or HTML written the same way is not", () => {
+	let png = "iVBORw0KGgo=";
+	for (let spaces of [90, 300, 5_000]) {
+		let markup = markdown(`![a dot](<data:;base64,${" ".repeat(spaces)}${png}>)`);
+		expect(tiles(markup), `${spaces}`).toEqual([
+			`a dot|data:;base64,${"%20".repeat(spaces)}${png}`,
+		]);
+		expect(markup, `${spaces}`).toContain(
+			'decoding="async" loading="lazy" referrerPolicy="no-referrer"',
+		);
+	}
+	let svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>').toString(
+		"base64",
+	);
+	let html = Buffer.from("<html><body onload=alert(1)>").toString("base64");
+	for (let written of [`${svg}`, `${html}`, "", "AAAA"]) {
+		let markup = markdown(`![where it was](<data:;base64,${" ".repeat(300)}${written}>)`);
+		expect(markup, written).not.toContain("<img");
+		expect(markup, written).toContain('data-chat-image-broken="unavailable"');
+		expect(markup, written).toContain(">where it was</span>");
+	}
+});
+
+test("an address on another site is drawn exactly as it was written", () => {
+	for (let src of ["https://example.invalid", "//example.invalid/a.png"]) {
+		expect(tiles(markdown(`![far](${src})`)), src).toEqual([`far|${src}`]);
+	}
+});
+
+test("an image inside a link is drawn as an image, with the link kept beside it", () => {
+	let markup = markdown("[![logo](https://example.invalid/l.png)](https://example.com)");
+
+	expect(tiles(markup)).toEqual(["logo|https://example.invalid/l.png"]);
+	expect(markup).not.toMatch(/<a [^>]*>[^]*<figure/);
+	expect(markup).toContain(
+		`<a class="${A_CLASS}" href="https://example.com" rel="noopener noreferrer" target="_blank">logo</a>`,
+	);
+});
+
 test("indentation keeps nested lists and code blocks intact", () => {
-	let nested =
-		/<li class="aui-md-li">parent\s*<ul class="aui-md-ul">\s*<li class="aui-md-li">child<\/li>\s*<li class="aui-md-li">sibling<\/li>\s*<\/ul>\s*<\/li>\s*<li class="aui-md-li">next<\/li>/;
+	let nested = new RegExp(
+		`<li class="${LI_CLASS}">parent\\s*<ul class="${
+			RegExp.escape(UL_CLASS)
+		}">\\s*<li class="${LI_CLASS}">child<\\/li>\\s*<li class="${LI_CLASS}">sibling<\\/li>\\s*<\\/ul>\\s*<\\/li>\\s*<li class="${LI_CLASS}">next<\\/li>`,
+	);
 
 	expect(markdown("- parent\n  - child\n  - sibling\n- next")).toMatch(nested);
 	expect(markdown("- parent\n    - child\n    - sibling\n- next")).toMatch(nested);
 	expect(markdown("1. parent\n   - child\n   - sibling\n2. next")).toMatch(nested);
 	expect(markdown("```py\nif ready:\n    run()\n```")).toContain("if ready:\n    run()");
-	expect(markdown("Ask @chopin about it")).toContain("Ask about it");
+	expect(markdown("Ask @chopin about it")).toContain("Ask @chopin about it");
 });
 
 test("a numbered list that continues after a lead-in line still renders as a list", () => {
@@ -153,17 +642,23 @@ test("a numbered list that continues after a lead-in line still renders as a lis
 	].join("\n");
 	let markup = markdown(source);
 
-	expect(markup).toContain('<p class="aui-md-p">Needs task 1 first:</p>');
+	expect(markup).toContain(`<p class="${P_CLASS}">Needs task 1 first:</p>`);
 	expect(markup).toContain(
-		'<ol class="aui-md-ol" start="3">\n<li class="aui-md-li"><code class="aui-md-inline-code">rewire-handler</code>: rewire it.</li>\n</ol>',
+		`<ol class="${OL_CLASS}" start="3">\n<li class="${LI_CLASS}"><code class="${CODE_CLASS}">rewire-handler</code>: rewire it.</li>\n</ol>`,
 	);
-	expect(markup).toContain('<p class="aui-md-p">Need task 3 first:</p>');
+	expect(markup).toContain(`<p class="${P_CLASS}">Need task 3 first:</p>`);
 	expect(markup).toMatch(
-		/<ol class="aui-md-ol" start="4">\s*<li class="aui-md-li"><code class="aui-md-inline-code">table-tests<\/code>: check tables\s+and statuses\.<\/li>\s*<li class="aui-md-li"><code class="aui-md-inline-code">secret-test<\/code>: check the secret\.<\/li>\s*<\/ol>/,
+		new RegExp(
+			`<ol class="${RegExp.escape(OL_CLASS)}" start="4">\\s*<li class="${LI_CLASS}"><code class="${
+				RegExp.escape(CODE_CLASS)
+			}">table-tests<\\/code>: check tables\\s+and statuses\\.<\\/li>\\s*<li class="${LI_CLASS}"><code class="${
+				RegExp.escape(CODE_CLASS)
+			}">secret-test<\\/code>: check the secret\\.<\\/li>\\s*<\\/ol>`,
+		),
 	);
 	// An escaped marker, a number inside a sentence, and code stay as written.
 	expect(markdown("Released in\n2024\\. Then more")).toContain(
-		'<p class="aui-md-p">Released in\n2024. Then more</p>',
+		`<p class="${P_CLASS}">Released in\n2024. Then more</p>`,
 	);
 	expect(markdown("Step\n`3. code`")).not.toContain("<ol");
 });
@@ -172,9 +667,9 @@ test("authoritative ranges render internal chips inside ordinary Markdown", () =
 	let source = "@chopin Read **#Release: v2 (API)** and [the docs](https://example.com).";
 	let markup = markdown(source, [reference(source, "#Release: v2 (API)")]);
 
-	expect(markup).not.toContain("@chopin");
+	expect(markup).toContain("@chopin Read");
 	expect(markup).toContain(
-		'<strong class="aui-md-strong"><a class="chat-reference" data-chat-reference="document" href="/documents/octo-org/score/reference-one">#Release: v2 (API)</a></strong>',
+		`<strong class="${STRONG_CLASS}"><a class="chat-reference" data-chat-reference="document" data-chopin-control="" href="/documents/octo-org/score/reference-one">#Release: v2 (API)</a></strong>`,
 	);
 	expect(markup).toContain('href="https://example.com"');
 	expect(markup).toContain('rel="noopener noreferrer"');
@@ -226,7 +721,7 @@ test("a command that opened a message is a chip, not a link, and the words after
 	expect(markup).toContain(
 		'<span class="chat-reference" data-chat-reference="command">/skill:release-notes</span>',
 	);
-	expect(markup).toContain('<strong class="aui-md-strong">v2</strong>');
+	expect(markup).toContain(`<strong class="${STRONG_CLASS}">v2</strong>`);
 	expect(markup).not.toContain("<a");
 });
 
@@ -294,19 +789,19 @@ test("ranges inside code, link labels, and link destinations remain ordinary tex
 	let markup = markdown(source, references);
 
 	expect(markup.match(/class="chat-reference"/g)).toHaveLength(1);
-	expect(markup).toContain('<code class="aui-md-inline-code">#Code</code>');
+	expect(markup).toContain(`<code class="${CODE_CLASS}">#Code</code>`);
 	expect(markup).toContain(">#Label</a>");
 	expect(markup).toContain('href="#Target"');
 	expect(markup).toContain(">#Plan</a>");
 });
 
-test("display projection protects mentions inside authoritative labels", () => {
+test("mentions are drawn as written, in the words and in a reference's label", () => {
 	let source = "@chopin See #Ask @chopin and @sam";
 	let markup = markdown(source, [reference(source, "#Ask @chopin")]);
 
-	expect(markup).not.toMatch(/^.*@chopin See/);
+	expect(markup).toContain("@chopin See ");
 	expect(markup).toContain(">#Ask @chopin</a>");
-	expect(markup).toContain("and Sam");
+	expect(markup).toContain("and @sam");
 });
 
 test("invalid and overlapping ranges remain safe ordinary text", () => {
@@ -326,7 +821,7 @@ function inline(source: string, links?: boolean): string {
 
 test("inline Markdown formats code, emphasis and links without blocks", () => {
 	expect(inline("Rewire `login` to **call** _three_ [helpers](https://example.com)")).toBe(
-		'Rewire <code class="aui-md-inline-code">login</code> to <strong class="aui-md-strong">call</strong> <em>three</em> <a class="aui-md-a" href="https://example.com" rel="noopener noreferrer" target="_blank">helpers</a>',
+		`Rewire <code class="${CODE_CLASS}">login</code> to <strong class="${STRONG_CLASS}">call</strong> <em>three</em> <a class="${A_CLASS}" href="https://example.com" rel="noopener noreferrer" target="_blank">helpers</a>`,
 	);
 	// A task title sits inside a button, so its links read as text.
 	expect(inline("See [the docs](https://example.com)", false)).toBe("See the docs");
@@ -336,10 +831,41 @@ test("inline Markdown formats code, emphasis and links without blocks", () => {
 	expect(inline("# Heading")).toBe("# Heading");
 	expect(inline("> quote")).toBe("&gt; quote");
 	expect(inline("    indented `code`")).toBe(
-		'indented <code class="aui-md-inline-code">code</code>',
+		`indented <code class="${CODE_CLASS}">code</code>`,
 	);
-	expect(inline("<b>raw</b> ![image](https://example.invalid/i.png)")).toBe("raw ");
+	expect(inline("<b>raw</b> ![image](https://example.invalid/i.png)")).toBe(
+		"&lt;b&gt;raw&lt;/b&gt; ",
+	);
 	expect(inline("one\n\ntwo")).toBe("one two");
+});
+
+/** Text with angle brackets that is not HTML: generics, comparisons and a placeholder. */
+const ANGLE_TEXT = ["Option<u64>", "Vec<Result<T, E>>", "x < y && y > z", "<not-a-tag>"];
+
+function escaped(text: string): string {
+	return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+test("text in angle brackets shows as written in a message, in a line of its own or mid-sentence", () => {
+	for (let text of ANGLE_TEXT) {
+		expect(markdown(text)).toContain(escaped(text));
+		expect(markdown(`Returns ${text} -> **done**`)).toContain(`Returns ${escaped(text)} -&gt; `);
+	}
+	// A line that starts like a tag no longer swallows the Markdown under it.
+	let markup = markdown("<not-a-tag>\n**bold** and `code`");
+	expect(markup).toContain("&lt;not-a-tag&gt;");
+	expect(markup).toContain(`<strong class="${STRONG_CLASS}">bold</strong>`);
+	expect(markup).toContain(`<code class="${CODE_CLASS}">code</code>`);
+	// An autolink is still a link.
+	expect(markdown("See <https://example.com/page>")).toContain('href="https://example.com/page"');
+});
+
+test("text in angle brackets shows as written in a task title and in its accessible name", () => {
+	for (let text of ANGLE_TEXT) {
+		expect(inline(`Return ${text} from \`parse\``)).toContain(`Return ${escaped(text)} from `);
+		expect(inline(text, false)).toBe(escaped(text));
+		expect(inlineText(`Return ${text}`)).toBe(`Return ${text}`);
+	}
 });
 
 test("the plain text of inline Markdown is the text it shows, with single spaces", () => {
@@ -352,12 +878,12 @@ test("the plain text of inline Markdown is the text it shows, with single spaces
 		"one\n\ntwo",
 	];
 	for (let source of sources) {
-		let shown = inline(source, false).replace(/<[^>]+>/g, "").replaceAll("&gt;", ">")
-			.replaceAll("&amp;", "&");
+		let shown = inline(source, false).replace(/<[^>]+>/g, "").replaceAll("&lt;", "<")
+			.replaceAll("&gt;", ">").replaceAll("&amp;", "&");
 		expect(inlineText(source)).toBe(shown.replace(/\s+/g, " ").trim());
 	}
 	expect(inlineText("Deploy on `main`")).toBe("Deploy on main");
-	expect(inlineText("<b>raw</b> ![image](https://example.invalid/i.png)")).toBe("raw");
+	expect(inlineText("<b>raw</b> ![image](https://example.invalid/i.png)")).toBe("<b>raw</b>");
 });
 
 const REPOSITORY = { owner: "octo-org", name: "score", ref: "main" };
@@ -374,12 +900,12 @@ test("a repository path in Chat opens the file on GitHub, as it does in the docu
 	let markup = inRepository(createElement(MessageMarkdown, { source }));
 
 	expect(markup).toContain(
-		`<a class="aui-md-a" href="${BLOB}/docs/review.md#L10-L20" rel="noopener noreferrer" target="_blank">the review</a>`,
+		`<a class="${A_CLASS}" href="${BLOB}/docs/review.md#L10-L20" rel="noopener noreferrer" target="_blank">the review</a>`,
 	);
-	expect(markup).toContain(`<a class="aui-md-a" href="${BLOB}/src/app.ts"`);
+	expect(markup).toContain(`<a class="${A_CLASS}" href="${BLOB}/src/app.ts"`);
 	expect(
 		inRepository(createElement(InlineMarkdown, { source: "Edit [the app](src/app.ts)" })),
-	).toContain(`<a class="aui-md-a" href="${BLOB}/src/app.ts"`);
+	).toContain(`<a class="${A_CLASS}" href="${BLOB}/src/app.ts"`);
 });
 
 test("every other link in Chat is as written, with or without a repository", () => {

@@ -23,7 +23,7 @@ import { chatInput, expectChatValue, fillChat } from "./chat-input";
 import { expectInsideViewport, expectNoHorizontalOverflow } from "./responsive";
 import { authenticate, expect, roomPath, test } from "./room";
 
-import type { Browser, Locator, Page } from "@playwright/test";
+import type { Browser, Page } from "@playwright/test";
 
 const PHONE = {
 	hasTouch: true,
@@ -62,13 +62,6 @@ async function readerOf(browser: Browser, baseURL: string, room: string, suffix:
 
 function messages(page: Page) {
 	return chat(page).locator("[data-chat-message-id]");
-}
-
-/** The address a sent image's tile is drawn from. */
-async function pictureUrl(tile: Locator): Promise<string> {
-	return tile.locator("span[aria-hidden]").first().evaluate(
-		node => /url\("?([^")]+)"?\)/.exec(getComputedStyle(node).backgroundImage)![1]!,
-	);
 }
 
 test("adds a file with the +, shows its name and size, and takes it away again", async ({ join }) => {
@@ -308,33 +301,36 @@ test("sends the message with its files, and a second person reads them", async (
 	for (let page of [ana, reader]) {
 		let message = messages(page).filter({ hasText: "The plan and a picture of the cap" });
 		await expect(message).toHaveCount(1);
-		let files = message.getByRole("group", { name: "Files sent with this message" });
-		await expect(files.getByRole("button", { name: /^shot\.png/ })).toBeVisible();
-		await expect(files.getByRole("button", { name: /^notes\.md/ })).toBeVisible();
-		// The tile of an image is drawn from the stored file itself.
-		let url = await pictureUrl(files.getByRole("button", { name: /^shot\.png/ }));
-		expect(
-			await page.evaluate(async source => {
-				let picture = new Image();
-				picture.src = source;
-				await picture.decode();
-				return picture.naturalWidth;
-			}, url),
+		let figure = message.locator('[data-chat-image="single"]');
+		await expect(figure).toHaveAttribute("data-load", "shown");
+		await expect(figure.locator("img")).toHaveAttribute("alt", "shot.png");
+		await expect.poll(() =>
+			figure.locator("img").evaluate(image => (image as HTMLImageElement).naturalWidth)
 		).toBe(2);
+		let files = message.getByRole("group", { name: "Files sent with this message" });
+		await expect(files.getByRole("button", { name: /^shot\.png/ })).toHaveCount(0);
+		await expect(files.getByRole("button", { name: /^notes\.md/ })).toBeVisible();
 	}
 	let message = messages(reader).filter({ hasText: "The plan and a picture of the cap" });
+	let figure = message.locator('[data-chat-image="single"]');
 	let files = message.getByRole("group", { name: "Files sent with this message" });
-	let image = await pictureUrl(files.getByRole("button", { name: /^shot\.png/ }));
-	// Pressing an image opens it in a tab of its own; pressing a text file downloads it under its name.
-	let [popup] = await Promise.all([
-		reader.waitForEvent("popup"),
-		files.getByRole("button", { name: /^shot\.png/ }).click(),
-	]);
-	expect(popup.url()).toBe(image);
-	await popup.close();
+	let image = (await figure.locator("img").getAttribute("src"))!;
+	// Pressing the image opens the viewer, and so does pressing the text file, which shows its text;
+	// the file's own toolbar downloads it under its name.
+	await figure.locator("[data-chat-image-frame]").click();
+	let dialog = reader.locator("[data-image-viewer]");
+	await expect(dialog.getByRole("img", { name: "shot.png" })).toBeVisible();
+	await expect(dialog.getByRole("button", { name: "Download image" })).toBeVisible();
+	await reader.keyboard.press("ArrowRight");
+	await expect(dialog.locator("[data-image-viewer-file='text']")).toHaveText(
+		NOTES.buffer.toString(),
+	);
+	await reader.keyboard.press("Escape");
+	await expect(dialog).toHaveCount(0);
+	await files.getByRole("button", { name: /^notes\.md/ }).hover();
 	let [saved] = await Promise.all([
 		reader.waitForEvent("download"),
-		files.getByRole("button", { name: /^notes\.md/ }).click(),
+		files.getByRole("button", { name: "Download notes.md" }).click(),
 	]);
 	expect(saved.suggestedFilename()).toBe("notes.md");
 	let notes = saved.url();
@@ -475,9 +471,10 @@ test("a message may be only a picture", async ({ join }) => {
 	await choose(page, SHOT);
 	await expect(chip(page, "shot.png")).toHaveAttribute("data-state", "done");
 	await composer(page).getByRole("button", { name: "Send message" }).click();
-	let message = messages(page).filter({ has: page.locator("[data-slot='message-attachments']") });
+	let message = messages(page).filter({ has: page.locator('[data-chat-image="single"]') });
 	await expect(message).toHaveCount(1);
-	await expect(message).not.toContainText("Ask Chopin");
+	await expect(message.locator("[data-slot='message-attachments']")).toHaveCount(0);
+	await expect(message).not.toContainText("Ask chopin");
 });
 
 test("keeps the composer's files usable at a phone's width, and accessible", async ({ join }) => {
@@ -512,9 +509,9 @@ test("keeps the composer's files usable at a phone's width, and accessible", asy
 	await chip(page, "logo.svg").getByRole("button", { name: "Remove logo.svg" }).click();
 	await chatInput(chat(page)).fill("From a phone");
 	await composer(page).getByRole("button", { name: "Send message" }).click();
-	await expect(
-		messages(page).filter({ hasText: "From a phone" }).locator("[data-slot='message-attachments']"),
-	).toBeVisible();
+	let sentMessage = messages(page).filter({ hasText: "From a phone" });
+	await expect(sentMessage.locator('[data-chat-image="single"]')).toBeVisible();
+	await expect(sentMessage.locator("[data-slot='message-attachments']")).toBeVisible();
 	await expectNoHorizontalOverflow(page);
 });
 
@@ -547,4 +544,114 @@ test("two files with one name are two: removing one leaves the other", async ({ 
 	await removed;
 	await expect(chips).toHaveCount(1);
 	await expect(chips.nth(0)).toHaveAttribute("data-file-id", first!);
+});
+
+test("sent image attachments draw as a gallery, share the message's lightbox with Markdown images, and stand Slack's placeholder where one cannot load, whatever its size", async ({ join, seed }) => {
+	let inline = `data:image/png;base64,${PNG.toString("base64")}`;
+	await seed("# Unified\n", {
+		transcript: [
+			{
+				id: "broken-and-huge",
+				author: { kind: "member", handle: "bo" },
+				text: "Stored attachments with a missing upload and an oversized one",
+				ts: 1_700_000_000_000,
+				attachments: [
+					{
+						id: "missing-att",
+						name: "missing.png",
+						kind: "image",
+						mimeType: "image/png",
+						size: 512,
+					},
+					{
+						id: "huge-att",
+						name: "huge.png",
+						kind: "image",
+						mimeType: "image/png",
+						size: 12 * 1_048_576,
+					},
+					{
+						id: "notes-att",
+						name: "readme.md",
+						kind: "file",
+						mimeType: "text/plain",
+						size: 42,
+					},
+				],
+			},
+		],
+	});
+	let page = await join("ana");
+	await openChat(page);
+
+	// Neither stored image is there, and the one of 12 MB is never refused for its size: both are
+	// tiles of Slack's grid that say they could not load.
+	let seeded = messages(page).filter({ hasText: "Stored attachments" });
+	let broken = seeded.locator('[data-chat-image="tile"]');
+	await expect(broken).toHaveCount(2);
+	await expect(broken.nth(0)).toHaveAttribute("data-load", "broken");
+	await expect(broken.nth(1)).toHaveAttribute("data-load", "broken");
+	await expect(
+		seeded.getByRole("img", { name: "Couldn’t load image: missing.png", exact: true }),
+	).toHaveCount(1);
+	await expect(
+		seeded.getByRole("img", { name: "Couldn’t load image: huge.png", exact: true }),
+	).toHaveCount(1);
+	await expect(seeded).not.toContainText("too large");
+	await expect(
+		seeded.getByRole("group", { name: "Files sent with this message" }).getByRole("button", {
+			name: /^readme\.md/,
+		}),
+	).toBeVisible();
+
+	// Now send a live message with a Markdown image, two attached images and a text file.
+	let second = {
+		name: "second.png",
+		mimeType: "image/png",
+		buffer: Buffer.concat([PNG, Buffer.from([0])]),
+	};
+	await choose(page, SHOT, second, NOTES);
+	await expect(chip(page, "shot.png")).toHaveAttribute("data-state", "done");
+	await expect(chip(page, "second.png")).toHaveAttribute("data-state", "done");
+	await expect(chip(page, "notes.md")).toHaveAttribute("data-state", "done");
+	let input = chatInput(chat(page));
+	await fillChat(input, `Compare ![inline](${inline}) with these`);
+	await input.press("Enter");
+
+	let sent = messages(page).filter({ hasText: "Compare" });
+	let tiles = sent.locator('[data-slot="image-gallery"] [data-chat-image="tile"]');
+	await expect(tiles).toHaveCount(2);
+	await expect(tiles.nth(0)).toHaveAttribute("aria-label", "Open image: shot.png");
+	await expect(tiles.nth(1)).toHaveAttribute("aria-label", "Open image: second.png");
+	await expect(tiles.nth(0)).toHaveAttribute("data-load", "shown");
+	await expect(tiles.nth(1)).toHaveAttribute("data-load", "shown");
+	let fileTiles = sent.getByRole("group", { name: "Files sent with this message" }).getByRole(
+		"button",
+		{ name: /\.md/ },
+	);
+	await expect(fileTiles).toHaveCount(3);
+	await expect(fileTiles.first()).toHaveAccessibleName(/^notes\.md/);
+	await expect(fileTiles.nth(1)).toHaveAccessibleName("Download notes.md");
+	await expect(fileTiles.nth(2)).toHaveAccessibleName("Copy link to notes.md");
+
+	// Clicking the first gallery tile opens the shared message viewer at 2 of 4: after the Markdown
+	// image, and before the text file, which the viewer steps to as well.
+	await tiles.nth(0).focus();
+	await page.keyboard.press("Enter");
+	let dialog = page.locator("[data-image-viewer]");
+	await expect(dialog.getByRole("status")).toHaveText("2 of 4");
+	await expect(dialog.getByRole("img", { name: "shot.png" })).toBeVisible();
+	await page.keyboard.press("ArrowLeft");
+	await expect(dialog.getByRole("status")).toHaveText("1 of 4");
+	await expect(dialog.getByRole("img", { name: "inline" })).toBeVisible();
+	await page.keyboard.press("ArrowRight");
+	await page.keyboard.press("ArrowRight");
+	await expect(dialog.getByRole("status")).toHaveText("3 of 4");
+	await expect(dialog.getByRole("img", { name: "second.png" })).toBeVisible();
+	await page.keyboard.press("ArrowRight");
+	await expect(dialog.getByRole("status")).toHaveText("4 of 4");
+	await expect(dialog.locator("[data-image-viewer-file='text']")).toContainText("# Notes");
+	await page.keyboard.press("Escape");
+	await expect(dialog).toHaveCount(0);
+	await expect(tiles.nth(0)).toBeFocused();
 });

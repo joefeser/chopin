@@ -1013,7 +1013,7 @@ if (url) {
 				},
 			};
 			expect(await turnModel(deps, "c")).toEqual({
-				notice: "acme/large is no longer available, so Chopin used its default model.",
+				notice: "acme/large is no longer available, so chopin used its default model.",
 			});
 			await sql`UPDATE planner_model_choices SET model_name = 'Large' WHERE channel_id = 'c'`;
 			await sql.close();
@@ -1021,7 +1021,7 @@ if (url) {
 			await sql.unsafe(`SET search_path TO "${schema}"`).simple();
 			store = new PostgresPlannerModelChoiceStore(sql, (_action, run) => run(), async () => {});
 			expect(await turnModel({ ...deps, storage: { plannerModelChoices: store } }, "c")).toEqual({
-				notice: "Large is no longer available, so Chopin used its default model.",
+				notice: "Large is no longer available, so chopin used its default model.",
 			});
 		} finally {
 			await sql.unsafe(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`).simple();
@@ -1098,6 +1098,11 @@ if (url) {
 				"034_planner_model_choices",
 				"035_planner_model_name",
 				"036_chat_attachments",
+				"037_chat_threads",
+				"038_plan_image_sizes",
+				"039_plan_image_types",
+				"040_chat_attachment_originals",
+				"041_document_full_width",
 			]);
 			expect([
 				...await sql<{ table: string | null }[]>`SELECT to_regclass('channel_slugs') AS table`,

@@ -196,6 +196,98 @@ describe("hosted plan persistence", () => {
 		await Service.close(restored);
 	});
 
+	it("restores a turn's images with their message, and refuses images on a person's message", async () => {
+		let context = await hosted();
+		let plan = await Service.open(context.channel.id, context.backend, context.server);
+		let images: ChatWire.Image[] = [
+			{
+				src: `/images/${"a".repeat(64)}.png`,
+				alt: "Ground floor",
+				caption: "",
+				width: 800,
+				height: 600,
+				generated: true,
+			},
+			{ src: `/images/${"b".repeat(64)}.webp`, width: 3, height: 4 },
+		];
+		plan.chat.entries.push({ id: ulid(), author: { kind: "agent" }, text: "", ts: 1, images });
+		await Service.persist(plan);
+		await Service.close(plan);
+
+		let restored = await Service.open(context.channel.id, context.backend, context.server);
+		expect(restored.chat.entries[0]?.images).toEqual(images);
+		restored.chat.entries.push({
+			id: ulid(),
+			author: { kind: "member", handle: "octocat" },
+			text: "Mine",
+			ts: 2,
+			images,
+		});
+		await Service.persist(restored);
+		await Service.close(restored);
+		await expect(Service.open(context.channel.id, context.backend, context.server)).rejects
+			.toThrow("hosted channel has an invalid transcript image");
+	});
+
+	it("restores the images a turn could not show with their message, and refuses a malformed one", async () => {
+		let context = await hosted();
+		let plan = await Service.open(context.channel.id, context.backend, context.server);
+		let refusedImages: ChatWire.ImageRefusal[] = [
+			{ before: 0, reason: "Image couldn't be shown: its data isn't valid base64." },
+			{ before: 1, reason: "Image couldn't be shown: its data isn't valid base64." },
+		];
+		let images: ChatWire.Image[] = [{
+			src: `/images/${"a".repeat(64)}.png`,
+			width: 800,
+			height: 600,
+			generated: true,
+		}];
+		plan.chat.entries.push({
+			id: ulid(),
+			author: { kind: "agent" },
+			text: "",
+			ts: 1,
+			images,
+			refusedImages,
+		});
+		await Service.persist(plan);
+		await Service.close(plan);
+
+		let restored = await Service.open(context.channel.id, context.backend, context.server);
+		expect(restored.chat.entries[0]?.refusedImages).toEqual(refusedImages);
+		restored.chat.entries[0]!.refusedImages = [{ before: 3, reason: 7 as never }];
+		await Service.persist(restored);
+		await Service.close(restored);
+		await expect(Service.open(context.channel.id, context.backend, context.server)).rejects
+			.toThrow("hosted channel has an invalid transcript image");
+	});
+
+	it("restores the sentence for an image that was too large with its message, and refuses one that only starts like it", async () => {
+		let context = await hosted();
+		let plan = await Service.open(context.channel.id, context.backend, context.server);
+		let refusedImages: ChatWire.ImageRefusal[] = [
+			{ before: 0, reason: "Image too large to show (30 MB, limit 10 MB)" },
+			{ before: 0, reason: "Image couldn't be shown: its data isn't valid base64." },
+		];
+		plan.chat.entries.push({
+			id: ulid(),
+			author: { kind: "agent" },
+			text: "",
+			ts: 1,
+			refusedImages,
+		});
+		await Service.persist(plan);
+		await Service.close(plan);
+
+		let restored = await Service.open(context.channel.id, context.backend, context.server);
+		expect(restored.chat.entries[0]?.refusedImages).toEqual(refusedImages);
+		restored.chat.entries[0]!.refusedImages = [{ before: 0, reason: "Image too large to show" }];
+		await Service.persist(restored);
+		await Service.close(restored);
+		await expect(Service.open(context.channel.id, context.backend, context.server)).rejects
+			.toThrow("hosted channel has an invalid transcript image");
+	});
+
 	it("restores workflow run cards, with runs still live then stopped", async () => {
 		let context = await hosted();
 		let plan = await Service.open(context.channel.id, context.backend, context.server);
@@ -324,8 +416,8 @@ describe("hosted plan persistence", () => {
 		await Chat.send(room(restored), ws, { ...message, rid: "retry" });
 		expect(restored.chat.entries.filter(entry => entry.id === requestId)).toHaveLength(1);
 		expect(replies.filter(frame => frame.kind === "chat:send")).toEqual([
-			expect.objectContaining({ rid: "first", id: requestId, queued: false }),
-			expect.objectContaining({ rid: "retry", id: requestId, queued: false }),
+			expect.objectContaining({ rid: "first", id: requestId }),
+			expect.objectContaining({ rid: "retry", id: requestId }),
 		]);
 		await Service.close(restored);
 	});

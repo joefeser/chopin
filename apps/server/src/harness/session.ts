@@ -1,10 +1,16 @@
-import { BACKGROUND_TOOL_NAMES, PLANNER_TOOL_NAMES, VISUAL_PLANNER_TOOL_NAMES } from "./tool-names";
+import {
+	BACKGROUND_TOOL_NAMES,
+	PLANNER_TOOL_NAMES,
+	REACTION_TOOL_NAMES,
+	VISUAL_PLANNER_TOOL_NAMES,
+} from "./tool-names";
 import { createJustBashNetworkSandboxSession } from "@ai-sdk/sandbox-just-bash";
 import {
 	decisionFollowupPlannerAgent,
 	headingPlannerAgent,
 	plannerAgent,
 	prosePlannerAgent,
+	reactionPlannerAgent,
 	refinePlannerAgent,
 	visualPlannerAgent,
 } from "./agents";
@@ -41,16 +47,37 @@ type Sandbox = Awaited<ReturnType<typeof createJustBashNetworkSandboxSession>>;
 
 type PlannerAgent = typeof plannerAgent;
 
+export type PlannerForkHooks = {
+	atomicEntries?: unknown[];
+	atomicLeafId?: string | null;
+	onAtomicEntries?: (entries: unknown[], leafId: string | null) => void;
+	remoteFrom?: { session: string; turn?: string };
+	onRemoteTurn?: (point: { session: string; turn: string }) => void;
+};
+
 export type PlannerChannel = {
 	room: DocumentRoom;
 	repository: HostedRepository;
-	instructions: string | ((workspace?: PlannerWorkspace | RemoteWorkspace) => string);
+	instructions:
+		| string
+		| ((
+			workspace?: PlannerWorkspace | (RemoteWorkspace & { forkedNatively?: boolean }),
+		) => string);
 	model?: string;
 	/**
 	 * `atomic` runs the session as a full Atomic session in the channel's workspace;
 	 * `remote` runs it in the client attached to the channel.
 	 */
 	harness?: string;
+	/** Active Chat instance for tool progress and job state; defaults to `room.plan.chat`. */
+	chat?: Pick<
+		NonNullable<DocumentRoom["plan"]["chat"]>,
+		"job" | "toolProgress" | "toolFinished"
+	>;
+	/** Session-tree and remote fork hooks for Chat threads. */
+	fork?: PlannerForkHooks;
+	/** An answer to a reader's reaction: no tools, isolated on every harness. */
+	reader?: true;
 };
 
 /** Atomic answers an action it could not carry out with `noop` or `cancelled`; report it rather than claim success. */
@@ -69,6 +96,12 @@ export type PlannerFiles = {
 	readsImages: boolean;
 };
 
+/**
+ * The Chat message a turn answers, and `retry` when the turn runs it again after an earlier turn
+ * for it failed. A remote client that offered `retry-turn` is told both.
+ */
+export type PlannerTurnMessage = { id: string; retry?: true };
+
 export type PlannerSession = {
 	/** The tools this session offers; a full Atomic session reports the set of its running turn. */
 	activeTools?: readonly string[];
@@ -82,8 +115,15 @@ export type PlannerSession = {
 		abortSignal: AbortSignal,
 		choice?: PlannerChoice,
 		files?: PlannerFiles,
+		message?: PlannerTurnMessage,
 	) => ReturnType<PlannerAgent["stream"]>;
 	destroy: () => Promise<void>;
+	/**
+	 * Gives the running turn a person's message, which it reads at its next step. Rejects when no
+	 * turn is running or its harness takes no input mid-run; whether one does is `plannerSteers`.
+	 * Absent for a background job's session, which no one talks to.
+	 */
+	steer?: (text: string) => Promise<void>;
 	/**
 	 * The questions this session asked that no member has answered yet, and the requests whose
 	 * result its client has not received. A session with either is kept past a turn that ended
@@ -154,6 +194,7 @@ export type PlannerSessionDependencies = {
 	refineAgent?: PlannerAgent;
 	proseAgent?: PlannerAgent;
 	followupAgent?: PlannerAgent;
+	reactionAgent?: PlannerAgent;
 	visualAgent?: PlannerAgent;
 	githubTools?: typeof githubTools;
 	createSandbox?: () => Promise<Sandbox>;
@@ -166,7 +207,9 @@ export async function openPlannerSession(
 	channel: PlannerChannel,
 	deps: PlannerSessionDependencies = {},
 ): Promise<Result<PlannerSession, OpenError>> {
-	let job = channel.room.plan.chat?.job;
+	let activeChat = channel.chat ?? channel.room.plan.chat;
+	let job = activeChat?.job;
+	let isolated = !!job || !!channel.reader;
 	if (job && !Object.hasOwn(BACKGROUND_TOOL_NAMES, job.kind)) {
 		return {
 			ok: false,
@@ -204,7 +247,7 @@ export async function openPlannerSession(
 		let sessionId = crypto.randomUUID();
 		unregister = (deps.registerCredential ?? registerCredential)(sessionId, owner.currentToken);
 		// Background jobs keep the isolated boundary; only a Planner turn may run as a full session.
-		let workspace = channel.harness === "atomic" && !job
+		let workspace = channel.harness === "atomic" && !isolated
 			? await plannerWorkspace(channel.room.id, channel.repository)
 			: undefined;
 		let planner: FullPlanner | undefined;
@@ -224,17 +267,31 @@ export async function openPlannerSession(
 					for (let listener of listeners) listener(runs);
 				},
 				toolReport: (id, output, state) => {
-					let chat = channel.room.plan.chat;
+					let chat = channel.chat ?? channel.room.plan.chat;
 					if (state === "running") chat?.toolProgress?.(id, output);
 					else chat?.toolFinished?.(id, output, state === "done");
 				},
+				...(channel.fork?.atomicEntries !== undefined
+					? { sessionEntries: channel.fork.atomicEntries }
+					: {}),
+				...(channel.fork?.atomicLeafId !== undefined
+					? { branchLeafId: channel.fork.atomicLeafId }
+					: {}),
+				...(channel.fork?.onAtomicEntries
+					? { onSessionEntries: channel.fork.onAtomicEntries }
+					: {}),
 			};
 			unregisterFull = registerFullPlanner(sessionId, planner);
 		}
 		let remote: RemotePlanner | undefined;
 		if (channel.harness === "remote") {
-			let held: RemotePlanner = { channelId: channel.room.id, isolated: !!job };
-			if (!job) {
+			let held: RemotePlanner = {
+				channelId: channel.room.id,
+				isolated,
+				...(channel.fork?.remoteFrom ? { forkFrom: { ...channel.fork.remoteFrom } } : {}),
+				...(channel.fork?.onRemoteTurn ? { onRemoteTurn: channel.fork.onRemoteTurn } : {}),
+			};
+			if (!isolated) {
 				held.humanInput = report =>
 					createHumanInput(
 						channel.room,
@@ -250,7 +307,7 @@ export async function openPlannerSession(
 					for (let listener of listeners) listener(runs);
 				};
 				held.toolReport = (id, output, state) => {
-					let chat = channel.room.plan.chat;
+					let chat = channel.chat ?? channel.room.plan.chat;
 					if (state === "running") chat?.toolProgress?.(id, output);
 					else chat?.toolFinished?.(id, output, state === "done");
 				};
@@ -258,9 +315,6 @@ export async function openPlannerSession(
 			remote = held;
 			unregisterRemote = registerRemotePlanner(sessionId, held);
 		}
-		let instructions = typeof channel.instructions === "function"
-			? channel.instructions(workspace ?? (remote && !job ? { remote: true } : undefined))
-			: channel.instructions;
 		let agent = deps.agent ?? (job?.kind === "heading"
 			? deps.headingAgent ?? headingPlannerAgent
 			: job?.kind === "refine" || job?.kind === "suggest"
@@ -269,6 +323,8 @@ export async function openPlannerSession(
 			? deps.proseAgent ?? prosePlannerAgent
 			: job?.kind === "decision-followup"
 			? deps.followupAgent ?? decisionFollowupPlannerAgent
+			: channel.reader
+			? deps.reactionAgent ?? reactionPlannerAgent
 			: channel.room.visual
 			? deps.visualAgent ?? visualPlannerAgent
 			: plannerAgent);
@@ -285,6 +341,14 @@ export async function openPlannerSession(
 			void opening.then(late => late.destroy()).catch(() => {});
 			throw cause;
 		}
+		let instructions = typeof channel.instructions === "function"
+			? channel.instructions(
+				workspace
+					?? (remote && !isolated
+						? { remote: true, forkedNatively: remote.forkedNatively === true }
+						: undefined),
+			)
+			: channel.instructions;
 		if (owner.signal.aborted) throw new Error("Planner owner unavailable");
 		let active = session;
 		let stopped: Promise<void> | undefined;
@@ -307,12 +371,14 @@ export async function openPlannerSession(
 				pauseRun: async (runId: string) => applied(await workflows().pause(runId)),
 				resumeRun: async (runId: string) => applied(await workflows().resume(runId)),
 			}
-			: remote && !job
+			: remote && !isolated
 			? remoteRunControl(remote, watchRuns)
 			: {};
 		let fixedTools = Object.freeze([
 			...(job
 				? BACKGROUND_TOOL_NAMES[job.kind]
+				: channel.reader
+				? REACTION_TOOL_NAMES
 				: channel.room.visual
 				? VISUAL_PLANNER_TOOL_NAMES
 				: PLANNER_TOOL_NAMES),
@@ -324,8 +390,8 @@ export async function openPlannerSession(
 					return planner?.activeTools ?? remote?.activeTools ?? fixedTools;
 				},
 				...runControl,
-				...(planner || remote && !job ? { inputs } : {}),
-				...(remote && !job
+				...(planner || remote && !isolated ? { inputs } : {}),
+				...(remote && !isolated
 					? {
 						rebind: (renewed: ActiveOwnerBinding) => {
 							unregister?.();
@@ -344,10 +410,13 @@ export async function openPlannerSession(
 						},
 					}
 					: {}),
-				stream: (prompt, abortSignal, choice, files) => {
+				stream: (prompt, abortSignal, choice, files, message) => {
 					// The remote turn aborts it when the turn ends or the link drops mid-tool.
 					let hostTools = remote ? new AbortController() : undefined;
-					if (remote) remote.hostTools = hostTools;
+					if (remote) {
+						remote.hostTools = hostTools;
+						remote.turnMessage = message;
+					}
 					// The level is on this turn alone, as the model is: nothing is left for the next one.
 					return startingTurn(choice?.thinkingLevel, () =>
 						agent.stream({
@@ -366,6 +435,7 @@ export async function openPlannerSession(
 							},
 						}));
 				},
+				...(job ? {} : { steer: (text: string) => active.experimental_steerTurn(text) }),
 				destroy: () =>
 					stopped ??= (async () => {
 						try {

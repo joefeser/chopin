@@ -3,6 +3,8 @@
  * channel authorization and WebSocket admission still run in the real server.
  */
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 let issuedCodes = new Map<string, string>();
 let nextCode = 0;
@@ -42,6 +44,16 @@ const repositories = [
 ];
 
 const CREATOR_WRITABLE = new Set(["archive-1", "archive-8", "archive-9"]);
+
+// A reader of octo-org/score whose access is whatever the file named for it says whenever GitHub is
+// asked: "revoked" takes the repository away, "unavailable" answers as GitHub does when it cannot be
+// reached, and anything else, or no file, leaves the access as it was. The test that owns the
+// handle writes the file; the same path is made in e2e/reaction-access.e2e.ts.
+const ACCESS_GATED = "gated-access-";
+
+function accessGate(handle: string): string {
+	return join(tmpdir(), "chopin-e2e-access", handle);
+}
 
 // People GitHub reports with less than the default access to the private
 // octo-org/score: a reader may pull but not push, and an outsider cannot see it.
@@ -217,6 +229,8 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 	if (url.origin === "https://api.github.com") {
 		let requestHeaders = new Headers(init?.headers);
 		let authorization = requestHeaders.get("authorization") ?? "";
+		let app = await asTheApp(url, authorization, init);
+		if (app) return app;
 		let authorized = /^Bearer ghu_e2e_(.+)_\d+$/.exec(authorization);
 		if (!authorized) return json({ message: "Bad credentials" }, { status: 401 });
 		let handle = authorized[1]!;
@@ -276,6 +290,20 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 					},
 				}));
 			}
+			if (handle.startsWith(ACCESS_GATED)) {
+				let gate = (await readFile(accessGate(handle), "utf8").catch(() => "")).trim();
+				if (gate === "unavailable") {
+					return json({ message: "Service Unavailable" }, { status: 503 });
+				}
+				available = available.map(value => ({
+					...value,
+					permissions: {
+						...value.permissions,
+						pull: gate === "revoked" ? false : value.permissions.pull,
+						push: false,
+					},
+				}));
+			}
 			if (handle === "paged" && url.searchParams.get("page") !== "2") {
 				return tagged(
 					{ repositories: available.slice(0, 1) },
@@ -301,6 +329,13 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 		}
 		// The head a machine with no checkout of octo-org/score clones.
 		if (url.pathname === "/repos/octo-org/score/commits/main") return json({ sha: "b".repeat(40) });
+		// A commit a Planner pushed for its plan's files: GitHub has every one but the zero SHA.
+		let commit = /^\/repos\/octo-org\/score\/commits\/([0-9a-f]{40})$/.exec(url.pathname)?.[1];
+		if (commit) {
+			return commit === "0".repeat(40)
+				? json({ message: `No commit found for SHA: ${commit}` }, { status: 422 })
+				: json({ sha: commit });
+		}
 		// The files of octo-org/score, which a message can mention.
 		if (url.pathname === "/repos/octo-org/score/git/trees/main") {
 			return json({
@@ -327,3 +362,66 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 	return network(input, init);
 };
 globalThis.fetch = Object.assign(fake, { preconnect: network.preconnect });
+
+/** The e2e App's id, with the key playwright.config.ts gives the servers. */
+const APP_ID = 4242;
+const BOT = { login: "chopin-e2e[bot]", id: 4_242_000, node_id: "BOT_chopin_e2e" };
+let mintedTokens = 0;
+
+/**
+ * GitHub as Chopin's GitHub App sees it: the App (by its JWT) finds its installation on an
+ * octo-org repository and mints a token for it, and that token reads who may push there and who
+ * a login is. Every octo-org repository has the App installed with Contents and Pull requests
+ * write, and a person may push wherever the list above says they may.
+ */
+async function asTheApp(url: URL, authorization: string, init?: RequestInit) {
+	let jwt = /^Bearer (ey[\w-]+\.[\w-]+\.[\w-]+)$/.exec(authorization)?.[1];
+	if (jwt) {
+		let claims = JSON.parse(Buffer.from(jwt.split(".")[1]!, "base64url").toString()) as {
+			iss?: unknown;
+		};
+		if (String(claims.iss) !== String(APP_ID)) {
+			return json({ message: "Bad credentials" }, { status: 401 });
+		}
+		let installed = /^\/repos\/octo-org\/[\w.-]+\/installation$/.test(url.pathname);
+		if (installed) {
+			return json({
+				id: 101,
+				suspended_at: null,
+				permissions: { contents: "write", pull_requests: "write", metadata: "read" },
+			});
+		}
+		if (url.pathname === "/app/installations/101/access_tokens" && init?.method === "POST") {
+			let asked = JSON.parse(String(init.body ?? "{}")) as { permissions?: unknown };
+			return json({
+				token: `ghs_e2e_app_${++mintedTokens}`,
+				expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+				permissions: asked.permissions ?? {},
+			}, { status: 201 });
+		}
+		return json({ message: "Not Found" }, { status: 404 });
+	}
+	if (!/^Bearer ghs_e2e_app_\d+$/.test(authorization)) return undefined;
+	if (url.pathname === "/installation/token") return new Response(null, { status: 204 });
+	let user = /^\/users\/([^/]+)$/.exec(url.pathname)?.[1];
+	if (user) {
+		let login = decodeURIComponent(user);
+		if (login === BOT.login) return json({ ...BOT, name: null });
+		return json({
+			login,
+			id: [...login].reduce((sum, character) => sum * 31 + character.charCodeAt(0) | 0, 7) >>> 0,
+			node_id: `U_${login}`,
+			name: null,
+		});
+	}
+	let permission = /^\/repos\/octo-org\/([\w.-]+)\/collaborators\/([^/]+)\/permission$/.exec(
+		url.pathname,
+	);
+	if (permission) {
+		let login = decodeURIComponent(permission[2]!);
+		let push = !login.startsWith(SCORE_READER) && !login.startsWith(SCORE_OUTSIDER)
+			&& login !== "readonly";
+		return json({ permission: push ? "write" : "read", user: { login, permissions: { push } } });
+	}
+	return json({ message: "Not Found" }, { status: 404 });
+}

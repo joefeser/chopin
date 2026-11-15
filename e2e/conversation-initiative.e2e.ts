@@ -5,6 +5,12 @@ import { expect, openIsolatedRoom, ready, test } from "./room";
 import type { BrowserContext, Page } from "@playwright/test";
 import type { Chat } from "../packages/protocol/index";
 
+// People a test brings in only so that its sender is not alone, closed when it ends.
+let cleanup: Array<() => Promise<void>> = [];
+test.afterEach(async () => {
+	for (let close of cleanup.splice(0)) await close();
+});
+
 type Seen = { at: number; connection: number; frame: Chat.Outgoing };
 type Sent = { at: number; frame: Chat.Incoming };
 
@@ -56,16 +62,19 @@ async function record(
 		sent,
 		loseNextAcknowledgement: () => loseFirstAcknowledgement = true,
 		starts: () => {
-			// Title jobs share state frames; response updates repeat a conversational turn's ID.
+			// Title jobs share state frames and chopin's name, but never answer in Chat: a turn of
+			// chopin's own counts once it has, from its first frame. Response updates repeat its ID.
 			let turns = new Map<string, { at: number; turn: Chat.Turn }>();
+			let answered = new Set<string>();
 			for (let item of seen) {
 				if (item.frame.kind !== "chat:state" || !item.frame.busy || !item.frame.turn) continue;
 				let turn = item.frame.turn;
-				if (turn.handle !== "chopin" && !turns.has(turn.id)) {
-					turns.set(turn.id, { at: item.at, turn });
-				}
+				if (turn.responded) answered.add(turn.id);
+				if (!turns.has(turn.id)) turns.set(turn.id, { at: item.at, turn });
 			}
-			return [...turns.values()];
+			return [...turns.values()].filter(({ turn }) =>
+				turn.handle !== "chopin" || answered.has(turn.id)
+			);
 		},
 		histories: () => seen.flatMap(item => item.frame.kind === "chat:history" ? [item.frame] : []),
 		sends: () => sent.flatMap(item => item.frame.kind === "chat:send" ? [item.frame] : []),
@@ -86,28 +95,73 @@ async function reply(page: Page) {
 	await expect(pane(page).getByText(PULL_REQUESTS[0]!.title, { exact: false })).toBeVisible();
 }
 
+const ALONE = "Message chopin";
+const TEAM = "Message the team, or @chopin to ask";
+
 test(
-	"every solo human turn gets one reply, including a brief acknowledgment",
+	"alone, every message is answered at once as if it named chopin, and the draft says so",
 	async ({ join, page, seed }, info) => {
 		await seed("# Conversational initiative\n\nCompare export formats for a small pilot.\n");
 		let frames = await record(page);
 		await join("ana");
 		await expect(pane(page).getByRole("button", { name: /automatic participation/ }))
 			.toHaveCount(0);
+		let input = chatInput(pane(page));
+		await expect(input).toHaveAttribute("data-placeholder", ALONE);
+		await page.screenshot({ path: info.outputPath("alone-hint.png") });
+		let sent = Date.now();
 		await send(page, "Thanks, that is clear.");
-		await reply(page);
+		// Sent to the room, as typed, and taken to chopin as a mention would be: its turn is ana's, and
+		// it starts with no wait for silence and no judgment.
+		expect(frames.sends().at(-1)).toMatchObject({ to: "room", text: "Thanks, that is clear." });
 		await expect.poll(() => frames.starts().length).toBe(1);
+		expect(frames.starts()[0]!.turn.handle).toBe("ana");
+		expect(frames.starts()[0]!.at - sent).toBeLessThan(900);
+		await reply(page);
 		await expect.poll(() => frames.seen.findLast(item => item.frame.kind === "chat:state")?.frame)
 			.toMatchObject({ busy: false });
 		await send(page, "Can you compare the export approaches for this small pilot?");
-		await reply(page);
+		await expect(pane(page).getByText(PULL_REQUESTS[0]!.title, { exact: false })).toHaveCount(2);
 		await expect.poll(() => frames.starts().length).toBe(2);
-		expect(frames.starts()[0]!.turn.handle).toBe("Chopin");
+		expect(frames.starts()[1]!.turn.handle).toBe("ana");
 		await page.screenshot({ path: info.outputPath("initiative-contribution.png"), fullPage: true });
 		await page.waitForTimeout(1800);
 		expect(frames.starts()).toHaveLength(2);
 	},
 );
+
+test("a second person switches the draft back at once and the room's rules apply until they leave", async ({ baseURL, browser, join, page, room, seed }) => {
+	await seed("# Second person\n\nCompare export formats for a small pilot.\n");
+	let frames = await record(page);
+	await join("ana");
+	let input = chatInput(pane(page));
+	await expect(input).toHaveAttribute("data-placeholder", ALONE);
+	// Joining while chopin answers leaves that turn to finish.
+	await send(page, "SLOW-LIVE show your work");
+	await expect.poll(() => frames.starts().length).toBe(1);
+	let peer = await openIsolatedRoom(browser, baseURL!, room, "bo", {});
+	try {
+		await expect(input).toHaveAttribute("data-placeholder", TEAM);
+		await expect(chatInput(pane(peer.page))).toHaveAttribute("data-placeholder", TEAM);
+		await expect.poll(
+			() => frames.seen.findLast(item => item.frame.kind === "chat:state")?.frame,
+			{ timeout: 20000 },
+		).toMatchObject({ busy: false });
+		expect(frames.starts()).toHaveLength(1);
+		let sent = Date.now();
+		await send(page, "INITIATIVE-USEFUL second: compare the export approaches.");
+		expect(frames.sends().at(-1)).toMatchObject({ to: "room" });
+		// Now automatic participation waits for silence and asks the judge before chopin answers.
+		await reply(page);
+		await expect.poll(() => frames.starts().length).toBe(2);
+		expect(frames.starts()[1]!.turn.handle).toBe("chopin");
+		expect(frames.starts()[1]!.at - sent).toBeGreaterThanOrEqual(1400);
+	} finally {
+		await peer.close();
+	}
+	// chopin answered, and the person who was here has gone: ana is alone again.
+	await expect(input).toHaveAttribute("data-placeholder", ALONE);
+});
 
 test("two active humans get a silence window, renewed typing holds it, and blur releases it", async ({ baseURL, browser, join, page, room, seed }) => {
 	await seed("# Group initiative\n\nCompare export formats for a small pilot.\n");
@@ -205,7 +259,7 @@ test("losing a send acknowledgement and retrying after reconnect never duplicate
 	).toHaveLength(0);
 });
 
-test("losing a child send acknowledgement then returning to the root and reloading preserves retry context", async ({ baseURL, join, page, room, seed }) => {
+test("losing a child send acknowledgement then returning to the root and reloading preserves retry context", async ({ baseURL, browser, join, page, room, seed }) => {
 	await seed("# Reconnected initiative\n\nCompare export formats for a small pilot.\n");
 	let title = `Retry child ${room.slice(0, 8)}`;
 	let child = await seedLinkedChildChannel(
@@ -215,6 +269,9 @@ test("losing a child send acknowledgement then returning to the root and reloadi
 		title,
 		`# ${title}\n\nOriginal finding.\n`,
 	);
+	// A second person is there, so an ordinary message is the room's (alone, it would be chopin's).
+	let peer = await openIsolatedRoom(browser, baseURL!, room, "bo", {});
+	cleanup.push(peer.close);
 	let frames = await record(page, true);
 	await join("ana");
 	await page.getByRole("link", { name: `#${title}`, exact: true }).click();
@@ -256,8 +313,10 @@ test("losing a child send acknowledgement then returning to the root and reloadi
 	).toHaveLength(0);
 });
 
-test("a mentioned request keeps its prepared destination after a lost request and reload, and a lost acknowledgement leaves a room message to be sent again", async ({ join, page, seed }) => {
+test("a mentioned request keeps its prepared destination after a lost request and reload, and a lost acknowledgement leaves a room message to be sent again", async ({ baseURL, browser, join, page, room, seed }) => {
 	await seed("# Retried direct request\n\nCompare export formats for a small pilot.\n");
+	let peer = await openIsolatedRoom(browser, baseURL!, room, "bo", {});
+	cleanup.push(peer.close);
 	let frames = await record(page, false, true);
 	await join("ana");
 	let input = chatInput(pane(page));
@@ -360,8 +419,10 @@ test("a mentioned request whose acknowledgement is lost after the server took it
 	expect(new Set(sentNext.map(item => item.requestId)).size).toBe(1);
 });
 
-test("a Planner reply after a pending human message prevents a second automatic turn", async ({ join, page, seed }) => {
+test("a Planner reply after a pending human message prevents a second automatic turn", async ({ baseURL, browser, join, page, room, seed }) => {
 	await seed("# Racing initiative\n\nCompare export formats for a small pilot.\n");
+	let peer = await openIsolatedRoom(browser, baseURL!, room, "bo", {});
+	cleanup.push(peer.close);
 	let frames = await record(page);
 	await join("ana");
 	await send(page, "@chopin SLOW-LIVE show your work");
@@ -382,7 +443,7 @@ test("a Planner reply after a pending human message prevents a second automatic 
 	expect(frames.starts()).toHaveLength(1);
 });
 
-test("ordinary child discussion stays quiet while natural direct requests preserve focus", async ({ baseURL, join, page, room, seed }) => {
+test("ordinary child discussion stays quiet while natural direct requests preserve focus", async ({ baseURL, browser, join, page, room, seed }) => {
 	await seed("# Focused initiative root\n\nCompare export formats for a small pilot.\n");
 	let title = `Focused child ${room.slice(0, 8)}`;
 	let port = Number(new URL(baseURL!).port);
@@ -393,6 +454,8 @@ test("ordinary child discussion stays quiet while natural direct requests preser
 		title,
 		`# ${title}\n\nOriginal finding.\n`,
 	);
+	let peer = await openIsolatedRoom(browser, baseURL!, room, "bo", {});
+	cleanup.push(peer.close);
 	let frames = await record(page);
 	await join("ana");
 	await page.getByRole("link", { name: `#${title}`, exact: true }).click();
@@ -414,7 +477,7 @@ test("ordinary child discussion stays quiet while natural direct requests preser
 	expect(frames.sends().at(-1)?.focus).toBeUndefined();
 	await reply(page);
 	expect(frames.starts()).toHaveLength(2);
-	expect(frames.starts().at(-1)!.turn.handle).toBe("Chopin");
+	expect(frames.starts().at(-1)!.turn.handle).toBe("chopin");
 });
 
 test("plain-language direct requests get a prompt reply", async ({ baseURL, browser, join, page, room, seed }) => {

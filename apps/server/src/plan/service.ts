@@ -7,7 +7,8 @@ import {
 	validDocumentTitleText,
 	withDocumentTitle,
 } from "@chopin/dialect";
-import { locksEditing, restoreBuilds, restoreLive } from "../tasks/builds";
+import { locksEditing, releaseEndedRun, restoreBuilds, restoreLive } from "../tasks/builds";
+import { restorePlanSources } from "../tasks/plan-source";
 import {
 	announceImplementation,
 	implementationStatus,
@@ -47,7 +48,9 @@ import * as presence from "./presence";
 import * as edit from "./edit";
 import * as room from "./room";
 import * as Chat from "../chat/service";
+import { validateReactions } from "../chat/reactions";
 import { restoreReferences } from "../chat/references";
+import { savedImages, savedRefusals } from "../chat/images";
 import { entriesForStorage, mergePointers } from "../chat/stored-pointers";
 import * as Comments from "../comments/service";
 import * as Questions from "../questions/service";
@@ -70,8 +73,6 @@ import type { Brief, CreationOrigin } from "../mcp";
 import { researchProjectionAllowed, ResearchProjectionConflict } from "../storage/model";
 import type {
 	ChannelRecord,
-	DeferredTurnChange,
-	DeferredTurnOutcome,
 	InitialChannel,
 	JsonValue,
 	Lease,
@@ -83,6 +84,7 @@ import type { PendingCardAction } from "../questions/card-actions";
 import type { ClaimInput, ClaimResult, Graph, Run } from "../tasks/graphs";
 import type { CoordinationOpRecord } from "../tasks/coordination-ops";
 import type { LiveBuild } from "../tasks/builds";
+import type { PlanSource } from "../tasks/plan-source";
 import type { Lifecycle, LifecycleInput, LifecycleResult } from "../tasks/lifecycle";
 
 /** Updates are grouped for this long before being applied together. */
@@ -153,6 +155,11 @@ export type Backend = {
 	onBuildStopped?: (channelId: string) => void;
 	/** A document's editing lock was released and announced. */
 	onEditingUnlocked?: (channelId: string) => void;
+	/**
+	 * A build opened a pull request or ended, after it was persisted: post the line in Chat. Called
+	 * once per notice for each open plan; the notice's ID keeps a repeat to one line.
+	 */
+	onBuildNotice?: (channelId: string, notice: { id: string; text: string }) => void;
 };
 
 export type DocumentTarget = {
@@ -316,6 +323,8 @@ export type Plan = {
 	lifecycle: Lifecycle;
 	/** The finished build this living document was last delivered from. */
 	live?: LiveBuild;
+	/** Where recent revisions' files were pushed, oldest first; a build starts from one. */
+	planSources: PlanSource[];
 	/**
 	 * A one-click Build plan waiting for its tasks, kept until the build starts or is cancelled so
 	 * the click outlives a decision the draft raised and a reload. In memory only (prototype).
@@ -364,6 +373,7 @@ type Sidecar = {
 	execution?: Run;
 	lifecycle?: Lifecycle;
 	live?: LiveBuild;
+	planSources?: PlanSource[];
 	mcpUpdates?: McpUpdateRecord[];
 	coordinationOps?: CoordinationOpRecord[];
 	questions: Questions.Record[];
@@ -398,6 +408,7 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 			? { lifecycle: plan.lifecycle }
 			: {}),
 		...(plan.live ? { live: plan.live } : {}),
+		...(plan.planSources.length ? { planSources: plan.planSources } : {}),
 		...(plan.mcpUpdates.length > 0 ? { mcpUpdates: plan.mcpUpdates } : {}),
 		...(plan.coordinationOps.length > 0 ? { coordinationOps: plan.coordinationOps } : {}),
 		questions: [...plan.records.values()],
@@ -603,6 +614,7 @@ function restoredState(
 	if (Object.hasOwn(item, "execution")) expected.push("execution");
 	if (Object.hasOwn(item, "lifecycle")) expected.push("lifecycle");
 	if (Object.hasOwn(item, "live")) expected.push("live");
+	if (Object.hasOwn(item, "planSources")) expected.push("planSources");
 	if (Object.hasOwn(item, "mcpUpdates")) expected.push("mcpUpdates");
 	if (Object.hasOwn(item, "coordinationOps")) expected.push("coordinationOps");
 	if (Object.hasOwn(item, "conversationPlan")) expected.push("conversationPlan");
@@ -650,9 +662,19 @@ function restoredState(
 		throw new Error("hosted channel has an invalid implementation lifecycle");
 	}
 	let lifecycle = hasLifecycle ? restoredLifecycle : undefined;
+	// A run whose build ended before a release that returns it then is returned as it opens.
+	if (graph && execution && restoredLifecycle) {
+		let released = releaseEndedRun({ graph, execution, lifecycle: restoredLifecycle }, builds);
+		if (!released.execution) {
+			graph = released.graph;
+			execution = undefined;
+			lifecycle = released.lifecycle;
+		}
+	}
 	let live = Object.hasOwn(item, "live")
 		? restoreLive(item.live, builds, lifecycle, graph, item.revision)
 		: undefined;
+	let planSources = restorePlanSources(item.planSources, item.revision);
 	let questions = objects(item.questions, "question record");
 	let records = questions.map(question => Questions.normalizeRecord(question));
 	let openQuestions = objects(item.openQuestions, "open questionnaire");
@@ -709,6 +731,12 @@ function restoredState(
 		) throw new Error("hosted channel has an invalid transcript entry");
 		validateNotice(entry, savedMessages);
 		mergePointers(entry);
+		if (
+			(Object.hasOwn(entry, "images") || Object.hasOwn(entry, "refusedImages"))
+				&& (entry.author as Record<string, JsonValue>).kind !== "agent"
+			|| Object.hasOwn(entry, "images") && !savedImages(entry.images)
+			|| Object.hasOwn(entry, "refusedImages") && !savedRefusals(entry.refusedImages)
+		) throw new Error("hosted channel has an invalid transcript image");
 		if (Object.hasOwn(entry, "references")) {
 			let author = entry.author as Record<string, JsonValue>;
 			if (author.kind !== "member") {
@@ -730,6 +758,7 @@ function restoredState(
 		} catch (err) {
 			throw new Error("hosted channel has invalid chat delivery metadata", { cause: err });
 		}
+		validateReactions(entry as unknown as Chat.Chat["entries"][number]);
 	}
 	let mcpUpdates = restoreMcpUpdates(item.mcpUpdates);
 	let coordinationOps = restoreCoordinationOps(item.coordinationOps);
@@ -799,6 +828,7 @@ function restoredState(
 		...(execution ? { execution } : {}),
 		...(lifecycle ? { lifecycle } : {}),
 		...(live ? { live } : {}),
+		...(planSources.length ? { planSources } : {}),
 		...(mcpUpdates.length > 0 ? { mcpUpdates } : {}),
 		...(coordinationOps.length > 0 ? { coordinationOps } : {}),
 		questions: records,
@@ -1022,16 +1052,14 @@ async function commitHosted(
 	allowArchived = false,
 	researchProjections: ResearchProjectionChange[] = [],
 	notifyDocumentPersisted = true,
-	deferredTurns: DeferredTurnChange[] = [],
-): Promise<DeferredTurnOutcome[] | undefined> {
+): Promise<void> {
 	let durable = plan.persistence;
 	if (
 		!update && captured.sidecarText === durable.lastSidecar
 		&& (captured.title === undefined || captured.title === durable.committedTitle)
-		&& deferredTurns.length === 0
 	) {
 		scheduleCheckpoint(plan);
-		return undefined;
+		return;
 	}
 	try {
 		let previousSource = durable.committedSource;
@@ -1051,7 +1079,6 @@ async function commitHosted(
 			now: new Date(),
 			...(researchProjections.length > 0 ? { researchProjections } : {}),
 			...(allowArchived ? { allowArchived: true } : {}),
-			...(deferredTurns.length > 0 ? { deferredTurns } : {}),
 		});
 		if (!result.repeated) {
 			durable.revision = result.revision;
@@ -1112,7 +1139,6 @@ async function commitHosted(
 			}
 		}
 		scheduleCheckpoint(plan);
-		return result.deferredTurns;
 	} catch (err) {
 		if (!(err instanceof ResearchProjectionConflict)) durable.fatal(err);
 		throw err;
@@ -1337,31 +1363,6 @@ export function persist(plan: Plan, chat?: () => ChatView): Promise<void> {
 	return pending;
 }
 
-/**
- * `persist`, with changes to the deferred Planner requests written in the same transaction, and
- * what each did. A request is durable no later than the entry that acknowledges it.
- */
-export function persistDeferred(
-	plan: Plan,
-	chat?: () => ChatView,
-	deferredTurns?: DeferredTurnChange[],
-): Promise<DeferredTurnOutcome[]> {
-	let commit = () =>
-		commitHosted(
-			plan,
-			undefined,
-			`state:${crypto.randomUUID()}`,
-			capture(plan, chat?.()),
-			false,
-			[],
-			true,
-			deferredTurns,
-		).then(outcomes => outcomes ?? []);
-	let pending = plan.flushing.then(commit, commit);
-	plan.flushing = pending.then(() => {});
-	return pending;
-}
-
 /** Reserve the same queue used by client batches for one complete server operation. */
 export function exclusive<T>(plan: Plan, action: () => Promise<T>): Promise<T> {
 	let operation = plan.flushing.then(action, action);
@@ -1562,10 +1563,12 @@ export async function readStored(
 	graph?: Graph;
 	execution?: Run;
 	lifecycle?: Lifecycle;
-	/** Every decision record the plan holds, normalized as on open. */
-	records: Questions.Record[];
+	/** Every decision record the plan holds, normalized as on open. Omitted
+	 * when the sidecar holds none — absence means "no records", not "unknown". */
+	records?: Questions.Record[];
 	/** Open questionnaires with their shared-draft revisions, as persisted. */
 	openQuestions: Questions.StoredOpen[];
+	planSources?: PlanSource[];
 }> {
 	let restored = await restoreHosted(loaded.channel.id, loaded);
 	try {
@@ -1573,13 +1576,16 @@ export async function readStored(
 		return {
 			source: room.project(restored.document),
 			revision: restored.sidecar.revision,
-			records: restored.sidecar.questions.map(Questions.normalizeRecord),
+			...(restored.sidecar.questions.length > 0
+				? { records: restored.sidecar.questions.map(Questions.normalizeRecord) }
+				: {}),
 			openQuestions: restored.sidecar.openQuestions,
 			...(restored.sidecar.creation ? { creation: restored.sidecar.creation } : {}),
 			...(restored.sidecar.graph ? { graph: restored.sidecar.graph } : {}),
 			...(restored.sidecar.builds ? { builds: restored.sidecar.builds } : {}),
 			...(restored.sidecar.execution ? { execution: restored.sidecar.execution } : {}),
 			...(restored.sidecar.lifecycle ? { lifecycle: restored.sidecar.lifecycle } : {}),
+			...(restored.sidecar.planSources ? { planSources: restored.sidecar.planSources } : {}),
 		};
 	} finally {
 		restored.document.doc.destroy();
@@ -1619,7 +1625,8 @@ export async function open(
 			sidecar.transcript,
 			sidecar.workflowRuns,
 			sidecar.initiativePaused,
-			backend.plannerKeepsRuns?.(id),
+			// An archived document's Planner ended with it: its runs come back stopped.
+			loaded.channel.archivedAt ? undefined : backend.plannerKeepsRuns?.(id),
 		),
 		conversationPlan: sidecar.conversationPlan ?? restoreConversationPlan(undefined),
 		conversationPlanRetries: sidecar.conversationPlanRetries ?? [],
@@ -1639,6 +1646,7 @@ export async function open(
 		execution: sidecar.execution,
 		lifecycle: sidecar.lifecycle ?? { history: [] },
 		...(sidecar.live ? { live: sidecar.live } : {}),
+		planSources: sidecar.planSources ?? [],
 		claiming: false,
 		queue: [],
 		timer: undefined,

@@ -1,8 +1,9 @@
 import { z } from "zod";
-import { RESUME_PROTOCOL, serves } from "../experiments/connections";
+import { APP_TOKEN_PROTOCOL, RESUME_PROTOCOL, serves } from "../experiments/connections";
 import type { Connection, Connections, DurableRun, Grant } from "../experiments/connections";
 import { ExperimentError } from "@chopin/experiment";
 import { fail } from "../experiments/service";
+import { buildEnding, stoppedIn } from "./build-ending";
 import { LIFECYCLE_TOOLS, lifecycleCall } from "../mcp/lifecycle";
 import { exclusive, source } from "../plan/service";
 import type { Plan } from "../plan/service";
@@ -18,6 +19,7 @@ import {
 	reportRebuild,
 	runner,
 } from "./builds";
+import type { PullRequestState } from "./builds";
 import { implementationLifecycle } from "./lifecycle";
 import { unapprovedContext } from "./open-decisions";
 
@@ -135,6 +137,12 @@ const REFUSALS: Record<string, Record<string, { retry?: true; advice: string }>>
 				"The task was completed as needing no code change, so it takes no pull request. Move on to the next task.",
 		},
 	},
+	report_rebuild: {
+		"pull-request-closed": {
+			advice:
+				"A pull request read_rebuild lists under closedPullRequests was closed or merged by a person. Never push to it, reopen it or recreate its branch. Put that work on one new draft pull request on a new branch, name the new pull request in the report instead, and call report_rebuild again.",
+		},
+	},
 	complete_task: {
 		"already-complete": {
 			advice:
@@ -179,6 +187,18 @@ export function implementationConnector(
 		mayTake?: (connection: Connection, person: string, documentId: string) => Promise<boolean>;
 		/** The GitHub login of a person, for the agent to credit in the pull requests it opens. */
 		login?: (userId: string) => Promise<string | undefined>;
+		/** Their GitHub name and noreply email, once a launch token was issued for them. */
+		identity?: (userId: string) => { name: string; email: string } | undefined;
+		/**
+		 * The state on GitHub of each of a build's live pull requests that can be read, with the
+		 * access of the machine running it. One left out is unknown.
+		 */
+		pullRequestStates?: (
+			build: BuildRequest,
+			urls: readonly string[],
+		) => Promise<ReadonlyMap<string, PullRequestState>>;
+		/** Where a document was before it was renamed, as full URLs; its old addresses still resolve. */
+		earlierUrls?: (id: string) => Promise<string[]>;
 	} = {},
 ) {
 	let mayTake = options.mayTake
@@ -201,11 +221,36 @@ export function implementationConnector(
 		return back === undefined || Date.now() < back + RECONNECTED_MS;
 	};
 	/**
-	 * What the agent of a build on a teammate's shared machine is told besides the document: who
-	 * asked for it, and the note for every pull request it opens. The pull requests come from the
-	 * machine owner's GitHub account, so the note says whose request it was.
+	 * What the agent of a build is told besides the document: who asked for it, and the note for
+	 * every pull request it opens. A connector that takes the GitHub App's installation tokens
+	 * (protocol 7) pushes as the App's bot, so every build credits the person who asked: in each
+	 * pull request, its reviewers and each commit's co-author. An older one pushes with the machine
+	 * owner's account, so only a build on a teammate's shared machine says whose request it was.
 	 */
 	let requestedBy = async (plan: Plan, build: BuildRequest, connection: Connection) => {
+		if ((connection.protocol ?? 1) >= APP_TOKEN_PROTOCOL) {
+			let login = await options.login?.(build.user);
+			let known = options.identity?.(build.user);
+			let who = login ?? "the person who asked";
+			return {
+				requestedBy: {
+					...(login ? { login } : {}),
+					...(known ? { name: known.name, email: known.email } : {}),
+					instructions: `${who} asked for this build. Its commits and pull requests come from `
+						+ "Chopin's GitHub App, so credit them: put pullRequestNote, unchanged, at the end of "
+						+ "the body of every pull request you open or update"
+						+ (login ? `, and request a review from ${login} on it` : "")
+						+ (known
+							? `; end every commit message with the trailer \`Co-authored-by: ${known.name} <${known.email}>\`.`
+							: "."),
+					pullRequestNote: `Requested by ${
+						login ? `@${login}` : "a teammate"
+					} in ${await documentUrl(
+						plan.id,
+					)}. Built by a coding agent with Chopin's GitHub App.`,
+				},
+			};
+		}
 		if (build.machineOwner === undefined) return;
 		let asked = await options.login?.(build.user) ?? "a teammate";
 		let owner = connection.login;
@@ -257,6 +302,22 @@ export function implementationConnector(
 	let api = {
 		track(id: string) {
 			tracked.add(id);
+		},
+		/**
+		 * A build of a document that is still queued or running, as the GitHub token for it needs it:
+		 * its repository, who asked for it and the machine it went to.
+		 */
+		async build(documentId: string, id: string) {
+			if (!await documentExists(documentId)) return undefined;
+			return await withPlan(documentId, async plan => {
+				let build = plan.builds.find(item => item.id === id);
+				if (!build || !["queued", "starting", "running"].includes(build.state)) return undefined;
+				return {
+					repository: build.checkout.repository,
+					starter: build.user,
+					...(build.machineId ? { machineId: build.machineId } : {}),
+				};
+			});
 		},
 		/**
 		 * Accept a build's durable run credential again after a restart, for the connection that holds
@@ -407,6 +468,21 @@ export function implementationConnector(
 					}
 				}
 				let build = plan.builds.at(-1);
+				// A person stopped it in Chopin: its machine hears who did, not that it was refused.
+				if (
+					build && !grant.run && build.id === args.id && build.stoppedBy !== undefined
+					&& build.state === "failed" && runner(build) === connection.owner
+					&& (build.machineId !== undefined
+						? build.machineId === connection.machineId
+						: build.connectionId === connection.id)
+					&& ["renew_implementation_build", "report_implementation_build"].includes(name)
+				) {
+					console.info(
+						`chopin: told ${caller} that build ${build.id} of document ${plan.id} was stopped `
+							+ "in Chopin",
+					);
+					fail("build-stopped", stoppedIn(build.stoppedBy));
+				}
 				// Chopin restarted since the build's connection opened. Its machine may carry on with a
 				// resumable build for a while; any other is over.
 				let restarted = !!build && !grant.run && build.id === args.id
@@ -464,14 +540,27 @@ export function implementationConnector(
 					) refuse("build-inactive", build);
 					if (rebuild) {
 						if (name === "read_rebuild") {
-							let read = await readRebuild(plan, build.id) ?? fail("build-inactive");
+							let states = options.pullRequestStates && plan.live?.target
+								? await options.pullRequestStates(build, plan.live.pullRequests).catch(() =>
+									undefined
+								)
+								: undefined;
+							let read = await readRebuild(plan, build.id, {
+								...(states ? { states } : {}),
+								document: {
+									url: await documentUrl(plan.id),
+									earlierUrls: await options.earlierUrls?.(plan.id).catch(() => []) ?? [],
+								},
+							}) ?? fail("build-inactive");
 							return { ...read, ...await requestedBy(plan, build, connection) };
 						}
 						if (name !== "report_rebuild") fail("tool-forbidden");
 						let report = rebuildReportSchema.safeParse(args);
 						if (!report.success) fail("invalid-request");
 						let result = await reportRebuild(plan, build.id, report.data);
-						if (result.kind === "refused") fail(result.reason);
+						if (result.kind === "refused") {
+							fail(result.reason, REFUSALS.report_rebuild?.[result.reason]?.advice);
+						}
 						return { state: "stopped" };
 					}
 					if (name === "read_implementation") {
@@ -492,6 +581,7 @@ export function implementationConnector(
 							}),
 							...unapprovedContext(plan.records.values()),
 							...await requestedBy(plan, build, connection),
+							...(build.planSource ? { planSource: structuredClone(build.planSource) } : {}),
 						}));
 					}
 					let parsed = lifecycleCall(name, { ...args, id: plan.id, runId: build.id });
@@ -533,7 +623,13 @@ export function implementationConnector(
 					name === "report_implementation_build" && args.idempotencyKey !== undefined
 					&& build.reportKey === args.idempotencyKey
 				) {
-					return { accepted: true };
+					let ending = args.state !== "running" && plan.graph
+						? buildEnding(
+							{ graph: plan.graph, execution: plan.execution, lifecycle: plan.lifecycle },
+							build,
+						)
+						: undefined;
+					return { accepted: true, ...(ending ? { ending } : {}) };
 				}
 				if (!["starting", "running"].includes(build.state) || build.expiresAt <= Date.now()) {
 					refuse("build-inactive", build);
@@ -586,6 +682,14 @@ export function implementationConnector(
 						if (claim.kind !== "started") fail("build-claim-refused");
 					}
 					await reportBuild(plan, connection.owner, connection.id, build.id, report);
+					// The machine's terminal and journal say how the build ended, as Chopin does.
+					let ending = report.state !== "running" && plan.graph
+						? buildEnding(
+							{ graph: plan.graph, execution: plan.execution, lifecycle: plan.lifecycle },
+							plan.builds.at(-1)!,
+						)
+						: undefined;
+					if (ending) return { accepted: true, ending };
 				} else fail("tool-forbidden");
 				return { accepted: true };
 			});

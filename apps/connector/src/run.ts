@@ -6,11 +6,21 @@ import { ConnectorStopped, failureKind, redacted } from "./connection";
 import { errorCode } from "./machine";
 import { backoff, delay, forgottenMessage, RUN_GRACE_MS, runReports } from "./reconnect";
 import { bridgeCommand } from "./bridge";
-import { gitCredentials, githubEnvironment, type GitHubToken, githubToken } from "./github-token";
-import { runAgent } from "./acp";
+import {
+	gitCredentials,
+	githubEnvironment,
+	GitHubRefused,
+	type GitHubToken,
+	githubToken,
+	withoutGitHub,
+} from "./github-token";
+import type { GitHubGrantRequest } from "./machine";
+import { type McpTokenFile, mcpTokenFile } from "./mcp-token";
+import { AgentTimedOut, runAgent, timedOut } from "./acp";
 import type { AgentInfo } from "./acp";
 import { serveLocalBridge } from "./local-bridge";
 import { createOutput } from "./output";
+import { blockedText, endingOf } from "./ending";
 import type { Output } from "./output";
 import { ask, describePermission, permissionMemory } from "./permission";
 import type { Sandbox } from "./sandbox";
@@ -28,6 +38,7 @@ import {
 import type { Checkouts } from "./checkouts";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import type { RunOutcome } from "./workspace";
 import {
 	implementationPrompt,
 	liveImplementationPrompt,
@@ -65,16 +76,34 @@ type Options = {
 	failures?: StartFailures;
 	/** The `--env` variables connect saved, for the agent. */
 	env?: Record<string, string>;
-	/** The machine token, to ask Chopin for the machine's GitHub token for a run that may push. */
+	/** The machine token, to ask Chopin for the GitHub token every run needs. */
 	machine?: string;
-	/** Hears, once each time, why Chopin gave no GitHub token when its App can't push. */
-	githubRefused?: (message: string, repository: string) => void;
+	/**
+	 * Asks Chopin for a run's GitHub token, written in `folder`; by default with `machine`. A run
+	 * with neither is refused, as one Chopin gave no token is.
+	 */
+	github?: (request: GitHubGrantRequest & { folder: string }) => Promise<GitHubToken>;
 	/** Where the agent starts: the machine's process sandbox, else plainly. */
 	sandbox?: Sandbox;
+	/** How long a build's or rebuild's agent may work, for tests; `BUILD_LIMIT_MS` by default. */
+	buildLimitMs?: number;
 };
+/** How long an investigation's or prototype's agent may work before it is stopped. */
+export const INVESTIGATION_LIMIT_MS = 60 * 60 * 1000;
+/**
+ * How long a build's agent may work through all of its tasks in one turn before it is stopped.
+ * A build of a few tasks that each verify the whole workspace can take most of an hour per task.
+ */
+export const BUILD_LIMIT_MS = 4 * 60 * 60 * 1000;
 export const STOPPED = "Stopped from the connector terminal.";
 /** A run out of reach says it is still trying at most this often. */
 const RETRY_SAID_MS = 10_000;
+
+/** A refusal's message without the code Chopin put in front of it. */
+function refusalMessage(error: unknown): string | undefined {
+	let message = error instanceof Error ? error.message.replace(/^[a-z][a-z0-9-]*:\s*/, "") : "";
+	return message.trim() || undefined;
+}
 
 function minutes(ms: number) {
 	let value = Math.round(ms / 60_000);
@@ -132,6 +161,8 @@ export async function runWork(
 	let ended: string | undefined;
 	/** Chopin forgot this connection, so the connector must stop once the run has reported. */
 	let forgotten = false;
+	/** A person stopped the build in Chopin, which says who: a stop, not a failure. */
+	let stoppedInChopin = false;
 	let now = options.now ?? Date.now;
 	/** When the terminal last said Chopin is out of reach, so retries say so at most every 10 s. */
 	let saidAt = 0;
@@ -201,6 +232,10 @@ export async function runWork(
 					continue;
 				}
 				let code = errorCode(error);
+				if (code === "build-stopped" && ended === undefined) {
+					stoppedInChopin = true;
+					ended = refusalMessage(error) ?? "Stopped in Chopin.";
+				}
 				// A build claimed before Chopin restarted is one it no longer knows.
 				ended ??= code === "server-restarted"
 					? "Chopin restarted, so it ended this run."
@@ -218,30 +253,50 @@ export async function runWork(
 	/** The checkout the run's worktree comes from. */
 	let root: string | undefined;
 	/**
-	 * The machine's GitHub token for this run, where Chopin gives one: for the agent, though a
-	 * spike never pushes, and to clone or fetch the repository when it has no registered checkout.
+	 * Chopin's GitHub token for this run, which every run needs before anything starts: to clone or
+	 * fetch the repository, and for the agent to push with, though a spike's agent is given none.
+	 * A refusal ends the run with the reason, and the machine never uses its own GitHub login.
 	 */
-	let issued: Promise<GitHubToken | undefined> | undefined;
+	let issued: Promise<GitHubToken> | undefined;
 	let github: GitHubToken | undefined;
 	let tokens = tokenFolder(
 		join(options.directory, "runs", runAttempt(input.id, implementation ? 1 : claim.generation)),
 	);
+	let repository = input.source.repository;
+	let request: GitHubGrantRequest & { folder: string } = {
+		repository,
+		purpose: "run",
+		run: input.id,
+		...(claim.documentId ? { document: claim.documentId } : {}),
+		folder: tokens,
+	};
 	let token = () =>
-		issued ??= options.machine
-			? mkdir(tokens, { recursive: true, mode: 0o700 }).then(() =>
-				githubToken({
-					url: options.url,
-					machine: options.machine!,
-					repository: input.source.repository,
-					file: join(tokens, "github"),
-					...(options.githubRefused ? { refused: options.githubRefused } : {}),
-				})
-			)
-			: Promise.resolve(undefined);
-	let secrets = () => [...Object.values(options.env ?? {}), ...github?.secrets() ?? []];
+		issued ??= mkdir(tokens, { recursive: true, mode: 0o700 }).then(() =>
+			options.github
+				? options.github(request)
+				: options.machine
+				? githubToken({ ...request, url: options.url, machine: options.machine })
+				: Promise.reject(new GitHubRefused("no-grant", repository))
+		);
+	// A token that lapsed without a renewal stops the agent, which could no longer push.
+	let lapsed = () => {
+		ended ??= (github?.expired.reason as Error | undefined)?.message;
+		abort.abort();
+	};
+	/** The token the agent's backend shows Chopin's own tools, minted from the run's credential. */
+	let mcp: McpTokenFile | undefined;
+	let secrets = () => [
+		...Object.values(options.env ?? {}),
+		...github?.secrets() ?? [],
+		...mcp?.secrets() ?? [],
+	];
 	let agentStop: string | undefined;
+	/** How the run ended, for its journal; a run cut short before it ends says nothing. */
+	let outcome: RunOutcome | undefined;
+	// A build's agent works through every task in one turn, so it gets longer than an investigation.
+	let limit = implementation ? options.buildLimitMs ?? BUILD_LIMIT_MS : INVESTIGATION_LIMIT_MS;
 	try {
-		let checkout = await options.checkouts.resolve(input.source.repository, token);
+		let checkout = await options.checkouts.resolve(repository, token);
 		root = checkout.root;
 		prepared = await prepareWorkspace(
 			root,
@@ -255,13 +310,11 @@ export async function runWork(
 			// environment and no one else's.
 			Object.keys(checkout.env).length > 0
 				? checkout.env
-				: await token().then(value =>
-					value ? gitCredentials(value.file, input.source.repository) : {}
-				),
+				: gitCredentials((await token()).file, repository),
 		);
 		// A prototype never pushes and its agent is given no token, in its environment or on disk
 		// where it could read it: the one that fetched its commit is gone before the agent starts.
-		if (claim.spike) await issued?.then(value => value?.stop()).catch(() => {});
+		if (claim.spike) await issued?.then(value => value.stop()).catch(() => {});
 		let path = prepared.path;
 		// A sandboxed agent can't add worktrees, which its prompt says (see `RunWorktrees`).
 		let confined = options.sandbox !== undefined && options.sandbox.report.engine !== "none";
@@ -274,7 +327,19 @@ export async function runWork(
 			spikeWork = { path, branch: `chopin/spike-${input.id.slice(0, 8)}` };
 			git(path, "checkout", "-b", spikeWork.branch);
 		}
-		if (!claim.spike) github = await token();
+		if (!claim.spike) {
+			github = await token();
+			github.expired.addEventListener("abort", lapsed, { once: true });
+			if (options.machine) {
+				mcp = await mcpTokenFile({
+					url: options.url,
+					machine: options.machine,
+					file: join(tokens, "mcp"),
+					credential: { run: claim.runToken },
+					scheduled: true,
+				});
+			}
+		}
 		output.job(
 			rebuild ? "rebuild" : implementation ? "build" : claim.spike ? "spike" : "investigation",
 			implementation
@@ -288,17 +353,29 @@ export async function runWork(
 		// it must use to reach Chopin, so it gets the stdio bridge, which does.
 		let stop = await runAgent({
 			...(options.onAgent ? { onInfo: options.onAgent } : {}),
+			limitMs: limit,
 			...(options.sandbox
 				? { sandbox: options.sandbox, writable: [prepared.extras], own: [path, tokenFolder(path)] }
 				: {}),
 			command: options.command,
 			cwd: path,
 			env: {
-				...options.env,
+				...withoutGitHub(options.env ?? {}),
 				// Where a build's agent adds any extra worktrees, as its prompt says.
 				...(implementation ? { CHOPIN_RUN_WORKTREES: prepared.extras } : {}),
-				...(github ? githubEnvironment(github, input.source.repository) : {}),
-				...(claim.spike ? noPushEnvironment() : {}),
+				...(github ? githubEnvironment(github, repository) : {}),
+				...(mcp ? { CHOPIN_MCP_TOKEN_FILE: mcp.file } : {}),
+				// A spike's agent reaches GitHub with nothing: no gh login, credential helper or SSH key
+				// of the machine's, and it can't push.
+				...(claim.spike
+					? {
+						GH_CONFIG_DIR: join(tokens, "no-gh"),
+						GH_PROMPT_DISABLED: "1",
+						GIT_TERMINAL_PROMPT: "0",
+						GIT_SSH_COMMAND: "false",
+						...noPushEnvironment([["credential.helper", ""]]),
+					}
+					: {}),
 			},
 			onStart: failure =>
 				void (failure
@@ -429,16 +506,30 @@ export async function runWork(
 			agentStop = stop;
 			throw new Error(`Agent stopped: ${stop}`);
 		}
-		await reports.deliver(implementation ? "report_implementation_build" : "complete_experiment", {
-			...identity,
-			...(implementation ? { state: "stopped", idempotencyKey: crypto.randomUUID() } : {}),
-		});
-		output.finished();
+		let answer = await reports.deliver(
+			implementation ? "report_implementation_build" : "complete_experiment",
+			{
+				...identity,
+				...(implementation ? { state: "stopped", idempotencyKey: crypto.randomUUID() } : {}),
+			},
+		);
+		// Chopin says how the build ended: blocked on a task, or the pull requests it opened.
+		let ending = endingOf(answer);
+		output.ended(ending);
+		outcome = ending?.kind === "blocked"
+			? { state: "blocked", reason: blockedText(ending) }
+			: { state: "finished" };
 	} catch (error) {
 		// Ctrl-C reports why before the connector disconnects, so Chopin knows at once. An agent
 		// that cancelled its own turn was interrupted too, unless the connector cancelled it.
 		let stopped = options.signal.aborted || agentStop === "cancelled" && !ended;
 		let missing = !implementation && errorCode(error) === "missing-result";
+		// An agent stopped at its time limit says so wherever the run's end shows: here, in its
+		// journal and in Chopin, never as an unexplained failure.
+		let late = error instanceof AgentTimedOut
+			|| error instanceof Error && error.message === timedOut(limit);
+		// Chopin gave no GitHub token, and its reason names the repository and what fixes it.
+		let refused = error instanceof GitHubRefused;
 		let message = stopped
 			? STOPPED
 			: ended
@@ -449,7 +540,16 @@ export async function runWork(
 			: error instanceof Error
 			? error.message
 			: "Local work failed";
+		// A person's Stop in Chopin ended the build there already: nothing failed, and nothing is
+		// left to report.
+		let chopinStop = !stopped && stoppedInChopin && ended === message;
+		outcome = stopped
+			? { state: "stopped" }
+			: chopinStop
+			? { state: "stopped", reason: message }
+			: { state: "failed", error: redacted(message, secrets()).slice(0, 2000) };
 		if (stopped) output.stopped();
+		else if (chopinStop) output.stopped(message);
 		else {
 			output.failed(
 				redacted(message, secrets()),
@@ -458,13 +558,15 @@ export async function runWork(
 		}
 		// After Ctrl-C, or out of reach for the whole grace period, the failure gets one bounded attempt.
 		let send = stopped || reports.expired() ? reports.final : reports.deliver;
-		await send(implementation ? "report_implementation_build" : "fail_experiment", {
-			...identity,
-			...(implementation ? { state: "failed", idempotencyKey: crypto.randomUUID() } : {}),
-			error: stopped || ended || !implementation
-				? message.slice(0, 2000)
-				: "Local implementation failed. Inspect the connector terminal.",
-		}).catch(() => {});
+		if (!chopinStop) {
+			await send(implementation ? "report_implementation_build" : "fail_experiment", {
+				...identity,
+				...(implementation ? { state: "failed", idempotencyKey: crypto.randomUUID() } : {}),
+				error: stopped || ended || late || refused || !implementation
+					? message.slice(0, 2000)
+					: "Local implementation failed. Inspect the connector terminal.",
+			}).catch(() => {});
+		}
 		// Retrying cannot reach a server that forgot this connection, so the connector stops too.
 		if (forgotten && !stopped) throw new ConnectorStopped("forgotten", message);
 	} finally {
@@ -478,10 +580,12 @@ export async function runWork(
 		if (spikeWork && root) {
 			await discardWorkspace(root, spikeWork.path, spikeWork.branch).catch(() => {});
 		}
-		await issued?.then(value => value?.stop()).catch(() => {});
+		github?.expired.removeEventListener("abort", lapsed);
+		await mcp?.stop().catch(() => {});
+		await issued?.then(value => value.stop()).catch(() => {});
 		// Extra worktrees end with the run; the run's own stays for inspection.
 		if (prepared && root) {
-			await endWorkspace(root, prepared).catch(() => {});
+			await endWorkspace(root, prepared, outcome).catch(() => {});
 		}
 		beating.abort();
 		await heartbeat;

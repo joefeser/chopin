@@ -493,6 +493,13 @@ export function resultText(result: unknown): string {
 	return serialize(result);
 }
 
+export function resultWithImages(result: unknown, toolName: string): NonNullable<unknown> {
+	let content = (result as { content?: unknown } | null)?.content;
+	let made = toolName !== "read" && Array.isArray(content)
+		&& content.some(part => part?.type === "image");
+	return made ? { content } : resultText(result);
+}
+
 /**
  * The stream parts for a tool Atomic runs itself: a builtin, extension, workflow
  * or subagent tool. Host tools report through `hostTool`, and a nested call
@@ -523,7 +530,9 @@ export function ownToolParts(
 	return [{
 		type: "tool-result",
 		...own,
-		result: resultText(event.type === "tool_execution_end" ? event.result : event.partialResult),
+		result: event.type === "tool_execution_end"
+			? resultWithImages(event.result, event.toolName)
+			: resultText(event.partialResult),
 		...(event.type === "tool_execution_end"
 			? { isError: event.isError }
 			: { preliminary: true }),
@@ -570,8 +579,20 @@ type Run = {
 	inputs: Map<number, string>;
 	stopped: boolean;
 	failure?: Error;
-	last?: { stopReason: string; errorMessage?: string };
+	last?: {
+		stopReason: string;
+		errorMessage?: string;
+		usage?: {
+			input?: number;
+			output?: number;
+			cacheRead?: number;
+			cacheWrite?: number;
+			totalTokens?: number;
+		};
+	};
 	stop: () => void;
+	/** Gives the model a person's message at its next step, between a step's tool calls and its next call. */
+	steer: (text: string) => Promise<void>;
 	done: Promise<void>;
 };
 
@@ -583,6 +604,7 @@ function control(run: Run): HarnessV1PromptControl {
 		async submitToolApproval() {
 			// The adapter emits no approval requests; there is nothing to answer.
 		},
+		submitUserMessage: text => run.steer(text),
 		done: run.done,
 	};
 }
@@ -668,6 +690,8 @@ export function createAtomicAdapter(
 	settings: AtomicSettings,
 ): HarnessV1 & {
 	shutdown(): Promise<void>;
+	/** A turn takes a person's message while it runs, through `submitUserMessage`. */
+	steers: true;
 	/** What a document's Planner can be set to run; see `atomicCatalog`. */
 	catalog(defaultModel: string | undefined): Promise<Wire.ModelCatalog>;
 	/** The commands a Planner working in `cwd` offers; see `sessionCommands`. */
@@ -684,6 +708,7 @@ export function createAtomicAdapter(
 		harnessId: "atomic",
 		builtinTools: {},
 		supportsBuiltinToolFiltering: true,
+		steers: true,
 
 		async doStart(startOptions: HarnessV1StartOptions): Promise<HarnessV1Session> {
 			if (startOptions.resumeFrom || startOptions.continueFrom) {
@@ -772,6 +797,37 @@ export function createAtomicAdapter(
 						}
 						run.emit(part);
 					}
+					if (
+						sessionManager
+						&& (event.type === "entry_appended" || event.type === "message_end"
+							|| event.type === "compaction_end")
+					) {
+						let header = sessionManager.getHeader();
+						if (header) {
+							full.onSessionEntries?.(
+								[header, ...sessionManager.getEntries()],
+								sessionManager.getLeafId(),
+							);
+						}
+					}
+				}
+				if (event.type === "compaction_start") {
+					run.emit({ type: "raw", rawValue: { type: "compacting" } });
+					return;
+				}
+				if (event.type === "compaction_end") {
+					if (!event.aborted && event.result) {
+						run.emit({
+							type: "compaction",
+							trigger: event.reason === "manual" ? "manual" : "auto",
+							summary: event.result.compactedText,
+							tokensBefore: event.result.tokensBefore,
+							tokensAfter: event.result.stats.tokensAfter,
+						});
+					} else {
+						run.emit({ type: "raw", rawValue: { type: "compaction-idle" } });
+					}
+					return;
 				}
 				if (!("message" in event) || event.message.role !== "assistant") return;
 				if (event.type === "message_start") {
@@ -844,7 +900,25 @@ export function createAtomicAdapter(
 					if (full && settings.journal) {
 						await mkdir(dirname(settings.journal), { recursive: true, mode: 0o700 });
 					}
-					sessionManager ??= SessionManager.inMemory(cwd);
+					if (!sessionManager) {
+						if (full?.sessionEntries?.length) {
+							sessionManager = SessionManager.inMemory(
+								cwd,
+								undefined,
+								structuredClone(full.sessionEntries) as Parameters<
+									typeof SessionManager.inMemory
+								>[2],
+							);
+							if (full.branchLeafId !== undefined) {
+								if (full.branchLeafId === null) await sessionManager.resetLeaf();
+								else if (sessionManager.getEntry(full.branchLeafId)) {
+									await sessionManager.branch(full.branchLeafId);
+								}
+							}
+						} else {
+							sessionManager = SessionManager.inMemory(cwd);
+						}
+					}
 					let loader = new DefaultResourceLoader({
 						cwd,
 						agentDir,
@@ -1012,6 +1086,17 @@ export function createAtomicAdapter(
 							run.pending.clear();
 							void bounded(agent.abort(), "Atomic abort timed out.").catch(() => {});
 						},
+						steer: async text => {
+							// Atomic would start a turn of its own for a message it is given while idle, and
+							// Chopin never starts one it did not ask for.
+							if (run.stopped || current !== run || !agent.isStreaming) {
+								throw new Error("The turn is not running.");
+							}
+							await bounded(
+								agent.steer(text, undefined, { expandPromptTemplates: false }),
+								"Atomic steering timed out.",
+							);
+						},
 						done: Promise.resolve(),
 					};
 					current = run;
@@ -1039,15 +1124,53 @@ export function createAtomicAdapter(
 								run.emit({ type: "text-delta", id, delta: JSON.stringify(policy.result.value) });
 								run.emit({ type: "text-end", id });
 							}
+							let recorded = run.last?.usage;
+							let inputTotal = (recorded?.input ?? 0) + (recorded?.cacheRead ?? 0)
+								+ (recorded?.cacheWrite ?? 0);
+							let outputTotal = recorded?.output ?? 0;
+							let hasUsage = inputTotal + outputTotal > 0;
+							let turnUsage = hasUsage
+								? {
+									inputTokens: {
+										total: inputTotal,
+										noCache: recorded?.input ?? 0,
+										cacheRead: recorded?.cacheRead ?? 0,
+										cacheWrite: recorded?.cacheWrite ?? 0,
+									},
+									outputTokens: {
+										total: outputTotal,
+										text: outputTotal,
+										reasoning: 0,
+									},
+								}
+								: ZERO_USAGE;
+							if (hasUsage && agent.model?.contextWindow && agent.model.contextWindow > 0) {
+								run.emit({
+									type: "raw",
+									rawValue: {
+										type: "context-window",
+										contextWindow: agent.model.contextWindow,
+									},
+								});
+							}
+							if (full && sessionManager) {
+								let header = sessionManager.getHeader();
+								if (header) {
+									full.onSessionEntries?.(
+										[header, ...sessionManager.getEntries()],
+										sessionManager.getLeafId(),
+									);
+								}
+							}
 							run.emit({
 								type: "finish-step",
 								finishReason: { unified: "stop", raw: undefined },
-								usage: ZERO_USAGE,
+								usage: turnUsage,
 							});
 							run.emit({
 								type: "finish",
 								finishReason: { unified: "stop", raw: undefined },
-								totalUsage: ZERO_USAGE,
+								totalUsage: turnUsage,
 							});
 						} finally {
 							if (current === run) current = undefined;

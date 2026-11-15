@@ -18,7 +18,7 @@
 				1
 			]
 		],
-		"sourceHash": "9770422f8676e5c2064982e343388ce35ce5952acddedd21713e28ad49d54210"
+		"sourceHash": "467fa6e55cbf1adc48fb7000c2faa94b04054bb2a2943750e8a8b0513ce1ccbe"
 	},
 	{
 		"file": "apps/web/src/document-rename.tsx",
@@ -46,7 +46,7 @@
 				1
 			]
 		],
-		"sourceHash": "0e7edd9b75e5ced538efd81678f79591f4efd884c50c5f9801a315fff2ba5a85"
+		"sourceHash": "a3be7162fe9c4bfd722e9bdcf860eb374fe8b6b866e356507ffea97f35e690fc"
 	},
 	{
 		"file": "apps/web/src/account-menu.tsx",
@@ -88,7 +88,7 @@
 				1
 			]
 		],
-		"sourceHash": "b1eac2a759867ebff7afc1082c41a10101ec8a747891361f2849447599ac5e10"
+		"sourceHash": "604efe4de3bf47d6edad78675287113d254bef9ed8bf90556fda98763dea491d"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -102,7 +102,7 @@
 				1
 			]
 		],
-		"sourceHash": "0a11fe298d25f70f899ec376a04f2e128b8de45e763d36c377d15f55aa8e2f8b"
+		"sourceHash": "f1286cf4e03a076a7378453eb71d5c504ce64147356bd5128141b69a2953bf4f"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -116,7 +116,7 @@
 				1
 			]
 		],
-		"sourceHash": "0a11fe298d25f70f899ec376a04f2e128b8de45e763d36c377d15f55aa8e2f8b"
+		"sourceHash": "f1286cf4e03a076a7378453eb71d5c504ce64147356bd5128141b69a2953bf4f"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -137,21 +137,21 @@
 				1
 			]
 		],
-		"sourceHash": "0a11fe298d25f70f899ec376a04f2e128b8de45e763d36c377d15f55aa8e2f8b"
+		"sourceHash": "f1286cf4e03a076a7378453eb71d5c504ce64147356bd5128141b69a2953bf4f"
 	},
 	{
-		"file": "apps/web/src/chat/message-delivery.tsx",
-		"reason": "The message menu is placed from its button's measured rectangle, above or below as there is room, as the document actions menu is: measured popup coordinates and visibility, not design token values.",
+		"file": "apps/web/src/chat/actions/message-toolbar.tsx",
+		"reason": "The emoji picker is placed from its button's measured rectangle, below or above as there is room and inside the screen, as the document actions menu is: measured popup coordinates and visibility, not design token values.",
 		"cases": [
 			[
 				"dynamic",
 				"*",
-				"position",
-				"unresolved style > MessageMenu > <div>",
+				"pickerPosition",
+				"unresolved style > MessageToolbar > MessageToolbar > <div>",
 				1
 			]
 		],
-		"sourceHash": "efb8748486bb9224d9e51bfc18b5298365ca9eebad95ee8b7a0c727c98f5a7cb"
+		"sourceHash": "ca4c5ded6cd7aabfd0a700c2fef9a8317fce3f991948829954ac99af8d72fed8"
 	},
 	{
 		"file": "apps/web/src/terminal-alert.tsx",
@@ -186,7 +186,7 @@
 				1
 			]
 		],
-		"sourceHash": "fc9cfa9c5d8ca9222b9cfc507af3b2ce94f4e580f6d17cfd251f38409a4835a9"
+		"sourceHash": "24d937f5509a78785b590828be4c562cf420d7467ef34e653fc45c85d23043b4"
 	},
 	{
 		"file": "apps/web/src/navigation-drawer.tsx",
@@ -204,17 +204,17 @@
 	},
 	{
 		"file": "apps/web/src/viewport.ts",
-		"reason": "Viewport adapter writes browser-measured --app-* geometry and keyboard insets; dynamic custom-property names are intentionally restricted by that adapter.",
+		"reason": "Viewport adapter writes browser-measured geometry: --app-height and the keyboard inset on the page, and #root's own left, top and width; the names are the five keys viewportVars returns.",
 		"cases": [
 			[
 				"dynamic",
 				"*",
 				"value",
-				"DOM setProperty > document.documentElement.style.setProperty > useVisualViewport > update",
+				"DOM setProperty > (name[0] === \"-\" ? document.documentElement : root).style.setProperty > useVisualViewport > update",
 				1
 			]
 		],
-		"sourceHash": "118bf3770755db660ca06af9f24cb03dabe49a901f453b5bdfcbccb12c90a1db"
+		"sourceHash": "622b935f9a3a602511c2ce3ba11156391a7e4ffa42b86847bd3edd543e44c283"
 	},
 	{
 		"file": "apps/web/src/workspace.tsx",
@@ -235,7 +235,7 @@
 				1
 			]
 		],
-		"sourceHash": "262e2b1e5c5dc9aaf0c14bd5c853051fda90e6b7c340dbe8186f124a7e50ec55"
+		"sourceHash": "8a16975e6d5525e89d41377d39b99729a56e2519a6b0ce6bab8f55777bc5a94f"
 	},
 	{
 		"file": "apps/web/src/navigation-dialog.tsx",
@@ -273,6 +273,20 @@
 		"sourceHash": "ef95f80b0d05b634dfbc54c1cf26cf950bbae85a1052b2980054499a8065e351"
 	},
 	{
+		"file": "apps/web/src/connecting-indicator.tsx",
+		"reason": "Component forwards or combines caller class names; static call-site classes are scanned. Runtime/cross-module values require review at this exact component boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"className",
+				"class > ConnectingIndicator > <span>",
+				1
+			]
+		],
+		"sourceHash": "96ebdfc813db44fa8c1125147689bfabd0c24e57f26a88b17f2ba5dcbd4088a9"
+	},
+	{
 		"file": "apps/web/src/machine-button.tsx",
 		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. Review the producer when changing this boundary.",
 		"cases": [
@@ -284,7 +298,7 @@
 				1
 			]
 		],
-		"sourceHash": "e663ed6d64c26bc0251dc0ff3f6866654f471a968ee58ea1b868dd079a1c7a52"
+		"sourceHash": "aa382c7199a65ff5e7346eb2243014844eaebbd2b340550d1f2ff538e738d63c"
 	},
 	{
 		"file": "apps/web/src/experiments/machine-setup.tsx",
@@ -340,203 +354,7 @@
 				1
 			]
 		],
-		"sourceHash": "4a274a795c3cc65ad14b7bc3c60483bfa62243d60f6c40fe5195142a85289123"
-	},
-	{
-		"file": "apps/web/src/markdown-text/markdown-text.tsx",
-		"reason": "MarkdownText draws its root with the class and attributes its surface passes (Chat's message root, a decision card's body); each caller's static classes are scanned at its own call site. Reviewed at this exact component boundary.",
-		"cases": [
-			[
-				"dynamic",
-				"*",
-				"codeOverrides",
-				"unresolved JSX props > MarkdownCodeOverride: FC<ComponentProps<CodeComponent>> > <CodeOverride>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"props",
-				"unresolved JSX props > MarkdownCodeOverride: FC<ComponentProps<CodeComponent>> > <CodeOverride>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"props",
-				"unresolved JSX props > MarkdownPreOverride: FC<ComponentProps<PreComponent>> > <PreOverride>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"options",
-				"unresolved JSX props > MarkdownRenderer: FC<MarkdownRendererProps> > <ReactMarkdown>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"options",
-				"unresolved JSX props > DeferredMarkdownRenderer: FC<MarkdownRendererProps> > <MarkdownRenderer>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"stableRest",
-				"unresolved JSX props > MarkdownTextInner: FC<MarkdownTextInnerProps> > <Renderer>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"attributes",
-				"unresolved JSX props > MarkdownTextImpl: FC<MarkdownTextProps> > <Container>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"rest",
-				"unresolved JSX props > MarkdownTextImpl: FC<MarkdownTextProps> > <MarkdownTextInner>",
-				1
-			],
-			[
-				"dynamic",
-				"class",
-				"[className, \"aui-md\", containerClassName].filter(Boolean)",
-				"class > MarkdownTextImpl: FC<MarkdownTextProps> > <Container>",
-				1
-			]
-		],
-		"sourceHash": "2cd6a8312b5856503115cda33d51b76879fb400811935e1b38ec0aadf1dc1de2"
-	},
-	{
-		"file": "apps/web/src/markdown-text/memoization.tsx",
-		"reason": "The memoizing wrapper forwards the properties react-markdown computed to the component it wraps, unchanged. Reviewed at this exact component boundary.",
-		"cases": [
-			[
-				"dynamic",
-				"*",
-				"props",
-				"unresolved JSX props > withoutNode > <Component>",
-				1
-			]
-		],
-		"sourceHash": "a9cceda09bc6905e37be11e647def47a8aa0d6e900510f7e912f4b26b44ce0c4"
-	},
-	{
-		"file": "apps/web/src/markdown-text/default-components.tsx",
-		"reason": "MarkdownText's elements forward the properties react-markdown computed from the parsed message (a link's href, a table cell's alignment, a list's task-list class, a code block's language class) onto the element and join the class they are given to their fixed aui-md-* class; the values are parsed message data, never authored styles. Reviewed at this exact component boundary.",
-		"cases": [
-			[
-				"dynamic",
-				"*",
-				"props",
-				"unresolved JSX props > element > <Tag>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"props",
-				"unresolved JSX props > defaultComponents > <table>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"props",
-				"unresolved JSX props > defaultComponents > Code > <code>",
-				1
-			],
-			[
-				"dynamic",
-				"class",
-				"own",
-				"class > element > <Tag>",
-				1
-			],
-			[
-				"dynamic",
-				"class",
-				"className",
-				"class > element > <Tag>",
-				1
-			],
-			[
-				"dynamic",
-				"class",
-				"className",
-				"class > defaultComponents > <table>",
-				1
-			],
-			[
-				"dynamic",
-				"class",
-				"className",
-				"class > defaultComponents > Code > <code>",
-				1
-			]
-		],
-		"sourceHash": "2e8add35b4eb5bc4b88422c4b8796757798861dd9141d0d66ee40aa211336002"
-	},
-	{
-		"file": "apps/web/src/markdown-text/code-blocks.tsx",
-		"reason": "The fenced-code override re-emits the pre and code properties react-markdown computed from the parsed message (a block's language class) onto the pre and code it draws; nothing is authored here. Reviewed at this exact component boundary.",
-		"cases": [
-			[
-				"dynamic",
-				"*",
-				"rest",
-				"unresolved JSX props > DefaultPre: PreComponent > <pre>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"rest",
-				"unresolved JSX props > DefaultCode: CodeComponent > <code>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"rest",
-				"unresolved JSX props > PreOverrideImpl > <FallbackPre>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"withDefaultProps<any>(preProps)(props)",
-				"unresolved JSX props > WrappedPre > <Pre>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"withDefaultProps<any>(codeProps)(props)",
-				"unresolved JSX props > WrappedCode > <Code>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"props",
-				"unresolved JSX props > CodeOverrideImpl: FC<CodeOverrideProps> > <components.Code>",
-				1
-			],
-			[
-				"dynamic",
-				"*",
-				"props",
-				"unresolved JSX props > CodeOverrideImpl: FC<CodeOverrideProps> > <CodeBlockOverride>",
-				1
-			]
-		],
-		"sourceHash": "536278deba1ca3bd121443588f57e37f7ecb4df845d6d106d5b3f0fd3abf99d9"
+		"sourceHash": "b13c284069d6cc8a7fa47bdf84b654176dbbac63b381b7e679a11ffca28da1e5"
 	},
 	{
 		"file": "apps/web/src/question-markdown.tsx",
@@ -550,7 +368,7 @@
 				1
 			]
 		],
-		"sourceHash": "8f8433e53e188bfb21813716660a6b9c8369dc8b814cc0e7a19fdde9e9f23401"
+		"sourceHash": "482f70b069e4b054f2742d2a70da39d292aff4061a858d27c41eb32860184e8b"
 	},
 	{
 		"file": "apps/web/src/chat/markdown.tsx",
@@ -559,18 +377,179 @@
 			[
 				"dynamic",
 				"class",
-				"[\"aui-md-a\", className].filter(Boolean)",
-				"class > ChatLink > <a>",
+				"className",
+				"class > ChatLink > <UpstreamLink>",
 				1
 			],
 			[
 				"dynamic",
 				"class",
 				"[\"chat-markdown\", className].filter(Boolean)",
-				"class > MessageMarkdown > MessageMarkdown > <MarkdownText>",
+				"class > MessageMarkdown > MessageMarkdown > body > <MarkdownText>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > CodeBlock > <DefaultPre>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > TableLane > <DefaultTable>",
 				1
 			]
 		],
-		"sourceHash": "25c7c40d5688c6dc6bbf7782b701bcddcac518dfa043f1278bda32afca2c3798"
+		"sourceHash": "2b84961aa4bf74a8bceedbf0f56bff2722bada832daf00f79c609e975fd47923"
+	},
+	{
+		"file": "apps/web/src/chat/assistant-ui/markdown-primitive.tsx",
+		"reason": "Props-driven primitive seam for the copied markdown-text registry item: forwards react-markdown parsed element properties (href, language class, task-list class, cell alignment) and caller surface root classes scanned at their call sites. Reviewed at this exact component boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > wrapWithoutNode > <Component>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"preProps",
+				"unresolved JSX props > BoundPre > <Pre>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > BoundPre > <Pre>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"codeProps",
+				"unresolved JSX props > BoundCode > <Code>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > BoundCode > <Code>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > PlainPre: PreComponent > <pre>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > PlainCode: CodeComponent > <code>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"rest",
+				"unresolved JSX props > FencePre > FencePre > <FallbackPre>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"codeProps",
+				"unresolved JSX props > FenceCode > FenceCode > <config.slots.Code>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > PreDispatch: FC<ComponentProps<PreComponent>> > <FencePre>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > CodeDispatch: FC<ComponentProps<CodeComponent>> > <FenceCode>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"options",
+				"unresolved JSX props > ParsedMarkdown: FC<ParsedMarkdownProps> > <ReactMarkdown>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"options",
+				"unresolved JSX props > DeferredParsedMarkdown: FC<ParsedMarkdownProps> > <ParsedMarkdown>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"attributes",
+				"unresolved JSX props > MarkdownTextPrimitive: FC<MarkdownTextPrimitiveProps> > <Container>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"stableOptions",
+				"unresolved JSX props > MarkdownTextPrimitive: FC<MarkdownTextPrimitiveProps> > <Renderer>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"joinClasses(preProps.className, className)",
+				"class > BoundPre > <Pre>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"joinClasses(codeProps.className, className)",
+				"class > BoundCode > <Code>",
+				1
+			],
+			[
+				"dynamic",
+				"class",
+				"rootClass",
+				"class > MarkdownTextPrimitive: FC<MarkdownTextPrimitiveProps> > <Container>",
+				1
+			]
+		],
+		"sourceHash": "17854ba1f1e12e412b0b653635d84ac5e995d43a8ea61c01b29f29456da49371"
+	},
+	{
+		"file": "apps/web/src/chat/assistant-ui/lucide.tsx",
+		"reason": "Maps a copied element's lucide-react icon to Chopin's own, forwarding the copy's SVG accessibility and class props unchanged. The copies' literal classes are scanned; nothing is styled here.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > lucide > Icon > <Glyph>",
+				1
+			]
+		],
+		"sourceHash": "95aefcb947eab31ec32ceb8f26897fec7bb4d3e77cd78ba47f52bd33fa600919"
 	}
 ]

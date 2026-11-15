@@ -2,10 +2,12 @@
  * Chat.
  *
  * One transcript per room, shared by everyone in it, and one turn at a time.
- * Messages that address the agent are queued rather than refused while it is
- * working: the plan belongs to the agent for the length of a turn, but the
- * Chat does not, and silencing somebody because a colleague prompted
- * first is a poor way to run a room with two people in it.
+ * Nothing a person sends is ever held for the next turn. A message to the
+ * agent starts a turn when it is idle; while a turn runs it is posted at once
+ * and given to that turn, which reads it at its next step; and where the
+ * harness cannot take input mid-run, or the machine is away, it is refused
+ * and says so. The Chat stays open to a colleague's prompt, but never as a
+ * line of messages waiting their turn.
  *
  * Ordinary conversation enters bounded context for the next turn. The optional
  * initiative scheduler can also propose a turn after saved human contributions
@@ -17,12 +19,14 @@
  */
 
 import { createHash } from "node:crypto";
-import { imagePath } from "../images/format";
+import { imagePath, imageSize } from "../images/format";
+import { fitImage, headerRefusal, inspectImages, STORE_REFUSAL, toolRowOutput } from "./images";
+import type { ToolImage } from "./images";
 
 import { ulid } from "@chopin/dialect";
 
 import { PLANNER_TOOL_NAMES } from "../harness/tool-names";
-import type { PlannerFiles, PlannerSession } from "../harness/session";
+import type { PlannerFiles, PlannerForkHooks, PlannerSession } from "../harness/session";
 import { verifiedCheckout } from "../harness/atomic/checkout";
 import { rememberCheckout } from "../harness/atomic/workspace";
 import { plannerInstructions } from "../agent/planner";
@@ -31,7 +35,7 @@ import type { DocumentRoom, ResearchWorkspaceRequest } from "../agent/tools";
 import type { VisualAdmission } from "../agent/visual-admission";
 import type { ChildDocuments } from "./children";
 import * as Service from "../plan/service";
-import { instruction } from "@chopin/protocol/address";
+import { instruction, PLANNER_NAME } from "@chopin/protocol/address";
 import { checkMessageAttachments, refusalText } from "@chopin/protocol/attachment";
 import { COMMAND_KINDS } from "@chopin/protocol/commands";
 import { UNREADABLE_NOTICE } from "@chopin/protocol/model-choice";
@@ -48,17 +52,8 @@ import {
 	remember,
 } from "./address";
 import { createNotices } from "./notices";
+import { CANNOT_STEER, type Steering, steering } from "./steering";
 import { ChatCommandError, ChatMentionError, ChatReferenceError } from "./references";
-import {
-	cancelledNotice,
-	type Deferred,
-	type DeferredConfig,
-	insert,
-	interruptedNotice,
-	mark,
-	move,
-	newTurn,
-} from "./deferred";
 import { createJobQueue, finishJob, jobReason, type JobTurn, safeProjection } from "./job-queue";
 import { translateJob } from "./job-translate";
 import { argsText, outputText, textOutput } from "./activity";
@@ -67,27 +62,25 @@ import { watchJobAbort } from "./job-fence";
 import { JOB_TOOLS } from "../agent/job-scope";
 import type { Job, JobOutcome } from "../conversation-plan/jobs";
 export type { Announcer, NoticeInput } from "./notices";
+export type { MemberEntry };
 import { isChannelId } from "../channels/id";
 import { holdsQuestion } from "../questions/records";
 import { broadcast, fail, PASSING, reply, tell } from "../wire";
 import { introduce } from "../people";
 import { MAX_MESSAGE_BYTES } from "./limits";
-import { contributed } from "./initiative";
+import { actor, alone, contributed } from "./initiative";
 import { checkPlannerReply, PlannerReplyError, publishPlannerReplies } from "./reply-policy";
+import { withSessionContext } from "./session-context";
 import { TOOL_UNAVAILABLE, turnFailureOf } from "./turn-failure";
+import { retryTarget } from "./retry";
 import { runDuration } from "./run-duration";
+import { READER_INSTRUCTIONS } from "./reaction-instructions";
 import type { InitiativeSchedule } from "./initiative-schedule";
 
 import type { Server } from "bun";
 import type { TextStreamPart, ToolSet } from "ai";
 import type { Chat as Wire, ConversationPlan, Request } from "@chopin/protocol";
 import type { Config } from "../config";
-import type {
-	DeferredTurn,
-	DeferredTurnChange,
-	DeferredTurnOutcome,
-	JsonValue,
-} from "../storage/model";
 import type { Decide } from "../conversation-plan/decisions";
 import type { JevRequest } from "../conversation-plan/jev";
 import type { HostedAuth } from "../auth/routes";
@@ -100,7 +93,7 @@ import type { ReferenceService } from "./references";
 import type { Socket, SocketData } from "../wire";
 import type { ToolError } from "@chopin/agent-link";
 
-/** Beyond this the queue is a backlog nobody is going to read. */
+/** Beyond this, Chopin's own turns waiting behind a running one are a backlog nobody will read. */
 const MAX_QUEUE = 20;
 const MAX_PENDING_SENDS = 20;
 const MAX_SESSION_REFERENCES = 50;
@@ -113,43 +106,46 @@ type Delivery = {
 	canonicalFingerprint: string;
 };
 
-type MemberEntry = Wire.Entry & { delivery?: Delivery };
+/**
+ * What the server keeps on an entry and clients never see: how a member's message was delivered,
+ * whether the Planner wrote an agent entry in answer to a reaction, and which reading of a
+ * reaction already got its answer.
+ */
+type MemberEntry = Wire.Entry & {
+	delivery?: Delivery;
+	viaReaction?: true;
+	answeredIntents?: string[];
+};
 
 /** How long the agent's cursor stays where it finished, after a turn ends. */
 const LINGER_MS = 5_000;
 
 /**
- * A queued message, with what the queue needs and clients do not.
+ * One of Chopin's own turns waiting for the running turn to end: a background job, or an
+ * instruction the server wrote that nobody typed. A person's request is never here: it starts a
+ * turn, is given to the one running, or is refused.
  *
  * `spent` is asked, just before the turn would run, whether somebody else has
  * already done the work. It is a function rather than a flag because the answer
- * is only knowable at that moment — and `JSON.stringify` drops it, so the wire
- * shape stays exactly `Wire.Waiting`.
+ * is only knowable at that moment.
  */
-export type Waiting = Wire.Waiting & {
+export type Waiting = {
+	id: string;
+	handle: string;
+	text: string;
 	signal?: AbortSignal;
 	readiness?: boolean;
-	delivery?: Delivery;
 	spent?: () => boolean;
-	/** True when this came from the composer rather than another instruction. */
-	message?: boolean;
 	/** The comment thread this turn was started to act on, if one was. */
 	thread?: string;
-	/** Told how the turn went, before the queue moves on; see `Instruction`. */
+	/** Told how the turn went, before the next one starts; see `Instruction`. */
 	ended?: Instruction["ended"];
 	started?: Instruction["started"];
-	/** Login session whose Copilot entitlement owns this queued turn. */
+	/** Login session whose Copilot entitlement owns this turn. */
 	sessionId?: string;
-	/** Verified member identity, retained only for a queued composer message. */
-	userId?: string;
-	/** A queued background turn, resolved only after its scope is cleaned up. */
+	/** A background turn, resolved only after its scope is cleaned up. */
 	job?: JobTurn;
-	posted?: boolean;
-	/** MCP caller whose instruction this is; it never claims ownership without their login. */
-	invokedBy?: string;
-	/** The task draft this queued turn carries; it has no message to show in the queue. */
-	draft?: string;
-	/** The child the member had open, resolved when the message was accepted. */
+	/** The child the turn is about. */
 	focus?: Focus;
 	/** The images and files sent with this message, which its entry shows once it is in Chat. */
 	attachments?: Wire.Attachment[];
@@ -157,17 +153,15 @@ export type Waiting = Wire.Waiting & {
 	threadChannel?: string;
 	/** See `Instruction`. */
 	quiet?: boolean;
-	/** The row that keeps this request while it waits; see `./deferred`. */
-	deferred?: Deferred;
-	/** The session opened for this request before its row moved, which its turn then runs in. */
-	opened?: { session: PlannerSession; binding: ActiveOwnerBinding };
+	reader?: Instruction["reader"];
+	authorize?: Instruction["authorize"];
 };
 
-/** A request for implementation tasks, live while its turn is queued or running. */
+/** A request for implementation tasks, live while its turn runs. */
 export type TaskDraft = {
 	id: string;
 	planRevision: number;
-	state: "queued" | "running";
+	state: "running";
 	/** The running turn, once it has begun. */
 	turn?: string;
 };
@@ -183,7 +177,8 @@ export type ActiveMemberRequest = {
 	focus?: Focus;
 };
 
-type MemberRequest = Pick<ActiveMemberRequest, "entryId" | "userId" | "focus">;
+/** `retry` runs the message's turn again after it failed: the same message, once in context. */
+type MemberRequest = Pick<ActiveMemberRequest, "entryId" | "userId" | "focus"> & { retry?: true };
 
 /** How a turn started by an instruction finished, for whoever started it. */
 export type Ended = {
@@ -215,7 +210,7 @@ export type Instruction = {
 	focus?: Focus;
 	/** The child holding `thread`, when the thread is not in this document. */
 	threadChannel?: string;
-	/** Kept out of the visible queue: its notice says why, and its text is for the Planner alone. */
+	/** Its notice says why it runs, and its text is for the Planner alone. */
 	quiet?: boolean;
 	/**
 	 * The transcript notice's id, stable across restarts: a turn whose notice Chat already shows
@@ -223,12 +218,16 @@ export type Instruction = {
 	 */
 	notice?: string;
 	/**
-	 * Marks an instruction a person asked for, which is kept as a row when it cannot start at once:
-	 * a comment note sent to Chopin, or an automatic follow-up an MCP caller asked for.
+	 * Marks an instruction a person asked for: a comment note sent to Chopin, or an automatic
+	 * follow-up an MCP caller asked for. While a turn runs it is refused, not held, as a message is
+	 * only when the harness can take it mid-run, which an instruction that needs a turn of its own
+	 * never can.
 	 */
-	defer?: { kind: "comment" | "invoke_system"; userId: string };
-	/** The row that keeps this turn, once it has been queued; set by Chat. */
-	deferred?: Deferred;
+	asked?: true;
+	/** Answers a reader's reaction: no tools, no owner claimed, the writers' kept session untouched. */
+	reader?: true;
+	/** Asked as the turn starts, long after it may have been queued; `false` ends it unrun. */
+	authorize?: () => Promise<boolean>;
 };
 
 /**
@@ -239,15 +238,15 @@ export type Instruction = {
  */
 export type RootChat = {
 	id: string;
-	/** Admission against the root's queue, opening the root's room if needed. */
-	admission(thread: string): Promise<"running" | "queued" | "off" | "busy">;
+	/** Whether the root's Chat can take the turn now, opening the root's room if needed. */
+	admission(): Promise<"running" | "off" | "busy">;
 	/** An explicit Planner turn on the root's Chat about a thread in this child. */
 	instruct(handle: string, text: string, said: string, about: Instruction): Promise<void>;
-	/** Whether the root's Chat is running or holding a turn for this child's thread. */
+	/** Whether the root's Chat is running a turn for this child's thread. */
 	working(thread: string): boolean;
 };
 
-/** Tell an instruction's owner how it went; their failure is theirs, not the queue's. */
+/** Tell an instruction's owner how it went; their failure is theirs, not the turn's. */
 async function report(about: Instruction | undefined, outcome: Ended): Promise<void> {
 	if (!about?.ended) return;
 	try {
@@ -259,7 +258,7 @@ async function report(about: Instruction | undefined, outcome: Ended): Promise<v
 
 /**
  * Set once the process is on its way out: no turn starts from then on, and a request that would
- * have started one waits in the queue, as it does behind a running turn.
+ * have started one is not answered, so its browser sends it again to the next process.
  */
 let startsHeld = false;
 
@@ -278,20 +277,24 @@ function refuseClosed(ws: Socket, rid: string): void {
 	if (!startsHeld) fail(ws, rid, "chat is closed", PASSING);
 }
 
-/** Whether a new request waits in the queue: a turn is running, or none may start. */
 /**
- * Whether people's requests fill the queue behind a machine that is there. Chopin's own background
- * jobs wait beside them and do not count, so one of them never makes a message that fits wait or
- * fail. Nothing fills the queue of a machine that is `away`: the requests are saved and kept
- * until it is back, and none is refused because it has been away long.
+ * Whether Chopin's own turns waiting behind a running one are a backlog. Background jobs wait
+ * beside them and do not count, so one of them never makes another fail.
  */
-function full(chat: Chat, away = false): boolean {
-	return !away && chat.waiting.filter(item => !item.job).length >= MAX_QUEUE;
+/** What marks an agent entry written while the turn answering a reaction runs. */
+function answeringReaction(chat: Chat): { viaReaction?: true } {
+	return chat.reactionTurn !== undefined && chat.reactionTurn === chat.turn?.id
+		? { viaReaction: true }
+		: {};
 }
 
+export function full(chat: Chat): boolean {
+	return chat.waiting.filter(item => !item.job).length >= MAX_QUEUE;
+}
+
+/** Whether a turn is running, or being started, or none may start. */
 function occupied(chat: Chat): boolean {
-	// Saved requests start in the order they were accepted, so a new one joins behind them.
-	return chat.busy || !!chat.starting || startsHeld || chat.waiting.some(item => item.deferred);
+	return chat.busy || !!chat.starting || startsHeld;
 }
 
 /**
@@ -301,7 +304,6 @@ function occupied(chat: Chat): boolean {
 export function interrupt(chat: Chat, notice: string): void {
 	if (!chat.busy || !chat.turnController || chat.turnController.signal.aborted) return;
 	chat.interruption = notice;
-	chat.restarted = true;
 	chat.turnController.abort();
 }
 
@@ -311,50 +313,35 @@ export async function settled(chat: Chat): Promise<void> {
 }
 
 /**
- * Whether an instruction about `thread` would run now, wait, or be refused.
- *
- * Asked before anything is saved, so a full queue refuses a comment rather than
- * saving one nobody will act on. A thread that already has a turn waiting
- * folds into it instead of queueing again, so it never counts against the cap.
+ * Whether an instruction a person asked for about a thread can run now, asked before anything is
+ * saved so a note is never saved for a turn nobody will start. A turn that is running means it
+ * cannot: nothing is held for the next one.
  */
-export function admission(
-	context: Pick<Room, "chat" | "config">,
-	thread?: string,
-	channel?: string,
-	/** The machine is away: a request waits for it as it would behind a running turn. */
-	away = false,
-): "running" | "queued" | "off" | "busy" {
+export function admission(context: Pick<Room, "chat" | "config">): "running" | "off" | "busy" {
 	let { chat, config } = context;
 	if (!config.agent) return "off";
-	if (thread && queuedFor(chat, thread, channel)) return "queued";
-	if (!occupied(chat) && !away) return "running";
-	return full(chat, away) ? "busy" : "queued";
+	return occupied(chat) ? "busy" : "running";
 }
 
-/**
- * The waiting turn for a thread, if one is queued and still worth running.
- *
- * `channel` names the child holding the thread; absent, the thread is this document's.
- */
-export function queuedFor(chat: Chat, thread: string, channel?: string): Waiting | undefined {
-	return chat.waiting.find(item =>
-		item.thread === thread && item.threadChannel === channel
-		&& !item.message && !item.job && !item.draft && !item.spent?.()
-	);
-}
-
-/** Whether a turn is running or waiting for a thread; `channel` as for `queuedFor`. */
+/** Whether a turn is running for a thread; `channel` names the child holding it, when it is one. */
 export function workingFor(chat: Chat | undefined, thread: string, channel?: string): boolean {
 	// A closed Chat runs nothing more, whatever its last turn left behind.
 	if (!chat || chat.closed) return false;
-	return chat.acting === thread && chat.actingChannel === channel
-		|| !!queuedFor(chat, thread, channel);
+	return chat.acting === thread && chat.actingChannel === channel;
 }
+
+export type TurnImages = {
+	work: Promise<void>;
+	entry?: string;
+	calls: Set<string>;
+};
 
 export type Chat = {
 	initiative?: InitiativeSchedule<import("./initiative").Source>;
 	initiativePaused?: boolean;
 	initiativeEnabled?: boolean;
+	/** Whether at most one person is in the conversation, as Chat was last told. */
+	alone?: boolean;
 	readiness?: boolean;
 	job?: ConversationPlan.Job;
 	jobOutput?: string;
@@ -362,20 +349,52 @@ export type Chat = {
 	jobFailureCode?: "source-shape";
 	jobCalls?: Map<string, string>;
 	jobToolNames?: ReadonlySet<string>;
-	/** The job shifted from the queue while its handoff save is pending. */
+	/** What a decision-followup job's turn last read of its scope (see `readScope`). */
+	jobScopeRead?: {
+		job: ConversationPlan.Job;
+		turn: Wire.Turn | undefined;
+		revision: number;
+		scope: string;
+		answersHash: string;
+		source: string;
+		context: string;
+	};
+	/** The job taken from the waiting turns while its handoff save is pending. */
 	handoffJob?: JobTurn;
+	/** The background job whose turn holds the Chat, until the next turn starts or the Chat is idle. */
+	backgroundTurn?: JobTurn;
+	/** The running job's own tool write, which a preemption lets finish so it is recorded whole. */
+	jobWriting?: Promise<unknown>;
+	/**
+	 * A person's turn that preempted a background job, started as soon as the job's turn has wound
+	 * down, ahead of anything waiting.
+	 */
+	preempting?: Parameters<typeof run>;
+	/** How often each job (by kind and target) has given way since it last finished, so it ends. */
+	preemptions?: Map<string, number>;
+	/** Reads reactions to the Planner's messages and starts the turns that answer them. */
+	reactions?: import("./reaction-reply").ReactionResponder;
+	/** The id of the running turn when it is answering a reaction. */
+	reactionTurn?: string;
+	reader?: true;
 	entries: Wire.Entry[];
+	/** Chopin's own turns waiting for the running one to end; never a person's message. */
 	waiting: Waiting[];
 	/** Serializes complete member send acceptance, including asynchronous resolution and persistence. */
 	sending: Promise<void>;
 	/** Work admitted to the send FIFO, including the operation currently resolving. */
 	pendingSends: number;
 	/**
-	 * A turn is being taken from the queue and has not begun, which can take a commit. Until it has,
+	 * A waiting turn is being taken and has not begun, which can take a commit. Until it has,
 	 * nothing else may start one: two turns would run at once, and the first to end would let a
 	 * third in.
 	 */
 	starting?: boolean;
+	/**
+	 * How a person's message reaches the Planner turn that is running: set while a turn that can be
+	 * talked to runs (never a background job's), and open once its session can take one.
+	 */
+	steering?: Steering;
 	/** The fallback notice the transcript last said, so a choice that stays gone is said once. */
 	modelNotice?: string;
 	/** Whether the composers were last told the choice could not be read, so only a change is sent. */
@@ -413,6 +432,7 @@ export type Chat = {
 	writing?: string;
 	/** The dedicated entry collecting tool calls for this turn. */
 	tooling?: string;
+	turnImages?: TurnImages;
 	/** Pending removal of the agent's cursor, cancelled if it edits again. */
 	lingering?: ReturnType<typeof setTimeout>;
 	/** When each running tool call started, for its duration. */
@@ -423,6 +443,7 @@ export type Chat = {
 	toolProgress?: (id: string, output: unknown) => void;
 	/** Text part ids are adapter-local; transcript ids are unique across turns. */
 	messageIds?: Map<string, string>;
+	toolEntries?: Map<string, string>;
 	/** Owner identity for the running turn only. */
 	owner?: { sessionId: string; generation: number; revision: number };
 	/** User-facing reason an in-flight turn was interrupted. */
@@ -441,31 +462,21 @@ export type Chat = {
 	 * than losing it.
 	 */
 	backscroll: Said[];
-	/** The document's live task draft; rebuilt from its row when the document opens. */
+	/** The document's live task draft: the one whose turn is running. */
 	draft?: TaskDraft;
-	/** The running turn was cut off because the process is restarting. */
-	restarted?: boolean;
-	/**
-	 * The machine could not open a session for the request at the head of the queue, which stays
-	 * waiting. Nothing tries it again until something new says the machine may be there: a request
-	 * accepted, the machine back, a login restored.
-	 */
-	unopened?: boolean;
-	/** Says once what a queue that cannot start waits for. */
-	/**
-	 * Requests whose sender took them back before the server had them, most recent last. A send
-	 * that arrives late, from a connection that was already lost, must not bring one back.
-	 */
-	retracted?: Set<string>;
-	/**
-	 * Messages whose save was answered as a passing trouble, though the commit may have gone through
-	 * and only its answer been lost. Their rows are looked up when the sender sends them again and
-	 * when the queue next starts, and put back in the queue and the transcript if they are there.
-	 */
-	unsure?: Set<string>;
+	/** Compaction markers recorded for this Chat or thread session. */
+	compactions?: Wire.CompactionRecord[];
+	/** True while the harness is actively compacting context. */
+	compacting?: boolean;
+	/** Latest context-window usage reported by the harness. */
+	usage?: Wire.ContextUsage;
+	/** Model context window size reported by the harness for this session. */
+	contextWindow?: number;
+	/** For a thread Chat: frozen top-level entries up to and including the root message. */
+	forkBootstrap?: Wire.Entry[];
+	/** Open thread `Chat` instances owned by this top-level Chat, closed when it closes. */
+	childChats?: Map<string, Chat>;
 };
-
-const MAX_RETRACTED = 200;
 
 export function create(): Chat {
 	return {
@@ -503,7 +514,13 @@ export function restore(
 		initiativePaused,
 		...(restoredRuns ? { runs: restoredRuns } : {}),
 		entries: entries.map(entry => {
-			let { streaming: _streaming, ...rest } = entry;
+			// A message an earlier release kept for a machine reads as an ordinary one: nothing is kept.
+			let {
+				streaming: _streaming,
+				deliveryState: _state,
+				deliveryFailure: _failure,
+				...rest
+			} = entry as Wire.Entry & { deliveryState?: unknown; deliveryFailure?: unknown };
 			return rest.tools?.some(tool => tool.status === "running")
 				? {
 					...rest,
@@ -529,7 +546,7 @@ function now(): number {
 	return Math.floor(Date.now() / 1000);
 }
 
-function begin(handle: string, entryOffset: number): Wire.Turn {
+function begin(handle: string, entryOffset: number, quiet = false): Wire.Turn {
 	let startedAt = Date.now();
 	return {
 		id: ulid(),
@@ -538,7 +555,19 @@ function begin(handle: string, entryOffset: number): Wire.Turn {
 		entryOffset,
 		startedAt,
 		responded: false,
+		...(quiet ? { quiet: true } : {}),
 	};
+}
+
+/**
+ * Says whether what is left of the running turn is for people to watch. A reply's words are all
+ * out while its after-answer check runs; a repair step the check starts is work again.
+ */
+function quieten(chat: Chat, server: Server<SocketData>, room: string, quiet: boolean): void {
+	if (!chat.turn || !!chat.turn.quiet === quiet) return;
+	if (quiet) chat.turn.quiet = true;
+	else delete chat.turn.quiet;
+	state(chat, server, room);
 }
 
 function digest(value: string): string {
@@ -624,8 +653,8 @@ function delivery(
 	};
 }
 
-function publicEntry(value: Wire.Entry): Wire.Entry {
-	let { delivery, ...entry } = value as MemberEntry;
+export function publicEntry(value: Wire.Entry): Wire.Entry {
+	let { delivery, viaReaction: _via, answeredIntents: _answered, ...entry } = value as MemberEntry;
 	return delivery?.destination === "planner" ? { ...entry, to: "planner" } : entry;
 }
 
@@ -658,73 +687,25 @@ function replay(
 	fingerprint: string,
 ): boolean {
 	let entries = chat.entries.filter(entry => entry.id === requestId);
-	let waiting = chat.waiting.filter(item => item.id === requestId);
-	if (entries.length === 0 && waiting.length === 0) return false;
-	// A message kept as a row is in the transcript and in the queue at once: one request.
-	let parked = entries.length === 1 && waiting.length === 1 && !!waiting[0]!.posted;
-	if (!parked && entries.length + waiting.length !== 1) {
-		fail(ws, msg.rid, "chat request id conflicts with existing state");
-		return true;
-	}
-	let entry = entries[0];
-	let queued = parked ? undefined : waiting[0];
-	let saved = entry ? (entry as MemberEntry).delivery : queued?.delivery;
+	if (entries.length === 0) return false;
+	let entry = entries[0]!;
 	try {
-		if (entry) validateDelivery(entry);
-		else if (
-			!queued || !saved || !REQUEST_ID.test(queued.id)
-			|| saved.canonicalFingerprint
-				!== canonicalFingerprint(saved.destination, queued.text, queued.references)
-		) throw new Error("invalid queued delivery metadata");
+		if (entries.length !== 1) throw new Error("duplicate chat request id");
+		validateDelivery(entry);
 	} catch {
 		fail(ws, msg.rid, "chat request id conflicts with existing state");
 		return true;
 	}
-	if (!saved || saved.destination !== msg.to || saved.requestFingerprint !== fingerprint) {
+	let saved = (entry as MemberEntry).delivery;
+	// A message to the room that went to the Planner, its sender being alone, is the same message:
+	// the fingerprint holds the destination it was sent to.
+	let sameDestination = saved?.destination === msg.to
+		|| (msg.to === "room" && saved?.destination === "planner");
+	if (!saved || !sameDestination || saved.requestFingerprint !== fingerprint) {
 		fail(ws, msg.rid, "chat request id was reused with different content");
 		return true;
 	}
-	reply(ws, msg.rid, {
-		kind: "chat:send",
-		ts: 0,
-		id: (entry ?? queued)!.id,
-		queued: waiting.length === 1,
-	});
-	return true;
-}
-
-/**
- * A retried send the process no longer holds, found among the rows: it gets the answer it first
- * got, and one that was deleted is refused rather than sent again.
- */
-async function replayRow(
-	context: Room,
-	ws: Socket,
-	msg: Request<Wire.Send>,
-	requestId: string,
-	fingerprint: string,
-): Promise<boolean> {
-	if (!context.deferred) return false;
-	let row = await context.plan.persistence.storage.deferredTurns.get(context.room, requestId);
-	if (!row) return false;
-	let saved = row.delivery as { destination?: unknown; requestFingerprint?: unknown } | undefined;
-	if (saved?.destination !== msg.to || saved?.requestFingerprint !== fingerprint) {
-		fail(ws, msg.rid, "chat request id was reused with different content");
-		return true;
-	}
-	if (row.state === "cancelled" && !context.chat.entries.some(entry => entry.id === requestId)) {
-		fail(ws, msg.rid, "this message was deleted");
-		return true;
-	}
-	// Kept by a commit whose answer was lost: it is back in the queue before it is answered as kept.
-	if (context.chat.unsure?.has(requestId)) {
-		if (row.state === "waiting") {
-			await adopt(context, row);
-			void kick(context);
-		}
-		context.chat.unsure.delete(requestId);
-	}
-	reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: requestId, queued: row.state === "waiting" });
+	reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: entry.id });
 	return true;
 }
 
@@ -743,30 +724,6 @@ function responded(chat: Chat, server: Server<SocketData>, room: string, text: s
 	if (!chat.turn || chat.turn.responded || !text.trim()) return;
 	chat.turn.responded = true;
 	state(chat, server, room);
-}
-
-/**
- * The queue as clients see it.
- *
- * Internal queue metadata decides how and under whose authority a turn runs.
- * None of it belongs in the wire projection. Queued background jobs are not messages
- * anyone sent, so they stay off the wire entirely.
- */
-function visible(chat: Chat): Wire.Waiting[] {
-	return chat.waiting.filter(item =>
-		!item.draft && !item.job && !item.quiet && !(item.deferred && item.message)
-	).map((
-		{ handle, id, text, references },
-	) => ({
-		handle,
-		id,
-		text,
-		...(references?.length ? { references } : {}),
-	}));
-}
-
-function queued(chat: Chat, server: Server<SocketData>, room: string): void {
-	broadcast(server, room, { kind: "chat:queue", ts: 0, waiting: visible(chat) });
 }
 
 function say(
@@ -793,8 +750,11 @@ export function greet(chat: Chat, ws: Socket): void {
 		busy: chat.busy,
 		...(chat.turn ? { turn: chat.turn } : {}),
 		...(chat.runs ? { runs: chat.runs } : {}),
-		queued: visible(chat),
-		participation: { enabled: !!chat.initiativeEnabled, paused: false },
+		participation: {
+			enabled: !!chat.initiativeEnabled,
+			paused: false,
+			...(chat.initiativeEnabled && chat.alone ? { alone: true } : {}),
+		},
 	});
 	// After the history, which ends whatever an earlier connection was told of it.
 	if (chat.modelUnreadable) tell(ws, { kind: "chat:model-unreadable", ts: 0, unreadable: true });
@@ -820,9 +780,10 @@ export type Room = {
 	claimantSessionId: string | undefined;
 	repository: HostedRepository;
 	/**
-	 * Under `HARNESS=remote`, how to attach a Planner when none is attached, or
-	 * undefined while one is. Planner requests are refused before anything is
-	 * posted or queued, and only an attachment takes Planner ownership.
+	 * Under `HARNESS=remote`, why a Planner request cannot go to a machine (none is attached, its
+	 * machine is away, or one is still being connected to), or undefined while one is attached.
+	 * Planner requests are refused with it before anything is posted, and only an attachment takes
+	 * Planner ownership.
 	 */
 	plannerNotAttached?: () => Promise<string | undefined>;
 	/**
@@ -831,24 +792,34 @@ export type Room = {
 	 */
 	plannerStarting?: () => Promise<void>;
 	/**
-	 * Under `HARNESS=remote`, whether a Planner is attached now, as opposed to expected back. A
-	 * person's request is accepted either way; only an attached Planner starts it.
+	 * Whether a message sent while a turn runs can reach it: the document's harness takes input
+	 * mid-run. Absent, or false, a message sent while a turn runs is refused.
 	 */
-	plannerReady?: () => Promise<boolean>;
-	/** Set in hosted mode: a request that cannot start at once is kept as a row. */
-	deferred?: DeferredConfig;
+	steers?: () => boolean;
 	activeOwner?: () => Promise<ActiveOwnerBinding | undefined>;
-	/** Saves the Chat, with changes to deferred requests in the same transaction, and what each did. */
-	persist: (
-		chat?: () => Pick<Chat, "entries" | "runs" | "initiativePaused">,
-		deferred?: DeferredTurnChange[],
-	) => Promise<DeferredTurnOutcome[] | void>;
+	/** Saves the Chat. */
+	persist: (chat?: () => Pick<Chat, "entries" | "runs" | "initiativePaused">) => Promise<void>;
 	initiativePresent?: (sessionId: string, actor: string) => boolean;
 	initiativeAuthorize?: (sessionId: string, actor: string) => Promise<boolean>;
+	/**
+	 * Whether this person is still in the room and may still read the document, as of now. Unlike
+	 * `initiativeAuthorize` it does not ask for write access, and it grants nothing: it only keeps a
+	 * reader's reaction from being answered after the reader has gone or lost access.
+	 */
+	reactionAuthorize?: (sessionId: string, actor: string) => Promise<boolean>;
 	commitRoomMessage?: (entry: Wire.Entry) => Promise<void>;
 	roomMessagePublished?: () => void;
-	/** Runs only after a new member entry is durably saved and its human turn reserved. */
+	/** Runs only after a new member entry is durably saved and its human turn reserved, or given to the one running. */
 	memberMessagePersisted?: (entry: Wire.Entry, claimantSessionId: string | undefined) => void;
+	/** Called when automatic participation stops holding a message it might reply to. */
+	initiativeSettled?: () => void;
+	/**
+	 * Who is in the document's conversation now (`people` in `./initiative`), a thread's included.
+	 * Absent where nobody is known, which is never alone.
+	 */
+	people?: () => Set<string>;
+	/** Called when who is in the conversation may have changed. */
+	peopleChanged?: () => void;
 	openPlannerSession?: typeof import("../harness/session")["openPlannerSession"];
 	/**
 	 * What the document's chosen model and thinking level come to for the next turn, checked against
@@ -891,6 +862,23 @@ export type Room = {
 	rootChannelId?: string;
 	/** Set only when this room is a child: how its comments reach the root's Chat. */
 	root?: RootChat;
+	/** Set only on a thread's room: the thread's root message id. */
+	threadRoot?: string;
+	/** Session-tree and remote fork hooks for top-level Chat and threads. */
+	sessionForks?: {
+		/** `retry`: the turn runs `currentEntryId` again, and nothing of its failed attempt is kept. */
+		prepareTurn: (currentEntryId?: string, retry?: boolean) => {
+			fork?: PlannerForkHooks;
+			skipBootstrap?: boolean;
+			untrackedEntries?: Wire.Entry[];
+		};
+		finishTurn: (
+			requestEntryId: string | undefined,
+			turnEntries: Wire.Entry[],
+		) => Promise<void> | void;
+	};
+	/** Called when harness-reported context usage or compactions change. */
+	onSessionMetaChanged?: () => Promise<void> | void;
 };
 
 type Retained = {
@@ -938,25 +926,26 @@ async function rebindRetained(context: Room, retained: Retained): Promise<boolea
 /**
  * Take a message.
  *
- * A room message appears immediately. A planner message queued behind another
- * turn stays visibly queued until that turn actually begins, then moves into
- * the transcript exactly once. The destination, rather than its prose, decides
- * which lifecycle it takes.
+ * A room message appears immediately. A message to the Planner is never held: it starts a turn
+ * when none is running, is posted and given to the turn that is running when its harness can take
+ * input mid-run, and is refused, saying why, when it cannot. The destination, rather than its
+ * prose, decides which lifecycle it takes. A person alone in the conversation is talking to the
+ * Planner, so their message to the room goes to it, as if it named it, with no wait for silence
+ * and no judgment; once a second person is there, it goes to the room again.
  */
 export async function send(context: Room, ws: Socket, msg: Request<Wire.Send>): Promise<void> {
-	if (
-		context.chat.pendingSends >= MAX_PENDING_SENDS
-		&& !(msg.to === "planner" && await awayOrNot(context))
-	) {
+	if (context.chat.pendingSends >= MAX_PENDING_SENDS) {
 		fail(ws, msg.rid, "too many chat messages are waiting to be processed", PASSING);
 		return;
 	}
 	context.chat.pendingSends++;
+	// Decided as it arrives, as automatic participation would have counted the room then.
+	let to = msg.to === "room" && alone(context, actor(ws)) ? "planner" as const : msg.to;
 	let enqueue = () => {
 		// Nothing a send throws says its message is at fault: it is answered as a passing trouble, and
 		// the browser sends it again with the same request id.
 		let process = () =>
-			processSend(context, ws, msg).catch(err => {
+			processSend(context, ws, msg, to).catch(err => {
 				console.error("[chat] a send failed before it was kept:", err);
 				fail(ws, msg.rid, "could not send message", PASSING);
 			});
@@ -965,15 +954,155 @@ export async function send(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 		context.chat.sending = completed.then(() => {}, () => {});
 		return completed;
 	};
-	// A message to the Planner waits for one that is starting before it joins the queue, so the
-	// room's messages never wait with it. With rows it waits for nothing: it is kept at once, and
-	// starts when the Planner arrives.
-	if (msg.to !== "planner" || !context.plannerStarting) return enqueue();
-	if (context.deferred) {
-		void context.plannerStarting().catch(() => {});
-		return enqueue();
-	}
+	// A message to the Planner waits, a bounded time, for one a machine is starting before it is
+	// checked for one, so the room's messages never wait with it.
+	if (to !== "planner" || !context.plannerStarting) return enqueue();
 	return context.plannerStarting().catch(() => {}).then(enqueue);
+}
+
+/** Whether a message sent now can be given to the turn that is running. */
+function canSteer(context: Room): boolean {
+	let { chat } = context;
+	return !!chat.steering && !chat.closed && !chat.turnController?.signal.aborted
+		&& !!context.steers?.();
+}
+
+/** Says in the log why a message was refused while a turn runs, naming the harness that takes none. */
+function refusedWhileRunning(context: Room): void {
+	console.warn(
+		`[chat] refused a message while a turn runs: the ${context.config.harness} harness takes no input while a turn runs`,
+	);
+}
+
+/**
+ * How many runs in a row of one job (its kind and target) a person's message may cut short. The
+ * next run is let finish, with the person's turn starting the moment it ends, so a job that keeps
+ * meeting messages still completes.
+ */
+const MAX_PREEMPTIONS = 3;
+
+/** What a job that gave way to a person's turn reports: it goes back to wait, unchanged. */
+const PREEMPTED: JobOutcome = { status: "preempted", reason: "A person asked the Planner." };
+
+/**
+ * Whether what holds the Chat is a background job, running or being handed the Chat, which a
+ * person's message to the Planner goes ahead of. A turn a person started, or one Chopin started
+ * for something a person did (a Build, a comment, a follow-up), is never one.
+ */
+function preemptible(chat: Chat): boolean {
+	if (chat.closed || chat.preempting || startsHeld) return false;
+	if (chat.starting) return !!chat.handoffJob;
+	return chat.busy && !!chat.backgroundTurn;
+}
+
+/**
+ * Starts a person's turn ahead of the background job holding the Chat. The job's turn is stopped
+ * and starts this one as it ends; a job being handed the Chat waits behind it instead. A write the
+ * job's own tool has under way finishes first, so it is recorded whole and not made again.
+ */
+function preempt(context: Room, turn: Parameters<typeof run>): void {
+	let { chat } = context;
+	if (chat.closed) return;
+	// The job ended while the message was saved: nothing is in the way.
+	if (!chat.busy && !chat.starting) return startRun(...turn);
+	chat.preempting = turn;
+	let job = chat.backgroundTurn;
+	let controller = chat.turnController;
+	if (chat.starting || !job || job.preempted || !controller || controller.signal.aborted) return;
+	let key = `${job.job.kind}:${job.job.target}`;
+	let preemptions = chat.preemptions ??= new Map();
+	let count = preemptions.get(key) ?? 0;
+	if (count >= MAX_PREEMPTIONS) return;
+	preemptions.set(key, count + 1);
+	job.preempted = true;
+	void Promise.resolve(chat.jobWriting).catch(() => {}).then(() => controller.abort());
+}
+
+/** A message posted to the transcript for the Planner turn that is running to read. */
+type Given = {
+	entry: string;
+	handle: string;
+	text: string;
+	references?: Wire.Reference[];
+	focus?: Focus;
+	userId: string;
+	/** An MCP caller's instruction, which reaches the model as written. */
+	invoked?: boolean;
+};
+
+/**
+ * Gives a posted message to the Planner turn that is running, to be read at its next step. The
+ * session may not be ready for it yet, so this waits for it. When the turn ends first or cannot
+ * take it, the message is not lost to a queue: a Planner that is idle by then starts a turn for
+ * it, and any other says plainly that it was not read.
+ */
+async function give(context: Room, message: Given): Promise<void> {
+	let { chat } = context;
+	let way = chat.steering;
+	let session = await way?.ready;
+	if (session?.steer && chat.steering === way && !chat.closed) {
+		try {
+			let references = message.references ?? [];
+			retainReferences(chat, references);
+			let available = references.filter(reference => chat.referenceCache.has(reference.id));
+			let prompt = compose(
+				[],
+				message.handle,
+				message.text,
+				references,
+				available,
+				message.invoked,
+			);
+			if (message.focus) prompt = `${focusContext(message.focus)}\n\n${prompt}`;
+			if (chat.entries.find(value => value.id === message.entry)?.attachments?.length) {
+				let sent = await context.auth.storage.chatAttachments.forEntry(context.room, message.entry);
+				let parts: string[] = [];
+				let images: string[] = [];
+				for (let file of sent) {
+					if (file.kind === "image") images.push(file.name);
+					else {
+						parts.push(
+							`<file name=${JSON.stringify(file.name)}>\n${
+								new TextDecoder().decode(file.bytes)
+							}\n</file>`,
+						);
+					}
+				}
+				if (images.length) {
+					parts.push(`(Sent with this message, shown in Chat: ${images.join(", ")}.)`);
+				}
+				if (parts.length) prompt = `${prompt}\n\n${parts.join("\n\n")}`;
+			}
+			await session.steer(prompt);
+			return;
+		} catch (err) {
+			console.error("[chat] a message could not be given to the running turn:", err);
+		}
+	}
+	if (chat.closed) return;
+	if (!occupied(chat)) {
+		startRun(
+			{ ...context, ...(message.invoked ? { invokedBy: message.userId } : {}) },
+			message.handle,
+			message.text,
+			undefined,
+			context.claimantSessionId,
+			false,
+			{
+				entryId: message.entry,
+				userId: message.userId,
+				...(message.focus ? { focus: message.focus } : {}),
+			},
+			message.references,
+		);
+		return;
+	}
+	await postNotice(
+		context,
+		`${PLANNER_NAME} did not read @${message.handle}'s message. Send it again to ask.`,
+		undefined,
+		ulid(),
+	).catch(err => console.error("[chat] could not say that a message was not read:", err));
 }
 
 /**
@@ -983,7 +1112,9 @@ export async function send(context: Room, ws: Socket, msg: Request<Wire.Send>): 
  * channel's Planner owner. A checkout matters only to the atomic harness, which
  * verifies it before anything is posted and remembers it for the channel. With a
  * `notice`, an automatic follow-up, Chat shows that notice instead of a message
- * and the text goes to the Planner alone, as for any other instruction.
+ * and the text goes to the Planner alone, as for any other instruction. While a turn
+ * runs, a message is given to it when its harness takes input mid-run, and an instruction
+ * that needs a turn of its own is refused: nothing is held for later.
  */
 export async function invoke(
 	context: Room,
@@ -991,84 +1122,66 @@ export async function invoke(
 	text: string,
 	checkout?: string,
 	focus?: Focus,
-	/** Called once, when the invoked turn ends or is dropped; never when this refuses. */
+	/** Called once, when the invoked turn ends or the message has been given to the one running; never when this refuses. */
 	settled?: () => void,
 	notice?: string,
 ): Promise<
 	| "planner-unavailable"
 	| "planner-not-attached"
 	| "planner-owner-unavailable"
-	| "planner-queue-full"
+	| "planner-busy"
 	| "checkout-unverified"
 	| undefined
 > {
 	let { chat, server, room } = context;
-	if (chat.pendingSends >= MAX_PENDING_SENDS && !await awayOrNot(context)) {
-		return "planner-queue-full";
-	}
+	if (chat.pendingSends >= MAX_PENDING_SENDS) return "planner-busy";
 	chat.pendingSends++;
 	let post = async () => {
 		if (!context.config.agent || chat.closed || context.rootChannelId) {
 			return "planner-unavailable" as const;
 		}
-		// With rows, a request for a machine that is away waits for it, and its owner is checked
-		// when it starts.
-		let waitsAway = context.deferred ? await away(context) : false;
-		if (!context.deferred && await context.plannerNotAttached?.()) {
-			return "planner-not-attached" as const;
-		}
+		if (await context.plannerNotAttached?.()) return "planner-not-attached" as const;
 		let verified: string | undefined;
 		if (checkout !== undefined && context.config.harness === "atomic") {
 			verified = await verifiedCheckout(context.repository, checkout);
 			if (!verified) return "checkout-unverified" as const;
 		}
-		if (!waitsAway) {
-			try {
-				await resolveOwner(context.auth, context.repository, room, claimant(context));
-			} catch {
-				return "planner-owner-unavailable" as const;
-			}
+		try {
+			await resolveOwner(context.auth, context.repository, room, claimant(context));
+		} catch {
+			return "planner-owner-unavailable" as const;
 		}
 		if (chat.closed) return "planner-unavailable" as const;
-		if ((context.deferred || occupied(chat)) && full(chat, waitsAway)) {
-			return "planner-queue-full" as const;
-		}
+		// A process that is stopping starts no turn: its caller asks again, of the next one.
+		if (startsHeld && !chat.busy && !chat.starting) return "planner-unavailable" as const;
 		if (notice !== undefined) {
+			// An automatic follow-up needs a turn of its own, which a running one cannot give it.
+			if (occupied(chat)) return "planner-busy" as const;
 			if (verified) rememberCheckout(room, verified);
 			await instruct(context, user.login, text, notice, {
 				quiet: true,
-				...(context.deferred ? { defer: { kind: "invoke_system" as const, userId: user.id } } : {}),
+				asked: true,
 				...(focus ? { focus } : {}),
 				...(settled ? { ended: () => settled() } : {}),
 			});
 			return undefined;
 		}
-		let waits = !!context.deferred || occupied(chat);
+		// A background job gives way to a person's instruction, as to their message.
+		let preempts = preemptible(chat);
+		let running = !preempts && occupied(chat);
+		if (running && !canSteer(context)) {
+			refusedWhileRunning(context);
+			return "planner-busy" as const;
+		}
 		let entry: Wire.Entry = {
 			id: ulid(),
 			author: { kind: "member", handle: user.login },
 			text,
 			ts: now(),
-			...(context.deferred
-				? { deliveryState: "sent" as const }
-				: {}),
 		};
-		let turn = context.deferred && waits
-			? newTurn({
-				documentId: room,
-				kind: "invoke_planner",
-				request: entry.id,
-				handle: user.login,
-				userId: user.id,
-				text,
-				focus,
-				claimant: context.claimantSessionId,
-				owner: chat.owner?.sessionId,
-			})
-			: undefined;
 		chat.entries.push(entry);
 		try {
-			await save(context, turn ? [insert(turn)] : undefined);
+			await context.persist();
 		} catch (error) {
 			chat.entries = chat.entries.filter(value => value !== entry);
 			throw error;
@@ -1078,24 +1191,18 @@ export async function invoke(
 		// The caller has no socket in the room, so nothing else has told it who they are.
 		introduce(server, room, { login: user.login, avatarUrl: user.avatarUrl });
 		announce(server, room, entry);
-		if (waits || occupied(chat)) {
-			chat.waiting.push({
-				id: entry.id,
+		if (running) {
+			let given = give(context, {
+				entry: entry.id,
 				handle: user.login,
 				text,
-				message: true,
-				posted: true,
-				sessionId: context.claimantSessionId,
-				userId: user.id,
-				invokedBy: user.id,
 				...(focus ? { focus } : {}),
-				...(settled ? { ended: settled } : {}),
-				...(turn ? { deferred: mark(turn, entry.id) } : {}),
+				userId: user.id,
+				invoked: true,
 			});
-			queued(chat, server, room);
-			if (turn) void kick(context);
+			if (settled) void given.finally(settled).catch(() => {});
 		} else {
-			startRun(
+			let asked: Parameters<typeof run> = [
 				{ ...context, invokedBy: user.id },
 				user.login,
 				text,
@@ -1103,11 +1210,15 @@ export async function invoke(
 				context.claimantSessionId,
 				false,
 				{ entryId: entry.id, userId: user.id, ...(focus ? { focus } : {}) },
-			);
-			// Started here, so this promise is this turn's own (and the queue it drains).
-			let running = chat.running;
+				[],
+			];
+			if (preempts) preempt(context, asked);
+			else startRun(...asked);
+			// Started here, or by the job's turn it preempted as that ends, so this promise holds this
+			// turn (and the waiting turns it starts).
+			let turn = chat.running;
 			if (settled) {
-				if (running) void running.finally(settled).catch(() => {});
+				if (turn) void turn.finally(settled).catch(() => {});
 				else settled();
 			}
 		}
@@ -1121,13 +1232,9 @@ export async function invoke(
 		chat.sending = completed.then(() => {}, () => {});
 		return completed;
 	};
-	// It waits for a Planner that is starting before it joins the queue, as `@chopin` does, unless
-	// rows keep it meanwhile.
+	// It waits, a bounded time, for a Planner that is starting before it is checked for one, as
+	// `@chopin` does.
 	if (!context.plannerStarting) return enqueue();
-	if (context.deferred) {
-		void context.plannerStarting().catch(() => {});
-		return enqueue();
-	}
 	return context.plannerStarting().catch(() => {}).then(enqueue);
 }
 
@@ -1143,7 +1250,13 @@ async function acceptAttachments(
 	requestId: string,
 	destination: Wire.Destination,
 	supplied: unknown,
-): Promise<{ attachments: Wire.Attachment[] } | { refusal: string; code?: typeof PASSING }> {
+): Promise<
+	| {
+		attachments: Wire.Attachment[];
+		bind: () => Promise<{ refusal: string; code?: typeof PASSING } | undefined>;
+	}
+	| { refusal: string; code?: typeof PASSING }
+> {
 	let limits = attachmentLimits(context.config);
 	if (!limits) return { refusal: "files are not accepted here" };
 	if (
@@ -1168,22 +1281,35 @@ async function acceptAttachments(
 			destination === "planner" && files.some(value => value.kind === "image")
 			&& !await context.readsImages?.()
 		) return { refusal: refusalText("images-unavailable") };
-		if (
-			!await chatAttachments.bind({
-				channelId: context.room,
-				userId: ws.data.principalId,
-				ids,
-				entryId: requestId,
-			})
-		) return { refusal: refusalText("gone") };
-		return { attachments: files.map(wireAttachment) };
+		return {
+			attachments: files.map(wireAttachment),
+			bind: async () => {
+				try {
+					let bound = await chatAttachments.bind({
+						channelId: context.room,
+						userId: ws.data.principalId,
+						ids,
+						entryId: requestId,
+					});
+					return bound ? undefined : { refusal: refusalText("gone") };
+				} catch (err) {
+					console.error("[chat] could not bind a message's files:", err);
+					return { refusal: "files are temporarily unavailable", code: PASSING };
+				}
+			},
+		};
 	} catch (err) {
 		console.error("[chat] could not read a message's files:", err);
 		return { refusal: "files are temporarily unavailable", code: PASSING };
 	}
 }
 
-async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): Promise<void> {
+async function processSend(
+	context: Room,
+	ws: Socket,
+	msg: Request<Wire.Send>,
+	to: Wire.Destination = msg.to,
+): Promise<void> {
 	let { chat, room, server } = context;
 	let suppliedRequestId = (msg as Request<Wire.Send> & { requestId?: unknown }).requestId;
 	if (
@@ -1196,7 +1322,7 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 	// Pre-deploy browser tabs did not send request IDs. They keep legacy at-most-once behavior.
 	let requestId = suppliedRequestId ?? crypto.randomUUID();
 	let handle = ws.data.handle;
-	let destination = msg.to;
+	let destination = to;
 	if (destination !== "room" && destination !== "planner") {
 		return fail(ws, msg.rid, "invalid message destination");
 	}
@@ -1209,10 +1335,6 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 	}
 	let request = requestFingerprint(msg, ws.data.principalId, ws.data.actor?.id);
 	if (replay(chat, ws, msg, requestId, request)) return;
-	if (destination === "planner" && await replayRow(context, ws, msg, requestId, request)) return;
-	if (destination === "planner" && chat.retracted?.has(requestId)) {
-		return fail(ws, msg.rid, "this message was deleted");
-	}
 	if (chat.closed) return refuseClosed(ws, msg.rid);
 	let focus: Focus | undefined;
 	let suppliedFocus = (msg as { focus?: unknown }).focus;
@@ -1278,6 +1400,9 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 	let text = projected.text;
 	let references = projected.references;
 	let attached: Wire.Attachment[] = [];
+	let bindAttachments:
+		| (() => Promise<{ refusal: string; code?: typeof PASSING } | undefined>)
+		| undefined;
 	let suppliedAttachments = (msg as { attachments?: unknown }).attachments;
 	if (suppliedAttachments !== undefined) {
 		let accepted = await acceptAttachments(
@@ -1289,6 +1414,7 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 		);
 		if ("refusal" in accepted) return fail(ws, msg.rid, accepted.refusal, accepted.code);
 		attached = accepted.attachments;
+		bindAttachments = accepted.bind;
 	}
 	if (!text && attached.length === 0) return fail(ws, msg.rid, "message text is empty");
 	if (chat.closed) return refuseClosed(ws, msg.rid);
@@ -1296,6 +1422,8 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 	let withAttachments = attached.length ? { attachments: attached } : {};
 
 	if (destination === "room") {
+		let bindFailure = await bindAttachments?.();
+		if (bindFailure) return fail(ws, msg.rid, bindFailure.refusal, bindFailure.code);
 		let entry: MemberEntry = {
 			id: requestId,
 			author: { kind: "member", handle },
@@ -1315,7 +1443,7 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 			}
 			return fail(ws, msg.rid, "could not save message", PASSING);
 		}
-		reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: entry.id, queued: false });
+		reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: entry.id });
 		announce(server, room, entry);
 		context.roomMessagePublished?.();
 		context.memberMessagePersisted?.(entry, context.claimantSessionId);
@@ -1329,6 +1457,8 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 		return;
 	}
 	if (!context.config.agent) {
+		let bindFailure = await bindAttachments?.();
+		if (bindFailure) return fail(ws, msg.rid, bindFailure.refusal, bindFailure.code);
 		let entries: MemberEntry[] = [{
 			id: requestId,
 			author: { kind: "member", handle },
@@ -1351,69 +1481,108 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 			chat.entries = chat.entries.filter(entry => !ids.has(entry.id));
 			return fail(ws, msg.rid, "could not save message", PASSING);
 		}
-		reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: entries[0]!.id, queued: false });
+		reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: entries[0]!.id });
 		for (let entry of entries) announce(server, room, entry);
 		context.memberMessagePersisted?.(entries[0]!, context.claimantSessionId);
 		return;
 	}
 
-	// A person's request is accepted whether or not a Planner is there, and kept as a row until a
-	// session is open on the machine and a turn starts it, even when nothing is running, so a hard
-	// stop or a machine that cannot open one loses nothing. Without rows (local mode with a Planner
-	// on the same computer) it is refused when none is attached.
-	let awayNow = false;
-	if (context.deferred) {
-		awayNow = await away(context);
-	} else {
-		let unattached = await context.plannerNotAttached?.();
-		if (unattached) return fail(ws, msg.rid, unattached, "planner-not-attached");
-	}
+	// Nothing a person sends is held: with no machine to take it (none attached, or its machine
+	// away) the message is refused, saying so.
+	let unattached = await context.plannerNotAttached?.();
+	if (unattached) return fail(ws, msg.rid, unattached, "planner-not-attached");
 	if (chat.closed) return refuseClosed(ws, msg.rid);
 
 	chat.initiative?.cancel();
-	if (context.deferred) {
-		return deferMessage(context, ws, msg, {
-			away: awayNow,
-			requestId,
-			handle,
-			text,
-			references,
-			attachments: attached,
-			delivery: savedDelivery,
-			focus,
-		});
-	}
-	if (occupied(chat)) {
-		if (full(chat)) {
-			// A tab that sends request ids keeps the message and sends it again once there is room,
-			// so only one that cannot is told in the Chat.
-			if (suppliedRequestId === undefined) {
-				say(chat, server, room, {
-					id: ulid(),
-					author: { kind: "system" },
-					text: "The queue is full. Wait for the current turn to finish.",
-					ts: now(),
-				});
-			}
-			return fail(ws, msg.rid, "the reply queue is full", "planner-queue-full");
-		}
-		let waiting: Waiting = {
+	if (preemptible(chat)) {
+		// A background job gives way: the person's turn starts once the job's turn has wound down.
+		let bindFailure = await bindAttachments?.();
+		if (bindFailure) return fail(ws, msg.rid, bindFailure.refusal, bindFailure.code);
+		let entry: MemberEntry = {
 			id: requestId,
-			handle,
+			author: { kind: "member", handle },
 			text,
+			ts: now(),
 			...(references?.length ? { references } : {}),
 			...withAttachments,
 			delivery: savedDelivery,
-			message: true,
-			sessionId: context.claimantSessionId,
-			userId: ws.data.principalId,
-			...(focus ? { focus } : {}),
 		};
-		chat.waiting.push(waiting);
-		reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: waiting.id, queued: true });
-		return queued(chat, server, room);
+		chat.entries.push(entry);
+		try {
+			await context.persist();
+		} catch {
+			chat.entries = chat.entries.filter(value => value.id !== entry.id);
+			return fail(ws, msg.rid, "could not save message", PASSING);
+		}
+		reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: entry.id });
+		if (chat.closed) return;
+		announce(server, room, entry);
+		preempt(context, [
+			context,
+			handle,
+			text,
+			undefined,
+			context.claimantSessionId,
+			false,
+			{ entryId: entry.id, userId: ws.data.principalId, ...(focus ? { focus } : {}) },
+			references ?? [],
+		]);
+		context.memberMessagePersisted?.(entry, context.claimantSessionId);
+		return;
 	}
+	if (chat.busy || chat.starting) {
+		if (!canSteer(context)) {
+			// A stopping process starts no turn in place of a job, and says nothing: the browser sends
+			// the message again to the next one.
+			if (startsHeld && chat.backgroundTurn) return refuseClosed(ws, msg.rid);
+			// A turn that is only beginning or finishing, or a person's turn about to start in place of
+			// a job, has no session to give a message to just now: the browser sends it again in a
+			// moment, to a Planner that is then idle or working. A harness that takes no input mid-run
+			// never will.
+			if (!chat.closed && context.steers?.()) {
+				return fail(ws, msg.rid, `${PLANNER_NAME} is between replies`, PASSING);
+			}
+			refusedWhileRunning(context);
+			return fail(ws, msg.rid, CANNOT_STEER, "planner-busy");
+		}
+		let bindFailure = await bindAttachments?.();
+		if (bindFailure) return fail(ws, msg.rid, bindFailure.refusal, bindFailure.code);
+		let entry: MemberEntry = {
+			id: requestId,
+			author: { kind: "member", handle },
+			text,
+			ts: now(),
+			...(references?.length ? { references } : {}),
+			...withAttachments,
+			delivery: savedDelivery,
+		};
+		chat.entries.push(entry);
+		try {
+			await context.persist();
+		} catch {
+			chat.entries = chat.entries.filter(value => value.id !== entry.id);
+			return fail(ws, msg.rid, "could not save message", PASSING);
+		}
+		reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: entry.id });
+		if (chat.closed) return;
+		announce(server, room, entry);
+		context.memberMessagePersisted?.(entry, context.claimantSessionId);
+		void give(context, {
+			entry: entry.id,
+			handle,
+			text,
+			...(references?.length ? { references } : {}),
+			...(focus ? { focus } : {}),
+			userId: ws.data.principalId,
+		});
+		return;
+	}
+	// A process that is stopping starts no turn, and says nothing: the browser sends the message
+	// again to the next one, with the same request id.
+	if (startsHeld) return refuseClosed(ws, msg.rid);
 
+	let bindFailure = await bindAttachments?.();
+	if (bindFailure) return fail(ws, msg.rid, bindFailure.refusal, bindFailure.code);
 	let entry: MemberEntry = {
 		id: requestId,
 		author: { kind: "member", handle },
@@ -1422,12 +1591,10 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 		...(references?.length ? { references } : {}),
 		...withAttachments,
 		delivery: savedDelivery,
-		// Sent until its prompt is on its way to the machine; the turn says when.
-		...(context.deferred ? { deliveryState: "sent" as const } : {}),
 	};
+	// The turn holds the Chat from here; people are told it is running once the machine has its prompt.
 	chat.busy = true;
 	chat.turn = begin(handle, chat.entries.length + 1);
-	state(chat, server, room);
 	chat.entries.push(entry);
 	try {
 		await context.persist();
@@ -1438,7 +1605,7 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 		state(chat, server, room);
 		return fail(ws, msg.rid, "could not save message", PASSING);
 	}
-	reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: entry.id, queued: false });
+	reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: entry.id });
 	if (chat.closed) return;
 	announce(server, room, entry);
 	startRun(
@@ -1454,110 +1621,118 @@ async function processSend(context: Room, ws: Socket, msg: Request<Wire.Send>): 
 	context.memberMessagePersisted?.(entry, context.claimantSessionId);
 }
 
-/** Saves the Chat, with changes to rows when there are any, and what each did. */
-function save(
-	context: Room,
-	changes: DeferredTurnChange[] | undefined,
-): Promise<DeferredTurnOutcome[] | void> {
-	return changes?.length ? context.persist(undefined, changes) : context.persist();
-}
-
-/** Whether a Planner request has to wait for a machine that is not attached. */
-export async function away(context: Pick<Room, "plannerReady" | "deferred">): Promise<boolean> {
-	return context.deferred && context.plannerReady ? !await context.plannerReady() : false;
+/**
+ * Run a failed Planner turn again for the message that began it: the same message, never a new
+ * one. The failed attempt (its failure notice and what the agent wrote during it) leaves the
+ * transcript and is saved gone before the room is told, so everyone reads one message and, in
+ * time, one reply, and the turn's agent is given the message once and nothing of the attempt.
+ * Serialized with sends, so a message and a retry never start two turns.
+ */
+export async function retry(context: Room, ws: Socket, msg: Request<Wire.Retry>): Promise<void> {
+	let { chat } = context;
+	let message = (msg as { message?: unknown }).message;
+	if (typeof message !== "string" || !message || message.length > 128) {
+		return fail(ws, msg.rid, "invalid message id");
+	}
+	if (context.rootChannelId) {
+		return fail(ws, msg.rid, "this document's Chat is on its root document");
+	}
+	if (chat.pendingSends >= MAX_PENDING_SENDS) {
+		return fail(ws, msg.rid, "too many chat messages are waiting to be processed", PASSING);
+	}
+	chat.pendingSends++;
+	let process = () =>
+		processRetry(context, ws, msg.rid, message).catch(err => {
+			console.error("[chat] a retry failed before its turn started:", err);
+			fail(ws, msg.rid, "could not retry the reply", PASSING);
+		});
+	let enqueue = () => {
+		let completed = chat.sending.then(process, process).finally(() => chat.pendingSends--);
+		chat.sending = completed.then(() => {}, () => {});
+		return completed;
+	};
+	if (!context.plannerStarting) return enqueue();
+	return context.plannerStarting().catch(() => {}).then(enqueue);
 }
 
 /**
- * `away`, where a check that fails says the machine is there. Asked only of a request that finds
- * too many being saved at once: a machine that is away keeps every one, however many, and only a
- * request for a machine that is there is turned away.
+ * The room's transcript as a Retry reads it. The top-level Chat leaves out what a thread's turn
+ * copied into it, which only that thread's Retry runs again.
  */
-function awayOrNot(context: Pick<Room, "plannerReady" | "deferred">): Promise<boolean> {
-	return away(context).catch(() => false);
+function ownEntries(context: Room): Wire.Entry[] {
+	let entries = context.threadRoot === undefined
+		? context.chat.entries.filter(entry => entry.fromThread === undefined)
+		: context.chat.entries;
+	return entries.map(publicEntry);
 }
 
-/**
- * Keep a message to the Planner that cannot start now: in the transcript at once, as sent, and as
- * a row in the commit that saves it, so the acknowledgement is never ahead of what survives.
- */
-async function deferMessage(
+async function processRetry(
 	context: Room,
 	ws: Socket,
-	msg: Request<Wire.Send>,
-	input: {
-		away: boolean;
-		requestId: string;
-		handle: string;
-		text: string;
-		references?: Wire.Reference[];
-		attachments?: Wire.Attachment[];
-		delivery: Delivery;
-		focus?: Focus;
-	},
+	rid: string,
+	message: string,
 ): Promise<void> {
 	let { chat, room, server } = context;
-	// Not a message that cannot be delivered: its sender's browser keeps it and sends it again, with
-	// the same request id, once there is room, so nothing is said in the Chat each time.
-	if (full(chat, input.away)) {
-		return fail(ws, msg.rid, "the queue is full", "planner-queue-full");
+	if (chat.closed) return refuseClosed(ws, rid);
+	if (!context.config.agent) return fail(ws, rid, `${PLANNER_NAME} is not running here`);
+	let found = retryTarget(ownEntries(context), message, ws.data.handle);
+	if ("refusal" in found) return fail(ws, rid, found.refusal);
+	let unattached = await context.plannerNotAttached?.();
+	if (unattached) return fail(ws, rid, unattached, "planner-not-attached");
+	let focus: Focus | undefined;
+	if (found.failure.focus) {
+		let child: Awaited<ReturnType<ChildDocuments["resolve"]>>;
+		try {
+			child = await context.children?.resolve(found.failure.focus);
+		} catch (err) {
+			console.error("[chat] could not resolve the focused child document:", err);
+			return fail(ws, rid, "the open child document is unavailable", PASSING);
+		}
+		if (!child) return fail(ws, rid, "the open child document is unavailable");
+		focus = { channelId: child.id, title: child.title };
 	}
-	let { requestId, handle, text, references, focus } = input;
-	let withAttachments = input.attachments?.length ? { attachments: input.attachments } : {};
-	let entry: MemberEntry = {
-		id: requestId,
-		author: { kind: "member", handle },
-		text,
-		ts: now(),
-		...(references?.length ? { references } : {}),
-		...withAttachments,
-		delivery: input.delivery,
-		deliveryState: "sent",
-	};
-	let turn = newTurn({
-		documentId: room,
-		kind: "composer",
-		request: requestId,
-		handle,
-		userId: ws.data.principalId,
-		text,
-		references,
-		delivery: { ...input.delivery, entry: requestId } as unknown as JsonValue,
-		focus,
-		claimant: context.claimantSessionId,
-		owner: chat.owner?.sessionId,
-	});
-	chat.entries.push(entry);
-	let outcomes: DeferredTurnOutcome[] | void;
+	if (chat.closed) return refuseClosed(ws, rid);
+	if (chat.busy || chat.starting) return fail(ws, rid, `${PLANNER_NAME} is already replying`);
+	// A process that is stopping starts no turn, and says nothing: the browser may ask the next one.
+	if (startsHeld) return refuseClosed(ws, rid);
+	// Read again: the transcript may have moved on while the machine and the child were checked.
+	let target = retryTarget(ownEntries(context), message, ws.data.handle);
+	if ("refusal" in target) return fail(ws, rid, target.refusal);
+	let { request, removed } = target;
+	let gone = new Set(removed);
+	let before = chat.entries;
+	chat.entries = before.filter(entry => !gone.has(entry.id));
+	chat.busy = true;
+	chat.turn = begin(request.author.handle, chat.entries.length);
 	try {
-		outcomes = await context.persist(undefined, [insert(turn)]);
+		await context.persist();
 	} catch {
-		chat.entries = chat.entries.filter(value => value !== entry);
-		(chat.unsure ??= new Set()).add(requestId);
-		return fail(ws, msg.rid, "could not save message", PASSING);
+		let added = chat.entries.filter(entry => !before.includes(entry));
+		chat.entries = [...before, ...added];
+		chat.busy = false;
+		chat.turn = undefined;
+		state(chat, server, room);
+		return fail(ws, rid, "could not retry the reply", PASSING);
 	}
-	let outcome = outcomes?.[0];
-	if (outcome && !(outcome.action === "insert" && outcome.status === "inserted")) {
-		chat.entries = chat.entries.filter(value => value !== entry);
-		return fail(ws, msg.rid, "chat request id conflicts with existing state");
-	}
-	chat.waiting.push({
-		id: requestId,
-		handle,
-		text,
-		...(references?.length ? { references } : {}),
-		...withAttachments,
-		delivery: input.delivery,
-		message: true,
-		posted: true,
-		sessionId: context.claimantSessionId,
-		userId: ws.data.principalId,
-		...(focus ? { focus } : {}),
-		deferred: mark(turn, requestId),
-	});
-	reply(ws, msg.rid, { kind: "chat:send", ts: 0, id: requestId, queued: true });
-	announce(server, room, entry);
-	context.memberMessagePersisted?.(entry, context.claimantSessionId);
-	void kick(context);
+	reply(ws, rid, { kind: "chat:retry", ts: 0, message });
+	if (chat.closed) return;
+	broadcast(server, room, { kind: "chat:removed", ts: 0, ids: removed });
+	chat.initiative?.cancel();
+	startRun(
+		context,
+		request.author.handle,
+		request.text,
+		undefined,
+		context.claimantSessionId,
+		true,
+		{
+			entryId: request.id,
+			userId: ws.data.principalId,
+			...(focus ? { focus } : {}),
+			retry: true,
+		},
+		request.references,
+	);
 }
 
 /** Say something in the transcript without asking the agent for anything. */
@@ -1572,17 +1747,16 @@ function instructionNotice(
 	comment?: Instruction["comment"],
 	id = ulid(),
 ): void | Promise<void> {
-	return postNotice(context, text, comment, id).then(() => {});
+	return postNotice(context, text, comment, id);
 }
 
-/** Saves a system notice, with changes to deferred requests in the same commit, then shows it. */
+/** Saves a system notice, then shows it. */
 function postNotice(
 	context: Room,
 	text: string,
 	comment: Instruction["comment"] | undefined,
 	id: string,
-	changes?: DeferredTurnChange[],
-): Promise<DeferredTurnOutcome[]> {
+): Promise<void> {
 	let { chat, room, server } = context;
 	let entry: Wire.Entry = {
 		id,
@@ -1592,20 +1766,22 @@ function postNotice(
 		...(comment ? { comment } : {}),
 	};
 	chat.entries.push(entry);
-	return Promise.resolve(save(context, changes)).then(outcomes => {
+	return context.persist().then(() => {
 		announce(server, room, entry);
-		return outcomes ?? [];
 	});
 }
 
 /**
- * Start a turn from something other than a message.
+ * Start a Planner turn from something other than a message.
  *
  * Accepting a comment is an instruction in a way prose is not — the `@chopin` rule
  * exists to separate conversation from instruction, and a button press is
  * already the latter. What it is not is a thing anybody said, so the transcript
  * gets a system entry explaining why the agent started moving; an agent that
  * begins editing for no visible reason is worse than a noisy log.
+ *
+ * One a person asked for (`about.asked`) is refused while a turn runs. One the server wrote
+ * itself, which nobody is waiting on, waits for the turn to end.
  */
 export function instruct(
 	context: Room,
@@ -1635,103 +1811,43 @@ export function instruct(
 			return context.persist().then(() => announce(server, room, entry));
 		}
 
-		// A thread that already has a turn waiting is told about the newer note
-		// by that turn: its prompt is replaced, since it reads the whole thread.
-		let folded = about.thread ? queuedFor(chat, about.thread, about.threadChannel) : undefined;
-		if (folded) {
-			folded.handle = handle;
-			folded.text = text;
-			return;
-		}
-
 		if (occupied(chat)) {
 			if (full(chat)) {
 				say(chat, server, room, {
 					id: ulid(),
 					author: { kind: "system" },
-					text: "The queue is full. Wait for the current turn to finish.",
+					text: `${PLANNER_NAME} has too much to do already. Try again when it has caught up.`,
 					ts: now(),
 				});
 				return report(about, { status: "failed" });
 			}
-			let { comment: _comment, notice: _notice, ...rest } = about;
+			let { comment: _comment, notice: _notice, asked: _asked, ...rest } = about;
 			chat.waiting.push({
 				id: ulid(),
 				handle,
 				text,
 				...rest,
-				sessionId: context.claimantSessionId,
+				sessionId: about.reader ? undefined : context.claimantSessionId,
 			});
-			return queued(chat, server, room);
+			return;
 		}
 
-		startRun(context, handle, text, about, context.claimantSessionId);
+		startRun(context, handle, text, about, about.reader ? undefined : context.claimantSessionId);
 	};
 	if (about.spent?.() || about.signal?.aborted) return report(about, { status: "skipped" });
+	// A turn a person asked for cannot wait for the one running: it is refused before it is noticed.
+	if (about.asked && occupied(chat)) return report(about, { status: "failed" });
 	// Automatic participation replies like any member would, so it announces nothing.
 	if (!said) return proceed();
-	if (about.defer && context.deferred) {
-		return instructDeferred(context, handle, text, said, about, proceed);
-	}
 	let announced = instructionNotice(context, said, about.comment, about.notice);
 	return announced instanceof Promise ? announced.then(proceed) : proceed();
-}
-
-/**
- * An instruction a person asked for, which waits as a row when a turn is running, none may start
- * or the machine is away, with its notice and the row saved in one commit.
- */
-async function instructDeferred(
-	context: Room,
-	handle: string,
-	text: string,
-	said: string,
-	about: Instruction,
-	proceed: () => void | Promise<void>,
-): Promise<void> {
-	let { chat, config, room, server } = context;
-	let folded = about.thread ? queuedFor(chat, about.thread, about.threadChannel) : undefined;
-	let waits = !folded && config.agent && !chat.closed && !full(chat, await away(context));
-	if (!waits || !about.defer) {
-		await instructionNotice(context, said, about.comment, about.notice);
-		return proceed();
-	}
-	let id = about.notice ?? ulid();
-	let turn = newTurn({
-		documentId: room,
-		kind: about.defer.kind,
-		request: id,
-		handle,
-		userId: about.defer.userId,
-		text,
-		focus: about.focus,
-		thread: about.thread,
-		threadChannel: about.threadChannel,
-		claimant: context.claimantSessionId,
-		owner: chat.owner?.sessionId,
-	});
-	let outcome = (await postNotice(context, said, about.comment, id, [insert(turn)]))[0];
-	// A row the document already had for this request, or for this thread, keeps its place.
-	if (outcome && outcome.action === "insert" && outcome.status !== "inserted") return;
-	if (chat.closed) return;
-	let { comment: _comment, notice: _notice, defer: _defer, ...rest } = about;
-	chat.waiting.push({
-		id,
-		handle,
-		text,
-		...rest,
-		sessionId: context.claimantSessionId,
-		deferred: mark(turn),
-	});
-	queued(chat, server, room);
-	void kick(context);
 }
 
 function drafting(
 	server: Server<SocketData>,
 	room: string,
 	draft: TaskDraft,
-	state: "queued" | "running" | "ended",
+	state: "running" | "ended",
 ): void {
 	broadcast(server, room, {
 		kind: "implementation:drafting",
@@ -1743,19 +1859,15 @@ function drafting(
 }
 
 /**
- * The draft that is still queued or running, if one is.
+ * The draft that is still running, if one is.
  *
- * A record whose queue entry or turn has gone without reaching the end of a
- * turn (a closed room, a queue cleared after a failed save) is dropped here
- * rather than tracked down every path that can discard it.
+ * A record whose turn has gone without reaching the end of one (a closed room, a failed save)
+ * is dropped here rather than tracked down every path that can discard it.
  */
 function liveDraft(chat: Chat): TaskDraft | undefined {
 	let draft = chat.draft;
 	if (!draft) return;
-	let alive = draft.state === "queued"
-		? chat.waiting.some(item => item.draft === draft.id)
-		: chat.busy && (!draft.turn || chat.turn?.id === draft.turn);
-	if (alive) return draft;
+	if (chat.busy && (!draft.turn || chat.turn?.id === draft.turn)) return draft;
 	chat.draft = undefined;
 }
 
@@ -1764,7 +1876,7 @@ export type TaskDraftResult =
 		ok: true;
 		draft: TaskDraft;
 		/** As of the reply: a turn can finish before its request is answered. */
-		state: "queued" | "running" | "ended";
+		state: "running" | "ended";
 		existing: boolean;
 	}
 	| { ok: false; reason: string; code?: "planner-not-attached" };
@@ -1776,8 +1888,8 @@ export type TaskDraftResult =
  * the transcript gets a system line saying who asked, and the instruction goes
  * to the model alone. One draft per document is live, whatever revision it was
  * asked for, since its instruction reads the latest document; asking again
- * returns it, so collaborators opening Build together start one turn. It takes
- * the same place in line, and the same limits, as a Chat message.
+ * returns it, so collaborators opening Build together start one turn. It needs a turn
+ * of its own, so it is refused while another one runs.
  */
 export async function draftTasks(
 	context: Room,
@@ -1785,14 +1897,13 @@ export async function draftTasks(
 	planRevision: number,
 	text: string,
 	said: string,
-	user = handle,
 ): Promise<TaskDraftResult> {
 	let { chat } = context;
-	if (chat.pendingSends >= MAX_PENDING_SENDS && !await awayOrNot(context)) {
-		return { ok: false, reason: "the reply queue is full" };
+	if (chat.pendingSends >= MAX_PENDING_SENDS) {
+		return { ok: false, reason: `${PLANNER_NAME} is busy. Try again in a moment.` };
 	}
 	chat.pendingSends++;
-	let post = () => postDraft(context, handle, planRevision, text, said, user);
+	let post = () => postDraft(context, handle, planRevision, text, said);
 	let accepted = chat.sending.then(post, post);
 	let completed = accepted.finally(() => chat.pendingSends--);
 	chat.sending = completed.then(() => {}, () => {});
@@ -1805,110 +1916,59 @@ async function postDraft(
 	planRevision: number,
 	text: string,
 	said: string,
-	user: string,
 ): Promise<TaskDraftResult> {
-	let { chat, config, room, server } = context;
-	if (!config.agent) return { ok: false, reason: "Chopin is not running" };
+	let { chat, config, server, room } = context;
+	if (!config.agent) return { ok: false, reason: `${PLANNER_NAME} is not running` };
 	if (chat.closed) return { ok: false, reason: "chat is closed" };
-	// Without rows, under HARNESS=remote, a draft queued with no Planner attached would never run;
-	// with them it waits for one.
-	let waitsAway = false;
-	if (context.deferred) {
-		waitsAway = await away(context);
-	} else {
-		let unattached = await context.plannerNotAttached?.();
-		if (unattached) return { ok: false, reason: unattached, code: "planner-not-attached" };
-	}
+	let unattached = await context.plannerNotAttached?.();
+	if (unattached) return { ok: false, reason: unattached, code: "planner-not-attached" };
 	let existing = liveDraft(chat);
 	if (existing) return { ok: true, draft: existing, state: existing.state, existing: true };
-	// The draft waits in the queue even when the Planner is idle, so it counts against it.
-	if (full(chat, waitsAway)) return { ok: false, reason: "the reply queue is full" };
-	let draft: TaskDraft = { id: ulid(), planRevision, state: "queued" };
+	if (occupied(chat)) return { ok: false, reason: BUSY_DRAFT };
+	let draft: TaskDraft = { id: ulid(), planRevision, state: "running" };
 	chat.draft = draft;
-	let turn = context.deferred
-		? newTurn({
-			documentId: room,
-			kind: "draft",
-			request: draft.id,
-			handle,
-			userId: user,
-			text,
-			planRevision,
-			claimant: context.claimantSessionId,
-			owner: chat.owner?.sessionId,
-		})
-		: undefined;
-	let waiting: Waiting = {
-		id: draft.id,
-		handle,
-		text,
-		draft: draft.id,
-		sessionId: context.claimantSessionId,
-		...(turn ? { deferred: mark(turn) } : {}),
-	};
-	// Held in the queue while the notice saves, so the draft stays live throughout.
-	chat.waiting.push(waiting);
 	let abandon = (reason: string): TaskDraftResult => {
-		chat.waiting = chat.waiting.filter(item => item !== waiting);
 		if (chat.draft === draft) chat.draft = undefined;
 		return { ok: false, reason };
 	};
+	// Held as the Chat's busy turn while the notice saves, so no other turn starts meanwhile.
+	chat.busy = true;
+	chat.turn = begin(handle, chat.entries.length);
+	state(chat, server, room);
 	try {
-		if (turn) await postNotice(context, said, undefined, ulid(), [insert(turn)]);
-		else await instructionNotice(context, said);
+		await instructionNotice(context, said);
 	} catch {
+		chat.busy = false;
+		chat.turn = undefined;
+		state(chat, server, room);
 		return abandon("could not save the request");
 	}
 	if (chat.closed) return abandon("chat is closed");
-	let answer = (): TaskDraftResult => ({
-		ok: true,
-		draft,
-		state: liveDraft(chat) === draft ? draft.state : "ended",
-		existing: false,
-	});
-	// A turn that ended while the notice saved may already have started, or finished, this one.
-	if (!chat.waiting.includes(waiting)) return answer();
-	if (occupied(chat) || turn) {
-		drafting(server, room, draft, "queued");
-		if (turn) void kick(context);
-		return answer();
-	}
-	chat.waiting = chat.waiting.filter(item => item !== waiting);
 	startRun(
 		{ ...context, draft: draft.id },
 		handle,
 		text,
 		undefined,
 		context.claimantSessionId,
+		true,
 	);
-	return answer();
+	return {
+		ok: true,
+		draft,
+		state: liveDraft(chat) === draft ? "running" : "ended",
+		existing: false,
+	};
 }
 
+const BUSY_DRAFT = `${PLANNER_NAME} is working on something else. Try again when it has finished.`;
+
 let jobState = safeProjection(state);
-let jobQueued = safeProjection(queued);
 let { job, cancelQueuedJobs, stopAfterPersistenceFailure } = createJobQueue({
-	queued: jobQueued,
 	state: jobState,
 	startRun,
 	MAX_QUEUE,
 });
 export { cancelQueuedJobs, job };
-
-/** Withdraw a queued message. Only whoever wrote it may. */
-export function unqueue(context: Room, ws: Socket, msg: Request<Wire.Unqueue>): void {
-	let { chat, room, server } = context;
-	let found = chat.waiting.find(item => item.id === msg.id);
-	if (!found || found.job || found.handle !== ws.data.handle) return;
-	// A request kept as a row is withdrawn with its row, or it would come back with a restart.
-	if (found.deferred) {
-		if (found.message) void remove(context, ws, msg as unknown as Request<Wire.Delete>);
-		else void cancelRow(context, found, "spent");
-		return;
-	}
-	chat.waiting = chat.waiting.filter(item => item.id !== msg.id);
-	queued(chat, server, room);
-	void report(found, { status: "skipped" });
-}
 
 /**
  * Stop the running turn and pause the Planner's workflow runs, so both hold
@@ -1955,15 +2015,15 @@ export async function abort(context: Room, ws: Socket): Promise<void> {
 			id: ulid(),
 			author: { kind: "system" },
 			text: paused
-				? `@${ws.data.handle} stopped Chopin and paused its workflows.`
+				? `@${ws.data.handle} stopped ${PLANNER_NAME} and paused its workflows.`
 				: outcome === "held"
-				? `@${ws.data.handle} asked Chopin to stop. Its machine is disconnected, `
+				? `@${ws.data.handle} asked ${PLANNER_NAME} to stop. Its machine is disconnected, `
 					+ "so its workflows will pause when it reconnects."
 				: outcome === "unconfirmed"
-				? `@${ws.data.handle} asked Chopin to stop its workflows. It has not confirmed `
+				? `@${ws.data.handle} asked ${PLANNER_NAME} to stop its workflows. It has not confirmed `
 					+ "yet, and if its machine is disconnected they will pause when it reconnects."
 				: outcome === "failed" && !turn
-				? `@${ws.data.handle} asked Chopin to stop, but its workflows could not be paused.`
+				? `@${ws.data.handle} asked ${PLANNER_NAME} to stop, but its workflows could not be paused.`
 				: `@${ws.data.handle} stopped the turn.`,
 			ts: now(),
 		});
@@ -1989,7 +2049,7 @@ export async function abort(context: Room, ws: Socket): Promise<void> {
 			say(chat, server, room, {
 				id: ulid(),
 				author: { kind: "system" },
-				text: `@${ws.data.handle} stopped Chopin and withdrew its open question.`,
+				text: `@${ws.data.handle} stopped ${PLANNER_NAME} and withdrew its open question.`,
 				ts: now(),
 			});
 		}
@@ -2045,12 +2105,12 @@ export async function resume(context: Room, ws: Socket): Promise<void> {
 	let { chat, room, server } = context;
 	let session = chat.retained?.session;
 	if (!session?.resumeRuns || !session.runs?.()?.paused.length) return;
-	let text = `@${ws.data.handle} resumed Chopin's workflows.`;
+	let text = `@${ws.data.handle} resumed ${PLANNER_NAME}'s workflows.`;
 	try {
 		await session.resumeRuns();
 	} catch (err) {
 		console.error("[chat] resuming workflow runs failed:", err);
-		text = "Chopin's workflows could not be resumed.";
+		text = `${PLANNER_NAME}'s workflows could not be resumed.`;
 	}
 	say(chat, server, room, { id: ulid(), author: { kind: "system" }, text, ts: now() });
 }
@@ -2081,7 +2141,7 @@ export async function controlRun(
 			text = `@${ws.data.handle} asked to pause ${run.name}. `
 				+ "It will pause when the machine reconnects.";
 		} else if (outcome === "unconfirmed") {
-			text = `@${ws.data.handle} asked to pause ${run.name}. Chopin has not confirmed `
+			text = `@${ws.data.handle} asked to pause ${run.name}. ${PLANNER_NAME} has not confirmed `
 				+ "yet, and if its machine is disconnected it will pause when it reconnects.";
 		}
 	} catch (err) {
@@ -2158,6 +2218,24 @@ export async function restoredRuns(
 	state(chat, server, room);
 }
 
+/**
+ * The document was archived: every run its Planner held ends with it, whether the Planner was
+ * attached, disconnected with its work kept, or between two processes of a deploy, so no card is
+ * left running or waiting on a question nobody can answer now. Saved with the document.
+ */
+export async function endRuns(
+	context: Pick<Room, "chat" | "room" | "server" | "persist">,
+): Promise<void> {
+	let { chat, room, server } = context;
+	if (!chat.runs?.length) return;
+	let at = now();
+	let next = chat.runs.map(run => ENDED_RUN[run.status] ? run : stopped(run, at));
+	if (JSON.stringify(next) === JSON.stringify(chat.runs)) return;
+	await context.persist(() => ({ entries: chat.entries, runs: next }));
+	chat.runs = next;
+	state(chat, server, room);
+}
+
 /** Run cards restored with the document; no session survives a reload of the room, so live ones were stopped. */
 export function restoreRuns(runs: Wire.Run[] | undefined): Wire.Run[] | undefined {
 	return runs?.length ? mergeRuns(runs, undefined, now()) : undefined;
@@ -2174,7 +2252,7 @@ const storedStages = new WeakMap<Chat, Map<string, { ids: string[]; json: Map<st
  * than its card carries. A report that only adds and changes stages writes those; one that drops
  * or reorders stages replaces the run's.
  */
-function storeStages(context: Room, cards: Wire.Run[]): Promise<void> | undefined {
+function storeStages(context: RunsRoom, cards: Wire.Run[]): Promise<void> | undefined {
 	let known = storedStages.get(context.chat)
 		?? new Map<string, { ids: string[]; json: Map<string, string> }>();
 	storedStages.set(context.chat, known);
@@ -2223,7 +2301,7 @@ function cardWindow(run: Wire.Run): Wire.Run {
 }
 
 /** Forgets the stored stages of runs Chat no longer shows. */
-async function forgetStages(context: Room, shown: Wire.Run[] | undefined): Promise<void> {
+async function forgetStages(context: RunsRoom, shown: Wire.Run[] | undefined): Promise<void> {
 	let ids = (shown ?? []).map(run => run.id);
 	let known = storedStages.get(context.chat);
 	for (let id of known?.keys() ?? []) if (!ids.includes(id)) known!.delete(id);
@@ -2235,11 +2313,50 @@ async function forgetStages(context: Room, shown: Wire.Run[] | undefined): Promi
 }
 
 const publishing = new WeakMap<Chat, Promise<void>>();
-const owners = new WeakMap<Chat, Map<string, PlannerSession>>();
-const unsaved = new WeakMap<PlannerSession, Runs>();
-const gone = new WeakSet<PlannerSession>();
+const owners = new WeakMap<Chat, Map<string, RunsOwner>>();
+const unsaved = new WeakMap<RunsOwner, Runs>();
+const gone = new WeakSet<RunsOwner>();
 
 type Runs = { active: string[]; paused: string[]; cards?: Wire.Run[] };
+
+/** The session whose runs a card shows: a retained Planner session, or one a restart rebuilt. */
+type RunsOwner = Pick<PlannerSession, "suspended">;
+
+/** What showing and storing a session's run cards needs of the room. */
+type RunsRoom = Pick<Room, "chat" | "room" | "server" | "persist"> & {
+	auth: { storage: Pick<Room["auth"]["storage"], "runStages"> };
+};
+
+/** Stand-ins, by session id, for the sessions a restart rebuilt whose clients report runs. */
+const rebuiltOwners = new WeakMap<Chat, Map<string, { owner: RunsOwner; down: boolean }>>();
+
+/**
+ * Shows the runs reported by a Planner session a restart rebuilt and its client took back, `down`
+ * while its client's link has dropped again. No turn of this process opened that session, so
+ * nothing here retains it and its reports reach Chat only this way, as a retained session's do.
+ */
+export function rebuiltRuns(
+	context: RunsRoom,
+	session: string,
+	runs: Runs,
+	down = false,
+): Promise<void> {
+	if (context.chat.closed) return Promise.resolve();
+	let known = rebuiltOwners.get(context.chat)
+		?? new Map<string, { owner: RunsOwner; down: boolean }>();
+	rebuiltOwners.set(context.chat, known);
+	let entry = known.get(session);
+	if (!entry) {
+		let made: { owner: RunsOwner; down: boolean } = {
+			owner: { suspended: () => made.down },
+			down,
+		};
+		entry = made;
+		known.set(session, entry);
+	}
+	entry.down = down;
+	return publishRuns(context, entry.owner, runs);
+}
 
 /**
  * Show the session's runs, keeping ended ones as summary cards until the next
@@ -2248,13 +2365,13 @@ type Runs = { active: string[]; paused: string[]; cards?: Wire.Run[] };
  * it: a report or release only changes its own session's cards.
  */
 function publishRuns(
-	context: Room,
-	session: PlannerSession,
+	context: RunsRoom,
+	session: RunsOwner,
 	runs: Runs | undefined,
 	releasing = false,
-	followUp = false,
+	followUp?: (run: Wire.Run, said: string) => Promise<void>,
 ): Promise<void> {
-	let known = owners.get(context.chat) ?? new Map<string, PlannerSession>();
+	let known = owners.get(context.chat) ?? new Map<string, RunsOwner>();
 	owners.set(context.chat, known);
 	for (let run of runs?.cards ?? []) known.set(run.id, session);
 	let turn = (publishing.get(context.chat) ?? Promise.resolve()).then(() =>
@@ -2265,11 +2382,11 @@ function publishRuns(
 }
 
 async function publishReport(
-	context: Room,
-	session: PlannerSession,
+	context: RunsRoom,
+	session: RunsOwner,
 	runs: Runs | undefined,
 	releasing: boolean,
-	followUp: boolean,
+	followUp: ((run: Wire.Run, said: string) => Promise<void>) | undefined,
 ): Promise<void> {
 	let { chat, room, server } = context;
 	let at = now();
@@ -2351,7 +2468,7 @@ async function publishReport(
 	for (let entry of finished) announce(server, room, entry);
 	state(chat, server, room);
 	if (prior.some(run => !shown.has(run.id))) await forgetStages(context, next);
-	for (let { run, said } of attention) await followUpEndedRun(context, run, said);
+	for (let { run, said } of attention) await followUp?.(run, said);
 }
 
 /**
@@ -2421,7 +2538,13 @@ function retain(
 			if (chat.retained?.session !== opened.session) return;
 			let planning = chat.busy && !chat.job && chat.agent === opened.session;
 			let followUp = !planning && opened.session.followsUpRuns !== false;
-			void publishRuns(context, opened.session, next, false, followUp);
+			void publishRuns(
+				context,
+				opened.session,
+				next,
+				false,
+				followUp ? (run, said) => followUpEndedRun(context, run, said) : undefined,
+			);
 			if (next.active.length || next.paused.length) return;
 			release();
 		});
@@ -2539,28 +2662,17 @@ export function documentRoom(context: Room): DocumentRoom {
 		}),
 		currentMemberRequest: () => currentMemberRequest(chat),
 		...(!chat.job && {
-			uploadImage: async ({ bytes, mimeType }) => {
+			uploadImage: async ({ alt, bytes, mimeType }) => {
 				if (
 					chat.closed || !chat.busy || !chat.turnController || chat.turnController.signal.aborted
 				) {
 					throw new Error("images can be stored only during a Planner turn");
 				}
+				let images = turnImages(chat);
 				let channel = await context.auth.storage.channels.get(room);
 				if (!channel) throw new Error("this document is unavailable");
 				if (channel.archivedAt) throw new Error("this document is archived");
-				// Whoever the turn is for owns the upload; a turn nobody asked for, such as a
-				// follow-up, is the Planner owner's.
-				let uploadedBy = currentMemberRequest(chat)?.userId;
-				if (!uploadedBy) {
-					let binding = await context.activeOwner?.();
-					if (!binding) throw new Error("this Planner has no owner to store the image for");
-					try {
-						uploadedBy = (await context.auth.sessions.resolve(binding.ownerSessionId))?.user.id;
-					} finally {
-						binding.release();
-					}
-				}
-				if (!uploadedBy) throw new Error("this Planner has no owner to store the image for");
+				let uploadedBy = await imageOwner(context);
 				let sha256 = createHash("sha256").update(bytes).digest("hex");
 				await context.auth.storage.images.put({
 					channelId: room,
@@ -2570,7 +2682,23 @@ export function documentRoom(context: Room): DocumentRoom {
 					uploadedBy,
 					now: context.auth.clock(),
 				});
-				return { path: imagePath(sha256, mimeType) };
+				let path = imagePath(sha256, mimeType);
+				let size = imageSize(mimeType, bytes);
+				if (chat.turnImages === images) {
+					later(images, () =>
+						size
+							? showImages(context, images, [{
+								src: path,
+								...(alt === undefined ? {} : { alt }),
+								...size,
+								generated: true,
+							}])
+							: showImages(context, images, [], undefined, [{
+								before: 0,
+								reason: `${headerRefusal(mimeType)}${alt ? ` Alt: ${alt}` : ""}`,
+							}]));
+				}
+				return { path };
 			},
 		}),
 		focusedChild: () =>
@@ -2647,22 +2775,41 @@ export function retainReferences(chat: Chat, references: Wire.Reference[]): void
 	}
 }
 
+/**
+ * What a reply sent from a thread with Also send to Chat does in the top-level Chat once it is
+ * there, as a message said in Chat does: the room hears of it, and one to the room may draw the
+ * Planner's initiative. One to the Planner is answered in its thread, and copied here as it is.
+ */
+export function copiedToChat(context: Room, ws: Socket, entry: Wire.Entry, focus?: string): void {
+	let { chat } = context;
+	context.roomMessagePublished?.();
+	context.memberMessagePersisted?.(entry, context.claimantSessionId);
+	if (entry.author.kind !== "member") return;
+	chat.backscroll = remember(chat.backscroll, {
+		entryId: entry.id,
+		handle: entry.author.handle,
+		text: entry.text,
+		...(entry.references?.length ? { references: entry.references } : {}),
+	});
+	if (publicEntry(entry).to !== "planner") contributed(context, ws, entry, focus);
+}
+
 export function sessionBootstrap(
 	chat: Chat,
 	cursor: number,
 	summary: string,
 	currentEntryId?: string,
 	currentReferences: Wire.Reference[] = [],
+	overrideEntries?: Wire.Entry[],
 ): string | undefined {
 	let start = Number.isSafeInteger(cursor) && cursor >= 0 && cursor <= chat.entries.length
 		? cursor
 		: 0;
-	// A message the Planner has not been given, or never will be, is not part of what it was told.
-	let candidates = chat.entries.slice(start)
-		.filter(entry =>
-			entry.id !== currentEntryId && entry.deliveryState !== "sent"
-			&& entry.deliveryState !== "failed"
-		)
+	let candidates = (overrideEntries
+		?? (chat.forkBootstrap
+			? [...chat.forkBootstrap, ...chat.entries.slice(start)]
+			: chat.entries.slice(start)))
+		.filter(entry => entry.id !== currentEntryId)
 		.slice(-100);
 	let allReferenceIds = new Set(
 		candidates.flatMap(entry => entry.references?.map(reference => reference.id) ?? []),
@@ -2673,6 +2820,8 @@ export function sessionBootstrap(
 			: entry.author.kind === "agent"
 			? "Planner"
 			: "System";
+		// A thread's reply also sent to Chat, and the Planner's answer to it: said in the thread.
+		if (entry.fromThread !== undefined) speaker = `${speaker} (in a thread, also sent to Chat)`;
 		return `${speaker}: ${annotatedText(entry.text, entry.references, readable)}`;
 	};
 	let selected: Wire.Entry[] = [];
@@ -2760,10 +2909,14 @@ async function repositorySession(
 	claimantSessionId: string | undefined,
 	currentEntryId?: string,
 	currentReferences: Wire.Reference[] = [],
-): Promise<{ session: PlannerSession; binding: ActiveOwnerBinding }> {
+	retry = false,
+	bootstrapInPrompt = false,
+): Promise<{ session: PlannerSession; binding: ActiveOwnerBinding; bootstrap?: string }> {
 	let retained = context.chat.retained;
+	let reader = !!context.chat.reader;
+	let isolated = reader || !!context.chat.job;
 	// A background job keeps its isolated session: it never borrows or ends the retained Planner.
-	if (retained && !context.chat.job) {
+	if (retained && !isolated) {
 		if (!retained.binding.signal.aborted && await retained.binding.revalidate()) {
 			context.chat.agent = retained.session;
 			return { session: retained.session, binding: retained.binding };
@@ -2802,7 +2955,11 @@ async function repositorySession(
 			|| binding.credentialRevision !== owner.access.revision
 			|| binding.repository.id !== repository.id
 			|| chat.lifecycle !== lifecycle || chat.openingOwner !== openingOwner
-		) throw new PlannerOwnerUnavailableError("Chopin's owner changed while opening. Try again.");
+		) {
+			throw new PlannerOwnerUnavailableError(
+				`${PLANNER_NAME}'s owner changed while opening. Try again.`,
+			);
+		}
 		await auth.storage.channels.updateAgentContext({
 			channelId: context.room,
 			ownerSessionId,
@@ -2813,27 +2970,54 @@ async function repositorySession(
 			now: new Date(),
 		});
 		chat.referenceCache.clear();
-		let bootstrap = sessionBootstrap(
+		// A reader's session has no tools and no history of its own, so it neither forks nor moves the
+		// Planner's session tree: its reply stays untracked, for the next Planner turn to be told.
+		let forkSetup = !isolated
+			? context.sessionForks?.prepareTurn(currentEntryId, retry)
+			: undefined;
+		let fullBootstrap = sessionBootstrap(
 			chat,
 			ownership.transcriptCursor,
 			ownership.summary,
 			currentEntryId,
 			currentReferences,
 		);
+		let nativeBootstrap = forkSetup?.skipBootstrap
+			? sessionBootstrap(
+				chat,
+				ownership.transcriptCursor,
+				ownership.summary,
+				currentEntryId,
+				currentReferences,
+				forkSetup.untrackedEntries ?? [],
+			)
+			: fullBootstrap;
 		let open = context.openPlannerSession
 			?? (await import("../harness/session")).openPlannerSession;
+		// What the room said changes every turn, and a fresh session starts for each one, so it goes
+		// before the turn's prompt: the instructions stay the same from turn to turn, and the model
+		// provider can reuse its cache of them instead of reading them all again.
+		let bootstrap: string | undefined;
 		let result = await open(binding, {
 			room: documentRoom(context),
 			repository,
-			instructions: workspace =>
-				plannerInstructions(
+			chat,
+			...(forkSetup?.fork ? { fork: forkSetup.fork } : {}),
+			instructions: reader ? READER_INSTRUCTIONS : workspace => {
+				let usedNative = !!forkSetup?.skipBootstrap
+					&& !(workspace && "remote" in workspace && workspace.forkedNatively === false);
+				let chosen = usedNative ? nativeBootstrap : fullBootstrap;
+				if (bootstrapInPrompt) bootstrap = chosen;
+				return plannerInstructions(
 					`${repository.owner}/${repository.name}`,
-					bootstrap,
+					bootstrapInPrompt ? undefined : chosen,
 					workspace,
 					visualRouting(context),
-				),
+				);
+			},
 			model: context.config.model || undefined,
 			harness: context.config.harness,
+			...(reader ? { reader: true as const } : {}),
 		});
 		if (!result.ok) {
 			if (binding.signal.aborted) {
@@ -2847,14 +3031,14 @@ async function repositorySession(
 			|| binding.signal.aborted || !await binding.revalidate()
 		) {
 			throw new PlannerOwnerUnavailableError(
-				"Chopin's session changed while opening. Try again.",
+				`${PLANNER_NAME}'s session changed while opening. Try again.`,
 			);
 		}
 		chat.agent = opened;
 		chat.owner = openingOwner;
-		if (!chat.job) consumeBootstrapBackscroll(chat);
+		if (!isolated) consumeBootstrapBackscroll(chat);
 		else chat.bootstrapEntries = undefined;
-		return { session: opened, binding };
+		return { session: opened, binding, ...(bootstrap ? { bootstrap } : {}) };
 	} catch (err) {
 		await opened?.destroy();
 		binding?.release();
@@ -2951,7 +3135,7 @@ function settle(chat: Chat, server: Server<SocketData>, room: string, stopped: b
 	chat.timings.clear();
 }
 
-/** Run one turn, then drain whatever queued up behind it. */
+/** Run one turn, then start the next of Chopin's own that waited behind it. */
 async function run(
 	context: Room,
 	handle: string,
@@ -2975,10 +3159,15 @@ async function run(
 	let replyOnly = false;
 	// The turn a failure notice names, kept past `finally`, which clears the live fields.
 	let began: { request?: string; focus?: string } = {};
+	let skipped = false;
+	let reader = !!about?.reader;
+	let isolated = reader || !!jobTurn;
+	chat.backgroundTurn = jobTurn;
 
 	if (!reserved) {
 		chat.busy = true;
-		chat.turn = begin(handle, chat.entries.length);
+		// A background job's turn is neither saved nor shown: Chat draws nothing for it.
+		chat.turn = begin(handle, chat.entries.length, !!jobTurn);
 		chat.acting = thread;
 		chat.actingChannel = about?.threadChannel;
 		(jobTurn ? jobState : state)(chat, server, room);
@@ -2986,12 +3175,15 @@ async function run(
 		chat.acting = thread;
 		chat.actingChannel = about?.threadChannel;
 	}
+	// A turn a person can talk to takes their messages as it works. A background job's session is
+	// isolated: it takes none.
+	let steered = !jobTurn && chat.turn ? steering(chat.turn.id) : undefined;
+	chat.steering = steered;
 	try {
 		about?.started?.();
 	} catch (err) {
 		console.error("[chat] an instruction's start could not be recorded:", err);
 	}
-	// Read directly: the drain has already taken this draft's queue entry.
 	let draft = context.draft && chat.draft?.id === context.draft ? chat.draft : undefined;
 	if (draft) {
 		draft.state = "running";
@@ -3018,6 +3210,7 @@ async function run(
 		}
 		: undefined;
 	chat.messageIds = new Map();
+	chat.toolEntries = new Map();
 	if (!jobTurn) chat.captured = new Set();
 	if (jobTurn) {
 		chat.job = jobTurn.job;
@@ -3026,6 +3219,7 @@ async function run(
 		chat.jobFailureCode = undefined;
 		chat.jobCalls = new Map();
 	}
+	if (reader) chat.reader = true;
 	let sendStarted = false;
 	let outcome: JobOutcome | undefined;
 	let persistenceError: unknown;
@@ -3037,18 +3231,36 @@ async function run(
 	if (about?.signal?.aborted) invalidate();
 	else about?.signal?.addEventListener("abort", invalidate, { once: true });
 	chat.turnController = turnController;
-	let held = jobTurn ? chat.retained : undefined;
+	let held = isolated ? chat.retained : undefined;
 	let heldOwner = chat.owner;
 	let heldReferences = held ? new Map(chat.referenceCache) : undefined;
 	try {
-		// A request kept as a row was handed to its machine in a session opened before its row moved.
-		let preopened = (about as Waiting | undefined)?.opened;
-		if (about) delete (about as Waiting).opened;
-		opened = preopened
-			?? await repositorySession(context, claimantSessionId, member?.entryId, references);
+		if (about?.authorize && !await about.authorize()) {
+			skipped = true;
+			turnController.abort();
+			throw new Error("The turn is no longer authorized.");
+		}
+		// A skill or a prompt template has to open the prompt, as a background job's header does, so
+		// their fresh sessions are told what the room said in their instructions instead.
+		let command = jobTurn || reader ? undefined : commandReference(references);
+		let { bootstrap, ...repositoryOpened } = await repositorySession(
+			context,
+			claimantSessionId,
+			member?.entryId,
+			references,
+			!!member?.retry,
+			!jobTurn && (command === undefined || command.commandKind === COMMAND_KINDS.workflow),
+		);
+		opened = repositoryOpened;
+		// Given once, with the session's first prompt.
+		let withBootstrap = (text: string) => {
+			let told = bootstrap;
+			bootstrap = undefined;
+			return withSessionContext(told, text);
+		};
 		if (about?.signal && about.spent?.()) turnController.abort();
 		if (chat.agent !== opened.session || turnController.signal.aborted) {
-			throw new Error("Chopin's session changed before the turn started. Try again.");
+			throw new Error(`${PLANNER_NAME}'s session changed before the turn started. Try again.`);
 		}
 		chat.jobToolNames = jobTurn
 			? new Set(opened.session.activeTools ?? PLANNER_TOOL_NAMES)
@@ -3058,10 +3270,12 @@ async function run(
 		let files: PlannerFiles | undefined;
 		if (jobTurn) {
 			prompt = jobTurn.prompt;
+		} else if (reader) {
+			// The backscroll and references are the writers' to take.
+			prompt = text;
 		} else {
 			// A skill or a prompt template is Atomic's own `/name args`, which has to open the prompt:
 			// what the room said and the focus line wait for the next turn instead of standing before it.
-			let command = commandReference(references);
 			let opening = command !== undefined && command.commandKind !== COMMAND_KINDS.workflow;
 			// Drained rather than copied: what the agent has been told once should
 			// not arrive again on the next turn.
@@ -3086,7 +3300,6 @@ async function run(
 				}
 			}
 		}
-		if (member) markDelivered(context, member.entryId);
 		sendStarted = true;
 		if (!jobTurn) {
 			chat.toolFinished = (id, output, success) => {
@@ -3128,14 +3341,28 @@ async function run(
 			}
 			let { notice: _, ...choice } = picked ?? {};
 			let session = opened.session;
+			// Only the first attempt runs the message again; a repair continues it.
+			let retrying = !!member?.retry;
 			await publishPlannerReplies({
 				session: {
-					stream: (text, abort, _choice, sent) => session.stream(text, abort, choice, sent),
+					stream: async (text, abort, _choice, sent) => {
+						let answers = member
+							? { id: member.entryId, ...(retrying ? { retry: true as const } : {}) }
+							: undefined;
+						retrying = false;
+						let result = await session.stream(withBootstrap(text), abort, choice, sent, answers);
+						// Its first call is made: a message given to the turn now reaches it, and
+						// people are told the turn is running, as the machine has its prompt.
+						steered?.open(session);
+						if (reserved && member) state(chat, server, room);
+						return result;
+					},
 				},
 				prompt,
 				...(files ? { files } : {}),
 				signal,
 				decide: context.decide,
+				repair: !reader,
 				// Only a card still holding its question counts: one a person discarded, or that
 				// was cancelled, leaves nothing for the people in the room to decide.
 				capturedDecisions: () =>
@@ -3149,6 +3376,11 @@ async function run(
 						&& record.origin === "planner" && !!record.followUp && holdsQuestion(record.status)
 					).length,
 				publish: part => translate(context, part),
+				quiet: quiet => quieten(chat, server, room, quiet),
+				beginAttempt: () => {
+					chat.toolEntries = new Map();
+					if (chat.turnImages) chat.turnImages.calls = new Set();
+				},
 			});
 		}
 		if (jobTurn && chat.closed) throw new Error("The document closed.");
@@ -3164,7 +3396,8 @@ async function run(
 				: { status: "done", output: chat.jobOutput };
 		}
 	} catch (err) {
-		console.error("[chat] turn failed:", err);
+		// A job that gave way to a person's turn did not fail: it runs again later.
+		if (!jobTurn?.preempted) console.error("[chat] turn failed:", err);
 		// A stop the room asked for is not a failure; an interruption is.
 		failed = !turnController.signal.aborted || !!chat.interruption;
 		// A reply the check refused ended no workflow run and answered no question.
@@ -3209,6 +3442,8 @@ async function run(
 		}
 		chat.interruption = undefined;
 	} finally {
+		steered?.end();
+		if (chat.steering === steered) chat.steering = undefined;
 		about?.signal?.removeEventListener("abort", invalidate);
 		releaseJobAbort?.();
 		chat.activeRequest = undefined;
@@ -3223,11 +3458,11 @@ async function run(
 			// A turn the Planner's link dropped under fails, but its client may come back for the
 			// runs and questions the session still holds.
 			if (
-				opened && !chat.closed && !jobTurn
+				opened && !chat.closed && !isolated
 				&& (!failed || replyOnly || opened.session.suspended?.())
 			) kept = retain(context, opened);
 			if (!kept) {
-				if (!jobTurn && chat.retained?.session === opened?.session) await chat.retained?.release();
+				if (!isolated && chat.retained?.session === opened?.session) await chat.retained?.release();
 				else await opened?.session.destroy();
 			}
 		} catch (err) {
@@ -3242,7 +3477,7 @@ async function run(
 						say(chat, server, room, {
 							id: ulid(),
 							author: { kind: "system" },
-							text: "Chopin's session could not close cleanly. Try again.",
+							text: `${PLANNER_NAME}'s session could not close cleanly. Try again.`,
 							turnFailure: turnFailureOf({ error: err, suspended: false, ...began }),
 							ts: now(),
 						});
@@ -3265,7 +3500,9 @@ async function run(
 				}
 			}
 		}
+		await endTurnImages(chat);
 		chat.messageIds = undefined;
+		chat.toolEntries = undefined;
 		chat.writing = undefined;
 		chat.tooling = undefined;
 		settle(chat, server, room, turnController.signal.aborted && !failed);
@@ -3277,14 +3514,16 @@ async function run(
 			chat.jobCalls = undefined;
 		}
 		chat.jobToolNames = undefined;
-		// A turn that came from a row ends it in the commit that saves the turn: `interrupted` when
-		// the restart cut it off, which is never run again.
-		let ending = about?.deferred && context.deferred
-			? [move(about.deferred.row, "started", chat.restarted ? "interrupted" : "ended")]
-			: undefined;
-		chat.restarted = undefined;
+		chat.reader = undefined;
+		if (!isolated && context.sessionForks) {
+			try {
+				await context.sessionForks.finishTurn(began.request, chat.entries.slice(firstEntry));
+			} catch (err) {
+				console.error("[chat] could not save session fork state:", err);
+			}
+		}
 		try {
-			if (!chat.closed || ending) logRefused(await save(context, ending));
+			if (!chat.closed) await context.persist();
 		} catch (err) {
 			persistenceError = err;
 			console.error("[chat] could not save a finished turn:", err);
@@ -3295,6 +3534,14 @@ async function run(
 				outcome = { status: "failed", reason: jobReason(persistenceError) };
 			} else if (chat.interruption) {
 				outcome = { status: "failed", reason: jobReason(chat.interruption) };
+			}
+			if (jobTurn.preempted && !chat.closed && !persistenceError) {
+				// What its own tool wrote before it gave way is its result; with none, it runs again.
+				let output = jobTurn.output ?? (outcome?.status === "done" ? outcome.output : undefined);
+				outcome = output === undefined ? PREEMPTED : { status: "done", output };
+			}
+			if (outcome?.status !== "preempted") {
+				chat.preemptions?.delete(`${jobTurn.job.kind}:${jobTurn.job.target}`);
 			}
 		}
 
@@ -3340,7 +3587,13 @@ async function run(
 		let said = chat.entries.slice(firstEntry).findLast(entry => entry.author.kind === "agent");
 		let stopped = turnController.signal.aborted && !failed;
 		await report(about, {
-			status: failed || persistenceError ? "failed" : stopped ? "stopped" : "done",
+			status: failed || persistenceError
+				? "failed"
+				: skipped
+				? "skipped"
+				: stopped
+				? "stopped"
+				: "done",
 			...(said?.text.trim() ? { text: said.text } : {}),
 		});
 	}
@@ -3350,8 +3603,9 @@ async function run(
 }
 
 /**
- * Starts the next queued turn, if one may start. Called when a turn has ended (`ended` says how)
- * and, with none running, when something that held the queue is over (`ended` absent).
+ * Starts the next of Chopin's own waiting turns, if one may start. Called when a turn has ended
+ * (`ended` says how) and, with none running, when something that held them is over (`ended`
+ * absent).
  */
 async function drain(
 	context: Room,
@@ -3374,26 +3628,23 @@ async function startNext(
 	ended?: { job: boolean; outcome: JobOutcome | undefined },
 ): Promise<void> {
 	let { chat, room, server } = context;
-	// Synchronous unless a request kept as a row has to pass the start rule, so a turn's end and
-	// the queue's next step stay in one tick as they always were.
-	let take = () => {
-		let head = chat.waiting[0];
-		if (!head?.deferred || !context.deferred) return pending(chat);
-		// A request the machine could not open a session for waits until something new says it may.
-		return chat.unopened ? undefined : nextStartable(context);
-	};
-	let next = startsHeld ? undefined : take();
-	if (next instanceof Promise) next = await next;
-	while (next) {
+	// A person's turn that preempted a job goes first.
+	let preempting = chat.preempting;
+	chat.preempting = undefined;
+	if (preempting && !startsHeld) {
+		chat.starting = false;
+		if (ended) await run(...preempting);
+		else startRun(...preempting);
+		return;
+	}
+	let next = startsHeld ? undefined : pending(chat);
+	if (next) {
 		if (next.job) chat.handoffJob = next.job;
-		let begun: Begun = "started";
-		let turnContext = { ...context, invokedBy: next.invokedBy, draft: next.draft };
 		try {
-			if (next.deferred && context.deferred) begun = await beginTurn(turnContext, next);
-			else await context.persist();
+			await context.persist();
 		} catch (err) {
 			if (chat.handoffJob === next.job) chat.handoffJob = undefined;
-			console.error("[chat] could not save a queued turn:", err);
+			console.error("[chat] could not save a waiting turn:", err);
 			if (next.job) finishJob(next.job, { status: "failed", reason: jobReason(err) });
 			stopAfterPersistenceFailure(chat, server, room);
 			return;
@@ -3401,29 +3652,18 @@ async function startNext(
 		if (chat.handoffJob === next.job) chat.handoffJob = undefined;
 		if (chat.closed) {
 			if (next.job) finishJob(next.job, { status: "failed", reason: "The document closed." });
-			if (next.opened) await discard(context, next.opened);
 			return;
 		}
-		if (begun === "unopened") {
-			// Still waiting, still marked sent: back at the head of the queue, as it was.
-			chat.unopened = true;
+		if (next.job?.settled) {
+			// Settled while its handoff save was pending: it never runs, and the next one is tried.
+			return startNext(context, ended);
+		}
+		if (chat.preempting) {
+			// A person asked while it was handed the Chat: it waits behind their turn.
 			chat.waiting.unshift(next);
-			queued(chat, server, room);
-			next = undefined;
-			break;
+			return startNext(context, ended);
 		}
-		if (begun === "gone" || next.job?.settled) {
-			next = take();
-			if (next instanceof Promise) next = await next;
-			continue;
-		}
-		(next.job ? jobQueued : queued)(chat, server, room);
-		let nextId = next.id;
-		let entry = next.message ? chat.entries.find(item => item.id === nextId) : undefined;
-		if (entry && !next.posted) {
-			announce(server, room, entry);
-			context.memberMessagePersisted?.(entry, next.sessionId);
-		}
+		let turnContext = { ...context };
 		let turn = [
 			turnContext,
 			next.handle,
@@ -3431,10 +3671,8 @@ async function startNext(
 			next,
 			claimantOf(context, next),
 			false,
-			next.message && next.userId
-				? { entryId: next.id, userId: next.userId, ...(next.focus ? { focus: next.focus } : {}) }
-				: undefined,
-			next.references,
+			undefined,
+			undefined,
 			next.job,
 		] as const;
 		// The turn marks the Chat busy as it begins, which ends the wait to start.
@@ -3449,6 +3687,7 @@ async function startNext(
 	// Called with nothing running, there is nothing to settle.
 	if (!ended) return;
 	chat.busy = false;
+	chat.backgroundTurn = undefined;
 	chat.turn = undefined;
 	chat.acting = undefined;
 	chat.actingChannel = undefined;
@@ -3492,12 +3731,11 @@ function startRun(
 }
 
 /**
- * The next queued turn worth running.
+ * The next waiting turn worth running.
  *
- * A turn whose work is already done is dropped rather than run: four accepted
- * comments should not cost four passes over the plan when the agent dealt with
- * all of them in the first. Only something that queued behind a turn can be
- * spent, which is why the question is asked here and not when it was accepted.
+ * A turn whose work is already done is dropped rather than run: an initiative proposal for a
+ * message somebody has since answered is not worth a pass over the plan. Only something that waited
+ * behind a turn can be spent, which is why the question is asked here and not when it was accepted.
  */
 export function pending(chat: Chat): Waiting | undefined {
 	let next = chat.waiting.shift();
@@ -3505,658 +3743,72 @@ export function pending(chat: Chat): Waiting | undefined {
 		void report(next, { status: "skipped" });
 		next = chat.waiting.shift();
 	}
-	if (next?.message && !next.posted) {
-		let entry: MemberEntry = {
-			id: next.id,
-			author: { kind: "member", handle: next.handle },
-			text: next.text,
-			ts: now(),
-			...(next.references?.length ? { references: next.references } : {}),
-			...(next.attachments?.length ? { attachments: next.attachments } : {}),
-			...(next.delivery ? { delivery: next.delivery } : {}),
-		};
-		chat.entries.push(entry);
-	}
 	return next;
 }
 
-/** What a start of the queue needs, or that it cannot start now. */
-type Gate = { ok: true; claimant?: string } | { ok: false };
-
-/**
- * Whether the queue may start, claiming nothing until a login is known to be live. Under
- * `HARNESS=remote` only an attached Planner starts it. Otherwise the document's owner must have a
- * live login, or, with no owner, a login of one of the waiting requests' senders, which claims it.
- */
-async function startGate(context: Room): Promise<Gate> {
-	if (context.plannerReady) return await context.plannerReady() ? { ok: true } : { ok: false };
-	let { auth, chat, room } = context;
-	let owner = (await auth.storage.channels.readAgent(room, auth.clock()))?.agent?.ownerSessionId;
-	if (owner) return await auth.sessions.resolve(owner) ? { ok: true } : { ok: false };
-	let candidates = new Set(chat.waiting.flatMap(item => item.deferred?.claimants ?? []));
-	for (let id of candidates) {
-		if (await auth.sessions.resolve(id)) return { ok: true, claimant: id };
-	}
-	return { ok: false };
-}
-
-/** Whether the person who sent a waiting request can still write to the document, if we can tell. */
-async function stillWrites(context: Room, item: Waiting): Promise<boolean> {
-	let { auth, repository } = context;
-	let session = item.sessionId ? await auth.sessions.resolve(item.sessionId) : undefined;
-	if (!session) return true;
-	try {
-		let checked = await auth.sessions.use(
-			session,
-			token => auth.github.repositoryAccess(token, repository.owner, repository.name),
-		);
-		let current = checked.value;
-		return !!current && current.id === repository.id
-			&& (current.permissions.push || current.permissions.admin);
-	} catch {
-		return true;
-	}
-}
-
-/** Logs what a commit refused to do to a row; a refused move changes nothing. */
-function logRefused(outcomes: DeferredTurnOutcome[] | void): void {
-	for (let outcome of outcomes ?? []) {
-		if (outcome.action === "transition" && !outcome.changed) {
-			console.error(`[chat] a queued request was not moved: ${outcome.reason}`);
-		}
-	}
-}
-
-/**
- * The next queued turn that may start. A request kept as a row starts only through the start
- * rule: a comment whose thread was resolved is cancelled quietly, and one whose sender can no
- * longer write is cancelled as failed. Anything else leaves the queue as it is.
- */
-async function nextStartable(context: Room): Promise<Waiting | undefined> {
-	let { chat } = context;
-	while (true) {
-		let first = chat.waiting[0];
-		if (!first) return undefined;
-		if (!first.deferred || !context.deferred) return pending(chat);
-		if (first.spent?.()) {
-			chat.waiting.shift();
-			await cancelRow(context, first, "spent");
-			continue;
-		}
-		let gate = await startGate(context);
-		if (!gate.ok) return undefined;
-		if (chat.waiting[0] !== first) continue;
-		// A child that was deleted or archived while the request waited would answer in the
-		// wrong document, so the request ends instead.
-		if (first.focus && context.children && !await context.children.resolve(first.focus.channelId)) {
-			if (chat.waiting[0] === first) chat.waiting.shift();
-			await cancelRow(context, first, "unavailable");
-			continue;
-		}
-		if (chat.waiting[0] !== first) continue;
-		if (!await stillWrites(context, first)) {
-			if (chat.waiting[0] === first) chat.waiting.shift();
-			await cancelRow(context, first, "access");
-			continue;
-		}
-		if (chat.waiting[0] !== first) continue;
-		if (gate.claimant) first.sessionId = gate.claimant;
-		return pending(chat);
-	}
-}
-
-/**
- * Shows a message as delivered once its prompt is on its way to the machine: a session is open
- * there and nothing before the prompt can fail. A request kept as a row is marked in the commit
- * that starts it; one that started at once is marked here.
- */
-function markDelivered(context: Room, entryId: string): void {
-	let { chat, room, server } = context;
-	let entry = chat.entries.find(value => value.id === entryId);
-	if (!entry || entry.deliveryState !== "sent") return;
-	entry.deliveryState = "delivered";
-	announce(server, room, entry);
-}
-
-type Begun = "started" | "gone" | "unopened";
-
-/** The login whose Copilot entitlement runs a queued turn. */
+/** The login whose Copilot entitlement runs a waiting turn. */
 function claimantOf(context: Room, next: Waiting): string | undefined {
-	if (next.job?.job.kind === "decision-followup") return undefined;
-	return next.invokedBy ? next.sessionId : next.sessionId ?? context.claimantSessionId;
+	if (next.job?.job.kind === "decision-followup" || next.reader) return undefined;
+	return next.sessionId ?? context.claimantSessionId;
 }
 
-/** Lets go of a session opened for a turn that will not run in it. */
-async function discard(context: Room, opened: NonNullable<Waiting["opened"]>): Promise<void> {
-	let { chat } = context;
-	// A retained session lives on for its workflow runs; it was only borrowed.
-	if (chat.retained?.session === opened.session) return;
-	try {
-		await opened.session.destroy();
-	} catch (err) {
-		console.error("[chat] could not close a session no turn used:", err);
+function readTokenNumber(value: unknown): number {
+	if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+		return Math.floor(value);
 	}
-	opened.binding.release();
-	if (chat.agent === opened.session) chat.agent = undefined;
-	chat.owner = undefined;
-}
-
-/**
- * Saves that a queued turn is about to run. A request kept as a row is handed to the machine only
- * once a session is open there: it moves from waiting to started in the commit that shows its
- * message as delivered, never before. `unopened` says the machine could not open one, and the row
- * is still waiting; `gone`, that the row is no longer waiting because it was cancelled meanwhile,
- * and the turn must not run.
- */
-async function beginTurn(context: Room, next: Waiting): Promise<Begun> {
-	let { chat, room, server } = context;
-	let held = next.deferred;
-	if (!held || !context.deferred) {
-		await context.persist();
-		return "started";
-	}
-	let opened: NonNullable<Waiting["opened"]>;
-	try {
-		opened = await repositorySession(
-			context,
-			claimantOf(context, next),
-			next.message && next.userId ? next.id : undefined,
-			next.references,
-		);
-	} catch (err) {
-		console.error("[chat] a saved request waits: no session could be opened for it:", err);
-		return "unopened";
-	}
-	let entry = next.message
-		? chat.entries.find(value => value.id === (held.entry ?? next.id))
-		: undefined;
-	let before = entry?.deliveryState;
-	if (entry) entry.deliveryState = "delivered";
-	let outcomes: DeferredTurnOutcome[] | void;
-	try {
-		outcomes = await context.persist(undefined, [move(held.row, "waiting", "started")]);
-	} catch (err) {
-		if (entry) entry.deliveryState = before;
-		await discard(context, opened);
-		throw err;
-	}
-	let outcome = outcomes?.[0];
-	if (outcome && outcome.action === "transition" && !outcome.changed) {
-		logRefused(outcomes);
-		if (entry && before !== undefined) entry.deliveryState = before;
-		await discard(context, opened);
-		return "gone";
-	}
-	if (entry) announce(server, room, entry);
-	next.opened = opened;
-	return "started";
-}
-
-/**
- * Starts the queue now if it may start, once whatever else is being accepted has been. A request
- * that can start at once, such as one a machine that is back was waiting for, never waits for the
- * next turn to end.
- */
-export function kick(context: Room): Promise<void> {
-	let { chat } = context;
-	if (!context.deferred || chat.closed) return Promise.resolve();
-	// Whatever called says the machine may be there now, so the head of the queue is tried again.
-	chat.unopened = false;
-	let go = async () => {
-		if (chat.closed) return;
-		// Before anything starts, so a message whose save was never answered is not passed over.
-		if (chat.unsure?.size) {
-			await adoptUnsure(context).catch(err =>
-				console.error("[chat] could not look for a message whose save was not answered:", err)
-			);
+	if (value && typeof value === "object" && "total" in value) {
+		let total = (value as { total?: unknown }).total;
+		if (typeof total === "number" && Number.isFinite(total) && total >= 0) {
+			return Math.floor(total);
 		}
-		if (chat.busy || chat.starting || startsHeld || chat.waiting.length === 0) return;
-		await drain(context);
+	}
+	return 0;
+}
+
+function readCachedTokens(value: unknown): number {
+	if (!value || typeof value !== "object") return 0;
+	let item = value as { cachedInputTokens?: unknown; inputTokens?: unknown };
+	if (typeof item.cachedInputTokens === "number" && item.cachedInputTokens > 0) {
+		return Math.floor(item.cachedInputTokens);
+	}
+	if (item.inputTokens && typeof item.inputTokens === "object") {
+		let cacheRead = (item.inputTokens as { cacheRead?: unknown }).cacheRead;
+		if (typeof cacheRead === "number" && cacheRead > 0) return Math.floor(cacheRead);
+	}
+	return 0;
+}
+
+function recordUsage(context: Room, rawUsage: unknown): void {
+	if (!rawUsage || typeof rawUsage !== "object") return;
+	let item = rawUsage as { inputTokens?: unknown; outputTokens?: unknown; totalTokens?: unknown };
+	let inputTokens = readTokenNumber(item.inputTokens);
+	let outputTokens = readTokenNumber(item.outputTokens);
+	let totalTokens = readTokenNumber(item.totalTokens) || inputTokens + outputTokens;
+	if (totalTokens <= 0) return;
+	let cachedTokens = readCachedTokens(rawUsage);
+	let contextWindow = context.chat.contextWindow && context.chat.contextWindow > 0
+		? context.chat.contextWindow
+		: 128_000;
+	let usage: Wire.ContextUsage = {
+		messages: totalTokens,
+		inputTokens,
+		outputTokens,
+		...(cachedTokens > 0 ? { cachedTokens } : {}),
+		totalTokens,
+		contextWindow,
 	};
-	let accepted = chat.sending.then(go, go);
-	chat.sending = accepted.then(() => {}, () => {});
-	return accepted.catch(err => console.error("[chat] could not start the queue:", err));
-}
-
-type CancelWhy = "spent" | "agent" | "unavailable" | "access";
-
-const FAILURE: Record<Exclude<CancelWhy, "spent">, Wire.DeliveryFailure> = {
-	agent: "machine-removed",
-	access: "access-lost",
-	unavailable: "document-unavailable",
-};
-
-/**
- * Ends a waiting request without running it. A message stays in the transcript marked as one that
- * could not be delivered, and says why; a comment whose thread was resolved needs no word, because
- * the resolution is what its members see; anything else gets a notice and its own mark cleared.
- */
-async function cancelRow(context: Room, item: Waiting, why: CancelWhy): Promise<void> {
-	let { chat, room, server } = context;
-	let held = item.deferred;
-	if (!held) return;
-	chat.waiting = chat.waiting.filter(value => value !== item);
-	let row = { kind: held.kind, handle: item.handle };
-	let entry = item.message
-		? chat.entries.find(value => value.id === (held.entry ?? item.id))
-		: undefined;
-	if (entry && why !== "spent") {
-		entry.deliveryState = "failed";
-		entry.deliveryFailure = FAILURE[why];
-	}
-	let changes = [move(held.row, "waiting", "cancelled", why === "spent" ? undefined : why)];
-	try {
-		if (!entry && why !== "spent") {
-			logRefused(
-				await postNotice(
-					context,
-					cancelledNotice(row, why === "agent" ? "agent" : why),
-					undefined,
-					`cancelled:${held.row}`,
-					changes,
-				),
-			);
-		} else {
-			logRefused(await context.persist(undefined, changes));
-		}
-	} catch (err) {
-		console.error("[chat] could not cancel a queued request:", err);
-	}
-	if (entry) announce(server, room, entry);
-	if (held.kind === "draft" && chat.draft?.id === held.request) {
-		drafting(server, room, chat.draft, "ended");
-		chat.draft = undefined;
-	}
-	if (held.kind === "comment" && why !== "spent") {
-		context.deferred?.threadEnded?.({ ...held, ...item } as never, "failed");
-	}
-	queued(chat, server, room);
-	void report(item, { status: "skipped" });
-}
-
-/** Ends every waiting request, because the agent was reset or the document went away. */
-export async function cancelQueued(context: Room, why: "agent" | "unavailable"): Promise<void> {
-	let { chat } = context;
-	if (!context.deferred) return;
-	await load(context);
-	for (let item of chat.waiting.slice()) {
-		if (item.deferred) await cancelRow(context, item, why);
-	}
-}
-
-/**
- * Withdraw a message the machine has not taken yet. Only its author may. It leaves the Chat for
- * everyone and is never delivered; its row is cancelled in the commit that removes it.
- */
-export function remove(context: Room, ws: Socket, msg: Request<Wire.Delete>): Promise<void> {
-	// After every send already admitted, so a delete never overtakes the message it takes back.
-	let process = () =>
-		removeNow(context, ws, msg).catch(err => {
-			// Unanswered, a delete would leave the page waiting on it. Without the code that ends
-			// it, it is asked again.
-			console.error("[chat] a message could not be deleted:", err);
-			fail(ws, msg.rid, "could not delete message");
-		});
-	let accepted = context.chat.sending.then(process, process);
-	context.chat.sending = accepted.then(() => {}, () => {});
-	return accepted;
-}
-
-async function removeNow(context: Room, ws: Socket, msg: Request<Wire.Delete>): Promise<void> {
-	let { chat, room, server } = context;
-	let entry = chat.entries.find(value => value.id === msg.id);
-	let item = chat.waiting.find(value => value.id === msg.id && value.message && value.deferred);
-	if (!entry && context.deferred) {
-		// Deleting twice leaves the message deleted, as asking twice would.
-		let row = await context.plan.persistence.storage.deferredTurns.get(room, msg.id);
-		if (row?.state === "cancelled" && row.handle === ws.data.handle) {
-			return reply(ws, msg.rid, { kind: "chat:delete", ts: 0, id: msg.id });
-		}
-		if (!row) {
-			// Nothing here: the send it takes back was lost, or is still on its way on a connection
-			// that is gone. It is remembered as taken back, so that it cannot arrive after this.
-			chat.retracted ??= new Set();
-			chat.retracted.add(msg.id);
-			if (chat.retracted.size > MAX_RETRACTED) {
-				chat.retracted.delete(chat.retracted.values().next().value!);
-			}
-			return reply(ws, msg.rid, { kind: "chat:delete", ts: 0, id: msg.id });
-		}
-		if (row.state === "waiting" && row.kind === "composer" && row.handle === ws.data.handle) {
-			// Kept by a send whose answer was a passing trouble (the commit went through and its
-			// acknowledgement did not): nothing of it was shown or queued here, so only the row is
-			// taken back, and the machine never gets it.
-			let queued = chat.waiting.find(value => value.deferred?.row === row.id);
-			chat.waiting = chat.waiting.filter(value => value !== queued);
-			try {
-				logRefused(await context.persist(undefined, [move(row.id, "waiting", "cancelled")]));
-			} catch {
-				if (queued) chat.waiting.push(queued);
-				return fail(ws, msg.rid, "could not delete message");
-			}
-			forgetFiles(context, msg.id);
-			return reply(ws, msg.rid, { kind: "chat:delete", ts: 0, id: msg.id });
-		}
-	}
-	if (
-		entry?.author.kind !== "member" || entry.author.handle !== ws.data.handle
-		|| entry.deliveryState === "delivered" || entry.deliveryState === undefined
-	) return fail(ws, msg.rid, "this message cannot be deleted", "message-not-deletable");
-	let index = chat.entries.indexOf(entry);
-	let changes: DeferredTurnChange[] = [];
-	if (entry.deliveryState === "sent") {
-		// Out of the queue first, so a turn that ends now cannot start it.
-		// Being taken by the machine right now: if that fails it waits again, so this is not the last
-		// word, and the browser asks again until it is delivered or deleted.
-		if (!item?.deferred) return fail(ws, msg.rid, "this message is already on its way");
-		chat.waiting = chat.waiting.filter(value => value !== item);
-		changes.push(move(item.deferred.row, "waiting", "cancelled"));
-	}
-	chat.entries.splice(index, 1);
-	// A running turn's entries sit after the ones before it; taking one of those out moves it up.
-	let shifted = !!chat.turn && index < chat.turn.entryOffset;
-	if (shifted) chat.turn!.entryOffset--;
-	try {
-		logRefused(await context.persist(undefined, changes));
-	} catch {
-		chat.entries.splice(index, 0, entry);
-		if (shifted) chat.turn!.entryOffset++;
-		if (item) chat.waiting.push(item);
-		return fail(ws, msg.rid, "could not delete message");
-	}
-	reply(ws, msg.rid, { kind: "chat:delete", ts: 0, id: msg.id });
-	broadcast(server, room, { kind: "chat:removed", ts: 0, id: msg.id });
-	forgetFiles(context, msg.id);
-	if (item) void report(item, { status: "skipped" });
-}
-
-/** A deleted message's files go with it; a failure here only leaves bytes nobody can reach. */
-function forgetFiles(context: Room, entryId: string): void {
-	void context.auth.storage.chatAttachments.discardEntry(context.room, entryId).catch(err =>
-		console.error("[chat] a deleted message's files were not removed:", err)
+	context.chat.usage = usage;
+	broadcast(context.server, context.room, { kind: "chat:context", ts: 0, usage });
+	void Promise.resolve(context.onSessionMetaChanged?.()).catch(err =>
+		console.error("[chat] could not persist context usage:", err)
 	);
 }
 
-/** Send a message that could not be delivered again, as it was. Only its author may. */
-export async function retry(context: Room, ws: Socket, msg: Request<Wire.Retry>): Promise<void> {
-	try {
-		await retryNow(context, ws, msg);
-	} catch (err) {
-		console.error("[chat] a message could not be sent again:", err);
-		fail(ws, msg.rid, "could not send message again");
-	}
-}
-
-async function retryNow(context: Room, ws: Socket, msg: Request<Wire.Retry>): Promise<void> {
-	let { chat, room, server } = context;
-	let entry = chat.entries.find(value => value.id === msg.id);
-	let saved = entry ? (entry as MemberEntry).delivery : undefined;
-	if (
-		!context.deferred || entry?.author.kind !== "member" || entry.author.handle !== ws.data.handle
-		|| entry.deliveryState !== "failed" || !saved
-	) return fail(ws, msg.rid, "this message cannot be sent again");
-	if (full(chat, await away(context))) {
-		return fail(ws, msg.rid, "the queue is full", "planner-queue-full");
-	}
-	let turn = newTurn({
-		documentId: room,
-		kind: "composer",
-		request: ulid(),
-		handle: entry.author.handle,
-		userId: ws.data.principalId,
-		text: entry.text,
-		references: entry.references,
-		delivery: { ...saved, entry: entry.id } as unknown as JsonValue,
-		claimant: context.claimantSessionId,
-		owner: chat.owner?.sessionId,
-	});
-	let failure = entry.deliveryFailure;
-	entry.deliveryState = "sent";
-	delete entry.deliveryFailure;
-	try {
-		await context.persist(undefined, [insert(turn)]);
-	} catch {
-		entry.deliveryState = "failed";
-		entry.deliveryFailure = failure;
-		return fail(ws, msg.rid, "could not send message again");
-	}
-	chat.waiting.push({
-		id: entry.id,
-		handle: entry.author.handle,
-		text: entry.text,
-		...(entry.references?.length ? { references: entry.references } : {}),
-		delivery: saved,
-		message: true,
-		posted: true,
-		sessionId: context.claimantSessionId,
-		userId: ws.data.principalId,
-		deferred: mark(turn, entry.id),
-	});
-	reply(ws, msg.rid, { kind: "chat:retry", ts: 0, id: entry.id });
-	announce(server, room, entry);
-	void kick(context);
-}
-
-/**
- * The waiting item a row stands for once a document opens again; undefined when nothing remains of
- * it. `behind` is the waiting rows accepted after it, which a message kept without its transcript
- * entry is put back ahead of.
- */
-async function restoreWaiting(
-	context: Room,
-	row: DeferredTurn,
-	behind: DeferredTurn[] = [],
-): Promise<Waiting | undefined> {
-	let { chat } = context;
-	let focus = row.focusChannelId
-		? { channelId: row.focusChannelId, title: row.focusTitle ?? "" }
-		: undefined;
-	let base = {
-		handle: row.handle,
-		text: row.text,
-		sessionId: row.claimantSessionId,
-		...(focus ? { focus } : {}),
-	};
-	switch (row.kind) {
-		case "composer":
-		case "invoke_planner": {
-			let saved = row.delivery as (Delivery & { entry?: string }) | undefined;
-			let entryId = saved?.entry ?? row.requestId;
-			let references = row.references as unknown as Wire.Reference[];
-			let entry = chat.entries.find(value => value.id === entryId);
-			// A message first sent keeps its row and its transcript entry in one commit. Its entry is
-			// missing only when that commit's answer was lost and a later save wrote the transcript
-			// without it: the row is its sender's message still, and its entry is made again. One sent
-			// again by its sender (`entryId` is not its own request) has an entry or has none to make.
-			if (!entry && row.kind === "composer" && saved && entryId === row.requestId) {
-				let made: MemberEntry = {
-					id: row.requestId,
-					author: { kind: "member", handle: row.handle },
-					text: row.text,
-					ts: Math.floor(row.createdAt.getTime() / 1000),
-					...(references.length ? { references } : {}),
-					delivery: {
-						destination: saved.destination,
-						requestFingerprint: saved.requestFingerprint,
-						canonicalFingerprint: saved.canonicalFingerprint,
-					},
-					deliveryState: "sent",
-				};
-				entry = made;
-				let ahead = behind.flatMap(value =>
-					chat.entries.findIndex(item =>
-						item.id
-							=== ((value.delivery as { entry?: string } | undefined)?.entry ?? value.requestId)
-					)
-				).filter(index => index >= 0);
-				chat.entries.splice(ahead.length ? Math.min(...ahead) : chat.entries.length, 0, made);
-			}
-			if (!entry) return undefined;
-			return {
-				...base,
-				id: entry.id,
-				...(references.length ? { references } : {}),
-				...(row.kind === "composer" && saved
-					? {
-						delivery: {
-							destination: saved.destination,
-							requestFingerprint: saved.requestFingerprint,
-							canonicalFingerprint: saved.canonicalFingerprint,
-						},
-					}
-					: {}),
-				message: true,
-				posted: true,
-				userId: row.userId,
-				...(row.kind === "invoke_planner" ? { invokedBy: row.userId } : {}),
-				deferred: mark(row, entry.id),
-			};
-		}
-		case "invoke_system":
-			return { ...base, id: row.requestId, quiet: true, deferred: mark(row) };
-		case "draft":
-			chat.draft = { id: row.requestId, planRevision: row.planRevision ?? 0, state: "queued" };
-			return { ...base, id: row.requestId, draft: row.requestId, deferred: mark(row) };
-		case "comment": {
-			let restored = await context.deferred?.restoreComment?.(row) as Waiting | undefined;
-			return restored && {
-				...restored,
-				id: row.requestId,
-				sessionId: row.claimantSessionId,
-				deferred: mark(row),
-			};
-		}
-	}
-}
-
-/**
- * Puts the document's waiting rows back in its queue, in the order they were accepted, and makes
- * its messages say what became of them: a message still marked sent whose row is gone from the
- * queue was cancelled while the document was closed, or was taken before the mark was saved.
- * Idempotent: a row already in the queue is left alone.
- */
-async function load(context: Room): Promise<void> {
-	let { chat, plan, room, server } = context;
-	let store = plan.persistence.storage.deferredTurns;
-	let waiting = await store.list(room, ["waiting"]);
-	let known = new Set(chat.entries);
-	for (let [index, row] of waiting.entries()) {
-		if (chat.waiting.some(item => item.deferred?.row === row.id)) continue;
-		let behind = waiting.slice(index + 1);
-		let item = await restoreWaiting(context, row, behind);
-		if (!item) {
-			logRefused(await context.persist(undefined, [move(row.id, "waiting", "cancelled")]));
-			continue;
-		}
-		enqueueRestored(chat, item, behind);
-		if (item.draft && chat.draft) drafting(server, room, chat.draft, "queued");
-	}
-	let made = chat.entries.filter(entry => !known.has(entry));
-	let changed = made.length > 0;
-	for (let entry of chat.entries) {
-		if (entry.deliveryState !== "sent" || chat.waiting.some(item => item.id === entry.id)) continue;
-		let row = await store.get(room, entry.id);
-		let cancelled = row?.state === "cancelled"
-			|| (!row && !waiting.some(value => value.requestId === entry.id));
-		entry.deliveryState = cancelled ? "failed" : "delivered";
-		// The reason the row was cancelled for; none recorded says nothing rather than a wrong one.
-		if (row?.cancelReason) entry.deliveryFailure = FAILURE[row.cancelReason];
-		changed = true;
-		announce(server, room, entry);
-	}
-	if (changed) await context.persist();
-	for (let entry of made) announce(server, room, entry);
-	queued(chat, server, room);
-}
-
-/** Puts a restored request in the queue ahead of the ones accepted after it, and of background jobs. */
-function enqueueRestored(chat: Chat, item: Waiting, behind: DeferredTurn[]): void {
-	let later = new Set(behind.map(row => row.id));
-	let at = chat.waiting.findIndex(value => !value.deferred || later.has(value.deferred.row));
-	chat.waiting.splice(at < 0 ? chat.waiting.length : at, 0, item);
-}
-
-/**
- * Puts back a message that its commit kept though the answer to it was lost: in the queue ahead of
- * what was accepted after it, in the transcript where it was, and saved there, so a restart finds
- * it too. Throws, leaving it for the next attempt, when it could not be saved.
- */
-async function adopt(context: Room, row: DeferredTurn): Promise<void> {
-	let { chat, plan, room, server } = context;
-	if (chat.waiting.some(item => item.deferred?.row === row.id)) return;
-	let waiting = await plan.persistence.storage.deferredTurns.list(room, ["waiting"]);
-	let behind = waiting.slice(waiting.findIndex(value => value.id === row.id) + 1);
-	let known = new Set(chat.entries);
-	let item = await restoreWaiting(context, row, behind);
-	if (!item) return;
-	enqueueRestored(chat, item, behind);
-	let made = chat.entries.filter(entry => !known.has(entry));
-	try {
-		await context.persist();
-	} catch (error) {
-		chat.waiting = chat.waiting.filter(value => value !== item);
-		chat.entries = chat.entries.filter(entry => !made.includes(entry));
-		throw error;
-	}
-	for (let entry of made) {
-		announce(server, room, entry);
-		context.memberMessagePersisted?.(entry, row.claimantSessionId);
-	}
-	queued(chat, server, room);
-}
-
-/** Looks for the messages whose save was not answered among the rows, and puts back the ones kept. */
-async function adoptUnsure(context: Room): Promise<void> {
-	let { chat, plan, room } = context;
-	for (let id of chat.unsure ?? []) {
-		let row = await plan.persistence.storage.deferredTurns.get(room, id);
-		if (row?.state === "waiting") await adopt(context, row);
-		chat.unsure!.delete(id);
-	}
-}
-
-const recovered = new WeakSet<Chat>();
-
-/**
- * Brings back what a restart left: requests a turn had started when the process stopped are
- * marked interrupted, with a notice and never run again, and the ones still waiting rejoin the
- * queue. Then the queue starts if it may.
- */
-export async function recover(context: Room): Promise<void> {
-	let { chat, plan, room, server } = context;
-	if (!context.deferred || context.rootChannelId || chat.closed) return;
-	if (!recovered.has(chat)) {
-		recovered.add(chat);
-		try {
-			let stale = await plan.persistence.storage.deferredTurns.interruptStale(
-				plan.persistence.lease(),
-				new Date(),
-				room,
-			);
-			for (let row of stale) {
-				try {
-					await noticeOnce(context, `interrupted:${row.id}`, interruptedNotice(row));
-				} catch (err) {
-					console.error("[chat] could not say that a restart stopped a request:", err);
-				}
-				if (row.kind === "comment") context.deferred.threadEnded?.(row, "failed");
-				if (row.kind === "draft") {
-					broadcast(server, room, {
-						kind: "implementation:drafting",
-						ts: 0,
-						id: row.requestId,
-						planRevision: row.planRevision ?? 0,
-						state: "ended",
-					});
-				}
-			}
-			await load(context);
-		} catch (err) {
-			recovered.delete(chat);
-			throw err;
-		}
-	}
-	await kick(context);
+function isHarnessCompactionCall(
+	part: { toolCallId: string; toolName: string; providerExecuted?: boolean },
+): boolean {
+	return part.providerExecuted === true && part.toolName === "compaction"
+		&& part.toolCallId.startsWith("harness-compaction-");
 }
 
 /** Project one AI SDK stream part into the shared Conversation. */
@@ -4165,8 +3817,29 @@ export function translate(context: Room, part: TextStreamPart<ToolSet>): void {
 	if (chat.job || chat.jobToolNames) return translateJob(context, part);
 	let ids = chat.messageIds ??= new Map();
 	switch (part.type) {
+		case "raw": {
+			let raw = part.rawValue as Record<string, unknown> | null | undefined;
+			if (!raw || typeof raw !== "object") return;
+			if (raw.type === "compacting") {
+				chat.compacting = true;
+				broadcast(server, room, { kind: "chat:compaction", ts: 0, status: "compacting" });
+			} else if (raw.type === "compaction-idle") {
+				chat.compacting = false;
+				broadcast(server, room, { kind: "chat:compaction", ts: 0, status: "idle" });
+			} else if (
+				raw.type === "context-window" && typeof raw.contextWindow === "number"
+				&& raw.contextWindow > 0
+			) {
+				chat.contextWindow = Math.floor(raw.contextWindow);
+			}
+			return;
+		}
+		case "finish-step":
+			recordUsage(context, part.usage);
+			return;
 		case "finish":
 			chat.tooling = undefined;
+			recordUsage(context, part.totalUsage);
 			return;
 		case "text-start": {
 			let id = ulid();
@@ -4192,7 +3865,8 @@ export function translate(context: Room, part: TextStreamPart<ToolSet>): void {
 					text: part.text,
 					ts: now(),
 					streaming: true,
-				});
+					...answeringReaction(chat),
+				} as Wire.Entry);
 			} else {
 				entry.text += part.text;
 				broadcast(server, room, { kind: "chat:delta", ts: 0, id, text: part.text });
@@ -4222,6 +3896,7 @@ export function translate(context: Room, part: TextStreamPart<ToolSet>): void {
 			return;
 		}
 		case "tool-call": {
+			if (isHarnessCompactionCall(part)) return;
 			if (!permitted(context, part.toolName)) return;
 			begun(chat, part.toolCallId);
 			publish(context, {
@@ -4236,6 +3911,49 @@ export function translate(context: Room, part: TextStreamPart<ToolSet>): void {
 		case "tool-result":
 		case "tool-error":
 		case "tool-output-denied": {
+			if (part.type === "tool-result" && isHarnessCompactionCall(part)) {
+				let output = (part.output ?? {}) as {
+					trigger?: unknown;
+					summary?: unknown;
+					tokensBefore?: unknown;
+					tokensAfter?: unknown;
+				};
+				let priorSummarized = (chat.compactions ?? []).reduce(
+					(sum, item) => sum + item.messagesSummarized,
+					0,
+				);
+				let allMessages = [
+					...(chat.forkBootstrap ?? []),
+					...chat.entries,
+				].filter(entry => entry.author.kind !== "system").length;
+				let messagesSummarized = Math.max(1, allMessages - priorSummarized);
+				let compaction: Wire.CompactionRecord = {
+					id: ulid(),
+					...(chat.entries.at(-1)?.id ? { afterEntryId: chat.entries.at(-1)!.id } : {}),
+					summary: typeof output.summary === "string" ? output.summary : "",
+					messagesSummarized,
+					...(typeof output.tokensBefore === "number"
+						? { tokensBefore: Math.floor(output.tokensBefore) }
+						: {}),
+					...(typeof output.tokensAfter === "number"
+						? { tokensAfter: Math.floor(output.tokensAfter) }
+						: {}),
+					trigger: output.trigger === "manual" ? "manual" : "auto",
+					ts: now(),
+				};
+				(chat.compactions ??= []).push(compaction);
+				chat.compacting = false;
+				broadcast(server, room, {
+					kind: "chat:compaction",
+					ts: 0,
+					status: "compacted",
+					compaction,
+				});
+				void Promise.resolve(context.onSessionMetaChanged?.()).catch(err =>
+					console.error("[chat] could not persist compaction:", err)
+				);
+				return;
+			}
 			let preliminary = part.type === "tool-result" && part.preliminary === true;
 			let success = part.type === "tool-result";
 			let output = part.type === "tool-result"
@@ -4243,6 +3961,12 @@ export function translate(context: Room, part: TextStreamPart<ToolSet>): void {
 				: part.type === "tool-error"
 				? part.error
 				: "Refused.";
+			let staged: ToolImage[] = [];
+			let refused: Wire.ImageRefusal[] = [];
+			if (success && !preliminary && !chat.turnImages?.calls.has(part.toolCallId)) {
+				({ images: staged, refusals: refused } = inspectImages(output));
+				if (staged.length || refused.length) turnImages(chat).calls.add(part.toolCallId);
+			}
 			conclude(
 				context,
 				part.toolCallId,
@@ -4251,6 +3975,7 @@ export function translate(context: Room, part: TextStreamPart<ToolSet>): void {
 				success,
 				part.type === "tool-output-denied",
 			);
+			if (staged.length || refused.length) stageImages(context, staged, refused, part.toolCallId);
 			return;
 		}
 		case "tool-approval-request":
@@ -4304,11 +4029,11 @@ function conclude(
 		: undefined;
 	let detail = name === "read_reference"
 		? success
-			? "Reference content was returned privately to Chopin."
+			? `Reference content was returned privately to ${PLANNER_NAME}.`
 			: "The reference could not be read."
 		: failure
 		? textOutput(failure.message)
-		: outputText(output);
+		: outputText(toolRowOutput(output));
 	publish(context, {
 		id,
 		name,
@@ -4360,7 +4085,7 @@ function plain(value: unknown): value is Record<string, unknown> {
 /** Whether the session offers this tool; one it does not offer ends the turn. */
 function permitted(context: Room, name: string): boolean {
 	let { chat } = context;
-	if ((chat.agent?.activeTools ?? PLANNER_TOOL_NAMES).includes(name)) return true;
+	if (!chat.reader && (chat.agent?.activeTools ?? PLANNER_TOOL_NAMES).includes(name)) return true;
 	console.error(`[chat] boundary failure: inactive tool ${name}`);
 	chat.interruption = `Chopin's tool boundary failure: ${name}`;
 	chat.turnController?.abort();
@@ -4393,17 +4118,18 @@ export function progressed(context: Room, id: string, output: unknown): void {
 	conclude(context, id, output, "running", true);
 }
 
+function holder(chat: Chat, id: string): Wire.Entry | undefined {
+	let entry = chat.entries.find(item => item.id === chat.toolEntries?.get(id));
+	return entry?.tools?.some(activity => activity.id === id) ? entry : undefined;
+}
+
 function tool(chat: Chat, id: string): Wire.Activity | undefined {
-	return chat.entries.flatMap(entry => entry.tools ?? []).find(item => item.id === id);
+	return holder(chat, id)?.tools?.find(item => item.id === id);
 }
 
 /** What a running tool call was called, from where it was filed. */
 function named(chat: Chat, id: string): string {
-	for (let entry of chat.entries) {
-		let found = entry.tools?.find(activity => activity.id === id);
-		if (found) return found.name;
-	}
-	return "tool";
+	return tool(chat, id)?.name ?? "tool";
 }
 
 /**
@@ -4417,13 +4143,20 @@ function named(chat: Chat, id: string): string {
 function attach(context: Room, activity: Wire.Activity): string {
 	let { chat, room, server } = context;
 	// Completion can arrive after idle; find its original activity by call id.
-	let entry = chat.entries.find(item => item.tools?.some(tool => tool.id === activity.id))
+	let entry = holder(chat, activity.id)
 		?? chat.entries.find(item => item.id === chat.tooling)
 		?? chat.entries.find(item => item.id === chat.writing);
 	if (entry && !entry.tools?.some(tool => tool.id === activity.id)) chat.tooling = entry.id;
 
 	if (!entry) {
-		entry = { id: ulid(), author: { kind: "agent" }, text: "", ts: now(), tools: [] };
+		entry = {
+			id: ulid(),
+			author: { kind: "agent" },
+			text: "",
+			ts: now(),
+			tools: [],
+			...answeringReaction(chat),
+		} as Wire.Entry;
 		chat.tooling = entry.id;
 		say(chat, server, room, entry);
 	}
@@ -4432,7 +4165,130 @@ function attach(context: Room, activity: Wire.Activity): string {
 	let existing = entry.tools.findIndex(item => item.id === activity.id);
 	if (existing >= 0) entry.tools[existing] = { ...entry.tools[existing], ...activity };
 	else entry.tools.push(activity);
+	(chat.toolEntries ??= new Map()).set(activity.id, entry.id);
 	return entry.id;
+}
+
+/** Whoever the turn is for owns what it stores; a turn nobody asked for is the Planner owner's. */
+async function imageOwner(
+	context: Room,
+	member = currentMemberRequest(context.chat)?.userId,
+): Promise<string> {
+	let uploadedBy = member;
+	if (!uploadedBy) {
+		let binding = await context.activeOwner?.();
+		if (!binding) throw new Error("this Planner has no owner to store the image for");
+		try {
+			uploadedBy = (await context.auth.sessions.resolve(binding.ownerSessionId))?.user.id;
+		} finally {
+			binding.release();
+		}
+	}
+	if (!uploadedBy) throw new Error("this Planner has no owner to store the image for");
+	return uploadedBy;
+}
+
+function turnImages(chat: Chat): TurnImages {
+	return chat.turnImages ??= { work: Promise.resolve(), calls: new Set() };
+}
+
+export async function endTurnImages(chat: Chat): Promise<void> {
+	let images = chat.turnImages;
+	if (!images) return;
+	let work: Promise<void>;
+	do {
+		work = images.work;
+		await work;
+	} while (images.work !== work);
+	if (chat.turnImages === images) chat.turnImages = undefined;
+}
+
+function later(images: TurnImages, work: () => void | Promise<void>): void {
+	images.work = images.work.then(work).catch(err => {
+		console.error("[chat] could not show an image in Chat:", err);
+	});
+}
+
+function showImages(
+	context: Room,
+	turn: TurnImages,
+	images: Wire.Image[],
+	held?: string,
+	refusals: Wire.ImageRefusal[] = [],
+): void {
+	let { chat, room, server } = context;
+	if (chat.closed || !(images.length || refusals.length) || chat.turnImages !== turn) return;
+	let entry = chat.entries.find(item => item.id === turn.entry)
+		?? chat.entries.find(item => item.id === held)
+		?? chat.entries.find(item => item.id === chat.tooling)
+		?? chat.entries.find(item => item.id === chat.writing);
+	if (!entry) {
+		entry = { id: ulid(), author: { kind: "agent" }, text: "", ts: now() };
+		chat.entries.push(entry);
+	}
+	turn.entry = entry.id;
+	let before = entry.images?.length ?? 0;
+	if (images.length) entry.images = [...entry.images ?? [], ...images];
+	if (refusals.length) {
+		entry.refusedImages = [
+			...entry.refusedImages ?? [],
+			...refusals.map(refusal => ({ ...refusal, before: before + refusal.before })),
+		];
+	}
+	announce(server, room, entry);
+}
+
+function stageImages(
+	context: Room,
+	images: ToolImage[],
+	refusals: Wire.ImageRefusal[],
+	call: string,
+): void {
+	let { auth, room } = context;
+	let member = currentMemberRequest(context.chat)?.userId;
+	let turn = turnImages(context.chat);
+	let held = holder(context.chat, call)?.id;
+	later(turn, async () => {
+		let shown: Wire.Image[] = [];
+		let notes: Wire.ImageRefusal[] = [];
+		let waiting = [...refusals];
+		let uploadedBy: string | undefined;
+		for (let [index, original] of images.entries()) {
+			while (waiting[0] && waiting[0].before <= index) {
+				notes.push({ ...waiting.shift()!, before: shown.length });
+			}
+			let image = await fitImage(original, context.config.imageMaxBytes);
+			if ("reason" in image) {
+				notes.push({ before: shown.length, reason: image.reason });
+				continue;
+			}
+			try {
+				uploadedBy ??= await imageOwner(context, member);
+				let sha256 = createHash("sha256").update(image.bytes).digest("hex");
+				await auth.storage.images.put({
+					channelId: room,
+					sha256,
+					mimeType: image.mimeType,
+					bytes: image.bytes,
+					uploadedBy,
+					now: auth.clock(),
+				});
+				shown.push({
+					src: imagePath(sha256, image.mimeType),
+					...(image.alt === undefined ? {} : { alt: image.alt }),
+					...(image.caption === undefined ? {} : { caption: image.caption }),
+					width: image.width,
+					height: image.height,
+					generated: true,
+				});
+			} catch (err) {
+				console.error("[chat] could not store an image to show in Chat:", err);
+				notes.push({ before: shown.length, reason: STORE_REFUSAL });
+			}
+		}
+		for (let refusal of waiting) notes.push({ ...refusal, before: shown.length });
+		showImages(context, turn, shown, held, notes);
+	});
 }
 
 export async function resetAgent(
@@ -4459,10 +4315,18 @@ export async function resetAgent(
 	chat.referenceCache.clear();
 	chat.bootstrapEntries = undefined;
 	chat.openingOwner = undefined;
+	if (chat.childChats) {
+		for (let child of chat.childChats.values()) {
+			await resetAgent(child, sessionId, revision, reason);
+		}
+	}
 }
 
 /** Let go of the session. The conversation is resumable by id. */
 export async function close(chat: Chat): Promise<void> {
+	let childChats = chat.childChats ? [...chat.childChats.values()] : [];
+	chat.childChats?.clear();
+	await Promise.all(childChats.map(child => close(child)));
 	// What was admitted before this finishes first: a message that was being saved is saved and
 	// answered, not refused as closed. Whatever arrives once the Chat is closed is refused.
 	for (let admitted: Promise<void> | undefined; admitted !== chat.sending;) {
@@ -4471,6 +4335,7 @@ export async function close(chat: Chat): Promise<void> {
 	}
 	chat.closed = true;
 	chat.initiative?.close();
+	chat.reactions?.close();
 	chat.job = undefined;
 	chat.jobOutput = undefined;
 	chat.lifecycle++;
@@ -4486,6 +4351,7 @@ export async function close(chat: Chat): Promise<void> {
 		chat.handoffJob = undefined;
 	}
 	chat.waiting = [];
+	chat.preempting = undefined;
 	chat.turnController?.abort();
 	chat.referenceCache.clear();
 	chat.bootstrapEntries = undefined;

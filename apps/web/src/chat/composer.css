@@ -1,36 +1,36 @@
 /*
  * The field inside the message box, the strips above it and the colour of a failed send's edge. The
- * menus that open over the box (`@` and `/`) and the Chopin chip are assistant-ui's elements, copied
- * (and patched only where an extension point was needed), so they have no rule here but where the
- * chip sits in the draft.
+ * menus that open over the box (`@` and `/`) are assistant-ui's elements, copied (and patched only
+ * where an extension point was needed), so they have no rule here.
  */
 .chat-composer .composer-surface[data-error] {
-	border-color: var(--color-danger-edge);
+	--composer-edge: var(--color-destructive);
 }
-/*
- * The field scrolls, not the draft in it, so the chip that floats at the start of the draft scrolls
- * with the first line it sits on. A floated chip leaves the draft's first line shorter and the rest
- * their whole width, and needs no measuring of the chip.
- */
+/* The field scrolls, not the draft in it, once the draft is taller than the cap. */
 .chat-composer .composer-field {
 	position: relative;
 	max-height: 12rem;
 	overflow-y: auto;
-	/* The draft's own type, so the chip and the cap are measured in its lines. */
-	font-size: var(--text-sm);
-	line-height: var(--text-sm--line-height);
+	/*
+	 * The draft's own type, so the cap is measured in its lines. It is the message's
+	 * type, as Slack's box writes in its messages' 15px on 22px.
+	 */
+	font-size: var(--text-base);
+	line-height: var(--text-base--line-height);
 }
+/* Slack's text area: one line at rest, 8px above and below it and 12px in from the box's edges. */
 .chat-composer .composer-draft-input {
 	position: relative;
 	display: block;
 	width: 100%;
-	min-height: calc(1.5rem + 2lh);
-	padding: 0.75rem;
+	/* One fluid line ends on a fraction of a pixel; rounded, the message box sits on whole pixels. */
+	min-height: round(calc(1lh + var(--spacing) * 4), 1px);
+	padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
 	border: 0;
 	background: transparent;
 	font: inherit;
-	font-size: var(--text-sm);
-	line-height: var(--text-sm--line-height);
+	font-size: var(--text-base);
+	line-height: var(--text-base--line-height);
 	color: var(--color-text-primary);
 	white-space: pre-wrap;
 	overflow-wrap: break-word;
@@ -48,6 +48,17 @@
 	pointer-events: none;
 	color: var(--color-text-quaternary);
 }
+/* Once a message is sent the words leave at once and the hint fades back in their place. */
+@media (prefers-reduced-motion: no-preference) {
+	.chat-composer .composer-draft-input[data-empty]::before {
+		animation: composer-hint-in var(--duration-base) var(--ease-out);
+	}
+}
+@keyframes composer-hint-in {
+	from {
+		opacity: 0;
+	}
+}
 .chat-composer .composer-draft-input[aria-disabled="true"] {
 	color: var(--color-text-tertiary);
 }
@@ -58,6 +69,77 @@
 	text-underline-offset: 0.2em;
 	text-decoration-thickness: var(--edge-width);
 }
+/*
+ * The draft draws what its Markdown means, in the transcript's proportions (assistant-ui's
+ * MarkdownText): blocks without margins of their own, lists inset with their markers, inline code
+ * and code blocks on the inset ground. Its words stay in the draft's own type.
+ */
+.chat-composer .composer-draft-input :is(.draft-paragraph, .draft-list, .draft-code-block) {
+	margin: 0;
+}
+.chat-composer .composer-draft-input .draft-list {
+	padding-inline-start: 1.25rem;
+	list-style: disc;
+}
+.chat-composer .composer-draft-input .draft-list-ordered {
+	list-style: decimal;
+}
+.chat-composer .composer-draft-input .draft-list-item::marker {
+	color: var(--color-text-tertiary);
+}
+.chat-composer .composer-draft-input .draft-bold {
+	font-weight: 600;
+}
+.chat-composer .composer-draft-input .draft-italic {
+	font-style: italic;
+}
+.chat-composer .composer-draft-input .draft-strike {
+	text-decoration: line-through;
+}
+.chat-composer .composer-draft-input .draft-code {
+	border-radius: var(--radius-sm);
+	background: var(--color-inset);
+	padding: 0.0625rem 0.25rem;
+	font-family: var(--font-mono);
+	font-size: inherit;
+}
+.chat-composer .composer-draft-input .draft-link {
+	color: var(--color-brand);
+	text-decoration: underline;
+	text-underline-offset: 0.2em;
+}
+.chat-composer .composer-draft-input .draft-code-block {
+	margin-block: 0.25rem;
+	border: var(--edge-width) solid var(--color-edge);
+	border-radius: var(--radius-md);
+	background: var(--color-inset);
+	padding: 0.5rem 0.75rem;
+	font-family: var(--font-mono);
+	font-size: inherit;
+	white-space: pre-wrap;
+}
+
+/* ⌘K's address, asked over the box in one row, in the shared menu recipe. */
+.chat-composer .composer-link {
+	display: flex;
+	align-items: center;
+	gap: calc(var(--spacing) * 1.5);
+	padding: calc(var(--spacing) * 1.5);
+}
+.chat-composer .composer-link-label {
+	padding-inline: calc(var(--spacing) * 1.5);
+	color: var(--color-text-secondary);
+	font-size: var(--text-sm);
+	font-weight: 500;
+}
+.chat-composer .composer-link-field {
+	flex: 1;
+	min-width: 0;
+	height: 2rem;
+	padding-inline: calc(var(--spacing) * 2);
+	font-size: var(--text-sm);
+}
+
 /*
  * A command, a section, a Decision, a research card or a file is one chip: the tint the transcript
  * gives a reference, so a person sees in the draft what the message will show. A document keeps
@@ -71,36 +153,6 @@
 	font-weight: 500;
 	text-decoration: none;
 	box-decoration-break: clone;
-}
-/*
- * The Chopin chip, assistant-ui's mention chip, sits where the draft's first line begins: the draft's
- * own padding on top and at the start, one line tall, so the badge in it is centred on that line.
- * The remove button is drawn over the cross the badge shows, outside the badge, which clips.
- */
-.chat-composer .composer-chip {
-	position: relative;
-	/* Over the draft, which is a positioned block under it, so the chip is what a press reaches. */
-	z-index: 1;
-	float: left;
-	display: flex;
-	align-items: center;
-	height: 1lh;
-	margin: 0.75rem 0.375rem 0 0.75rem;
-	font-size: var(--text-sm);
-	line-height: var(--text-sm--line-height);
-}
-/* The cross is the last 12px of the badge, past 1px of edge and 6px of padding. */
-.chat-composer .composer-chip-remove {
-	position: absolute;
-	inset-inline-end: 0.3125rem;
-	top: 50%;
-	width: 1rem;
-	height: 1rem;
-	translate: 0 -50%;
-	border-radius: var(--radius-full);
-}
-.chat-composer .composer-chip-remove:hover:not(:disabled) {
-	background: var(--color-selected-strong);
 }
 /*
  * The rows of assistant-ui's menu are its own; this is only the list that holds them, which keeps
@@ -126,7 +178,8 @@
 	color: var(--color-text-secondary);
 	font-size: var(--text-sm);
 }
-.chat-composer .composer-notice > span {
+/* The words take the room; the connecting dots beside them keep their icon's box. */
+.chat-composer .composer-notice > span:not(.connecting-indicator) {
 	flex: 1;
 	min-width: 0;
 	overflow-wrap: anywhere;
@@ -154,30 +207,13 @@
 	white-space: nowrap;
 }
 /*
- * The connection and failure banners are this strip with a phase: neutral while reconnecting,
- * warning where dropped, success for a moment once it is back, danger for a failure. They have
- * one entrance and no exit: the strip is simply gone when its cause is.
+ * The failure banner is this strip with a phase: danger for a failure, neutral while it retries.
+ * It has one entrance and no exit: the strip is simply gone when its cause is.
  */
-.chat-composer .composer-notice[data-success] {
-	background: var(--color-success-surface);
-	color: var(--color-success-text);
-}
-.chat-composer .composer-notice[data-success] .composer-notice-icon {
-	--color-icon: var(--color-success-icon);
-}
-/* A phase that is only under way, reconnecting or retrying, is neutral, as it is in the document. */
 .chat-composer
-	.composer-notice[data-banner]:not([data-warning], [data-success], [data-error])
+	.composer-notice[data-banner]:not([data-warning], [data-error])
 	.composer-notice-icon {
 	--color-icon: var(--color-neutral-icon);
-}
-.chat-composer .composer-notice > .composer-notice-count {
-	flex: none;
-	color: var(--color-text-tertiary);
-	font-size: var(--text-xs);
-	line-height: var(--text-xs--line-height);
-	font-variant-numeric: tabular-nums;
-	white-space: nowrap;
 }
 .chat-composer .composer-notice[data-banner] > .btn {
 	flex: none;
@@ -358,23 +394,15 @@
 		/* theme.css keeps touch text at 16px or more, so focus never zooms. */
 		line-height: 1.5;
 	}
-	/*
-	 * A line of draft is a full touch target tall, so the chip's cross can reach its own 44px inside
-	 * the field, which clips what it holds, without the draft's top and bottom taking any of it.
-	 */
+	/* The draft at rest is a full touch target tall, one line with its padding. */
 	.chat-composer .composer-draft-input {
 		min-height: var(--control-target-coarse);
 		padding: 0.625rem 0.5rem;
 		line-height: 1.5;
 	}
-	/* The chip begins on the first line, as the draft's own padding does here. */
-	.chat-composer .composer-chip {
-		margin: 0.625rem 0.375rem 0 0.5rem;
-		line-height: 1.5;
-	}
 	/*
 	 * A narrow box shortens the hint rather than wrapping it out of view. It is left where the first
-	 * line would begin, which is after the chip when there is one, so it has no inset of its own.
+	 * line begins, so it has no inset of its own.
 	 */
 	.chat-composer .composer-draft-input[data-empty]::before {
 		overflow: hidden;
@@ -403,10 +431,6 @@
 		margin-bottom: 0.375rem;
 		background: var(--color-warning-surface);
 	}
-	.chat-composer .composer-notice[data-success] {
-		margin-bottom: 0.375rem;
-		background: var(--color-success-surface);
-	}
 	.chat-composer .composer-unavailable {
 		min-height: 0;
 	}
@@ -431,24 +455,53 @@
 }
 
 /*
- * The message box. A rounded rectangle with a hairline, white as the page, over a toolbar of
+ * The message box. A rounded rectangle with the control boundary, white as the page, over a toolbar of
  * formatting marks that sits on the inset ground and a row of controls under the draft; every size
- * is a Chopin control size (28px buttons, 16px icons, the large radius) and every colour a token.
+ * is a Chopin control size (28px buttons, the large radius) with Slack's 18px glyphs, which draw
+ * Chopin's 1.5 stroke at its own grid, and every colour a token.
  * The menus (references, mentions, commands, models) open over it.
  */
 .chat-composer {
 	container: composer / inline-size;
 }
+.chat-composer .btn-icon {
+	--btn-icon-size: calc(var(--spacing) * 4.5);
+}
 .chat-composer .composer-surface {
+	--composer-edge: var(--color-control-boundary);
 	position: relative;
 	display: flex;
 	flex-direction: column;
-	border: var(--edge-width) solid var(--color-control-edge);
+	border: var(--edge-width) solid transparent;
 	border-radius: var(--radius-lg);
 	background: var(--color-page);
 }
+/*
+ * The box's edge, drawn over its border on a layer that holds nothing else, so it is only ever drawn
+ * whole. Drawn with the box, its rounded corners came out a shade apart whenever a button near a
+ * corner was painted again (the send button turning on as the connection comes), which the 3:1 edge
+ * shows where a faint hairline hid it, and a drag, a keyboard resize and a fresh load could end
+ * a shade apart.
+ */
+.chat-composer .composer-surface::before {
+	content: "";
+	position: absolute;
+	inset: calc(-1 * var(--edge-width));
+	border: var(--edge-width) solid var(--composer-edge);
+	border-radius: inherit;
+	pointer-events: none;
+	will-change: transform;
+}
+/*
+ * Where Chat docks it, the box is inset 16px from the pane's sides and foot, as Slack's message box
+ * floats inside its pane (`p-message_pane_input`), a hairline box with no shadow on the ground.
+ */
+.workspace-chat-panel .chat-composer {
+	padding-inline: calc(var(--spacing) * 4);
+	padding-bottom: calc(var(--spacing) * 4 + env(safe-area-inset-bottom));
+}
 .chat-composer .composer-surface:focus-within {
-	border-color: var(--color-text-tertiary);
+	--composer-edge: var(--color-text-tertiary);
 }
 .chat-composer .composer-format {
 	/* Drawn above the draft but after it in the page, so Tab reaches the draft first. */
@@ -472,12 +525,16 @@
 	margin-inline: 0.25rem;
 	background: var(--color-edge);
 }
+/*
+ * Slack's footer: 28px buttons 4px under the draft and 6px from the box's sides and foot, so the
+ * send button sits as far from both edges of its corner and its shadow stays clear of the curve.
+ */
 .chat-composer .composer-row {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
-	gap: 0.25rem;
-	padding: 0.25rem 0.375rem 0.375rem;
+	gap: var(--spacing);
+	padding: var(--spacing) calc(var(--spacing) * 1.5) calc(var(--spacing) * 1.5);
 }
 .chat-composer :is(.composer-left, .composer-actions) {
 	display: flex;
@@ -520,6 +577,189 @@
 	flex: none;
 	color: var(--color-text-tertiary);
 	transform: rotate(90deg);
+}
+/*
+ * While the machine's models load, the pill waits in its own place, its name in the level's
+ * tertiary ink, breathing to quaternary and back at chopin's connecting pace; still under reduced
+ * motion. Only colour moves: opacity would lay its text out on a layer of its own, a pixel off the
+ * real pill's. Nothing opens, so nothing shades under the pointer.
+ */
+.chat-composer .composer-model-pill[aria-busy="true"] {
+	background-color: transparent;
+	color: var(--color-text-tertiary);
+}
+@keyframes composer-model-waiting {
+	50% {
+		color: var(--color-text-quaternary);
+	}
+}
+@media (prefers-reduced-motion: no-preference) {
+	.chat-composer .composer-model-pill[aria-busy="true"] > * {
+		animation: composer-model-waiting calc(var(--duration-linger) * 2) var(--motion-move) infinite;
+	}
+}
+
+/*
+ * The pill's Model selector, portalled out of the composer. It is never taller than the screen has
+ * room for beside the pill (Base UI's `--available-height`): the model list gives up its height
+ * and scrolls, so the search field and the Thinking row stay on screen.
+ */
+.composer-model-selector {
+	max-height: var(--available-height, none);
+}
+/*
+ * The row under the pointer, or the keyboard's active row, is one shade darker than the popover, as
+ * a row of Chopin's own menus is when it is active (`--color-selected`), with its words at AA on it;
+ * every other row lies on the popover. The copied row asks for a shade wherever cmdk sets
+ * `data-selected`, which it sets to `false` as well as `true`, so every row had the shade and the
+ * one under the pointer looked like the rest. The chosen model keeps its check.
+ */
+.composer-model-selector [data-slot="model-selector-item"] {
+	background: transparent;
+	transition: background-color var(--duration-fast) var(--ease-out);
+}
+.composer-model-selector [data-slot="model-selector-item"][data-selected="true"] {
+	background: var(--color-selected);
+}
+/*
+ * A level under the pointer takes the same shade. The chosen level is marked as the emoji picker's
+ * chosen skin tone is, the petrol wash inside a petrol edge, in primary ink and medium weight, so a
+ * level that is only pointed at never reads as chosen.
+ */
+.composer-model-effort [role="radio"] {
+	cursor: pointer;
+}
+@media (hover: hover) {
+	.composer-model-effort [role="radio"]:hover {
+		background: var(--color-selected);
+		color: var(--color-text-primary);
+	}
+}
+.composer-model-effort [role="radio"][data-checked] {
+	background: var(--color-brand-wash);
+	color: var(--color-text-primary);
+	outline: var(--edge-width) solid var(--color-brand);
+	outline-offset: calc(-1 * var(--edge-width));
+}
+/*
+ * Wrappers the list and the levels' lane are reached through, which hold each one's scrollbar
+ * (`ScrollThumb`). They draw no box of their own; the list's gives up its height as the list does.
+ */
+.composer-model-list {
+	position: relative;
+	display: flex;
+	min-height: 0;
+	flex-direction: column;
+}
+.composer-model-levels {
+	position: relative;
+	flex: none;
+}
+/*
+ * The selector's scrollbars: drawn whenever the list or the levels overflow, with no pointer over
+ * them, so a person sees there is more; gone when everything fits. Chat's thumb (6px, round, inset
+ * 2px in a 10px lane, the strongest scrollbar ink), darkening under the pointer and while dragged.
+ * A finger scrolls what is under it, as in Chat; only a pointer that hovers takes the thumb.
+ */
+.model-scroll-track {
+	position: absolute;
+	z-index: 1;
+	contain: strict;
+	pointer-events: none;
+}
+.model-scroll-track[data-idle] {
+	display: none;
+}
+.model-scroll-track[data-axis="y"] {
+	inset-inline-end: 0;
+	width: var(--scrollbar-size);
+}
+.model-scroll-track[data-axis="x"] {
+	bottom: 0;
+	height: var(--scrollbar-size);
+}
+.model-scroll-thumb {
+	border: solid transparent;
+	border-width: var(--scrollbar-inset);
+	border-radius: var(--radius-full);
+	background: var(--color-scrollbar-thumb-active) padding-box;
+	transition: background-color var(--duration-fast) var(--ease-out);
+}
+.model-scroll-track[data-axis="y"] > .model-scroll-thumb {
+	width: 100%;
+	min-height: var(--scrollbar-thumb-min);
+}
+.model-scroll-track[data-axis="x"] > .model-scroll-thumb {
+	height: 100%;
+	min-width: var(--scrollbar-thumb-min);
+}
+@media (hover: hover) and (pointer: fine) {
+	.model-scroll-thumb {
+		pointer-events: auto;
+	}
+	.model-scroll-thumb:hover,
+	.model-scroll-track[data-dragging] > .model-scroll-thumb {
+		background-color: var(--color-text-tertiary);
+	}
+}
+/* Forced colours draw no background of ours: the thumb is its edge, in the system's text colour. */
+@media (forced-colors: active) {
+	.model-scroll-thumb {
+		border-color: currentcolor;
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.model-scroll-thumb {
+		transition: none;
+	}
+}
+/*
+ * The Thinking row keeps the label above the levels when they cannot sit beside it, and the levels
+ * are one lane that scrolls sideways when even the row's width cannot hold them. Its padding,
+ * taken back by the margin, keeps the 44px a finger aims at inside the lane on touch, and its
+ * scroll padding keeps a level brought into view clear of the fade.
+ */
+.composer-model-effort {
+	--composer-level-fade: 1.5rem;
+	flex-wrap: wrap;
+}
+/* Levels that overflow leave room under them for their scrollbar. */
+.composer-model-effort[data-more] {
+	padding-bottom: calc(var(--scrollbar-size) + 0.25rem);
+}
+.composer-model-effort > [role="radiogroup"] {
+	position: relative;
+	max-width: calc(100% + 1rem);
+	margin: -0.625rem -0.5rem;
+	padding: 0.625rem 0.5rem;
+	overflow-x: auto;
+	overflow-y: hidden;
+	overscroll-behavior-x: contain;
+	scroll-padding-inline: var(--composer-level-fade);
+	scrollbar-width: none;
+}
+.composer-model-effort > [role="radiogroup"]::-webkit-scrollbar {
+	display: none;
+}
+/* The side that still hides levels fades, as a wide table's does. */
+.composer-model-effort[data-more="end"] > [role="radiogroup"] {
+	mask-image: linear-gradient(
+		to right,
+		black calc(100% - var(--composer-level-fade)),
+		transparent
+	);
+}
+.composer-model-effort[data-more="start"] > [role="radiogroup"] {
+	mask-image: linear-gradient(to right, transparent, black var(--composer-level-fade));
+}
+.composer-model-effort[data-more="both"] > [role="radiogroup"] {
+	mask-image: linear-gradient(
+		to right,
+		transparent,
+		black var(--composer-level-fade),
+		black calc(100% - var(--composer-level-fade)),
+		transparent
+	);
 }
 /* The toolbar gives way where the pane is narrow, and on a phone, where the draft has the room. */
 @container composer (max-width: 20rem) {
@@ -566,7 +806,7 @@
 
 /* What is staged for the message sits above its text: the chips of its files, and the voice while it is listened to. */
 .chat-composer .composer-staging {
-	padding: calc(var(--spacing) * 2) calc(var(--spacing) * 2) 0;
+	padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3) 0;
 }
 /* The picture of an image fills the box of its chip's icon. */
 .chat-composer .composer-file-thumb {

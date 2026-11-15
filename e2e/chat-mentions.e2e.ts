@@ -43,11 +43,18 @@ function rows(page: Page) {
 		);
 }
 
-async function names(page: Page) {
-	return (await rows(page)).map(row => row.name);
+/** `@` lists Chopin and people, and nothing else: every row is tagged one or the other. */
+async function people(page: Page) {
+	let shown = await rows(page);
+	expect(shown.every(row => row.tag === "agent" || row.tag === "human")).toBe(true);
+	return shown;
 }
 
-test("the @ picker lists the Planner, people here and past authors, and sends only @chopin to the Planner", async ({ join, page }) => {
+async function names(page: Page) {
+	return (await people(page)).map(row => row.name);
+}
+
+test("the @ picker lists the Planner and the people, those here first, and sends only @chopin to the Planner", async ({ join, page }) => {
 	let sent: Chat.Send[] = [];
 	await enablePlanner(page);
 	await stubAvatars(page);
@@ -86,10 +93,14 @@ test("the @ picker lists the Planner, people here and past authors, and sends on
 	await draft.fill("Ask @");
 	await expect(list).toBeVisible();
 	await expect(draft).toHaveAttribute("aria-expanded", "true");
-	// Chopin first, tagged `agent`; the people after it, tagged `human`.
-	expect(await rows(ana)).toEqual([
-		{ name: "Chopin", tag: "agent" },
+	// Chopin first, tagged `agent`; the people after it, tagged `human`: the one here, then the
+	// others who can read the document (the account that made it, as the server lists them once
+	// GitHub will not), then the one who spoke and left. The readers are asked of the server, so the
+	// list is read once that answer is in.
+	await expect.poll(() => people(ana)).toEqual([
+		{ name: "chopin", tag: "agent" },
 		{ name: "cy", tag: "human" },
+		{ name: "e2e", tag: "human" },
 		{ name: "bo", tag: "human" },
 	]);
 	await expect(list.getByRole("option", { name: "cy" }).locator("img")).toHaveAttribute(
@@ -99,10 +110,14 @@ test("the @ picker lists the Planner, people here and past authors, and sends on
 	// The failed photograph falls back to the login's initial.
 	await expect(list.getByRole("option", { name: "bo" }).locator("img")).toHaveCount(0);
 	await expect(list.getByRole("option", { name: "bo" })).toHaveText("bbohuman");
-	await expect(list.getByRole("option", { name: /^Chopin/ })).toHaveAttribute(
+	await expect(list.getByRole("option", { name: /^chopin/ })).toHaveAttribute(
 		"aria-selected",
 		"true",
 	);
+
+	// The document's parts and files are `#`'s, never `@`'s.
+	await expect(list.getByRole("option", { name: "src/chat/composer.tsx" })).toHaveCount(0);
+	let last = list.getByRole("option", { name: "bo" });
 
 	await draft.press("ArrowDown");
 	await expect(list.getByRole("option", { name: "cy" })).toHaveAttribute("aria-selected", "true");
@@ -110,31 +125,37 @@ test("the @ picker lists the Planner, people here and past authors, and sends on
 		"aria-activedescendant",
 		(await list.getByRole("option", { name: "cy" }).getAttribute("id"))!,
 	);
+	await draft.press("ArrowDown");
+	await expect(list.getByRole("option", { name: "e2e" })).toHaveAttribute("aria-selected", "true");
 	await draft.press("ArrowUp");
 	await draft.press("ArrowUp");
-	await expect(list.getByRole("option", { name: "bo" })).toHaveAttribute("aria-selected", "true");
+	await expect(list.getByRole("option", { name: /^chopin/ })).toHaveAttribute(
+		"aria-selected",
+		"true",
+	);
+	await draft.press("ArrowUp");
+	// ArrowUp from the first row lands on the last.
+	await expect(last).toHaveAttribute("aria-selected", "true");
 
 	await draft.pressSequentially("C");
-	expect(await names(ana)).toEqual(["Chopin", "cy"]);
+	await expect.poll(() => names(ana)).toEqual(["chopin", "cy"]);
 	await draft.press("Backspace");
 	await draft.pressSequentially("ch");
-	expect(await names(ana)).toEqual(["Chopin"]);
+	await expect.poll(() => names(ana)).toEqual(["chopin"]);
 	await draft.press("Enter");
-	// Chopin is the chip at the start of the draft, not an @chopin in its words.
-	await expectChatValue(draft, "Ask ");
-	await expect(chat.getByRole("group", { name: "Asking Chopin", exact: true })).toBeVisible();
+	// Choosing Chopin writes its mention, as choosing a person does.
+	await expectChatValue(draft, "Ask @chopin ");
+	expect(await chatCaret(draft)).toBe("Ask @chopin ".length);
+	await expect(draft.locator('.draft-mention[data-mention="chopin"]')).toHaveText("@chopin");
+	await expect(chat.getByRole("group", { name: "Asking chopin" })).toHaveCount(0);
 	await expect(list).toHaveCount(0);
 	await expect(draft).toBeFocused();
 	await draft.pressSequentially("what is open?");
 	await chat.getByRole("button", { name: "Send message" }).click();
-	await expect.poll(() => sent.at(-1)?.text).toBe("@chopin Ask what is open?");
+	await expect.poll(() => sent.at(-1)?.text).toBe("Ask @chopin what is open?");
 	expect(sent.at(-1)?.to).toBe("planner");
 
 	await expectChatValue(draft, "");
-	// The chip stays on after Chopin is asked; Backspace at the start takes it off.
-	await expect(chat.getByRole("group", { name: "Asking Chopin", exact: true })).toBeVisible();
-	await draft.press("Backspace");
-	await expect(chat.getByRole("group", { name: "Asking Chopin", exact: true })).toHaveCount(0);
 	await draft.fill("Thanks @cy");
 	await draft.press("Enter");
 	await expectChatValue(draft, "Thanks @cy ");
@@ -149,15 +170,13 @@ test("the @ picker lists the Planner, people here and past authors, and sends on
 	await expect(list).toHaveCount(0);
 	await draft.fill("@c");
 	await expect(list).toBeVisible();
+	// Tab completes the highlighted row, as Enter does, and the draft keeps the focus.
 	await draft.press("Tab");
-	await draft.evaluate(() =>
-		new Promise<void>(resolve =>
-			requestAnimationFrame(() => requestAnimationFrame(() => resolve()))
-		)
-	);
-	await expect(draft).not.toBeFocused();
-	await expectChatValue(draft, "@c");
-	await draft.focus();
+	await expectChatValue(draft, "@chopin ");
+	await expect(list).toHaveCount(0);
+	await expect(draft).toBeFocused();
+	await draft.fill("@c");
+	await expect(list).toBeVisible();
 	await draft.press("Escape");
 	await expect(list).toHaveCount(0);
 	await expectChatValue(draft, "@c");
@@ -179,13 +198,41 @@ test("the @ picker stays inside a narrow Chat panel", async ({ join, page }) => 
 	await draft.fill("@");
 	let list = chat.locator("[data-chat-mention-picker]");
 	await expect(list).toBeVisible();
-	expect(await names(opened)).toEqual(["Chopin"]);
+	await expect.poll(() => names(opened)).toEqual(["chopin", "e2e"]);
 	await expectInsideViewport(list);
 	await expectNoHorizontalOverflow(opened);
 	let panel = await chat.boundingBox();
 	let box = await list.boundingBox();
 	expect(box!.x).toBeGreaterThanOrEqual(panel!.x);
 	expect(box!.x + box!.width).toBeLessThanOrEqual(panel!.x + panel!.width);
+});
+
+test("# and Mention docs list the document's parts and files, and @ never does", async ({ join, page }) => {
+	await enablePlanner(page);
+	await stubAvatars(page);
+	let ana = await join("ana");
+	let chat = chatPane(ana);
+	let draft = chatInput(chat);
+	let documents = chat.getByRole("listbox", { name: "Document references" });
+	let file = documents.getByRole("option", { name: "src/chat/composer.tsx" });
+
+	await chat.getByRole("button", { name: "Mention docs", exact: true }).click();
+	await expectChatValue(draft, "#");
+	await expect(draft).toBeFocused();
+	await expect(file).toBeVisible();
+	// The words of a path go on past a slash, and the row becomes a chip the server reads as a file.
+	await draft.pressSequentially("comp");
+	await expect(documents.getByRole("option")).toHaveText(["src/chat/composer.tsxfile"]);
+	await draft.press("Enter");
+	await expectChatValue(draft, "@src/chat/composer.tsx ");
+	await expect(draft.locator('.draft-reference[data-reference="file"]')).toHaveText(
+		"@src/chat/composer.tsx",
+	);
+	await expect(documents).toHaveCount(0);
+
+	// A `#` past a space with nothing to match holds no menu open over the sentence.
+	await draft.pressSequentially("and #12 is");
+	await expect(documents).toHaveCount(0);
 });
 
 test("the @ picker closes on Escape or an outside press and keeps the draft", async ({ join, page }) => {

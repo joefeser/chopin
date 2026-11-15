@@ -14,6 +14,9 @@ import { BuildPlanButton } from "./build-plan-button";
 import { SETUP } from "./build-connection-popover";
 import { SHARE_DETAIL, YourMachines } from "./experiments/machine-list";
 import { ChatComposer } from "./chat/composer";
+import { QuietNote } from "./chat/quiet-note";
+import FixSteps from "./fix-steps";
+import { machineFix } from "./machine-fix";
 import { plannerForBanner } from "./chat/connection-phase";
 import {
 	destinationCue,
@@ -154,8 +157,11 @@ function choice(): MachineChoice {
 		},
 		read: 1,
 		saving: false,
+		chosen: 0,
 		choose: async () => {},
 		refresh: () => {},
+		moves: 0,
+		endSwitch: () => {},
 	};
 }
 
@@ -232,44 +238,37 @@ test("every glyph the button's dot takes says nothing, and none of it is an inte
 	}
 });
 
-test("the banner at the composer says every state in plain words, with the button or without", () => {
+test("the machine's state is never drawn in Chat; its fix-it steps and quiet note say every state in plain words", () => {
 	for (let status of statuses()) {
 		for (let hasButton of [true, false]) {
 			let view = connectionStep(INITIAL_MEMORY, {
 				...WELL,
 				planner: plannerForBanner(status, hasButton),
 			}).view;
-			if (view.phase === "online") continue;
-			let markup = render(createElement(ConnectionBannerView, { onRetry: () => {}, view }));
-			expect(markup.length).toBeGreaterThan(0);
-			expectPlain(`banner ${status.kind} ${hasButton}`, words(markup));
-			// And as the composer draws it, above the field.
-			let drawn = render(
-				createElement(ChatComposer, {
-					...COMPOSER,
-					banner: {
-						id: "b",
-						node: createElement(ConnectionBannerView, { onRetry: () => {}, view }),
-					},
-				}),
-			);
-			expectPlain(
-				`drawn ${status.kind} ${hasButton}`,
-				words(
-					drawn.slice(
-						drawn.indexOf('<div class="composer-notice"'),
-						drawn.indexOf("composer-surface"),
-					),
-				),
-			);
+			// Presence and the menu tell it; nothing is drawn by the offline bar or the composer.
+			expect(render(createElement(ConnectionBannerView, { onRetry: () => {}, view }))).toBe("");
+			for (let place of ["menu", "note"] as const) {
+				for (let mine of [true, false]) {
+					let fix = machineFix(status, { mine, choose: hasButton, place });
+					if (!fix) continue;
+					expectPlain(
+						`steps ${status.kind} ${place} ${mine}`,
+						words(render(createElement(FixSteps, { fix, menu: place === "menu" })))
+							// The machine's own words are its own, shown as reported.
+							.filter(text => !fix.details?.join("\n").includes(text)),
+					);
+					expectPlain(
+						`note ${status.kind} ${place} ${mine}`,
+						words(render(createElement(QuietNote, { fix, text: "Message not sent." }))),
+					);
+				}
+			}
 		}
 	}
 });
 
 test("a lost connection, its action, its return and its one polite word are plain", () => {
-	expect(OFFLINE_MESSAGE).toBe(
-		"You're offline. Your changes are kept and will sync when you reconnect.",
-	);
+	expect(OFFLINE_MESSAGE).toBe("You're offline. Your changes are kept.");
 	let phases = [
 		connectionStep(INITIAL_MEMORY, { ...WELL, socket: "lost", failures: 1 }),
 		connectionStep(INITIAL_MEMORY, { ...WELL, socket: "lost", failures: 4 }),
@@ -374,7 +373,7 @@ test("the busy labels, the agent's face and the composer's picker hints are plai
 		["writing", "unseen", undefined].map(state => documentActivityLabel(state as never)),
 	);
 	let working = render(createElement(PlanStatus, { busy: true, synced: true }));
-	expect(working).toContain("Chopin is working");
+	expect(working).toContain("chopin is working");
 	expectPlainWords("the document's status", words(working));
 	expectPlainWords("the agent's face", words(render(createElement(AgentFace, {}))));
 	for (let text of ["", "should we ask about auth first?", "@chopin draft the auth section"]) {
@@ -382,16 +381,14 @@ test("the busy labels, the agent's face and the composer's picker hints are plai
 		if (cue) expectPlainWords("a picker hint", [cue.text]);
 	}
 	expect(destinationCue("should we ask about auth first?", [], true)?.text)
-		.toBe("Sent to people here. Type @ to ask Chopin");
+		.toBe("Sent to people here. Type @ to ask chopin");
 	let empty = render(createElement(Transcript, {
 		active: true,
 		emptyHint: { planner: true, references: true },
 		entries: [],
 		handle: "ana",
-		onWithdraw: () => {},
-		queued: [],
 	}));
-	expect(empty).toContain("to ask Chopin");
+	expect(empty).toContain("to ask chopin");
 	expectPlainWords("the empty Chat", words(empty));
 });
 
@@ -465,7 +462,7 @@ test("what a message's analysis, its evidence and a failed background job say is
 		},
 	}];
 	let evidence = render(createElement(EvidencePopover, { rows, onSource: () => {} } as never));
-	expect(evidence).toContain("Chopin suggested");
+	expect(evidence).toContain("chopin suggested");
 	expectPlainWords("the evidence", words(evidence));
 	let jobs = render(createElement(PlannerJobDiagnostics, {
 		canEdit: true,
@@ -542,7 +539,14 @@ test("every reason Build plan waits and every refusal Build shows is plain, mach
 	expectPlain("Build plan's reasons", reasons);
 
 	let refusals = [
-		["@mona's machine is offline, so it can't reply now. Your work is kept.", undefined],
+		[
+			"@mona's machine is offline, so this message wasn't sent. Send it again when it's back.",
+			undefined,
+		],
+		[
+			"Still connecting to @mona's machine, so this message wasn't sent. Send it again in a moment.",
+			"planner-not-attached",
+		],
 		["anything", "planner-not-attached"],
 		["Connect a machine to get a reply. Choose one with the machine button.", undefined],
 		["accepted comments awaiting plan changes", undefined],
@@ -550,7 +554,7 @@ test("every reason Build plan waits and every refusal Build shows is plain, mach
 		["the queue is full", undefined],
 		["the reply queue is full", undefined],
 		["Planner is not running", undefined],
-		["Chopin is not running", undefined],
+		["chopin is not running", undefined],
 		["write access is needed", undefined],
 		["this cannot be built", undefined],
 	] as const;

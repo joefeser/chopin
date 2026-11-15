@@ -1,11 +1,11 @@
 /**
- * What the page says about the document's remote Planner. A healthy Planner is not mentioned. A
- * person with a machine button reads every state on it and in its menu; everyone also reads it on
- * the one connection banner at the composer's top edge, with the reason for a machine that cannot
- * be connected to drawn beneath (a person with a machine button is not told "no machine" there).
- * A screen reader hears each state once from the page's one polite live region, which is the
- * connection banner's: it speaks the room's connection and the Planner's alike, and the banner
- * and the button never announce anything themselves. These helpers read all of those.
+ * What the page says about the document's remote Planner. A healthy Planner is not mentioned, and
+ * Chat never draws its state: a person with a machine button reads every state in its dot and name
+ * and the steps to fix it in its menu, chopin's avatar carries the same presence, and a message
+ * chopin cannot take is its ephemeral row. A screen reader hears each state once from the page's
+ * one polite live region, which speaks the room's connection and the Planner's alike (a person with
+ * a machine button is not told "no machine" there); the button never announces anything itself.
+ * These helpers read all of those.
  */
 import { expect } from "@playwright/test";
 
@@ -15,9 +15,36 @@ import type { Locator, Page } from "@playwright/test";
 
 export const NONE = "No machine is connected.";
 
-/** The banner on the composer's top edge. */
+/**
+ * Whatever the page draws of a connection: only the offline bar, for the room's own socket. The
+ * Planner's machine is never drawn there, so for it this is always empty.
+ */
 export function strip(page: Page): Locator {
-	return page.locator(".chat-composer [data-connection-banner]");
+	return page.locator("[data-connection-banner]");
+}
+
+/**
+ * The page tells `text` of the Planner's machine: in the machine button's name and tooltip where the
+ * person has a button, and from the page's live region where they have none. Nothing of it is drawn
+ * in Chat either way.
+ */
+export async function expectTold(page: Page, text: string | RegExp): Promise<void> {
+	let button = machineButton(page);
+	if (await button.count() > 0) {
+		let words = typeof text === "string"
+			? new RegExp(`\\. ${text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`)
+			: new RegExp(`\\. ${text.source.replace(/^\^/, "")}`);
+		await expect(button).toHaveAttribute("data-tooltip", words);
+		await expect(button).toHaveAccessibleName(words);
+	} else {
+		await expect(announced(page)).toContainText(text);
+	}
+	await expect(strip(page)).toHaveCount(0);
+}
+
+/** chopin's ephemeral row: a message it could not take, said to this person alone. */
+export function quietNote(page: Page): Locator {
+	return page.locator("[data-quiet-note]");
 }
 
 /**
@@ -85,7 +112,7 @@ export async function expectNoPlanner(page: Page): Promise<void> {
 
 /**
  * Wait until a Planner is attached after the page knew none was: the live region has fallen
- * silent and the strip has gone, with nothing typed.
+ * silent and nothing is drawn, with nothing typed.
  */
 export async function expectPlannerAttached(page: Page): Promise<void> {
 	await expect(announced(page)).toHaveText("");
@@ -120,4 +147,94 @@ export async function expectNoMachineWords(page: Page, said: string | RegExp): P
 		)
 	);
 	expect(described.filter(text => MACHINE_WORDS.test(text))).toEqual([]);
+}
+
+/** The connecting dots inside `within`: the banner's icon or the machine button's badge. */
+export function connectingDots(within: Locator): Locator {
+	return within.locator("[data-connecting]");
+}
+
+/**
+ * The dots brighten in turn: each runs the one endless wave, by opacity alone, a step after the one
+ * before it, so nothing turns, grows or moves.
+ */
+export async function expectConnectingWave(dots: Locator): Promise<void> {
+	await expect(dots).toBeVisible();
+	let waves = await dots.evaluate(indicator =>
+		[...indicator.querySelectorAll(".connecting-dot")].map(dot =>
+			dot.getAnimations().map(animation => {
+				let effect = animation.effect as KeyframeEffect;
+				return {
+					name: (animation as CSSAnimation).animationName,
+					state: animation.playState,
+					iterations: effect.getComputedTiming().iterations,
+					delay: effect.getTiming().delay,
+					changes: [
+						...new Set(
+							effect.getKeyframes().flatMap(frame =>
+								Object.keys(frame).filter(key =>
+									!["offset", "computedOffset", "easing", "composite"].includes(key)
+								)
+							),
+						),
+					],
+				};
+			})
+		)
+	);
+	expect(waves).toEqual([0, 200, 400].map(delay => [{
+		name: "connecting-wave",
+		state: "running",
+		iterations: Infinity,
+		delay,
+		changes: ["opacity"],
+	}]));
+}
+
+/**
+ * Under reduced motion the dots hold still, stepped from faint to full: an ellipsis, which reads as
+ * under way with nothing moving.
+ */
+export async function expectConnectingStill(dots: Locator): Promise<void> {
+	await expect(dots).toBeVisible();
+	await expect.poll(() =>
+		dots.evaluate(indicator =>
+			[...indicator.querySelectorAll(".connecting-dot")].map(dot => ({
+				moving: dot.getAnimations().length,
+				opacity: getComputedStyle(dot).opacity,
+			}))
+		)
+	).toEqual([
+		{ moving: 0, opacity: "0.35" },
+		{ moving: 0, opacity: "0.65" },
+		{ moving: 0, opacity: "1" },
+	]);
+}
+
+/**
+ * Over one whole wave and a little more, every frame lays out `targets` exactly where the first did:
+ * the dots, and what is around them, never shift. It starts once every entrance has finished (the
+ * banner's own slide in moves all of it together); the dots' wave never finishes, by design.
+ */
+export async function expectSteadyLayout(targets: Locator[]): Promise<void> {
+	let handles = await Promise.all(targets.map(target => target.elementHandle()));
+	let page = targets[0]!.page();
+	let boxes = await page.evaluate(async elements => {
+		await Promise.all(
+			document.getAnimations()
+				.filter(animation => animation.effect?.getComputedTiming().iterations !== Infinity)
+				.map(animation => animation.finished.catch(() => undefined)),
+		);
+		let seen = new Set<string>();
+		let end = performance.now() + 1_400;
+		while (performance.now() < end) {
+			seen.add(JSON.stringify(elements.map(element => {
+				let box = element!.getBoundingClientRect();
+				return [box.x, box.y, box.width, box.height];
+			})));
+			await new Promise(resolve => requestAnimationFrame(resolve));
+		}
+		return [...seen];
+	}, handles);
+	expect(boxes).toHaveLength(1);
 }

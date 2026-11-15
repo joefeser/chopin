@@ -32,7 +32,7 @@
 				1
 			]
 		],
-		"sourceHash": "a08ec14cab5bf5f0d0503c29021fbfabeef1479ee1ac61db53c8b70fe6bb99ca"
+		"sourceHash": "92a97252d627c7fdd25dff01933e104f6d62e10368d6f07dc56d3326305d0ab1"
 	},
 	{
 		"file": "packages/question/src/react/resolved-actions.tsx",
@@ -378,6 +378,13 @@
 				"dynamic",
 				"*",
 				"props",
+				"unresolved JSX props > RotateIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
 				"unresolved JSX props > MinusIcon > <LineIcon>",
 				1
 			],
@@ -386,6 +393,20 @@
 				"*",
 				"props",
 				"unresolved JSX props > FitWidthIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > WrapIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > GripIcon > <LineIcon>",
 				1
 			],
 			[
@@ -450,9 +471,44 @@
 				"props",
 				"unresolved JSX props > MicIcon > <LineIcon>",
 				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > DownloadIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ImageOffIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ExternalLinkIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > EllipsisVerticalIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ReactionAddIcon > <LineIcon>",
+				1
 			]
 		],
-		"sourceHash": "d3058cfabee370f4e290411018e9dfed08186e740009bf05fa3cea81ae66f722"
+		"sourceHash": "7ede216ca263e151d26b03ceb7b9e50ee71b09003e6e39c58e68d3538b1b7ed4"
 	},
 	{
 		"file": "packages/icons/src/warning.tsx",
@@ -977,7 +1033,7 @@
 				1
 			]
 		],
-		"sourceHash": "8acd4c0ce30f8405a1db20dd07fe274c453c0ebdb29fdaa3d37a756fec5bbd34"
+		"sourceHash": "2e7ab2d3fc09e76fe45f18caed8efd9b85fc318f37f40dda41d03fb22fc5d584"
 	},
 	{
 		"file": "packages/dialect/src/nodes/containers.ts",
@@ -1111,5 +1167,208 @@
 			]
 		],
 		"sourceHash": "7c0d739dacfc022855c92a4136f0ff1c3645780461787ae82b66bae98aa5a4b4"
+	},
+	{
+		"file": "packages/icons/src/chat.tsx",
+		"reason": "Icon wrapper forwards SVG accessibility, sizing, and caller styling props. Literal style/class call sites are scanned; no ambient rendering code is executed.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ChevronDownIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ChevronLeftIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > GlobeIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > SpinnerIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ThumbsUpIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ThumbsDownIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > ShieldAlertIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > SmileyIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > LeafIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > CupIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > CarIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > BallIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > HeartIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FlagIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > Page > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FileIcon > <Page>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FileTextIcon > <Page>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FileCodeIcon > <Page>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FileSheetIcon > <Page>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FileZipIcon > <Page>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FilePdfIcon > <Page>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FileImageIcon > <Page>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FileVideoIcon > <Page>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > FileAudioIcon > <Page>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > SlidesIcon > <LineIcon>",
+				1
+			],
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > BotIcon > <LineIcon>",
+				1
+			]
+		],
+		"sourceHash": "849f2df62af9c71dbef7c7bdcd359a747899273b1631673395f66322cfd735af"
+	},
+	{
+		"file": "packages/icons/src/copy.tsx",
+		"reason": "Icon wrapper forwards SVG accessibility, sizing, and caller styling props. Literal style/class call sites are scanned; no ambient rendering code is executed.",
+		"cases": [
+			[
+				"dynamic",
+				"*",
+				"props",
+				"unresolved JSX props > CopyIcon > <LineIcon>",
+				1
+			]
+		],
+		"sourceHash": "854f4adabbe3c622a0454187d46355981ace01b852b3a7063ccc4cf585981bcc"
 	}
 ]

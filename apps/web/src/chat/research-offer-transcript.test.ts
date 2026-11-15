@@ -45,8 +45,6 @@ test("the exact public brief appears under its source message and viewer control
 				},
 			],
 			handle: "ana",
-			onWithdraw: () => {},
-			queued: [],
 			conversationPlan: state,
 			researchOffers: {
 				links: {},
@@ -108,8 +106,7 @@ test("the speaker's messages after an offer card continue without a repeated hea
 		[{
 			kind: "messages",
 			author: { kind: "member", handle: "ana" },
-			queued: false,
-			messages: messages.map(message => ({ ...message, queued: false })),
+			messages,
 		}],
 		offerState("offered").researchOffers!,
 	);
@@ -122,8 +119,6 @@ test("the speaker's messages after an offer card continue without a repeated hea
 		active: true,
 		entries: messages,
 		handle: "ana",
-		onWithdraw: () => {},
-		queued: [],
 		conversationPlan: offerState("offered"),
 		researchOffers: {
 			links: {},
@@ -136,7 +131,7 @@ test("the speaker's messages after an offer card continue without a repeated hea
 			onRetryLink: () => {},
 		},
 	}));
-	expect(markup.match(/>Ana<\/span>/g)).toHaveLength(1);
+	expect(markup.match(/>ana<\/span>/g)).toHaveLength(1);
 });
 
 test("a ready request linked from a visible offer card announces itself only on the card", () => {
@@ -151,8 +146,6 @@ test("a ready request linked from a visible offer card announces itself only on 
 				ts: 3,
 			}],
 			handle: "ana",
-			onWithdraw: () => {},
-			queued: [],
 			conversationPlan: offerState("accepted"),
 			researchOffers: {
 				links: { "offer-1": { status: "linked", researchRequestId: "request-1" } },

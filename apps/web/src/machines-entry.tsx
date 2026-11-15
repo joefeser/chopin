@@ -1,5 +1,6 @@
 import { Menu } from "@base-ui/react/menu";
 import { Count } from "@chopin/editor/count";
+import { focusIsFree } from "@chopin/editor/focus-return";
 import { CloudIcon, MachineIcon, PlusIcon, ServerIcon, WarningIcon } from "@chopin/icons";
 import { Fragment, useLayoutEffect, useRef } from "react";
 
@@ -187,7 +188,8 @@ function MachinesMenuPopup({ children }: { children: ReactNode }) {
 	return (
 		<Menu.Popup
 			className="machines-menu"
-			finalFocus={() => openedOn.current === location.href}
+			// The menu fades for 120ms; a machine button pressed meanwhile keeps its focus and its menu.
+			finalFocus={() => openedOn.current === location.href && focusIsFree(popup.current)}
 			ref={popup}
 		>
 			{children}

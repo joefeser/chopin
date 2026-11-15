@@ -1,4 +1,9 @@
+import { PLANNER_NAME } from "@chopin/editor/people";
 import { useEffect } from "react";
+
+// Every route waits for this chunk before it mounts (main.tsx), so the cursor contract rides with
+// it: in place from the first frame React draws, and none of the entry stylesheet's bytes.
+import "./cursors.css";
 
 const DELAY = 400;
 // After a tooltip was visible, the next one opens at once for this long.
@@ -25,7 +30,8 @@ function iconButton(target: EventTarget | null): HTMLElement | null {
 	if (marked && !marked.closest("[inert]")) return marked;
 	let button = target.closest<HTMLButtonElement>("button");
 	if (
-		!button || button.disabled || button.closest("[inert]")
+		// A copied element's trigger (`TooltipIconButton`) opens its own tooltip; a second would say it again.
+		!button || button.disabled || button.closest("[inert], [data-slot='tooltip-trigger']")
 		|| button.matches(
 			".sr-only, .navigation-drawer-backdrop, .navigation-modal-backdrop, .plan-comment-button:not([data-tooltip]), .plan-decision-marker",
 		)
@@ -50,14 +56,17 @@ function openPopup(element: HTMLElement): boolean {
 	return element.getAttribute("aria-expanded") === "true" && popup !== null && popup !== "false";
 }
 
+// Sentence case, unless the label begins with the agent's name, which keeps its lower case.
+const FIRST_LETTER = new RegExp(`^(?!${PLANNER_NAME}\\b)[a-z]`);
+
 /**
- * Tooltips use sentence case.
+ * Tooltips use sentence case, except where they begin with chopin's name.
  * Names and handles opt out so they keep their own casing.
  */
 export function tooltipText(label: string, verbatim: boolean): string {
 	return verbatim
 		? label.trim()
-		: label.trim().replace(/^[a-z]/, (letter) => letter.toUpperCase());
+		: label.trim().replace(FIRST_LETTER, letter => letter.toUpperCase());
 }
 
 /** Hover tooltips never show on coarse pointers; focus ones only for keyboard focus. */
@@ -94,12 +103,37 @@ export function IconTooltip() {
 		// Escape dismisses the focused control's tooltip until focus moves.
 		let dismissed: HTMLElement | null = null;
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		let originalTitle: string | null = null;
+		// The trigger whose native title is held back, so the browser never draws it beside this
+		// tooltip: while its tooltip is pending or shown, and while it is pressed.
+		let held: HTMLElement | null = null;
+		let heldTitle: string | null = null;
 		// A pressed trigger stays quiet until the pointer leaves it.
 		let pressed: HTMLElement | null = null;
 		let warmUntil = 0;
 		// Shows the active trigger's tooltip; called again when its label changes while visible.
 		let shown: ((instant: boolean) => void) | null = null;
+
+		// A title set again while held (a label React rewrites) is taken back at once.
+		function take() {
+			let title = held?.getAttribute("title") ?? null;
+			if (title === null) return;
+			heldTitle = title;
+			held!.removeAttribute("title");
+		}
+
+		function hold(element: HTMLElement) {
+			if (held !== element) release();
+			held = element;
+			take();
+		}
+
+		function release() {
+			if (held && heldTitle !== null && !held.hasAttribute("title")) {
+				held.setAttribute("title", heldTitle);
+			}
+			held = null;
+			heldTitle = null;
+		}
 
 		function hide(instant = false) {
 			clearTimeout(timer);
@@ -108,11 +142,8 @@ export function IconTooltip() {
 			if (instant) tooltip.setAttribute("data-instant", "");
 			else tooltip.removeAttribute("data-instant");
 			tooltip.removeAttribute("data-visible");
-			if (active && originalTitle !== null && !active.hasAttribute("title")) {
-				active.setAttribute("title", originalTitle);
-			}
+			if (held !== pressed) release();
 			active = null;
-			originalTitle = null;
 			shown = null;
 		}
 
@@ -121,16 +152,18 @@ export function IconTooltip() {
 			hide();
 			if (!button || button === pressed) return;
 			active = button;
-			originalTitle = button.getAttribute("title");
-			if (originalTitle !== null) button.removeAttribute("title");
+			hold(button);
 			let show = (instant: boolean) => {
 				timer = undefined;
 				if (!button.isConnected || openPopup(button)) return hide();
 				if (instant) tooltip.setAttribute("data-instant", "");
 				else tooltip.removeAttribute("data-instant");
 				let label = button.getAttribute("data-tooltip") ?? button.getAttribute("aria-label")
-					?? originalTitle ?? button.querySelector(".sr-only")?.textContent;
+					?? heldTitle ?? button.querySelector(".sr-only")?.textContent;
 				if (!label) return hide();
+				// A modal dialog is drawn above the page, so a tooltip for its controls is drawn inside it.
+				let layer = button.closest("dialog[open]") ?? document.body;
+				if (tooltip.parentElement !== layer) layer.append(tooltip);
 				tooltip.textContent = tooltipText(label, button.hasAttribute("data-tooltip-verbatim"));
 				tooltip.setAttribute("data-shortcut", button.dataset.tooltipShortcut ?? "");
 				let rect = button.getBoundingClientRect();
@@ -197,11 +230,18 @@ export function IconTooltip() {
 		function pointerDown(event: PointerEvent) {
 			pressed = iconButton(event.target);
 			hide(true);
+			if (pressed) hold(pressed);
 		}
 
 		function attributeChange(records: MutationRecord[]) {
 			for (let record of records) {
 				let target = record.target as HTMLElement;
+				if (record.attributeName === "title") {
+					if (target !== held || !target.hasAttribute("title")) continue;
+					take();
+					if (target === active && tooltip.hasAttribute("data-visible")) shown?.(true);
+					continue;
+				}
 				if (target !== active) continue;
 				if (record.attributeName === "aria-expanded" && openPopup(target)) {
 					if (target === hovered) pressed = target;
@@ -219,6 +259,7 @@ export function IconTooltip() {
 			if (
 				pressed?.contains(event.target as Node) && !pressed.contains(event.relatedTarget as Node)
 			) {
+				if (held === pressed && held !== active) release();
 				pressed = null;
 			}
 			if (
@@ -268,7 +309,7 @@ export function IconTooltip() {
 		let observer = new MutationObserver(attributeChange);
 		observer.observe(document.body, {
 			attributes: true,
-			attributeFilter: ["aria-expanded", "data-tooltip"],
+			attributeFilter: ["aria-expanded", "data-tooltip", "title"],
 			subtree: true,
 		});
 		document.addEventListener("scroll", scroll, true);
@@ -283,6 +324,7 @@ export function IconTooltip() {
 		document.addEventListener("keydown", keyDown, true);
 		return () => {
 			hide();
+			release();
 			tooltip.remove();
 			document.removeEventListener("pointerover", pointerOver, true);
 			document.removeEventListener("pointerout", pointerOut, true);

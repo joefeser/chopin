@@ -11,18 +11,36 @@ an element only draws what it is given.
 assistant-ui ships each element twice. The **standalone** lane, `elements-<name>`, takes props and
 callbacks; the **connected** lane, `<name>`, reads a runtime. Copy the standalone one. Where an
 element has only a connected form, or the connected one cannot express Chopin's state (one thread,
-several authors, a queue the server keeps), say so in the pull request and draw it from props
+several authors, a transcript the server keeps), say so in the pull request and draw it from props
 instead of adding the runtime. The model selector, `elements-model-selector`, was the first one
 copied, and the composer, `elements-composer`, with the `surfaces` recipes and `range` helper it
 stands on, is Chat's composer shell. Its menu and rows (`ComposerMenu`, `ComposerPersonItem`,
-`ComposerCommandItem`) are Chat's `@` and `/` menus, and `elements-directive-text` and the Badge it
-stands on are the Chopin chip. The same Composer holds the standalone elements for what a message
+`ComposerCommandItem`) are Chat's `@` and `/` menus. The same Composer holds the standalone elements for what a message
 carries: its staged-file chips (`ComposerAttachments`, `ComposerAttachmentChip`) and the dictation's
 voice and button (`ComposerVoice`, `ComposerVoiceButton`) fill the box's slots, and
-`elements-message-attachment` draws a sent message's files. The tile the registry calls `attachment`
-draws a live runtime attachment through `AttachmentPrimitive` and has no props-driven form, so it is
-not copied and the chip carries a file's states from props. Each carries a
-[recorded patch](#patching-a-copy) where Chat needed an extension point.
+`elements-message-attachment` draws a sent message's non-image files. Every image in Chat — from a
+Planner turn, from Markdown, or attached to a sent message — is drawn by `image` (assistant-ui has no
+separate `elements-image` item; `image.tsx` is already props-driven and imports only two prop types,
+declared locally in `part-types.d.ts` without installing `@assistant-ui/react`) and
+`elements-image-gallery` (with the `href` helper it stands on, and its `<Dialog>` lightbox). Those, the
+received-files tiles, the staged-file chips and a Chat message's code blocks are the one place where
+Slack's look wins over assistant-ui's proportions: Chat draws its images, placeholders, files and code
+as Slack does, so Chopin's own unlayered rules (`src/chat/image.css`, `src/chat/media/media.css`,
+`src/chat/markdown.css`) restyle the copies from outside, as the message rows' toolbar is, while the
+copies keep their structure, behaviour and recorded bytes; the plate's pristine specimens keep
+assistant-ui's geometry, and `e2e/design/chat-media.e2e.ts` and `e2e/chat-code-blocks.e2e.ts` hold
+Chat's to Slack's. A code block's colours come through the `SyntaxHighlighter` slot that
+`markdown-primitive.tsx` already offers, so the copy needs no patch for them.
+Chat draws no context-window usage: `ComposerContext` stays in the copied `elements-composer` unused, and
+`elements-context-breakdown` is drawn only on the design-audit plate. Because assistant-ui ships no
+compaction marker, the expandable compaction divider is Chopin's own `Unfold` disclosure.
+Every copy's `lucide-react` import is mapped in `tsconfig.json` to `src/chat/assistant-ui/lucide.tsx`, which draws each icon it names with Chopin's own (`packages/icons`), so Chat has one icon language and no lucide artwork ships; a copy that names an icon the file lacks fails `bun run types`, and the icon is added there, drawn in `packages/icons`. `markdown-text` has only a connected entry, so its `@assistant-ui/react` and
+`@assistant-ui/react-markdown` imports map in `tsconfig.json` to Chopin's props-driven
+`react-markdown` seam (`src/chat/assistant-ui/markdown-primitive.tsx`). The tile the registry calls
+`attachment` draws a live runtime attachment through `AttachmentPrimitive` and has no props-driven
+form, so it is not copied and the chip carries a file's states from props. `elements-agent-handoff`
+and `elements-subagent-list` draw research delegation, unpatched, inside the attachment of a Chat
+app message. Each carries a [recorded patch](#patching-a-copy) where Chat needed an extension point.
 
 ## Add it
 

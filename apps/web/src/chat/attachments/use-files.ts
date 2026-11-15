@@ -31,6 +31,8 @@ export type FilesControl = {
 	retry: (id: string) => void;
 	/** Forgets the files once a message has been sent with them. The server keeps them. */
 	clear: () => void;
+	/** Puts uploaded files back in the draft when the server refused the send without taking them. */
+	restore: (files: readonly Chat.Attachment[]) => void;
 	/** The browser's own copy of a file, for its thumbnail. */
 	source: (id: string) => File | undefined;
 	uploading: number;
@@ -90,6 +92,21 @@ export function useFiles({ channelId, limits, imagesAllowed }: Config): FilesCon
 			if (!abort.signal.aborted) dispatch({ type: "failed", id, refusal, message, retry });
 		};
 		try {
+			// An image too large to send goes as a smaller copy of itself, never refused for its size.
+			let original: { bytes: number; width: number; height: number } | undefined;
+			if (claimsImage(file.name, file.type)) {
+				let shrunk = await import("./shrink").then(shrink =>
+					shrink.shrinkImage(file, caps.maxBytes)
+				)
+					.catch(() => undefined);
+				if (abort.signal.aborted) return;
+				if (shrunk) {
+					file = shrunk.file;
+					original = shrunk.original;
+					sources.current.set(id, { file, abort });
+					dispatch({ type: "resized", id, name: file.name, size: file.size });
+				}
+			}
 			let inspected = await upload.inspectFile(file, caps);
 			if (abort.signal.aborted) return;
 			if (!inspected.ok) return fail(inspected.refusal, inspected.message, false);
@@ -98,6 +115,7 @@ export function useFiles({ channelId, limits, imagesAllowed }: Config): FilesCon
 				channelId: target,
 				file,
 				name: file.name,
+				...(original ? { original } : {}),
 				signal: abort.signal,
 				onProgress: progress => {
 					if (!abort.signal.aborted) dispatch({ type: "progress", id, progress });
@@ -124,15 +142,18 @@ export function useFiles({ channelId, limits, imagesAllowed }: Config): FilesCon
 		let carried = [...latest.current];
 		for (let file of chosen) {
 			let id = crypto.randomUUID();
+			let image = claimsImage(file.name, file.type);
+			// An image over the cap is sent as a smaller copy, at most the cap, so it counts as that.
+			let size = image ? Math.min(file.size, caps.maxBytes) : file.size;
 			let draft: DraftFile = {
 				id,
 				name: file.name || "File",
-				kind: claimsImage(file.name, file.type) ? "image" : "file",
-				size: file.size,
+				kind: image ? "image" : "file",
+				size,
 				mimeType: file.type,
 				status: { type: "running", reason: "uploading", progress: 0 },
 			};
-			let refused = refusalFor(carried, file.size, caps);
+			let refused = refusalFor(carried, size, caps);
 			if (refused) {
 				draft = {
 					...draft,
@@ -176,6 +197,10 @@ export function useFiles({ channelId, limits, imagesAllowed }: Config): FilesCon
 		dispatch({ type: "clear" });
 	}, []);
 
+	let restore = useCallback((restored: readonly Chat.Attachment[]) => {
+		dispatch({ type: "restore", files: restored });
+	}, []);
+
 	// A composer that goes away stops what it was uploading; the server forgets what nobody sent.
 	useEffect(() => {
 		let held = sources.current;
@@ -199,6 +224,7 @@ export function useFiles({ channelId, limits, imagesAllowed }: Config): FilesCon
 		remove,
 		retry,
 		clear,
+		restore,
 		source: id => sources.current.get(id)?.file,
 		uploading: state.uploading,
 		failed: state.failed,

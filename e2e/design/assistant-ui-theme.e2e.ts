@@ -29,14 +29,32 @@ const ROOTS = [
 	'[data-slot="model-selector-trigger"]',
 	'[data-slot="model-selector-content"]',
 	'[data-slot="composer-menu"]',
-	'[data-slot="directive-text-chip"]',
 	'[data-slot="composer-attachments"]',
 	'[data-slot="composer-voice"]',
 	'[data-slot="composer-voice-button"]',
 	'[data-slot="message-attachments"]',
+	'[data-slot="markdown-text"]',
+	'[data-slot="tooltip-content"]',
+	'[data-slot="context-breakdown"]',
+	'[data-slot="image-root"]',
+	'[data-slot="image-zoom-overlay"]',
+	'[data-slot="image-gallery"]',
+	'[data-slot="dialog-overlay"]',
+	'[data-slot="dialog-content"]',
+	'[data-slot="message-actions"]',
+	'[data-slot="dropdown-menu-content"]',
+	"[data-audit-reactions]",
+	'[data-slot="agent-handoff"]',
+	'[data-slot="subagent-list"]',
+	// The emoji picker's chrome and its first section; its other sections are drawn the same way.
+	"[data-audit-picker] .emoji-picker-search",
+	"[data-audit-picker] .emoji-picker-tabs",
+	'[data-audit-picker] [data-emoji-section="frequent"]',
+	"[data-audit-picker] .emoji-picker-footer",
 ] as const;
 
-// The voice's dot pulses for as long as it listens, and a colour is read once nothing is moving.
+// The voice's dot pulses for as long as it listens, and subagent cards spin and shimmer: a colour
+// is read once nothing is moving.
 test.use({ contextOptions: { reducedMotion: "reduce" } });
 
 type Colour = { r: number; g: number; b: number; a: number };
@@ -71,7 +89,12 @@ async function drawn(
 		let body = getComputedStyle(document.body).fontFamily;
 		// Chopin's own stack for technical words, which a copy's `font-mono` tag draws (the layer does
 		// not restore a family, so the copy's is Chopin's, and the two are the same string).
-		let mono = getComputedStyle(document.documentElement).getPropertyValue("--font-mono").trim();
+		probe.style.fontFamily = "var(--font-mono)";
+		let mono = getComputedStyle(probe).fontFamily;
+		// Where only emoji are drawn (a reaction, the picker): the platform's emoji fonts, then Inter.
+		probe.style.fontFamily = "var(--font-emoji)";
+		let emoji = getComputedStyle(probe).fontFamily;
+		probe.style.fontFamily = "";
 		let describe = (element: Element) =>
 			`${element.tagName.toLowerCase()}${
 				element.getAttribute("data-slot") ? `[${element.getAttribute("data-slot")}]` : ""
@@ -127,6 +150,8 @@ async function drawn(
 								? "Chopin"
 								: style.fontFamily === mono
 								? "Chopin mono"
+								: style.fontFamily === emoji
+								? "Chopin emoji"
 								: style.fontFamily
 						}`,
 					);
@@ -158,7 +183,10 @@ async function states(page: Page, measure: (state: string) => Promise<void>) {
 		await expect.poll(
 			() =>
 				page.evaluate(() =>
-					document.getAnimations().filter(animation => animation.playState === "running").length
+					document.getAnimations().filter(animation =>
+						animation.playState === "running"
+						&& (animation.effect?.getComputedTiming().iterations ?? 1) !== Infinity
+					).length
 				),
 			{ message: state },
 		)
@@ -168,7 +196,7 @@ async function states(page: Page, measure: (state: string) => Promise<void>) {
 	let first = plate(page, "assistant-ui").getByRole("combobox").first();
 	await first.scrollIntoViewIfNeeded();
 	await check("rest");
-	// What a hover colours in the files and the voice, before the selector opens over them.
+	// What a hover colours in the files, the voice and the images, before the selector opens over them.
 	let message = plate(page, "assistant-ui").locator('[data-slot="message-attachments"] button')
 		.first();
 	await message.scrollIntoViewIfNeeded();
@@ -181,6 +209,39 @@ async function states(page: Page, measure: (state: string) => Promise<void>) {
 		.first();
 	await remove.hover();
 	await check("a chip's remove hover");
+
+	let action = plate(page, "assistant-ui").locator('[data-slot="image-download"]');
+	await action.scrollIntoViewIfNeeded();
+	await action.hover();
+	await check("image action hover");
+
+	let zoom = plate(page, "assistant-ui").locator(".aui-image-zoom-trigger").first();
+	await zoom.click();
+	await expect(page.locator('[data-slot="image-zoom-overlay"]')).toBeVisible();
+	await check("image zoom open");
+	await page.keyboard.press("Escape");
+	await expect(page.locator('[data-slot="image-zoom-overlay"]')).toHaveCount(0);
+
+	let tile = plate(page, "assistant-ui").locator('[data-slot="image-gallery"] button').first();
+	await tile.scrollIntoViewIfNeeded();
+	await tile.hover();
+	await check("gallery tile hover");
+	await tile.focus();
+	await page.keyboard.press("Tab");
+	await page.keyboard.press("Shift+Tab");
+	await check("gallery tile focus");
+	await tile.click();
+	let dialog = page.locator('[data-slot="dialog-content"]');
+	await expect(dialog).toBeVisible();
+	await expect.poll(() => dialog.evaluate(node => getComputedStyle(node).opacity)).toBe("1");
+	await check("gallery dialog open");
+	await dialog.getByRole("button", { name: "Next image" }).hover();
+	await check("gallery next hover");
+	await dialog.getByRole("button", { name: "Next image" }).click();
+	await dialog.locator('a[target="_blank"]').hover();
+	await check("gallery source hover");
+	await page.keyboard.press("Escape");
+	await expect(dialog).toHaveCount(0);
 	await first.scrollIntoViewIfNeeded();
 	await first.hover();
 	await check("trigger hover");
@@ -201,6 +262,72 @@ async function states(page: Page, measure: (state: string) => Promise<void>) {
 	await check("row hover");
 	await page.locator('[data-slot="model-selector-effort"] [role="radio"]').nth(2).hover();
 	await check("level hover");
+	await page.keyboard.press("Escape");
+
+	let markdown = plate(page, "assistant-ui").locator('[data-slot="markdown-text"]');
+	let link = markdown.locator(".aui-md-a").first();
+	await link.scrollIntoViewIfNeeded();
+	await link.hover();
+	await check("markdown link hover");
+
+	let copy = markdown.locator(".aui-button-icon");
+	await copy.scrollIntoViewIfNeeded();
+	await copy.hover();
+	await expect(page.locator('[data-slot="tooltip-content"]')).toBeVisible();
+	await expect.poll(() =>
+		page.locator('[data-slot="tooltip-content"]').evaluate(node => getComputedStyle(node).opacity)
+	).toBe("1");
+	await check("markdown copy hover and tooltip");
+	await copy.focus();
+	await page.keyboard.press("Tab");
+	await page.keyboard.press("Shift+Tab");
+	await check("markdown copy focus");
+
+	let messageAction = plate(page, "assistant-ui").locator('[data-slot="message-actions"]').first()
+		.getByRole("button").first();
+	await messageAction.scrollIntoViewIfNeeded();
+	await messageAction.hover();
+	await check("message action hover");
+	await messageAction.focus();
+	await page.keyboard.press("Tab");
+	await page.keyboard.press("Shift+Tab");
+	await check("message action focus");
+
+	let pill = plate(page, "assistant-ui").locator("[data-chat-reaction]").nth(1);
+	await pill.scrollIntoViewIfNeeded();
+	await pill.hover();
+	await check("reaction pill hover");
+	await pill.focus();
+	await page.keyboard.press("Tab");
+	await page.keyboard.press("Shift+Tab");
+	await check("reaction pill focus");
+
+	let more = plate(page, "assistant-ui").getByRole("button", { name: "More actions" });
+	await more.scrollIntoViewIfNeeded();
+	await more.click();
+	await expect(page.locator('[data-slot="dropdown-menu-content"]')).toBeVisible();
+	await expect.poll(() =>
+		page.locator('[data-slot="dropdown-menu-content"]').evaluate(node =>
+			getComputedStyle(node).opacity
+		)
+	).toBe("1");
+	await check("dropdown open");
+	await page.locator('[data-slot="dropdown-menu-item"]').first().hover();
+	await check("dropdown item hover");
+	await page.locator('[data-slot="dropdown-menu-item"][data-variant="destructive"]').hover();
+	await check("dropdown destructive hover");
+	await page.keyboard.press("Escape");
+
+	await plate(page, "emoji").getByRole("button", { name: "Show the emoji picker" }).click();
+	let picker = plate(page, "emoji").locator("[data-audit-picker]");
+	await picker.scrollIntoViewIfNeeded();
+	await picker.locator("[data-emoji]").nth(3).hover();
+	await check("emoji picker cell hover");
+	await picker.getByRole("tab", { name: "Animals and nature" }).hover();
+	await check("emoji picker tab hover");
+	await picker.getByRole("button", { name: /^Skin tone:/ }).click();
+	await check("emoji picker skin tones open");
+	await picker.getByRole("button", { name: "Default skin tone" }).click();
 }
 
 for (let mode of ["light", "dark"] as const) {
@@ -215,12 +342,12 @@ for (let mode of ["light", "dark"] as const) {
 			expect(unthemed(result), `${state}, ${mode}: colours that are no Chopin token`).toEqual([]);
 			expect(result.leaks, `${state}, ${mode}: borders drawn in the text colour`).toEqual([]);
 			expect(
-				result.fonts.filter(font => !/: Chopin( mono)?$/.test(font)),
+				result.fonts.filter(font => !/: Chopin( mono| emoji)?$/.test(font)),
 				`${state}, ${mode}: type outside Chopin's typeface`,
 			).toEqual([]);
 			checked += result.drawn.length;
 		});
-		expect(checked).toBeGreaterThan(300);
+		expect(checked).toBeGreaterThan(600);
 	});
 }
 
@@ -246,8 +373,11 @@ async function computed(page: Page, expression: string): Promise<string> {
 
 type Property = "backgroundColor" | "color" | "borderTopColor";
 
-async function paint(element: Locator, property: Property): Promise<string> {
-	return element.evaluate((node, name) => getComputedStyle(node)[name], property);
+async function paint(element: Locator, property: Property, pseudo?: "::before"): Promise<string> {
+	return element.evaluate(
+		(node, [name, at]) => getComputedStyle(node, at)[name as Property],
+		[property, pseudo] as const,
+	);
 }
 
 for (let name of ["light", "dark"] as const) {
@@ -260,12 +390,13 @@ for (let name of ["light", "dark"] as const) {
 		await composer.scrollIntoViewIfNeeded();
 		let token = (value: string) => computed(page, `var(--color-${value})`);
 
-		// The box is the page's surface with Chopin's control edge, and its edge darkens on focus.
+		// The box is the page's surface with the control boundary, and its edge darkens on focus. The
+		// edge is drawn over the box's border by its own layer, so it is read there.
 		let box = composer.locator(".composer-surface");
 		expect(await paint(box, "backgroundColor")).toBe(await token("page"));
-		expect(await paint(box, "borderTopColor")).toBe(await token("control-edge"));
+		expect(await paint(box, "borderTopColor", "::before")).toBe(await token("control-boundary"));
 		await composer.getByRole("combobox", { name: "Message" }).focus();
-		expect(await paint(box, "borderTopColor")).toBe(await token("text-tertiary"));
+		expect(await paint(box, "borderTopColor", "::before")).toBe(await token("text-tertiary"));
 
 		// The toolbar is the inset ground with Chopin's edge for its divider, and its marks quiet ink.
 		let toolbar = composer.getByRole("toolbar", { name: "Formatting" });
@@ -321,5 +452,37 @@ for (let name of ["light", "dark"] as const) {
 			return found;
 		});
 		expect(strangers).toEqual([]);
+	});
+}
+
+for (let name of ["light", "dark"] as const) {
+	test(`the message toolbar and reaction pills take Slack's shapes in Chopin's colours, in ${name}`, async ({ page }) => {
+		await page.evaluate(
+			dark => document.documentElement.classList.toggle("dark", dark),
+			name === "dark",
+		);
+		let token = (value: string) => computed(page, `var(--color-${value})`);
+		let outline = (element: Locator) =>
+			element.evaluate(node => getComputedStyle(node).outlineColor);
+
+		// Slack's actions group is white with a grey ring at 13%; here the page's surface and the
+		// button outline's edge (12%), so the box stands off a shown row's shade.
+		let toolbar = plate(page, "assistant-ui").locator(".chat-message-toolbar");
+		await toolbar.scrollIntoViewIfNeeded();
+		expect(await paint(toolbar, "backgroundColor")).toBe(await token("page"));
+		expect(await outline(toolbar)).toBe(await token("button-outline-edge"));
+		// Slack greys a button under the pointer; here Chopin's hover surface does.
+		let add = toolbar.getByRole("button", { name: "Add reaction" });
+		await add.hover();
+		await expect.poll(() => paint(add, "backgroundColor")).not.toBe("rgba(0, 0, 0, 0)");
+
+		// Slack's reacted pill is the accent's wash with the accent's ring; here Chopin's brand.
+		let pills = plate(page, "assistant-ui").locator("[data-chat-reaction]");
+		let mine = pills.and(page.locator('[aria-pressed="true"]')).first();
+		let theirs = pills.and(page.locator('[aria-pressed="false"]')).first();
+		expect(await paint(mine, "backgroundColor")).toBe(await token("brand-wash"));
+		expect(await outline(mine)).toBe(await token("brand"));
+		expect(await paint(theirs, "backgroundColor")).toBe(await token("inset"));
+		expect(await outline(theirs)).toBe(await token("edge"));
 	});
 }

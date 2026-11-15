@@ -31,7 +31,7 @@ test.each([false, true])(
 	},
 );
 
-test("jobs and human turns drain in arrival order without leaking job scope", async () => {
+test("a job waits for a human turn, and a person's message while a job runs preempts it, without leaking job scope", async () => {
 	let first = harness();
 	await Chat.send(first.context, socket(), member("Human first"));
 	await until(() => first.prompts.length === 1);
@@ -47,14 +47,23 @@ test("jobs and human turns drain in arrival order without leaking job scope", as
 	let second = harness();
 	let ahead = Chat.job(second.context, JOB, "job first", "session");
 	await until(() => second.prompts.length === 1);
-	await Chat.send(second.context, socket(), member("Human second"));
-	expect(second.chat.waiting).toHaveLength(1);
-	await runJobTool(second.chat, "refine_decision", async () => ({ output: { added: 0 } }));
-	second.emit("session.idle");
-	expect(await ahead).toEqual({ status: "done", output: '{"added":0}' });
+	// A job's session is isolated: nobody talks to it, and a person's message takes its place.
+	let frames: Array<Record<string, unknown>> = [];
+	let sender = {
+		data: { handle: "ana", principalId: "U_ana" },
+		send: (frame: string) => frames.push(JSON.parse(frame)),
+	} as unknown as Parameters<typeof Chat.send>[1];
+	await Chat.send(second.context, sender, member("Human second"));
+	expect(frames).toEqual([expect.objectContaining({ kind: "chat:send" })]);
+	expect(await ahead).toMatchObject({ status: "preempted" });
 	await until(() => second.prompts.length === 2);
+	// The person's turn has no job scope: the job's tool is refused to it.
 	expect(second.chat.job).toBeUndefined();
-	expect(second.prompts[1]).toContain("Human second");
+	await expect(
+		runJobTool(second.chat, "refine_decision", async () => ({ output: { added: 0 } })),
+	).rejects.toThrow();
+	expect(second.chat.waiting).toHaveLength(0);
+	expect(second.steered).toEqual([]);
 	second.emit("session.idle");
 	await until(() => !second.chat.busy);
 });
@@ -72,7 +81,6 @@ test("archiving cancels a job queued behind a human turn without dropping human 
 		reason: "This document was archived.",
 	});
 	expect(state.chat.waiting.map(item => item.id)).toEqual(["human-later"]);
-	expect(state.frames.at(-1)).toMatchObject({ kind: "chat:queue" });
 	state.emit("session.idle");
 	await until(() => state.prompts.length === 2);
 	expect(state.prompts).not.toContain("job later");
@@ -105,21 +113,4 @@ test("archive reset fences a job shifted out of the queue during persistence", a
 		reason: "This document was archived.",
 	});
 	expect(state.prompts).toHaveLength(1);
-});
-
-test("a job queued behind a turn never reaches clients as a queued message", async () => {
-	let state = harness();
-	await Chat.send(state.context, socket(), member("Human first"));
-	await until(() => state.prompts.length === 1);
-	let queued = Chat.job(state.context, JOB, "job later", "session");
-	await Chat.send(state.context, socket(), member("Human later"));
-	expect(state.chat.waiting).toHaveLength(2);
-	let frame = state.frames.findLast(f => f.kind === "chat:queue");
-	expect(frame).toMatchObject({ waiting: [{ text: "Human later" }] });
-	Chat.cancelQueuedJobs(state.context, "This document was archived.");
-	await queued;
-	state.emit("session.idle");
-	await until(() => state.prompts.length === 2);
-	state.emit("session.idle");
-	await until(() => !state.chat.busy);
 });

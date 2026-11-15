@@ -11,20 +11,22 @@
  * own visual, which also reads tables.
  */
 
-import { lazy, Suspense, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useContext, useMemo, useRef, useState } from "react";
 import { HOSTED_IMAGE_PATH } from "@chopin/dialect";
+import { ImagePlace } from "@chopin/editor/image-place";
 import { QuestionMarkdownContext } from "@chopin/question/react";
 import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
 import { gfmTable } from "micromark-extension-gfm-table";
 
+import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
 import { CHAT_COMPONENTS, CHAT_ELEMENTS, MarkdownPhrase } from "./chat/markdown";
+import { noHtmlRemarkPlugin } from "./chat/no-html";
 import { orderedRunsRemarkPlugin } from "./chat/ordered-runs";
-import { MarkdownText } from "./markdown-text/markdown-text";
 
 import type { ReactNode } from "react";
 import type { QuestionMarkdownRenderer } from "@chopin/question/react";
+import type { SyntaxHighlighterProps } from "./chat/assistant-ui/markdown-primitive";
 import type { MarkdownComponents } from "./chat/markdown";
-import type { SyntaxHighlighterProps } from "./markdown-text/markdown-text";
 
 const CardDiagram = lazy(() =>
 	import("@chopin/editor/card-diagram").then(({ CardDiagram }) => ({ default: CardDiagram }))
@@ -33,7 +35,7 @@ const ImageLightbox = lazy(() =>
 	import("@chopin/editor/image-lightbox").then(({ ImageLightbox }) => ({ default: ImageLightbox }))
 );
 
-const BLOCK_ELEMENTS = [...CHAT_ELEMENTS, "img"];
+const BLOCK_ELEMENTS = CHAT_ELEMENTS;
 /** An option's own visual may also be a small table. */
 const PREVIEW_ELEMENTS = [...BLOCK_ELEMENTS, "table", "thead", "tbody", "tr", "th", "td"];
 
@@ -54,6 +56,7 @@ export function documentImageUrl(src: string | undefined, document: string): str
 function CardImage({ alt, document, src }: { alt: string; document: string; src?: string }) {
 	let [failed, setFailed] = useState(false);
 	let [viewing, setViewing] = useState(false);
+	let place = useContext(ImagePlace);
 	let view = useRef<HTMLButtonElement>(null);
 	let url = documentImageUrl(src, document);
 	if (!alt.trim()) return null;
@@ -83,12 +86,12 @@ function CardImage({ alt, document, src }: { alt: string; document: string; src?
 			{viewing && (
 				<Suspense fallback={null}>
 					<ImageLightbox
-						alt={alt}
+						images={[{ src: url, alt }]}
 						onClose={() => {
 							setViewing(false);
 							requestAnimationFrame(() => view.current?.focus());
 						}}
-						src={url}
+						place={place}
 					/>
 				</Suspense>
 			)}
@@ -165,8 +168,13 @@ export function lineBreaksRemarkPlugin() {
 	return (tree: MarkdownNode) => walk(tree);
 }
 
-let PLAIN_BLOCKS = [orderedRunsRemarkPlugin, lineBreaksRemarkPlugin];
-let PREVIEW_BLOCKS = [tablesRemarkPlugin, orderedRunsRemarkPlugin, lineBreaksRemarkPlugin];
+let PLAIN_BLOCKS = [noHtmlRemarkPlugin, orderedRunsRemarkPlugin, lineBreaksRemarkPlugin];
+let PREVIEW_BLOCKS = [
+	noHtmlRemarkPlugin,
+	tablesRemarkPlugin,
+	orderedRunsRemarkPlugin,
+	lineBreaksRemarkPlugin,
+];
 
 export function questionMarkdown(document: string): QuestionMarkdownRenderer {
 	let components = blockComponents(document);
@@ -175,7 +183,6 @@ export function questionMarkdown(document: string): QuestionMarkdownRenderer {
 			<MarkdownPhrase
 				components={INLINE_COMPONENTS}
 				links={links}
-				skipHtml={false}
 				source={source}
 			/>
 		),
@@ -194,7 +201,7 @@ export function questionMarkdown(document: string): QuestionMarkdownRenderer {
 	};
 }
 
-let ROOT_PROPS = { "data-question-markdown": "" };
+let ROOT_PROPS = { "data-question-markdown": "", "data-slot": undefined };
 
 /** Card text in this document renders as Markdown, with this document's images. */
 export function QuestionMarkdownProvider(

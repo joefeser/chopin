@@ -368,7 +368,8 @@ Each operating system has its own catch:
 - **Linux.** A systemd user service. Install turns on linger so it keeps
   running after you log out. If that needs an administrator, install prints
   the `sudo loginctl enable-linger` command for them. Never run `chopin` itself
-  with `sudo`.
+  with `sudo`. When `loginctl` can't answer, install and status read
+  systemd-logind's own record, `/var/lib/systemd/linger/<user>`, and say so.
 - **macOS.** A LaunchAgent, which runs only while you are logged in.
 - **Windows.** A Task Scheduler task, which runs only while you are logged on.
 
@@ -435,11 +436,21 @@ have, how the last one ended and the last line it printed to stderr that says
 why (a closing "Exiting with code 1" notice does not count), with tokens and
 `--env` values masked, your home directory shown as `~` and the line cut at 300
 characters. From the second launch in a row, the document's machine button turns
-its dot to a warning and its menu says **Can't connect to studio**
-with a **How to fix** link (see [Can't connect to a machine](#cant-connect-to-a-machine)),
+its dot to a warning and its menu says **Can't connect to studio** with the steps
+to fix it (see [Can't connect to a machine](#cant-connect-to-a-machine)),
 while the connector keeps retrying. Once the Planner attaches, or a launch stays up, it
 goes. A Chopin from before this does not know the report; the connector asks it
 once and carries on.
+
+A chopin older than 0.0.23 cannot make the report, and a Planner that never attaches
+without exiting makes none, so Chopin says what it saw itself. Each launch asks Chopin for a
+credential, so from the third launch in a row the machine's **Can't connect** reads
+_It started and stopped again before it connected_, with the release the machine runs and
+`chopin update` where that release is older than 0.0.23. Two minutes after a machine was asked, with
+no Planner attached, it reads _It hasn't answered yet_ or _It started but hasn't connected yet_
+and _Waiting since 7:26 PM_, whatever release it runs. Run `chopin update` on that machine and
+restart the service (`chopin service restart`): its next failure then comes with the reason
+the Planner printed.
 
 A connector started with `--planner-command` says it can run Planners, and
 lists each Planner it runs because Chopin asked this machine for it
@@ -489,31 +500,34 @@ A document left on **Default machine** gets its Planner too, on a machine of
 the person who created it, picked as for builds: their default machine when it
 is connected and can run Planners, else the machine that last worked on the
 document, else any of theirs that can. Chopin asks for it while someone has the
-document open, and stops it once nobody has used the document for 30 minutes.
+document open, and from the moment its creator makes it with **New document**, before
+their page has loaded it, and stops it once nobody has used the document for 30 minutes.
 A Planner that is replying, or waiting on a question or on a live or paused
 workflow run, counts as use, so its work and its questions are never cut short
 however long nobody views the document.
 A Planner stays on its machine while that machine is connected, even when
 another comes online; it moves when the machine disconnects or the creator
 changes the document's machine or their default. Until it attaches, the
-machine button's dot is a thin spinner and its name says **Connecting to
+machine button's dot is three petrol dots that brighten in turn and its name says **Connecting to
 studio** (the machine's name), and an `@chopin` message sent meanwhile waits for
 it. Once it has attached the button says nothing more about it.
 
 ### Can't connect to a machine
 
 Chopin asked a machine to run a document's Planner, and the Planner's backend
-exited before it stayed up, more than once in a row. The machine button, left of
-**Build plan**, has a warning dot, and its menu opens onto **Can't connect to
-studio**, the last line the backend wrote to stderr that says why, and how often
-and when it was tried, such as _Tried 3 times, last at 6:29 PM. Still trying._,
-with a **How to fix** link to this section. A person who has no machine button,
-such as a teammate with no machine of their own, reads what the menu would say
-on the composer's top edge instead, whatever is being typed: the reason exactly
-as the machine reported it, and how often and when it was tried, under **Can't
-connect to @mona's machine**, since only the owner's login is ever named, never
-the machine. A screen reader hears **Can't connect to studio** once, as it
-appears, from a live region of the page that does not depend on either.
+exited before it stayed up, more than once in a row. Nothing about it is drawn in
+Chat. The machine button, left of **Build plan**, has a warning dot, and its menu
+opens onto **Can't connect to studio**: one sentence of why, numbered steps (such
+as `chopin status` on the machine, in a block with a **Copy** button) and
+**Learn more**, which links here. **Show
+details** unfolds the last line the backend wrote to stderr that says why, exactly
+as reported, and when it was last tried. chopin's avatar carries the same warning
+dot. A person who has no machine button, such as a teammate with no machine of
+their own, sees it there, and when they ask chopin something it can't take, chopin
+says so in a row only they see, with **How to fix** unfolding the same steps under
+**Can't connect to @mona's machine**, since only the owner's login is ever named,
+never the machine. A screen reader hears **Can't connect to studio** once, as it
+appears, from a live region of the page.
 
 Chopin keeps retrying, and the connector backs off between launches, so nothing
 needs pressing once the cause is fixed: the next launch attaches, the warning
@@ -608,7 +622,10 @@ running keeps going until it finishes, like a Planner mid-reply.
   goes, even if that machine had not been asked yet. An editor's choice made
   while the creator's own stood is only stored, for their own builds and runs,
   and counts again once the creator chooses no machine. Builds and runs follow
-  each person's own choice, whoever created the document.
+  each person's own choice, whoever created the document. A person whose choice does
+  not place it is told so in the machine menu, above the machines: _The document's
+  creator chose where its replies come from, so your choice runs your builds and
+  runs._ What Chat says of the Planner keeps naming the machine it is on.
 - A document left on **Default machine** whose creator has no connected
   machine that can run Planners uses a shared one too. Builds, runs and
   investigations never go to a teammate's machine unless the person chose it for
@@ -696,10 +713,10 @@ instead.
 
 |             | In the sandbox                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Writes      | Only the worktree the connector made for it (a run's, or a Planner's own; never your checkout), the repository's git directory in the few places commits and refs go and that worktree's entry (see [Git in the sandbox](#git-in-the-sandbox)), the agent's own state (`~/.atomic`, `~/.copilot` or `~/.pdd-kit` for the built-in agents), a private temporary directory, and what you add with `--sandbox-write`. Nothing else.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Writes      | Only the worktree the connector made for it (a run's, or a Planner's own; never your checkout), the repository's git directory in the few places commits and refs go and that worktree's entry (see [Git in the sandbox](#git-in-the-sandbox)), the agent's own state (`~/.atomic` or `~/.copilot` for the built-in agents), a private temporary directory, and what you add with `--sandbox-write`. Nothing else.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Reads       | The rest of the disk on Linux and macOS, except `~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `.netrc`, `.git-credentials` and browser profiles, which read as empty or unreadable, and the connector's state directory (`--base-dir`), of which it sees only its own worktree and the folder of its own tokens. The machine token and every other run's and Planner's files, tokens included, are out of its sight, those made after it started too; so is the state directory when a working directory holds it, as a home does. **On Windows a ProcessContainer reads only what it is given, so it is not the rest of the disk:** your profile folder (the same names are unreadable), the directories on `PATH` and those that `PYTHONHOME`, `GOROOT`, `GOPATH`, `CARGO_HOME`, `RUSTUP_HOME`, `JAVA_HOME`, `DOTNET_ROOT`, `NODE_PATH`, `VIRTUAL_ENV`, `CONDA_PREFIX` and the other tool variables in MXC's own baseline name, the programs installed per user in `%LOCALAPPDATA%\Programs`, its working directory and its worktree, the repository's git directory whole (its configuration, hooks, objects and every worktree's entry, since a worktree's `.git` leads into it), and what Windows lets every container read (`C:\Windows`, `C:\Program Files`). A folder on another drive, in another user's profile or anywhere else, a checkout among them, is not readable, but for the checkout a Planner runs in, and for a run's checkout's git directory, which is read without that checkout's files. |
 | Network     | Only through a proxy on your machine that allows the hosts below and refuses the rest. A direct connection fails, IPv6 is blocked, and the proxy resolves names.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| Environment | Everything it has today, including `GH_TOKEN` and `--env` values. `TMPDIR` points at the private directory, `PATH` names each directory by its real path, and `NODE_USE_ENV_PROXY=1` makes Node's own `fetch` use the proxy; the proxy variables come from MXC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Environment | Everything it has today but GitHub credentials (see [Which GitHub account pushes](#which-github-account-pushes)), and `--env` values. `TMPDIR` points at the private directory, `PATH` names each directory by its real path, and `NODE_USE_ENV_PROXY=1` makes Node's own `fetch` use the proxy; the proxy variables come from MXC. On Linux and macOS it reaches the sandbox in a `0600` file that a shell exports and deletes before the agent starts, so no value is on any process's command line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 Hosts an agent may reach (the full list is `HOST_GROUPS` in
 [`apps/connector/src/sandbox-policy.ts`](../apps/connector/src/sandbox-policy.ts)):
@@ -709,8 +726,7 @@ Hosts an agent may reach (the full list is `HOST_GROUPS` in
   the hosts GitHub serves raw files and release downloads from
   (`objects.githubusercontent.com`, `raw.githubusercontent.com`,
   `release-assets.githubusercontent.com`,
-  `github-releases.githubusercontent.com`), where provers such as Verus, Z3,
-  cvc5, F\* and elan ship their releases;
+  `github-releases.githubusercontent.com`);
 - the model providers: `api.anthropic.com`, `api.openai.com`, `chatgpt.com`,
   `auth.openai.com`, `generativelanguage.googleapis.com`,
   `oauth2.googleapis.com`, `*.githubcopilot.com`,
@@ -729,21 +745,13 @@ Hosts an agent may reach (the full list is `HOST_GROUPS` in
   Haskell (Hackage, GHCup), OCaml (opam), Elixir and Erlang (Hex), Swift
   (swift.org, CocoaPods), Dart (pub.dev), Julia, R (CRAN), Zig, C and C++
   (Conan), Bazel and Nix;
-- the formal-methods toolchains beyond those registries: Lean
-  (`lean-lang.org` and `*.lean-lang.org` for elan, releases and Reservoir;
-  Mathlib's build cache at `mathlib4.lean-cache.cloud` and
-  `lakecache.blob.core.windows.net`; the Lean docs), and the docs and
-  installers of Verus, F\*, Pulse and KaRaMeL (`aka.ms`, `fstar-lang.org`),
-  LemmaScript, Rocq and Isabelle;
-- research: `pldb.kirancodes.me`, a read-only search of programming-languages
-  papers that pdd-kit's agents use, and arXiv;
 - the hosts you add.
 
 Every built-in host is a fixed public service. None is general-purpose storage
 that a stranger could write to and read back, such as
-`storage.googleapis.com`, a `*.blob.core.windows.net` account other than
-Mathlib's cache, Amazon S3, gists or a paste site, since those are where an
-injected instruction would send what an agent read. A test keeps it that way.
+`storage.googleapis.com`, a `*.blob.core.windows.net` account, Amazon S3, gists
+or a paste site, since those are where an injected instruction would send what
+an agent read. A test keeps it that way.
 The registries and GitHub still accept a publish or a push from whoever holds
 a token, so the list narrows where data can go but doesn't close every path.
 If a project needs one of those storage hosts, as Flutter's SDK does
@@ -776,6 +784,7 @@ corporate registry is.
 | `--no-sandbox`          | Never sandboxes. `chopin status` says it is off.                                                                                        |
 | `--sandbox-host <host>` | Allows an agent to reach one more host. Repeat it.                                                                                      |
 | `--sandbox-write <dir>` | Allows an agent to write one more directory, such as a package cache or a local remote, but never your checkout (see below). Repeat it. |
+| `--sandbox-hide <path>` | Hides one more file or folder from every agent, even inside a `--sandbox-write` directory, such as a tool's own sign-in. Repeat it.     |
 
 ### Git in the sandbox
 
@@ -1094,40 +1103,49 @@ nothing.
 
 ## Which GitHub account pushes
 
-Builds and Planner commands push branches and open draft pull requests as you,
-with your token from Chopin's GitHub App. Investigations get the token too;
-prototypes never do.
+Chopin's GitHub App does, never your own login. Before each Planner command,
+build or investigation starts, the connector asks Chopin for a token of the App
+for that one repository. Chopin checks that the person it is for can push there:
+whoever started the run, or you for a Planner on your machine. Commits are made
+as the App's bot (`<app>[bot]`), and a build's pull request names and credits
+the person who asked. A prototype's token only fetches its commit and is gone
+before its agent starts. Setting the App up is in
+[Chopin's GitHub App identity](github-app-identity.md#set-it-up).
 
-| What runs                          | Gets your token as                                                                       |
-| ---------------------------------- | ---------------------------------------------------------------------------------------- |
-| A build's or investigation's agent | `GH_TOKEN` and `GITHUB_TOKEN`. Git uses it for github.com.                               |
-| A Planner command                  | `CHOPIN_GITHUB_TOKEN`; see [the Planner's environment](agent-connection.md#environment). |
+| Variable                                                              | What it is                                                                                |
+| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `GH_CONFIG_DIR`                                                       | A gh configuration of the launch's own, holding the current token. gh never reads yours.  |
+| `CHOPIN_GITHUB_TOKEN_FILE`                                            | A file (mode `0600`) holding the current token, renewed before it expires.                |
+| `CHOPIN_MCP_TOKEN_FILE`                                               | A file holding a Chopin token for Chopin's own tools at `/mcp`. It is not a GitHub token. |
+| `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` and the committer's             | The App's bot. Your Git identity and signing settings are not used.                       |
+| `CHOPIN_STARTER_LOGIN`, `CHOPIN_STARTER_NAME`, `CHOPIN_STARTER_EMAIL` | Who the work is for, for "Requested by" and a `Co-authored-by` trailer.                   |
 
-The machine uses your own `gh` and Git login instead when:
+Nothing a launch inherits reaches GitHub another way: `GH_TOKEN`,
+`GITHUB_TOKEN`, other `GH_*` variables, `GIT_ASKPASS`, `SSH_AUTH_SOCK`,
+`GIT_SSH*` and `GIT_CONFIG_*` are removed from its environment and from your
+`--env` values, and Git never uses SSH (`GIT_SSH_COMMAND=false`).
 
-- the server runs `AUTH_MODE=local`;
-- you can't push to the repository; or
-- the App can only read the repository. The connector and `chopin status` then
-  say so:
+When Chopin refuses a token, nothing starts. The connector says why, naming the
+repository, and the run or Planner fails with that reason; see
+[Refusals](github-app-identity.md#refusals). `chopin status` asks Chopin, without
+a token being made, about each registered checkout's repository:
 
 ```text
-The GitHub App can't push to octo-org/score (it needs Contents and Pull requests write), so this machine uses its own GitHub login for it.
+Checkouts:  octo-org/score at /work/score; Chopin's GitHub App can't write to octo-org/score; it needs Contents and Pull requests write, which an admin of the repository must grant. This machine won't use its own GitHub login, so nothing runs there.
 ```
+
+`chopin status --json` has the same as `github`: `"ok"`, the refusal's code,
+or `"unknown"` when Chopin couldn't be asked.
 
 ### Your Git configuration
 
-Where Chopin gives the machine a token, the connector's Git commands for that
-repository, and those of the Planner and agent it starts, use the repository's
-`https://github.com/` address and the token, whatever your own Git
-configuration says. A `url.<base>.insteadOf` or `pushInsteadOf` rule that sends
-GitHub to SSH, which a background service has no agent or key for, doesn't
-reach them, and a checkout whose `origin` is an SSH address is fetched and
-pushed over https. The rest of your configuration (identity, signing, other
-rules and repositories) applies as it is, and nothing is written to your global
-configuration or the checkout's own.
-
-If a Git command still reaches GitHub over SSH and fails, the error names the
-rule that rewrites the address.
+The connector's Git commands for a repository, and those of the Planner and
+agent it starts, use the repository's `https://github.com/` address and Chopin's
+token, whatever your Git configuration says. A `url.<base>.insteadOf` or
+`pushInsteadOf` rule that sends GitHub to SSH doesn't reach them, a checkout
+whose `origin` is an SSH address is fetched and pushed over https, and your
+credential helpers are not run. Nothing is written to your global configuration
+or the checkout's own.
 
 ## Update
 
@@ -1167,6 +1185,7 @@ pairs again. To remove the service as well, run `chopin service uninstall`.
 | `chopin connect … --no-sandbox`                             | Never sandboxes agents and Planner commands.                                                                                 |
 | `chopin connect … --sandbox-host <host>`                    | Lets agents reach one more host through the sandbox. Repeat it.                                                              |
 | `chopin connect … --sandbox-write <dir>`                    | Lets agents write one more directory inside the sandbox. Repeat it.                                                          |
+| `chopin connect … --sandbox-hide <path>`                    | Hides one more file or folder from agents in the sandbox. Repeat it.                                                         |
 | `chopin pair [--label <name>] [--key <key>]`                | Pairs this machine, or pairs it again. The label defaults to the hostname.                                                   |
 | `chopin status [--json]`                                    | Shows the server, pairing, the connector, the service and what it runs, the sandbox, your checkouts and clones, and the log. |
 | `chopin service install [--allow-downgrade] [--skip-check]` | Copies what `chopin connect` last ran and runs it as a background service.                                                   |

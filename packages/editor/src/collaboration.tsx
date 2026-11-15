@@ -13,6 +13,7 @@ import { useEffect, useRef, useState } from "react";
 import {
 	addComposerChild$,
 	contentEditableWrapperElement$,
+	markdownExport$,
 	realmPlugin,
 	rootEditor$,
 } from "@mdxeditor/editor";
@@ -74,6 +75,9 @@ function v1(binding: BaseBinding): binding is Binding {
 	return "collabNodeMap" in binding;
 }
 
+/** Each peer's last state whose caret this reader could place, by binding. */
+let placed = new WeakMap<BaseBinding, Map<number, UserState>>();
+
 /**
  * Peers whose caret can actually be drawn.
  *
@@ -82,16 +86,42 @@ function v1(binding: BaseBinding): binding is Binding {
  * to the frame rather than no position at all — so their labelled caret lands
  * at whatever point the plan happens to be scrolled to. Better to omit them
  * until the block is open again.
+ *
+ * A peer's caret can also name text this reader does not have yet. Presence is
+ * relayed at once and edits only once they are committed, so the caret of
+ * somebody who has just started a paragraph or typed into a table cell arrives
+ * first. Lexical cannot place it, drops their selection, and makes it again
+ * when the edit lands; each time it rewrites the stylesheet that colours peers'
+ * selections, and the browser restyles every element on the page for that, most
+ * of a second on a long document. Until the edit arrives, such a caret is drawn
+ * where it last could be.
  */
 function visible(binding: BaseBinding, provider: Provider): Map<number, UserState> {
 	let states = provider.awareness.getStates();
 	if (!v1(binding)) return states;
 
 	let out = new Map<number, UserState>();
+	let last = placed.get(binding) ?? new Map<number, UserState>();
+	placed.set(binding, last);
+	for (let client of last.keys()) {
+		if (!states.has(client)) last.delete(client);
+	}
 
 	binding.editor.getEditorState().read(() => {
-		for (let [client, state] of states) {
-			let { anchorKey } = $getAnchorAndFocusForUserState(binding, state);
+		for (let [client, current] of states) {
+			let state = current;
+			let { anchorKey, focusKey } = $getAnchorAndFocusForUserState(binding, state);
+			let ahead = state.focusing && state.anchorPos != null && state.focusPos != null
+				&& (anchorKey === null || focusKey === null);
+			let previous = last.get(client);
+			if (ahead && previous) {
+				state = previous;
+				({ anchorKey } = $getAnchorAndFocusForUserState(binding, state));
+			} else if (state.focusing && anchorKey !== null && focusKey !== null) {
+				last.set(client, state);
+			} else {
+				last.delete(client);
+			}
 			let node = anchorKey === null ? null : $getNodeByKey(anchorKey);
 			let block = enclosing(node);
 			if (block && collapsed(binding.editor, block)) continue;
@@ -287,6 +317,10 @@ function Collaboration(options: CollaborationOptions) {
 export function collaborationPlugin(options: CollaborationOptions) {
 	return realmPlugin<CollaborationOptions>({
 		init(realm, params) {
+			// The shared document is the source of truth and the server writes its Markdown. MDXEditor
+			// otherwise exports the whole document to Markdown on every keystroke, for nobody, and a
+			// node it cannot write throws ahead of collaboration's own listener.
+			realm.pub(markdownExport$, false);
 			realm.pub(addComposerChild$, () => <Collaboration {...(params ?? options)} />);
 		},
 	})(options);

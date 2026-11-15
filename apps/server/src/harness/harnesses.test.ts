@@ -8,8 +8,10 @@ import {
 	harnessFor,
 	plannerCatalog,
 	plannerCommands,
+	plannerOfferIncoming,
 	plannerOfferKnown,
 	plannerRanWithoutOffer,
+	plannerSteers,
 	registerCredential,
 	shutdownHarnesses,
 } from "./harnesses";
@@ -23,6 +25,30 @@ it("selects the tested Copilot SDK, Atomic, and remote harnesses", () => {
 	expect(Object.keys(harnesses)).toEqual(["copilot-sdk", "atomic", "remote"]);
 	expect(harnessFor({ harness: "copilot-sdk" }).harnessId).toBe("copilot-sdk");
 	expect(() => harnessFor({ harness: "not-installed" })).toThrow("Unknown harness: not-installed");
+});
+
+it("takes a message while a turn runs on Atomic, and on a remote client only if it offered steer-turn", () => {
+	expect(plannerSteers("doc")).toBe(false);
+	harnessFor({ harness: "atomic", harnessAuth: "ai-gateway", host: "127.0.0.1" });
+	expect(plannerSteers("doc")).toBe(true);
+	shutdownHarnesses();
+});
+
+it("refuses a message while a turn runs on the Copilot SDK, which names no way to take one", () => {
+	harnessFor({ harness: "copilot-sdk" });
+	expect(plannerSteers("doc")).toBe(false);
+});
+
+it("takes a message for a remote Planner only while its attached client offered steer-turn", () => {
+	harnessFor({ harness: "remote" });
+	expect(plannerSteers("doc")).toBe(false);
+	let release = attachLink("doc", { steers: false } as unknown as AgentLink);
+	expect(plannerSteers("doc")).toBe(false);
+	release();
+	release = attachLink("doc", { steers: true } as unknown as AgentLink);
+	expect(plannerSteers("doc")).toBe(true);
+	expect(plannerSteers("another")).toBe(false);
+	release();
 });
 
 it("refuses host-login fallback on public binds but accepts it on loopback", () => {
@@ -227,6 +253,29 @@ it("knows what a remote Planner offers only from an attached client that has rep
 	// Every other harness knows what it offers, which may be nothing.
 	for (let harness of ["copilot-sdk", "atomic", "not-installed"]) {
 		expect(plannerOfferKnown(harness, "doc-a")).toBe(true);
+	}
+});
+
+it("says a remote Planner's models are on their way only while a machine may be starting it or its client has yet to report them, never while it is held away", () => {
+	let pending = true;
+	let link = {
+		get catalogPending() {
+			return pending;
+		},
+	} as unknown as AgentLink;
+	// Nobody holds it and nobody is attached: a machine may be starting it.
+	expect(plannerOfferIncoming("remote", "doc-a", false)).toBe(true);
+	// Held while its client is away (a deploy's hand-over window): what it offered was already told.
+	expect(plannerOfferIncoming("remote", "doc-a", true)).toBe(false);
+	let detach = attachLink("doc-a", link);
+	// Attached, it is the client's word: on their way until it reports, then not.
+	expect(plannerOfferIncoming("remote", "doc-a", true)).toBe(true);
+	pending = false;
+	expect(plannerOfferIncoming("remote", "doc-a", true)).toBe(false);
+	expect(plannerOfferIncoming("remote", "doc-a", false)).toBe(false);
+	detach();
+	for (let harness of ["copilot-sdk", "atomic"]) {
+		expect(plannerOfferIncoming(harness, "doc-a", false)).toBe(false);
 	}
 });
 

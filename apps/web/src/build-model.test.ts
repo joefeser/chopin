@@ -11,15 +11,19 @@ import {
 	buildLook,
 	buildPhase,
 	buildRefusalCopy,
+	buildRun,
 	buildTabReady,
 	builtCount,
+	builtDetail,
 	draftRefusalCopy,
 	elapsed,
+	endedCard,
 	endedReason,
 	firstBuildStep,
 	linkParts,
 	liveTaskGroups,
 	liveTaskState,
+	planSourceLine,
 	pullRequestCommits,
 	pullRequestNumber,
 	retryAction,
@@ -112,6 +116,72 @@ function run(outcome: History["outcome"], pullRequests = 0): History {
 		outcome,
 	};
 }
+
+describe("endedCard", () => {
+	let returned = (
+		ended: BuildRequest,
+		reason: string,
+		tasks: History["progress"]["tasks"] = [],
+	) =>
+		endedCard(snapshot({
+			build: ended,
+			lifecycle: {
+				execution: { state: "idle" },
+				history: [{
+					...run({ kind: "revision_requested", reason }),
+					progress: { tasks, events: [] },
+				}],
+			},
+		}));
+
+	it("says who stopped a build in Chopin, and when", () => {
+		let at = "2026-10-10T17:54:55.000Z";
+		let time = new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+		expect(returned(
+			{ ...build("failed"), error: "Stopped in Chopin.", stoppedBy: "ana", finishedAt: at },
+			"Stopped in Chopin by @ana.",
+		)).toEqual({ title: "Stopped by @ana", detail: `At ${time}. Build plan builds it again.` });
+	});
+
+	it("says its agent blocked a task, leading with the agent's reason", () => {
+		expect(returned(build("stopped"), "“First” is blocked: Missing source: the files", [{
+			id: "a",
+			state: "blocked",
+			blocker: "Missing source: the files",
+		}])).toEqual({
+			title: "Blocked",
+			detail: "Missing source: the files. Build plan builds it again.",
+		});
+	});
+
+	it("says a build failed, and why", () => {
+		expect(returned(
+			{ ...build("failed"), error: "Your local agent disconnected." },
+			"Your local agent disconnected.",
+		)).toEqual({
+			title: "Build failed",
+			detail: "Your local agent disconnected. Build plan builds it again.",
+		});
+		expect(returned(
+			{ ...build("failed"), error: "Stopped from the connector terminal." },
+			"Stopped from the connector terminal.",
+		)).toEqual({
+			title: "Stopped from the connector terminal",
+			detail: "Build plan builds it again.",
+		});
+	});
+
+	it("keeps Returned for changes for a run its agent or a reviewer returned", () => {
+		expect(returned(build("stopped"), "Split it")).toEqual({
+			title: "Returned for changes",
+			detail: "Split it. Build plan builds it again.",
+		});
+		expect(returned(build("stopped"), "The build stopped before it finished.")).toEqual({
+			title: "Stopped before it finished",
+			detail: "Build plan builds it again.",
+		});
+	});
+});
 
 describe("buildPhase", () => {
 	it("loads before the first snapshot", () => {
@@ -240,6 +310,17 @@ describe("attribution", () => {
 	});
 });
 
+describe("plan source", () => {
+	it("names the plan revision and the branch at its short commit a build started from", () => {
+		let planSource = { revision: 4, branch: "plans/launch", commit: "0123456789".repeat(4) };
+		expect(planSourceLine({ ...build("running"), planSource }))
+			.toBe("Building from plan revision 4 at plans/launch@0123456");
+		expect(planSourceLine({ ...build("stopped"), planSource }))
+			.toBe("Built from plan revision 4 at plans/launch@0123456");
+		expect(planSourceLine(build("stopped"))).toBeUndefined();
+	});
+});
+
 describe("refusals", () => {
 	it("explains the refusals the server names and leaves the rest to the failure line", () => {
 		expect(draftRefusalCopy("resolve accepted comments awaiting plan changes first"))
@@ -249,10 +330,10 @@ describe("refusals", () => {
 		);
 		for (let queued of ["the reply queue is full", "the Planner queue is full"]) {
 			expect(draftRefusalCopy(queued))
-				.toBe("Chopin is busy with other requests. Try again shortly.");
+				.toBe("chopin is busy with other requests. Try again shortly.");
 		}
-		for (let off of ["Chopin is not running", "the Planner is not running"]) {
-			expect(draftRefusalCopy(off)).toBe("Chopin isn’t running for this document.");
+		for (let off of ["chopin is not running", "the Planner is not running"]) {
+			expect(draftRefusalCopy(off)).toBe("chopin isn’t running for this document.");
 		}
 		expect(draftRefusalCopy("not connected")).toBeUndefined();
 		expect(draftRefusalCopy("could not save the request")).toBeUndefined();
@@ -310,7 +391,7 @@ describe("first build", () => {
 		expect(advanceFirstBuild(resent, { type: "draft-ended", drafted: false, changed: true }))
 			.toEqual({
 				stage: "failed",
-				message: "The document changed while Chopin was breaking it into tasks.",
+				message: "The document changed while chopin was breaking it into tasks.",
 			});
 	});
 
@@ -355,6 +436,9 @@ describe("first build", () => {
 	it("maps refused starts and rebuilds to plain copy", () => {
 		expect(buildRefusalCopy("no-workspace")).toBe("Start your local agent, then retry");
 		expect(buildRefusalCopy("reviewed graph has changed")).toBe("The tasks changed. Try again");
+		expect(buildRefusalCopy("plan-source-unavailable"))
+			.toBe("The plan’s commit isn’t on GitHub. Ask chopin to push it again");
+		expect(buildRefusalCopy("plan source has changed")).toBe("The plan’s files changed. Try again");
 		expect(buildRefusalCopy("accepted comments awaiting plan changes"))
 			.toBe("Update the document for accepted comments first");
 		expect(buildRefusalCopy("something internal")).toBe("The build couldn’t start. Try again");
@@ -375,10 +459,16 @@ describe("first build", () => {
 		// Chopin says so when the machine was connected but its connection dropped.
 		expect(
 			draftRefusalCopy(
-				"@mona's machine is offline, so it can't reply now. Your work is kept and picks up when it's back.",
+				"@mona's machine is offline, so this message wasn't sent. Send it again when it's back.",
 				"planner-not-attached",
 			),
 		).toBe("Reconnect the machine to build.");
+		expect(
+			draftRefusalCopy(
+				"Still connecting to @mona's machine, so this message wasn't sent. Send it again in a moment.",
+				"planner-not-attached",
+			),
+		).toBe("Still connecting to @mona's machine. Try again in a moment.");
 	});
 
 	it("returns to the button when drafting or starting fails", () => {
@@ -784,7 +874,7 @@ describe("build status", () => {
 		});
 		expect(look(snapshot({ graph: undefined }), { planner: false })).toEqual({
 			kind: "plan",
-			blocked: "Chopin isn’t running for this document",
+			blocked: "chopin isn’t running for this document",
 		});
 		expect(look(undefined)).toEqual({ kind: "plan", blocked: "Chopin isn’t connected" });
 	});
@@ -1016,5 +1106,124 @@ describe("endedReason", () => {
 		expect(endedReason({ error: "Local implementation failed. Inspect the connector terminal." }))
 			.toBeUndefined();
 		expect(endedReason(undefined)).toBeUndefined();
+	});
+});
+
+describe("an agent stopped at its time limit", () => {
+	const SAID = "Its agent ran for 4 hours, so chopin stopped it.";
+
+	it("is named when it ends a build short of its tasks", () => {
+		expect(endedReason({ error: SAID })).toBe("Build stopped — its agent ran for 4 hours.");
+	});
+
+	it("stays Built when every task finished first, and the card says how its agent ended", () => {
+		let ended = { ...live(), build: { ...build("failed"), error: SAID } };
+		expect(
+			buildLook(ended, {
+				state: { stage: "idle" },
+				userId: "u",
+				live: false,
+				canEdit: true,
+				connected: true,
+				planner: true,
+				hasContent: true,
+			}).kind,
+		).toBe("built");
+		expect(builtDetail(ended)).toBe(
+			"Every task finished, then its agent ran for 4 hours and chopin stopped it",
+		);
+		expect(builtDetail(live())).toBeUndefined();
+	});
+});
+
+describe("a pull request a person closed", () => {
+	it("is named on the built card, and builds open new pull requests instead", () => {
+		let closed = live({
+			commits: [{ pullRequest: PR, sha: "a".repeat(40), message: "m", revision: 5, at: "x" }],
+			closedPullRequests: [{ url: PR, state: "closed", at: "2026-10-10T10:00:00.000Z" }],
+		});
+		expect(builtDetail(closed)).toBe(
+			"1 commit since first build. #7 closed on GitHub, so builds open new pull requests instead",
+		);
+	});
+});
+
+describe("the running build in Chat's run strip", () => {
+	let two = (state: "in_progress" | "queued") =>
+		snapshot({
+			graph: {
+				...snapshot().graph!,
+				definition: {
+					tasks: ["First", "Second"].map((title, index) => ({
+						id: String(index),
+						title,
+						context: "",
+						goal: "",
+						acceptance: [],
+						dependsOn: [],
+					})),
+				},
+			},
+			build: { ...build("running"), activity: { text: "Running a command", at: "x" } },
+			lifecycle: {
+				execution: { state: "active" },
+				history: [],
+				activity: {
+					tasks: [{
+						id: "0",
+						state: "completed",
+						pullRequest: { url: "https://github.com/o/r/pull/7", state: "open" },
+					}, { id: "1", state }],
+					events: [],
+				},
+			},
+		});
+
+	it("names the task being built, the agent's activity and the pull requests so far", () => {
+		expect(buildRun(two("in_progress"))).toEqual({
+			id: "b",
+			kind: "build",
+			state: "building",
+			done: 1,
+			total: 2,
+			task: "Second",
+			activity: "Running a command",
+			started: "2026-10-10T10:00:00.000Z",
+			pullRequests: ["https://github.com/o/r/pull/7"],
+		});
+		// Between tasks it names the next one.
+		expect(buildRun(two("queued"))?.task).toBe("Second");
+	});
+
+	it("shows a queued build without a task, a rebuild by its pull requests, and nothing once it ends", () => {
+		expect(buildRun(snapshot({ build: build("queued") }))).toMatchObject({
+			state: "queued",
+			done: 0,
+			total: 1,
+		});
+		expect(buildRun(snapshot({ build: build("queued") }))?.task).toBeUndefined();
+		let live = {
+			buildId: "b",
+			user: "u",
+			repositoryId: "r",
+			baseRevision: 1,
+			pullRequests: ["https://github.com/o/r/pull/7"],
+			commits: [],
+			tasks: [],
+			outOfSync: false,
+			rebuild: { ...build("running"), id: "r2", kind: "rebuild" as const },
+		};
+		expect(buildRun(snapshot({ live }))).toMatchObject({
+			id: "r2",
+			kind: "rebuild",
+			state: "building",
+			pullRequests: ["https://github.com/o/r/pull/7"],
+		});
+		for (let state of ["stopped", "failed"] as const) {
+			expect(buildRun(snapshot({ build: build(state) }))).toBeUndefined();
+			expect(buildRun(snapshot({ live: { ...live, rebuild: { ...live.rebuild, state } } })))
+				.toBeUndefined();
+		}
+		expect(buildRun(snapshot())).toBeUndefined();
 	});
 });

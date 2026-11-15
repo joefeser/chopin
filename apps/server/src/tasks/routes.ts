@@ -9,9 +9,12 @@ import {
 	runner,
 } from "./builds";
 import { implementationLifecycle } from "./lifecycle";
+import { planSourceFor } from "./plan-source";
 import { planningReadiness, reportImplementationLifecycle } from "./plan-graphs";
 import { exclusive } from "../plan/service";
 import { GitHubError } from "../github/client";
+import type { GitHubReferenceSource } from "../github/client";
+import type { PullRequestState } from "./builds";
 import { AdmissionDenied } from "../auth/admission";
 import { ownOrigin } from "../auth/config";
 import { implementationConnector } from "./connector";
@@ -21,7 +24,12 @@ import type { Source } from "@chopin/experiment";
 import type { HostedAuth } from "../auth/routes";
 import type { Plan } from "../plan/service";
 import type { RouteHandler, Router } from "../http/router";
-import type { BuildMachine, ImplementationSnapshot } from "@chopin/protocol/implementation";
+import type {
+	BuildMachine,
+	BuildRequest,
+	ImplementationSnapshot,
+	PlanSource,
+} from "@chopin/protocol/implementation";
 
 type Options = {
 	withPlan<T>(id: string, action: (plan: Plan) => Promise<T>): Promise<T>;
@@ -47,13 +55,16 @@ type Options = {
 	takers?: (owner: string, repositoryId: string, documentId: string) => Promise<Connection[]>;
 	/** Whether a connection may take `person`'s work on a document now, as `takers` decides. */
 	mayTake?: (connection: Connection, person: string, documentId: string) => Promise<boolean>;
+	/** The GitHub name and noreply email of a person a launch token was issued for, when known. */
+	identity?: (userId: string) => { name: string; email: string } | undefined;
 	/** Reads the stored machine choices, or throws `machine-choice-unavailable`. */
 	machineChoices?: () => Promise<void>;
 	/**
-	 * The checkout a connection's build of a document starts from; without it, only a checkout the
-	 * connection said it has.
+	 * The checkout a connection's build of a document starts from: the plan source's commit when
+	 * there is one, checked on GitHub (else `plan-source-unavailable`). Without it, only a checkout
+	 * the connection said it has, at the plan source's commit when there is one.
 	 */
-	sourceFor?: (connection: Connection, documentId: string) => Promise<Source>;
+	sourceFor?: (connection: Connection, documentId: string, plan?: PlanSource) => Promise<Source>;
 };
 let buildSchema = z.object({
 	retryOf: z.string().uuid().optional(),
@@ -105,6 +116,37 @@ class MachineRefused extends Error {
 }
 
 /**
+ * The state on GitHub of each of `urls` in the build's repository, read with the access of the
+ * machine that runs the build. A pull request whose state can't be read is left out: unknown.
+ */
+async function pullRequestStates(
+	auth: HostedAuth,
+	build: BuildRequest,
+	urls: readonly string[],
+): Promise<ReadonlyMap<string, PullRequestState>> {
+	let states = new Map<string, PullRequestState>();
+	let github = auth.github as Partial<GitHubReferenceSource>;
+	let machine = build.machineId ? await auth.storage.machines.get(build.machineId) : undefined;
+	if (!github.pullRequest || !machine) return states;
+	let [owner, name] = build.checkout.repository.split("/");
+	let prefix = `https://github.com/${build.checkout.repository}/pull/`.toLowerCase();
+	await Promise.all(urls.map(async url => {
+		let number = Number(url.toLowerCase().startsWith(prefix) ? url.slice(prefix.length) : NaN);
+		if (!owner || !name || !Number.isSafeInteger(number) || number <= 0) return;
+		try {
+			let found = await auth.machines.use(
+				machine!,
+				token => github.pullRequest!(token, owner!, name!, number),
+			);
+			if ("state" in found) states.set(url, found.state);
+		} catch {
+			// Unknown: the agent checks the pull request itself before it pushes.
+		}
+	}));
+	return states;
+}
+
+/**
  * A browser build runs on the machine the clicker chose for the document: their own connection for
  * its repository, or a teammate's shared machine whose owner can push there.
  */
@@ -128,7 +170,19 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 		{
 			...options.resumeMs === undefined ? {} : { resumeMs: options.resumeMs },
 			...options.mayTake ? { mayTake: options.mayTake } : {},
+			...options.identity ? { identity: options.identity } : {},
 			login: async id => (await auth.storage.users.get(id))?.login,
+			earlierUrls: async id => {
+				let channel = await auth.storage.channels.get(id);
+				if (!channel || channel.parentChannelId) return [];
+				return (await auth.storage.channels.earlierSlugs(id)).map(slug =>
+					new URL(
+						documentPath(channel.repositoryOwner, channel.repositoryName, slug),
+						auth.config.origin,
+					).href
+				);
+			},
+			pullRequestStates: (build, urls) => pullRequestStates(auth, build, urls),
 		},
 	);
 	let safe = (handler: RouteHandler): RouteHandler => async (request, url, params) => {
@@ -331,11 +385,20 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 					409,
 				);
 			}
+			// The plan's files the Planner pushed for this revision, which the build starts from.
+			let planSource = await options.withPlan(
+				id,
+				async plan => planSourceFor(plan.planSources, input.planRevision),
+			);
 			let source: Source | undefined;
 			try {
-				source = options.sourceFor
-					? await options.sourceFor(connection, id)
-					: checkoutOf(connection, channel.repositoryId);
+				if (options.sourceFor) source = await options.sourceFor(connection, id, planSource);
+				else {
+					source = checkoutOf(connection, channel.repositoryId);
+					if (source && planSource) {
+						source = { ...source, commit: planSource.commit, branch: planSource.branch };
+					}
+				}
 			} catch (error) {
 				let code = (error as { code?: unknown } | undefined)?.code;
 				throw new GitHubError(typeof code === "string" ? code : "no-workspace", 409);
@@ -369,6 +432,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 							...(connection.about?.service ? { machineService: true as const } : {}),
 							repositoryId: channel.repositoryId,
 							checkout,
+							...(planSource ? { planSource } : {}),
 						});
 						let holder = options.connections.assigned(connection.id);
 						// Another document's build holds the connection: this one starts after it.
@@ -469,7 +533,7 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 					await reportBuild(plan, runner(build), build.connectionId, build.id, {
 						state: "failed",
 						error: "Stopped in Chopin.",
-						stoppedByUser: true,
+						stoppedBy: session.user.login,
 					});
 					options.connections.release(build.connectionId, id);
 				} catch (error) {
@@ -523,10 +587,11 @@ export function registerImplementationRoutes(router: Router, auth: HostedAuth, o
 				if (!build || build.id !== input.buildId || !["stopped", "failed"].includes(build.state)) {
 					throw new GitHubError("stop the local agent before returning the plan for changes", 409);
 				}
-				if (
-					plan.execution?.id !== build.id
-					&& !plan.lifecycle.history.some(item => item.run.id === build.id)
-				) {
+				// A run ends with its build (see releaseEndedRun), so it is usually returned already.
+				if (plan.execution?.id !== build.id) {
+					if (plan.lifecycle.history.some(item => item.run.id === build.id)) {
+						return json({ accepted: true });
+					}
 					throw new GitHubError("implementation is not awaiting changes", 409);
 				}
 				let result = await reportImplementationLifecycle(plan, {
