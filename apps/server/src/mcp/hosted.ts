@@ -152,8 +152,10 @@ type ExposedState = {
 	graph?: Graph;
 	execution?: Run;
 	lifecycle?: Lifecycle;
-	/** Decision records, for the unapproved-context surface beside the graph. */
-	records: QuestionRecord[];
+	/** Decision records, for the unapproved-context surface beside the graph.
+	 * Omitted when the stored sidecar holds none — absence means "no records". */
+	records?: QuestionRecord[];
+	planSources?: PlanSource[];
 };
 
 function exposed(
@@ -976,7 +978,7 @@ export function hosted(
 							channel,
 							revision: projected.revision,
 							creation: projected.creation,
-							records: projected.records,
+							records: projected.records ?? [],
 							openQuestions: projected.openQuestions,
 							...(projected.graph ? { graph: projected.graph } : {}),
 						});
