@@ -15,7 +15,13 @@ import {
 	useSyncExternalStore,
 } from "react";
 import type { ReactNode } from "react";
-import { MessageForwardIcon, MessageIcon, SignInIcon, WrenchIcon } from "@chopin/icons";
+import {
+	DocumentIcon,
+	MessageForwardIcon,
+	MessageIcon,
+	SignInIcon,
+	WrenchIcon,
+} from "@chopin/icons";
 import { parseChildDocumentPath } from "@chopin/protocol/document-url";
 
 import { ChopinMark, Face, openCommentThread, PLANNER_NAME, useCardMeta } from "@chopin/editor";
@@ -27,7 +33,7 @@ import { ReactionPills, ReactionRefusal } from "./actions/reaction-pills";
 import { DeliveryMark, FailedLine } from "./message-delivery";
 import { ChatImageDocument, MessageImages } from "./image";
 import { messageMenuActions } from "./message-menu-actions";
-import { MessageMarkdown } from "./markdown";
+import { ChatLink, MessageMarkdown } from "./markdown";
 import { plainTextOf } from "./message-copy";
 import { withIntents } from "./pending-reactions";
 import { ownEmoji, reactionChanges, reactionCounts } from "./reactions";
@@ -63,7 +69,8 @@ let MessageFiles = lazy(() => import("./attachments/message-files"));
 const ANALYSIS = import.meta.env.DEV || import.meta.env.VITE_MESSAGE_ANALYSIS === "on";
 
 import type { Chat, ConversationPlan } from "@chopin/protocol";
-import type { CompletedWork, Group, Message } from "./model";
+import type { CompletedWork, Group, Message, WorkingTurn } from "./model";
+import type { Local } from "./chronology";
 import type { OfferPlace } from "./offer-motion";
 import type { CardMetaStore, QuestionnaireStore } from "@chopin/editor";
 import type { Transport } from "@chopin/question/react";
@@ -81,6 +88,8 @@ export type TranscriptThreads = {
 	openRootId?: string;
 	canStart: boolean;
 	onOpen: (rootId: string) => void;
+	/** Who is writing in a thread, by its root (`typingWords`), said on the root's row. */
+	replying?: Record<string, string>;
 };
 
 type PlanMarkers = {
@@ -196,6 +205,40 @@ function SystemEntry(
 			</p>
 		</div>
 	);
+}
+
+/** A document the Planner created from this one, linking to it. */
+function CreatedDocumentEntry(
+	{ created, enter, text }: {
+		created: NonNullable<Chat.Entry["document"]>;
+		enter: boolean;
+		text: string;
+	},
+) {
+	let [before, after] = splitAround(displayText(text), created.title);
+	return (
+		<div
+			className="flex items-start justify-start gap-3 text-left text-text-tertiary"
+			data-chat-created-document={created.channelId}
+			data-chat-enter={enter || undefined}
+			data-chat-system
+		>
+			<div className="mt-0.5 shrink-0">
+				<DocumentIcon aria-hidden="true" size={16} />
+			</div>
+			<p className="m-0 min-w-0 break-words text-sm [overflow-wrap:anywhere]">
+				{before}
+				<ChatLink className="link" href={created.path}>{created.title}</ChatLink>
+				{after}
+			</p>
+		</div>
+	);
+}
+
+/** The words of a line before and after the first `part`, or the whole line before it. */
+function splitAround(text: string, part: string): [string, string] {
+	let at = text.indexOf(part);
+	return at < 0 ? [`${text} `, ""] : [text.slice(0, at), text.slice(at + part.length)];
 }
 
 /** A comment sent to Chopin: what it was about and what it said, linking back to the thread. */
@@ -337,6 +380,7 @@ function MessageBody(
 	let own = message.author.kind === "member" && message.author.handle === handle;
 	let delivery = own ? deliveryOf(message) : undefined;
 	let threadSummary = markers.threads?.summaries[message.id];
+	let threadReplying = markers.threads?.replying?.[message.id];
 	let rootOpen = markers.threads?.openRootId === message.id;
 	let threads = markers.threads;
 	let canThread = !!threads
@@ -443,8 +487,13 @@ function MessageBody(
 						/>
 					)}
 					{shown.refusal && <ReactionRefusal text={shown.refusal} />}
-					{threadSummary && markers.threads && (
-						<ThreadSummaryRow onOpen={markers.threads.onOpen} summary={threadSummary} />
+					{(threadSummary || threadReplying) && markers.threads && (
+						<ThreadSummaryRow
+							onOpen={markers.threads.onOpen}
+							replying={threadReplying}
+							rootId={message.id}
+							summary={threadSummary}
+						/>
 					)}
 					<MessageToolbar
 						actions={actions}
@@ -615,7 +664,8 @@ export let Transcript = memo(function Transcript(
 		entries,
 		handle,
 		lead,
-		tail,
+		local,
+		note,
 		live,
 		onCardLink,
 		onAddExcerpt,
@@ -641,8 +691,10 @@ export let Transcript = memo(function Transcript(
 		conversationPlan?: ConversationPlan.State;
 		conversationPlanJobs?: ConversationPlan.Job[];
 		lead?: ReactNode;
-		/** The last row, after every entry: chopin's ephemeral note to this person. */
-		tail?: ReactNode;
+		/** What only this browser has: messages still sending, and notices under a send. */
+		local?: readonly Local[];
+		/** chopin's ephemeral note to this person, drawn where its time puts it among the rest. */
+		note?: { id: string; ts: number; row: ReactNode };
 		threads?: TranscriptThreads;
 		onCardLink?: (link: CardLink) => void;
 		onAddExcerpt?: (action: ExcerptCorrectionAction) => Promise<void>;
@@ -671,7 +723,7 @@ export let Transcript = memo(function Transcript(
 		/** The page's connection banner shows: a message's "Couldn't send" gives way to it, and is back with the connection. */
 		quietFailures?: boolean;
 		suspendedWork?: CompletedWork;
-		working?: Pick<Chat.Turn, "id" | "started" | "entryOffset">;
+		working?: WorkingTurn;
 		sourceDestination?: ChatDestination;
 	},
 ) {
@@ -712,9 +764,20 @@ export let Transcript = memo(function Transcript(
 	let offers = researchOffers ? conversationPlan?.researchOffers : undefined;
 	// The same rows while the transcript does not change, so a row already mounted is not rendered
 	// again when older ones are mounted above it.
+	let noteId = note?.id;
+	let noteTs = note?.ts;
 	let groups = useMemo(
-		() => researchTranscript(group(entries, working, completedWork, suspendedWork), offers ?? []),
-		[entries, working, completedWork, suspendedWork, offers],
+		() =>
+			researchTranscript(
+				group(entries, working, completedWork, suspendedWork, [
+					...local ?? [],
+					...noteId === undefined || noteTs === undefined
+						? []
+						: [{ kind: "note" as const, id: noteId, ts: noteTs }],
+				]),
+				offers ?? [],
+			),
+		[entries, working, completedWork, suspendedWork, offers, local, noteId, noteTs],
 	);
 	let messages = groups.flatMap(item => item.kind === "messages" ? item.messages : []);
 	// A turn keeps one row from its placeholder through completion, so it enters once.
@@ -727,6 +790,7 @@ export let Transcript = memo(function Transcript(
 	let keyed = groups.map(item => {
 		if (item.kind === "research") return { item, key: `research:${item.offer.id}` };
 		if (item.kind === "system") return { item, key: item.id };
+		if (item.kind === "note") return { item, key: `note:${item.id}` };
 		let first = item.messages[0]!;
 		let turn = first.working ? working?.id : turns.get(first.id);
 		return { item, key: turn ? `turn:${turn}` : `sent-${first.id}` };
@@ -735,7 +799,13 @@ export let Transcript = memo(function Transcript(
 		groups.flatMap(item =>
 			item.kind === "messages"
 				? item.messages.map(message => message.id)
-				: [item.kind === "research" ? `research:${item.offer.id}` : item.id]
+				: [
+					item.kind === "research"
+						? `research:${item.offer.id}`
+						: item.kind === "note"
+						? `note:${item.id}`
+						: item.id,
+				]
 		),
 	);
 	let before = previous.current;
@@ -1101,7 +1171,9 @@ export let Transcript = memo(function Transcript(
 					let afterCompactions = compactions?.filter(
 						compaction => compaction.afterEntryId && groupIds.has(compaction.afterEntryId),
 					) ?? [];
-					let node = item.kind === "research"
+					let node = item.kind === "note"
+						? note?.row
+						: item.kind === "research"
 						? (
 							<div
 								data-chat-enter={enters(key) || undefined}
@@ -1135,6 +1207,14 @@ export let Transcript = memo(function Transcript(
 									enter={enters(key)}
 									onOpenChild={onOpenChild}
 									room={room}
+								/>
+							)
+							: item.document
+							? (
+								<CreatedDocumentEntry
+									created={item.document}
+									enter={enters(key)}
+									text={item.text}
 								/>
 							)
 							: announced.has(readyChild(item.text) ?? "")
@@ -1178,14 +1258,13 @@ export let Transcript = memo(function Transcript(
 					);
 				})}
 				{compacting && <CompactingRow />}
-				{tail}
 				{/* With the stack's own gap, the last message ends 20px above the box, as Slack's clears its. */}
 				<div className="h-1 shrink-0" />
 				{emptyHint && (
 					<div
-						aria-hidden={groups.length > 0 || !!tail || undefined}
+						aria-hidden={groups.length > 0 || undefined}
 						className={`pointer-events-none absolute inset-0 flex items-center justify-center px-6 transition-opacity motion-reduce:transition-none ${
-							groups.length > 0 || tail ? "opacity-0" : "opacity-100"
+							groups.length > 0 ? "opacity-0" : "opacity-100"
 						}`}
 						data-chat-empty=""
 					>

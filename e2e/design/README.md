@@ -1,7 +1,7 @@
 # Rendered design checks
 
 `bun run design:browser` builds and runs a disposable Linux amd64 container with
-Bun 1.4.4 and a digest-pinned Playwright 1.62.1 Noble image. It installs from the
+Bun 1.4.5 and a digest-pinned Playwright 1.62.1 Noble image. It installs from the
 frozen lockfile, starts the real `/design-audit` development route and runs Chromium.
 Docker is required. No database, GitHub login, API key, host port or paid agent is used.
 This is an optional visual review command. Screenshot differences and exact
@@ -71,6 +71,6 @@ The optional visual suite runs 38 interface checks across the two viewport sizes
 
 Chopin meets WCAG 2.2 AA everywhere, in light and dark (the Contrast Rule in `apps/web/DESIGN.md`, decided on 11 November 2026; until then the Delete red, quiet timestamps and metadata, loading and tool status, the pierre-light code palette and the audit-page labels were recorded exceptions).
 
-[`contrast.e2e.ts`](contrast.e2e.ts), part of `bun run design:behavior`, holds it. [`contrast.ts`](contrast.ts) walks every visible text node, generated text and placeholder, and every icon in a control, status icon, field, composer and checkbox edge, status dot and focus ring (each control focused as a keyboard would), and measures each against the colour actually composited behind it: the ancestors' backgrounds and every group's opacity, through shadow roots. It fails any pair below 4.5:1 for text, 3:1 for large text and non-text parts, except disabled controls. Dark is the system's dark preference with the `.dark` class the copies read; Chopin draws it as light.
+[`contrast.e2e.ts`](contrast.e2e.ts), part of `bun run design:behavior`, holds it. [`contrast.ts`](contrast.ts) walks every visible text node, generated text and placeholder, and every icon in a control, status icon, field, composer and checkbox edge, status dot and focus ring (each control focused as a keyboard would), and measures each against the colour actually composited behind it: the ancestors' backgrounds and every group's opacity, through shadow roots. It fails any pair below 4.5:1 for text, 3:1 for large text and non-text parts, except disabled controls. Dark is the dark theme as the default System choice draws it when the system turns dark while the page is open (`drawTheme` in [`fixture.ts`](fixture.ts)).
 
 The optional visual suite's axe scans expect no findings: there are no approved contrast records any more.

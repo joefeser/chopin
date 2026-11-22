@@ -14,6 +14,7 @@
 		"@ai-sdk/mcp": "catalog:harness",
 		"@ai-sdk/sandbox-just-bash": "catalog:harness",
 		"@bastani/atomic": "catalog:harness",
+		"@bastani/atomic-ai": "catalog:harness",
 		"@chopin/agent-link": "workspace:*",
 		"@chopin/dialect": "workspace:*",
 		"@chopin/diagrams": "workspace:*",
@@ -35,6 +36,7 @@
 		"zod": "catalog:harness"
 	},
 	"devDependencies": {
+		"@bastani/atomic-storage-postgres": "catalog:harness",
 		"@types/bun": "catalog:bun",
 		"@types/mdast": "4.0.4"
 	}

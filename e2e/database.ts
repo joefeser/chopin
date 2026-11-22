@@ -55,14 +55,17 @@ export async function createChannel(
 	port: number,
 	id: string,
 	repository = SCORE,
+	/** Who created it, the one who may delete it with a repository admin; `e2e` by default. */
+	creator = "e2e",
 ): Promise<void> {
 	await sql(port, async database => {
 		let now = new Date();
 		let slug = testChannelSlug(id);
+		let createdBy = `U_${creator}`;
 		await database.begin(async transaction => {
 			await transaction`
 				INSERT INTO users (id, login, avatar_url, created_at, updated_at)
-				VALUES ('U_e2e', 'e2e', '', ${now}, ${now})
+				VALUES (${createdBy}, ${creator}, '', ${now}, ${now})
 				ON CONFLICT (id) DO NOTHING
 			`;
 			await transaction`
@@ -72,7 +75,7 @@ export async function createChannel(
 				) VALUES (
 					${id}, ${repository.id}, ${repository.owner}, ${repository.name},
 					${`Test ${id.slice(0, 8)}`},
-					'U_e2e', 0, 1, ${now}, ${now}
+					${createdBy}, 0, 1, ${now}, ${now}
 				)
 			`;
 			await transaction`
@@ -270,7 +273,6 @@ async function seed(
 		...(state.builds ? { builds: state.builds } : {}),
 		...(state.execution ? { execution: state.execution } : {}),
 		...(state.lifecycle ? { lifecycle: state.lifecycle } : {}),
-		...(state.workflowRuns ? { workflowRuns: state.workflowRuns } : {}),
 	};
 	await sql(port, async database => {
 		await database`
@@ -283,20 +285,6 @@ async function seed(
 					${document.update}, ${JSON.stringify(sidecar)}::jsonb, ${new Date()}
 				)
 			`;
-		for (let [runId, stages] of Object.entries(state.runStages ?? {})) {
-			let rows = stages.map((stage, position) => ({ position, ...stage }));
-			await database`
-				INSERT INTO workflow_run_stages (
-					channel_id, run_id, stage_id, position, name, kind, status, parent_ids, started, ended
-				)
-				SELECT ${id}, ${runId}, x.id, x.position, x.name, x.kind, x.status, x."parentIds",
-					x.started, x.ended
-				FROM jsonb_to_recordset(${JSON.stringify(rows)}::text::jsonb) AS x(
-					position bigint, id text, name text, kind text, status text, "parentIds" jsonb,
-					started bigint, ended bigint
-				)
-			`;
-		}
 	});
 }
 
@@ -734,4 +722,34 @@ export async function readDocument(port: number, id: string): Promise<{
 		if (!row) throw new Error(`missing checkpoint for ${id}`);
 		return { epoch: row.epoch, source: row.source, update: new Uint8Array(row.document) };
 	});
+}
+
+export async function markAiKeyRejected(
+	port: number,
+	login: string,
+	provider: "openai" | "anthropic",
+): Promise<void> {
+	await sql(port, database =>
+		database`
+			UPDATE ai_credentials SET rejected_at = now()
+			WHERE user_id = (SELECT id FROM users WHERE login = ${login}) AND provider = ${provider}
+		`);
+}
+
+export async function seedUnreadableAiKey(
+	port: number,
+	login: string,
+	provider: "openai" | "anthropic",
+	suffix: string,
+): Promise<void> {
+	await sql(port, database =>
+		database`
+			INSERT INTO ai_credentials (user_id, provider, kind, ciphertext, suffix, updated_at)
+			VALUES (
+				(SELECT id FROM users WHERE login = ${login}), ${provider}, 'api-key',
+				${Buffer.alloc(48, 7)}, ${suffix}, now()
+			)
+			ON CONFLICT (user_id, provider) DO UPDATE SET
+				kind = EXCLUDED.kind, ciphertext = EXCLUDED.ciphertext, suffix = EXCLUDED.suffix
+		`);
 }

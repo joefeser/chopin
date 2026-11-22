@@ -21,16 +21,14 @@ export const AGENT_SUBPROTOCOL = "chopin.agent.v1";
  * request carried the header, so a client that never asks never sees the field.
  */
 export const AGENT_FEATURES = {
-	/** `runs` cards may carry `stagesDelta: true` with only new and changed stages, uncounted. */
-	runStageDeltas: "run-stage-deltas",
 	/**
 	 * A question option's `preview` is its own framed Markdown visual on every card surface, and
 	 * the turn's host tools include `upload_plan_image`, which stores an image the Planner made.
 	 */
 	decisionOptionPreviews: "decision-option-previews",
 	/**
-	 * After a link drops unexpectedly, the server keeps the sessions that have a live or paused
-	 * run, an open question or an answer the client has not acknowledged, however long the client
+	 * After a link drops unexpectedly, the server keeps the sessions that have an open question or
+	 * an answer the client has not acknowledged, however long the client
 	 * stays away, and the same account's next link takes them back with `resume`. The client
 	 * acknowledges each `input-result` with `input-received`. Without the feature a closed link
 	 * ends everything it held.
@@ -86,7 +84,54 @@ export const AGENT_FEATURES = {
 	 * fresh session whose `instructions` hold neither the message nor the failed attempt.
 	 */
 	retryTurn: "retry-turn",
+	/**
+	 * With `capability-catalog`: `start` and `fork` carry the document's chosen `model` and
+	 * `thinkingLevel`, checked against the catalog the client last reported, so the session the
+	 * client makes, and any it makes again for the document on its own, opens on them. They only
+	 * open the session: each turn runs its own fields, and one it leaves out means the client's
+	 * default. Without the feature neither message has the fields.
+	 */
+	sessionChoice: "session-choice",
+	/**
+	 * `start` and `fork` carry `ai`: what the session's runner is handed for the models it calls,
+	 * in place of any key or sign-in of its own, and an `ai` message replaces it whenever it changes
+	 * (the person connected or removed a provider, or the launch was renewed before its deadline). A
+	 * runner sends each provider's requests to its `baseUrl` with its `placeholder` as the key, and
+	 * adds the launch's own credential in `AI_LAUNCH_HEADER` itself, never handing it to the agent's
+	 * tools. Without the feature neither message has the field and no `ai` message is sent: the
+	 * client uses its own models as before.
+	 */
+	aiCredentials: "ai-credentials",
+	/**
+	 * With `ai-credentials`: a client asks once per link, with `ai-catalog`, for a launch that only
+	 * lists models, so it can report the models of the account it will run on before any session
+	 * has a launch. The server answers with an `ai-catalog` message carrying the link's catalog
+	 * grants, and sends another whenever they change; they end with the link. Chopin's credential
+	 * proxy serves them each provider's model list and the model catalog, and refuses every other
+	 * request on them. Without the feature neither message is sent.
+	 */
+	aiCatalog: "ai-catalog",
+	/**
+	 * With `ai-catalog`: each `ai-catalog` names its launch in `catalogLaunch`, an opaque id that is
+	 * no credential, new with every `ai-catalog`, renewals and one with no providers included. A
+	 * `capabilities` report names, in `catalogLaunch`, the `ai-catalog` whose grants its models were
+	 * listed through, read with them, never a list saved or read under another. The server takes a
+	 * report as what the client offers only while the launch it names was handed for the person's
+	 * AI accounts as they are now: a report naming none, or one handed before the person connected,
+	 * replaced or removed an account, is no report, so a client lists its models again through each
+	 * new `catalogLaunch` and reports them naming it, even when they are the same. Without the
+	 * feature, a report counts for the latest catalog launch handed when it arrives, and for none
+	 * before the first is handed or between a change of the person's accounts and the launch
+	 * handed for them.
+	 */
+	catalogLaunches: "catalog-launches",
 } as const;
+
+/**
+ * The header in which a runner sends the launch's own credential (`ai.launch`) with every request
+ * to Chopin's credential proxy. The runner adds it on the way out; the agent never sees it.
+ */
+export const AI_LAUNCH_HEADER = "x-chopin-launch";
 
 /** How often a client that offered `restart-notice` retries a `resume` refused with `retry`. */
 export const RESTART_RESUME_RETRY_MS = 250;
@@ -127,8 +172,8 @@ const MAX_ID = 128;
 const MAX_NAME = 128;
 const MAX_NOTE = MAX_LINK_NOTE_LENGTH;
 const MAX_TOOLS = 256;
-const MAX_RUNS = 64;
-const MAX_STAGES = 64;
+/** The most sessions one link keeps across a drop. */
+const MAX_HELD_SESSIONS = 64;
 const MAX_QUESTIONS = 16;
 const MAX_OPTIONS = 32;
 const MAX_TURN_ATTACHMENTS = 20;
@@ -140,7 +185,6 @@ const name = z.string().min(1).max(MAX_NAME);
 const note = z.string().max(MAX_NOTE);
 const text = z.string().max(MAX_LINK_MESSAGE_BYTES);
 const count = z.number().int().nonnegative();
-const seconds = z.number().int().nonnegative();
 const json = z.json();
 
 const finishReason = z.strictObject({
@@ -262,7 +306,7 @@ export const catalogModelSchema = z.looseObject({
 });
 
 /**
- * One command a client offers, such as a skill, a prompt template or a workflow. `kind` says
+ * One command a client offers, such as a skill or a prompt template. `kind` says
  * which, as a string the client defines. Chopin keeps the entries it is given and shows none of
  * them yet.
  */
@@ -403,50 +447,6 @@ export const inputSchema = z.discriminatedUnion("method", [
 	z.strictObject({ method: z.literal("editor"), title: note, initial: note.optional() }),
 ]);
 
-const runStage = z.strictObject({
-	id,
-	name: z.string().max(MAX_NOTE),
-	parentIds: z.array(id).max(MAX_STAGES).optional(),
-	kind: z.literal("tool").optional(),
-	status: z.enum([
-		"pending",
-		"running",
-		"awaiting_input",
-		"paused",
-		"blocked",
-		"completed",
-		"failed",
-		"skipped",
-		"stopped",
-	]),
-	started: seconds.optional(),
-	ended: seconds.optional(),
-});
-
-const runFields = {
-	id,
-	name: z.string().max(MAX_NOTE),
-	status: z.enum(["running", "waiting", "paused", "finished", "blocked", "failed", "stopped"]),
-	started: seconds,
-	updated: seconds,
-	ended: seconds.optional(),
-	waiting: count,
-};
-
-/**
- * A workflow run card, as Chat shows it. A full card's `stages` replace the run's, at most 64,
- * with `earlierStages` counting those it leaves out. A delta card (`stagesDelta: true`) adds
- * new stages and replaces changed ones by id, keeping the rest; only the frame bounds how many.
- */
-export const runSchema = z.union([
-	z.strictObject({
-		...runFields,
-		stages: z.array(runStage).max(MAX_STAGES),
-		earlierStages: count.optional(),
-	}),
-	z.strictObject({ ...runFields, stagesDelta: z.literal(true), stages: z.array(runStage) }),
-]);
-
 const checkout = z.strictObject({
 	origin: z.string().max(2_048).optional(),
 	branch: z.string().max(256).optional(),
@@ -457,7 +457,32 @@ const checkout = z.strictObject({
 const heldSessions = z.array(z.strictObject({
 	session: id,
 	requests: z.array(id).max(MAX_OPEN_REQUESTS),
-})).max(MAX_RUNS);
+})).max(MAX_HELD_SESSIONS);
+
+/** An environment variable's name, as a runner sets a provider's key variable. */
+const variable = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/);
+
+/**
+ * With `ai-credentials`: what a session's runner is handed for one launch, for the person the
+ * Planner runs for. `launch` is the launch's own credential and `expiresAt` its deadline in
+ * milliseconds since the epoch; both are present exactly when `providers` is not empty. Each of
+ * `providers` is one model provider: its `baseUrl` on Chopin's credential proxy, the `placeholder`
+ * that stands in for the person's key there, and the environment variable (`keyVariable`) agents
+ * read that provider's key from. `withheld` names each provider the person connected that the
+ * launch was not given, with why. An empty `providers` means the runner has no grant now: none
+ * was given, or the ones it had ended.
+ */
+export const aiGrantsSchema = z.strictObject({
+	launch: z.string().min(1).max(256).optional(),
+	expiresAt: count.optional(),
+	providers: z.array(z.strictObject({
+		provider: identifier,
+		baseUrl: z.string().min(1).max(2_048),
+		placeholder: z.string().min(1).max(256),
+		keyVariable: variable,
+	})).max(16),
+	withheld: z.array(z.strictObject({ provider: identifier, reason: identifier })).max(16),
+});
 
 /** Every message a client sends. */
 export const clientMessageSchema = z.discriminatedUnion("type", [
@@ -495,9 +520,6 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
 		type: z.literal("input-request"),
 		request: id,
 		session: id,
-		workflowRunId: id.optional(),
-		workflowStageId: id.optional(),
-		rootRunId: id.optional(),
 		/** The block the question concerns, as the Planner's latest read of the document names it. */
 		block: z.strictObject({
 			index: z.number().int().nonnegative(),
@@ -513,13 +535,6 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
 	 */
 	z.strictObject({ type: z.literal("input-received"), request: id }),
 	z.strictObject({
-		type: z.literal("runs"),
-		session: id,
-		active: z.array(id).max(MAX_RUNS),
-		paused: z.array(id).max(MAX_RUNS),
-		cards: z.array(runSchema).max(MAX_RUNS),
-	}),
-	z.strictObject({
 		type: z.literal("control-result"),
 		request: id,
 		ok: z.boolean(),
@@ -528,14 +543,25 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
 	z.strictObject({ type: z.literal("detach") }),
 	/**
 	 * With `capability-catalog`: what the client offers now, sent right after `attached` (and
-	 * after any `resume`, which stays the first message) and again whenever it changes.
+	 * after any `resume`, which stays the first message) and again whenever it changes. With
+	 * `catalog-launches`, `catalogLaunch` names the `ai-catalog` its models were listed through.
 	 */
-	z.strictObject({ type: z.literal("capabilities"), catalog: capabilityCatalogSchema }),
+	z.strictObject({
+		type: z.literal("capabilities"),
+		catalog: capabilityCatalogSchema,
+		/** With `catalog-launches`. */
+		catalogLaunch: id.optional(),
+	}),
 	/**
 	 * With `resumable-sessions`, the first message after `attached`: the sessions this client
 	 * still holds from a link that dropped, and the questions each still waits on.
 	 */
 	z.strictObject({ type: z.literal("resume"), sessions: heldSessions }),
+	/**
+	 * With `ai-catalog`: asks, once per link, for the link's catalog grants (after `resumed` on a
+	 * link that resumes). Asking again changes nothing.
+	 */
+	z.strictObject({ type: z.literal("ai-catalog") }),
 ]);
 
 const toolSpec = z.strictObject({
@@ -569,6 +595,20 @@ export const refusalCodeSchema = z.enum([
 	"sign-in-required",
 	"unavailable",
 ]);
+
+/**
+ * What a session opens on. With `session-choice`: the document's chosen model and thinking level,
+ * as the client's catalog spelled them; absent where nobody chose one, or the catalog no longer
+ * offers it, and the client uses its own. A turn's own fields, or their absence, still decide it.
+ */
+const sessionOpening = {
+	/** With `session-choice`. */
+	model: z.string().optional(),
+	/** With `session-choice`. */
+	thinkingLevel: z.string().optional(),
+	/** With `ai-credentials`: what the session's runner is handed for the models it calls. */
+	ai: aiGrantsSchema.optional(),
+};
 
 /** Every message a server sends. */
 export const serverMessageSchema = z.discriminatedUnion("type", [
@@ -608,6 +648,7 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 		type: z.literal("start"),
 		session: id,
 		mode: z.enum(["planner", "isolated"]),
+		...sessionOpening,
 	}),
 	z.strictObject({
 		type: z.literal("fork"),
@@ -617,6 +658,7 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 			session: id,
 			turn: id.optional(),
 		}),
+		...sessionOpening,
 	}),
 	z.strictObject({
 		type: z.literal("turn"),
@@ -657,6 +699,23 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 	}),
 	z.strictObject({ type: z.literal("abort"), session: id, turn: id }),
 	/**
+	 * With `ai-credentials`: the session's grants changed, and `ai` replaces what `start`, `fork` or
+	 * an earlier `ai` gave. The earlier launch's credential and placeholders stop working; an empty
+	 * `providers` says the session has no grant now.
+	 */
+	z.strictObject({ type: z.literal("ai"), session: id, ai: aiGrantsSchema }),
+	/**
+	 * With `ai-catalog`, once the client asked: the link's catalog grants, which list models and run
+	 * none, replacing any earlier ones. An empty `providers` says the account has none to list now.
+	 * With `catalog-launches`, `catalogLaunch` names this launch, and every one is new.
+	 */
+	z.strictObject({
+		type: z.literal("ai-catalog"),
+		ai: aiGrantsSchema,
+		/** With `catalog-launches`. */
+		catalogLaunch: id.optional(),
+	}),
+	/**
 	 * With `steer-turn`: a person's message for the turn that is running, to read at its next
 	 * step. The client answers with `control-result`, `ok: false` when the turn has ended.
 	 */
@@ -676,8 +735,6 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 		value: json.optional(),
 		message: note.optional(),
 	}),
-	z.strictObject({ type: z.literal("stop"), request: id, session: id, run: id.optional() }),
-	z.strictObject({ type: z.literal("resume"), request: id, session: id, run: id.optional() }),
 	z.strictObject({ type: z.literal("destroy"), session: id }),
 	/**
 	 * The answer to `resume`: the sessions the server kept and gave back, each with the questions
@@ -688,6 +745,7 @@ export const serverMessageSchema = z.discriminatedUnion("type", [
 ]);
 
 export type CapabilityCatalog = z.infer<typeof capabilityCatalogSchema>;
+export type AiGrants = z.infer<typeof aiGrantsSchema>;
 export type CatalogModel = z.infer<typeof catalogModelSchema>;
 export type TurnAttachment = z.infer<typeof turnAttachment>;
 export type CatalogCommand = z.infer<typeof catalogCommandSchema>;
@@ -698,7 +756,6 @@ export type ToolError = z.infer<typeof toolErrorSchema>;
 export type ToolImage = z.infer<typeof toolImageSchema>;
 export type InputCall = z.infer<typeof inputSchema>;
 export type InputMethod = InputCall["method"];
-export type LinkRun = z.infer<typeof runSchema>;
 export type RefusalCode = z.infer<typeof refusalCodeSchema>;
 export type ProtocolErrorCode = Extract<ServerMessage, { type: "error" }>["code"];
 export type ClientMessageOf<T extends ClientMessage["type"]> = Extract<ClientMessage, { type: T }>;

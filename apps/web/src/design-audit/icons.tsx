@@ -10,6 +10,7 @@ import {
 	InfoIcon,
 	InvestigationIcon,
 	KeyboardIcon,
+	KeyIcon,
 	LightbulbIcon,
 	LinkPlusIcon,
 	LoaderIcon,
@@ -38,8 +39,6 @@ import documentActions from "../assets/figma/navigation/document-actions.svg";
 import newDocument from "../assets/figma/navigation/new-document.svg";
 import panelClose from "../assets/icons/panel-close.svg";
 import chat from "../assets/icons/chat.svg";
-import plannerResume from "../assets/icons/planner-resume.svg";
-import plannerStop from "../assets/icons/planner-stop.svg";
 
 import type { IconProps } from "@chopin/icons";
 import type { ComponentType } from "react";
@@ -58,8 +57,6 @@ const NUCLEO_ICONS: readonly IconCatalogueItem[] = [
 	{ name: "Document actions", source: documentActions },
 	{ name: "New document", source: newDocument },
 	{ name: "Chat", source: chat },
-	{ name: "Workflow stop", source: plannerStop },
-	{ name: "Workflow resume", source: plannerResume },
 	{ icon: LinkPlusIcon, name: "Link plus" },
 	{ icon: MessagePlusIcon, name: "Message plus" },
 	{ icon: ArrowUpIcon, name: "Arrow up" },
@@ -90,6 +87,7 @@ const NUCLEO_ICONS: readonly IconCatalogueItem[] = [
 	{ icon: SearchIcon, name: "Search" },
 	{ icon: LoaderIcon, name: "Loader" },
 	{ icon: MachineIcon, name: "Machine" },
+	{ icon: KeyIcon, name: "Key" },
 	{ icon: ServerIcon, name: "Server" },
 	{ icon: UsersIcon, name: "Users" },
 ];

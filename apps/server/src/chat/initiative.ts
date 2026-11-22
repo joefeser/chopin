@@ -81,9 +81,16 @@ function available(source: Source): "ready" | "wait" | "drop" {
 				|| (entry.author.kind === "agent" && !!entry.text.trim())
 			)?.id !== source.id
 		|| Service.implementationActive(context.plan)
-		|| chat.runs?.some(run => ["running", "waiting", "paused"].includes(run.status))
 	) return "drop";
 	return chat.busy || chat.pendingSends > 0 || chat.waiting.length > 0 ? "wait" : "ready";
+}
+
+/**
+ * A composer's `chat:pacing`: whether its person is writing in Chat, for automatic participation
+ * and who is alone with chopin, paced as it always was and apart from what Chat shows of typing.
+ */
+export function pacing(context: Room, ws: Socket, active: boolean): void {
+	initiative(context)?.typing(ws.data.client, actor(ws), active);
 }
 
 export function initiative(context: Room) {

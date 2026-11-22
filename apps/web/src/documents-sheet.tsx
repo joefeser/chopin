@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { Drawer } from "@base-ui/react/drawer";
+import { safeLocalStorage } from "@chopin/editor/browser-storage";
 import { Face } from "@chopin/editor/face";
 import { focusIsFree } from "@chopin/editor/focus-return";
 import { childDocumentPath, documentPath } from "@chopin/protocol/document-url";
@@ -18,10 +19,11 @@ import {
 
 import { ActionSheet } from "./action-sheet";
 import { unansweredDecisionsLabel } from "./decision-view-control";
+import { mayDeleteDocument } from "@chopin/protocol/document-delete";
 import { DocumentActionsMenu } from "./document-actions-menu";
+import { AiAccountsEntry } from "./ai-accounts/entry";
 import { MachinesEntry } from "./machines-entry";
 import {
-	browserStorage,
 	documentGroups,
 	filterDocumentGroups,
 	readRecentIds,
@@ -39,6 +41,27 @@ import type { DocumentCreationPhase } from "./use-document-creation";
 
 type Page = "documents" | "archived";
 
+/** The sheet's inline filter, a field people find by its edge. The design audit shows it in place. */
+export function DocumentsSheetSearch(
+	{ onQuery, query }: { onQuery: (query: string) => void; query: string },
+) {
+	return (
+		<label className="documents-sheet-search">
+			<SearchIcon aria-hidden="true" size={16} />
+			<span className="sr-only">Search documents</span>
+			<input
+				autoComplete="off"
+				className="field"
+				enterKeyHint="search"
+				onChange={event => onQuery(event.target.value)}
+				placeholder="Search documents"
+				type="search"
+				value={query}
+			/>
+		</label>
+	);
+}
+
 /**
  * Phones navigate documents from a bottom sheet rather than the desktop's left drawer: one
  * project at a time, filtered inline, with archived documents a page deeper inside the sheet.
@@ -47,6 +70,7 @@ type Page = "documents" | "archived";
 export function DocumentsSheet(
 	{
 		activeRepositoryId,
+		aiAccountsCurrent,
 		catalogueMode,
 		currentDocumentId,
 		machinesCurrent,
@@ -65,6 +89,7 @@ export function DocumentsSheet(
 		user,
 	}: {
 		activeRepositoryId?: string;
+		aiAccountsCurrent?: boolean;
 		catalogueMode: "active" | "archived";
 		currentDocumentId?: string;
 		/** /machines is open, so the Machines row is the current page. */
@@ -166,6 +191,8 @@ export function DocumentsSheet(
 					{canManageProject(entry.project) && (
 						<DocumentActionsMenu
 							channel={channel}
+							deletable={!!entry.project.repository
+								&& mayDeleteDocument(channel, entry.project.repository.permissions, user.id)}
 							className="documents-sheet-more"
 							onAction={action => onDocumentAction(channel, action)}
 							trigger={<EllipsisIcon aria-hidden="true" size={18} />}
@@ -235,7 +262,7 @@ export function DocumentsSheet(
 
 	let recents = entry && open && page === "documents" && !query.trim()
 		? recentDocuments(
-			readRecentIds(browserStorage(), user.id, entry.project.repositoryId),
+			readRecentIds(safeLocalStorage, user.id, entry.project.repositoryId),
 			entry.documents.channels,
 			currentDocumentId,
 		)
@@ -339,18 +366,7 @@ export function DocumentsSheet(
 										</li>
 									</ul>
 								)}
-								<label className="documents-sheet-search">
-									<SearchIcon aria-hidden="true" size={16} />
-									<span className="sr-only">Search documents</span>
-									<input
-										autoComplete="off"
-										enterKeyHint="search"
-										onChange={event => setQuery(event.target.value)}
-										placeholder="Search documents"
-										type="search"
-										value={query}
-									/>
-								</label>
+								<DocumentsSheetSearch onQuery={setQuery} query={query} />
 								<div className="documents-sheet-scroll">
 									{recents.length > 0 && (
 										<section aria-label="Recent" className="documents-sheet-section" data-recent="">
@@ -394,6 +410,12 @@ export function DocumentsSheet(
 										</li>
 										<li className="documents-sheet-row" data-current={machinesCurrent || undefined}>
 											<MachinesEntry current={machinesCurrent} placement="sheet" />
+										</li>
+										<li
+											className="documents-sheet-row"
+											data-current={aiAccountsCurrent || undefined}
+										>
+											<AiAccountsEntry current={aiAccountsCurrent} placement="sheet" />
 										</li>
 										<li className="documents-sheet-row">
 											<button

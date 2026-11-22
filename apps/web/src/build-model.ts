@@ -1,3 +1,4 @@
+import { noAiAccountRun } from "@chopin/protocol/ai-credentials";
 import { PLANNER_NAME } from "@chopin/editor/people";
 import type { BuildRequest, ImplementationSnapshot } from "@chopin/protocol/implementation";
 
@@ -180,6 +181,8 @@ export function builtDetail(snapshot: Snapshot | undefined): string | undefined 
 
 export function endedReason(build: { error?: string } | undefined): string | undefined {
 	let error = build?.error;
+	// It never started: Chopin had no AI account of its starter's to run it on, and says so.
+	if (noAiAccountRun(error)) return error;
 	if (error === "Stopped from the connector terminal.") {
 		return "Build stopped from the connector terminal.";
 	}
@@ -939,7 +942,7 @@ export function buildTabReady(snapshot: Snapshot | undefined, look: BuildLook): 
 	return look.kind !== "plan" || !!snapshot && hasBuilt(snapshot);
 }
 
-/** A running build as Chat's run strip shows it, beside the workflow runs. */
+/** A running build as Chat shows it, in a card under its transcript. */
 export type BuildRun = {
 	id: string;
 	/** A first build works through its tasks; a rebuild carries edits onto its pull requests. */
@@ -958,8 +961,8 @@ export type BuildRun = {
 };
 
 /**
- * The build Chat's run strip shows while one runs, or nothing. It is read from the same snapshot
- * as Build, so the strip and Build never disagree; once the build ends the strip lets it go and
+ * The build Chat's build card shows while one runs, or nothing. It is read from the same snapshot
+ * as Build, so the card and Build never disagree; once the build ends the card lets it go and
  * Chat's line about how it ended stays.
  */
 export function buildRun(snapshot: Snapshot | undefined): BuildRun | undefined {

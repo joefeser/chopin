@@ -33,7 +33,8 @@ function server(port: number, database: string, extra: Record<string, string>) {
 		 * `scripts/dev.ts` gives: the wrapper does not exit when the thing it
 		 * started dies, so Playwright would end up supervising nothing.
 		 */
-		command: "bun --preload ./e2e/github.ts --preload ./e2e/jev.ts apps/server/src/main.ts",
+		command: "bun --preload ./e2e/github.ts --preload ./e2e/ai-providers.ts --preload ./e2e/jev.ts"
+			+ " apps/server/src/main.ts",
 		cwd: ROOT,
 		url: `http://${HOST}:${port}/`,
 		env: {
@@ -189,11 +190,10 @@ export default defineConfig({
 				"**/harness-investigation.e2e.ts",
 				"**/chat-threads.e2e.ts",
 				"**/chat-thread-reactions.e2e.ts",
+				"**/chat-typing.e2e.ts",
 				"**/chat-tab-complete.e2e.ts",
 				"**/chat-mention-format.e2e.ts",
-				"**/run-card.e2e.ts",
-				"**/chat-run-strip.e2e.ts",
-				"**/chat-run-scrollbars.e2e.ts",
+				"**/chat-scrollbars.e2e.ts",
 				"**/message-reactions.e2e.ts",
 				"**/reaction-reader.e2e.ts",
 				"**/auth-lifecycle.e2e.ts",
@@ -234,11 +234,10 @@ export default defineConfig({
 				"**/harness-investigation.e2e.ts",
 				"**/chat-threads.e2e.ts",
 				"**/chat-thread-reactions.e2e.ts",
+				"**/chat-typing.e2e.ts",
 				"**/chat-tab-complete.e2e.ts",
 				"**/chat-mention-format.e2e.ts",
-				"**/run-card.e2e.ts",
-				"**/chat-run-strip.e2e.ts",
-				"**/chat-run-scrollbars.e2e.ts",
+				"**/chat-scrollbars.e2e.ts",
 				"**/message-reactions.e2e.ts",
 				"**/reaction-reader.e2e.ts",
 			],

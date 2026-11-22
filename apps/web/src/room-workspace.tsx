@@ -10,9 +10,11 @@ import {
 	useSyncExternalStore,
 } from "react";
 import { createPortal, flushSync } from "react-dom";
+import { safeLocalStorage } from "@chopin/editor/browser-storage";
 import { FollowLinkProvider } from "@chopin/editor/follow-link";
 import { ImagePlace } from "@chopin/editor/image-place";
 import { rememberAvatars } from "@chopin/editor/people";
+import { mayDeleteDocument } from "@chopin/protocol/document-delete";
 import { documentPath } from "@chopin/protocol/document-url";
 import {
 	ArchiveIcon,
@@ -99,6 +101,7 @@ import { ChildPhoneChromeContext, sameEditState } from "./child-phone-chrome";
 import { ChildProvenance } from "./child-provenance";
 import { ChildTitleContext } from "./child-title";
 import { shouldShowResearchActionError, useResearchOfferLinks } from "./chat/research-offer";
+import type { PlannerPlace } from "./chat/model-picker-state";
 import type { PlannerView } from "./chat/planner-settle";
 import type { ResearchDraftController } from "./chat/research-draft-controller";
 import { useDocumentEditing } from "./document-editing";
@@ -138,7 +141,7 @@ import {
 } from "./document-history-panel";
 import { DocumentRename } from "./document-rename";
 import { LostEditsNotice, UNDO_REFUSALS, UndoRefusedNotice } from "./document-status-notices";
-import { browserStorage, rememberOpened } from "./documents-sheet-model";
+import { rememberOpened } from "./documents-sheet-model";
 import { PhoneHeader, PhoneHeaderContent } from "./phone-header";
 import { DocumentSkeleton } from "./phone-skeleton";
 import { useEditorFocus, useKeyboardOpen } from "./keyboard-open";
@@ -253,6 +256,8 @@ export function RoomMembers(
 
 type TitleProps = {
 	archivedAt?: string;
+	/** The reader may delete the document for good: its menu offers Delete. */
+	canDelete?: boolean;
 	canManage: boolean;
 	editing?: TitleEdit;
 	label: string;
@@ -284,6 +289,7 @@ let renamedFromField = new Map<string, number>();
 export function DocumentTitle(
 	{
 		archivedAt,
+		canDelete = false,
 		canManage,
 		decision,
 		editing,
@@ -411,6 +417,7 @@ export function DocumentTitle(
 						channel={{ archivedAt, title: label }}
 						className="title-control-action"
 						decision={decision}
+						deletable={canDelete && !decision}
 						onAction={action => action === "rename" ? onEditingChange("rename") : onAction(action)}
 						settings={width && !decision && !archivedAt && (
 							<MenuSwitchItem checked={width.full} onChange={width.onChange}>
@@ -480,6 +487,7 @@ export function Header(
 		<header className="room-header relative flex shrink-0 flex-nowrap items-center px-2 py-2 sm:px-5 sm:py-0">
 			<DocumentTitle
 				archivedAt={props.archivedAt}
+				canDelete={props.canDelete}
 				canManage={props.canManage}
 				editing={props.editing}
 				icon
@@ -507,12 +515,14 @@ export function RoomWorkspace(
 		archivedAt,
 		canEdit = true,
 		canManage,
+		createdBy,
 		description,
 		descriptionRevision,
 		fullWidth,
 		handle,
 		label,
 		onMetadataChanged,
+		parentChannelId,
 		presentation,
 		repository,
 		room,
@@ -545,7 +555,7 @@ export function RoomWorkspace(
 	} = useNavigationDocument();
 	// Phones list a project's recently opened documents in the documents sheet.
 	useEffect(() => {
-		if (!archivedAt) rememberOpened(browserStorage(), userId, repository.id, room);
+		if (!archivedAt) rememberOpened(safeLocalStorage, userId, repository.id, room);
 	}, [archivedAt, repository.id, room, userId]);
 	let [status, setStatus] = useState<Status>("connecting");
 	let [outage, setOutage] = useState<Outage>();
@@ -760,7 +770,7 @@ export function RoomWorkspace(
 	let hasPlanProse = useHasPlanContent(questions);
 	let hasPlanContent = documentHasPlanningContent(hasPlanProse);
 	let [decisionView, setDecisionView] = useState<DecisionViewState>(() => {
-		let stored = localStorage.getItem("chopin:view:document");
+		let stored = safeLocalStorage.getItem("chopin:view:document");
 		return {
 			phase: "initial",
 			preferred: initialDocumentView(profile, stored),
@@ -1025,7 +1035,7 @@ export function RoomWorkspace(
 	let selectView = (next: DecisionView, revealFirst = true) => {
 		setDecisionView(state => selectDecisionView(state, next));
 		if (hasPlanContent && profile.persistView) {
-			localStorage.setItem("chopin:view:document", next);
+			safeLocalStorage.setItem("chopin:view:document", next);
 		}
 		if (next === "decisions" && revealFirst) {
 			let first = firstOpenDecision(entries, cardMetadata);
@@ -1307,9 +1317,9 @@ export function RoomWorkspace(
 			channelId: room,
 			onAuthenticationRequired: () => location.reload(),
 			onOutage: setOutage,
-			onDeleted: () => {
+			onDeleted: by => {
 				setDeleted(true);
-				onDocumentDeleted(room);
+				onDocumentDeleted(room, by);
 			},
 			onStatus: next => {
 				if (next === "connected") {
@@ -1453,18 +1463,24 @@ export function RoomWorkspace(
 		choose: hasMachineButton,
 		place: "note",
 	});
-	// Whether the Planner is on its way, for the composer's model pill to wait for its models: read
-	// from the room's word alone, so it holds before the machine is named, and over once the machine
-	// can't start it, went away, or none was chosen.
-	let plannerComing: "starting" | "attached" | undefined = !agent
+	// Where the Planner is, for the composer's model pill to wait for its models or say why it can't:
+	// read from the room's word alone, so it holds before the machine is named, and says nothing
+	// before the room's first word.
+	let plannerPlace: PlannerPlace | undefined = !agent
 		? undefined
 		: midSwitch
 		? "starting"
-		: attachment?.state === "attached"
+		: !attachment
+		? undefined
+		: attachment.state === "attached"
 		? "attached"
-		: attachment?.state === "starting" && !attachment.failure
-		? "starting"
-		: undefined;
+		: attachment.state === "starting"
+		? attachment.failure ? "failed" : "starting"
+		: attachment.state === "held"
+		? "held"
+		: attachment.state === "disconnected"
+		? "away"
+		: "none";
 	// Mid-switch the old machine's attachment is not chopin's state: it is connecting to the new one.
 	let presence = agent
 		? plannerPresence(midSwitch ? undefined : attachment, plannerNote)
@@ -1888,8 +1904,13 @@ export function RoomWorkspace(
 	let machinePicker = status === "connected" || (!!wire?.restarting && treatAsConnected)
 		? machineSlot
 		: undefined;
+	// Who may delete it for good: its creator while they can write, or a repository admin. A child
+	// goes with its parent and has no Delete of its own.
+	let canDelete = effectiveCanManage && !!createdBy
+		&& mayDeleteDocument({ createdBy, parentChannelId }, repository.permissions, userId);
 	let titleProps: TitleProps = {
 		archivedAt: workspaceArchivedAt,
+		canDelete,
 		canManage: effectiveCanManage,
 		editing: titleEdit,
 		label: metadata.title,
@@ -2111,7 +2132,7 @@ export function RoomWorkspace(
 									fix: noteFix,
 									...(hasMachineButton ? { choose: openMachinePicker } : {}),
 								}}
-								plannerComing={plannerComing}
+								plannerPlace={plannerPlace}
 								onTranscript={setTranscriptFacts}
 								focus={presentation.type === "parent-with-child" ? presentation.childId : undefined}
 								onOpenChild={presentation.onChildOpen}
@@ -2127,7 +2148,6 @@ export function RoomWorkspace(
 									: !workspaceCanEdit
 									? "You have read-only access to this document."
 									: undefined}
-								onShowDecisions={() => selectDestination("decisions")}
 								build={runningBuild}
 								onShowBuild={() => selectDestination("build")}
 								onResearch={researchEnabled ? startResearch : undefined}
@@ -2194,6 +2214,7 @@ export function RoomWorkspace(
 								>
 									<PhoneHeaderContent
 										archivedAt={workspaceArchivedAt}
+										canDelete={canDelete}
 										canManage={effectiveCanManage}
 										comments={openComments}
 										context={buildSlot}

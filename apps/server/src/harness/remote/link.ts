@@ -14,7 +14,8 @@ import {
 	parseClientMessage,
 	usableCatalog,
 } from "@chopin/agent-link";
-import { untilUnpaused } from "../atomic/full";
+import { AI_RENEW_BEFORE_MS, AiLaunchRefused } from "../../ai/launches";
+import { AI_ACCOUNT_UNCHECKED_SESSION, NO_AI_ACCOUNT_SESSION } from "../../ai/account-check";
 
 import type {
 	HarnessV1PromptControl,
@@ -24,6 +25,7 @@ import type {
 	HarnessV1StreamPart,
 } from "@ai-sdk/harness";
 import type {
+	AiGrants,
 	CapabilityCatalog,
 	ClientMessage,
 	ClientMessageOf,
@@ -33,14 +35,15 @@ import type {
 	ServerMessageOf,
 	TurnAttachment,
 } from "@chopin/agent-link";
-import type { Chat as Wire } from "@chopin/protocol";
 import type { JsonValue, PlannerHeldSession } from "../../storage/model";
-import type { PlannerRuns } from "../atomic/full";
+import { withdrawnValue } from "../atomic/human-input";
 import type { AskedInput, HumanInput, HumanInputStatus, InputMethod } from "../atomic/human-input";
 import type { PlannerTurn } from "../turn-level";
 import type { RemotePlanner } from "./registry";
 
 const OPERATION_TIMEOUT_MS = 10_000;
+/** How soon a renewal of a session's AI launch that failed is tried again. */
+const AI_RETRY_MS = 60_000;
 const REVALIDATE_EVERY_MS = 5 * 60_000;
 const MAX_OPEN_INPUTS = 16;
 /** How many settled `input-request` ids a link remembers to refuse their reuse. */
@@ -56,9 +59,6 @@ function once(work: () => void): () => void {
 		work();
 	};
 }
-/** How many controls whose wait ran out a link remembers, to hear their late answers. */
-const MAX_LATE_CONTROLS = 64;
-const LIVE_RUN = new Set(["running", "waiting", "paused"]);
 
 export type LinkSocket = {
 	send(text: string): void;
@@ -87,6 +87,40 @@ export type AttachOutcome =
 	}
 	| { ok: false; code: RefusalCode; message: string };
 
+/**
+ * The AI launches of a link's sessions, all for the person the link acts for. Given only to a
+ * link whose client offered `ai-credentials`.
+ */
+export type LinkAi = {
+	/**
+	 * Prepares a launch for a session of the document, owned by the session: what the runner is
+	 * handed, and the id that ends it. Throws `AiLaunchRefused` when it would be given nothing (no AI
+	 * account Chopin can use, or the launch ended first), and another error when it could not be
+	 * prepared now. A launch handed out with no provider (an earlier Chopin's) is never started on.
+	 */
+	launch(channelId: string, sessionId: string): Promise<{ launchId?: string; grants: AiGrants }>;
+	/**
+	 * Prepares the link's catalog launch (`ai-catalog`), owned by the link `linkId`: the proxy lets
+	 * it list each provider's models and read the model catalog, and refuses it everything else.
+	 * Throws as `launch` does.
+	 */
+	catalog?(channelId: string, linkId: string): Promise<{ launchId?: string; grants: AiGrants }>;
+	end(launchId: string): void;
+	/** Calls `changed` whenever the person's AI credentials change; returns how to stop. */
+	watch(changed: () => void): () => void;
+	/** Hears that a session holds a launch now, or no longer does (see `Port.aiHeld`). */
+	held?(launchId: string, holding: boolean): void;
+};
+
+/**
+ * A session's start or fork refused because its launch would be given no provider: the account it
+ * is for has no AI account Chopin can use. Its turn says so in these words, with `code`.
+ */
+export class NoAiAccountError extends Error {
+	override name = "NoAiAccountError";
+	readonly code = "no-ai-account" as const;
+}
+
 export type LinkOptions = {
 	/** Resolves the document the client asked for and takes its Planner, or refuses. */
 	attach(message: ClientMessageOf<"attach">): Promise<AttachOutcome>;
@@ -99,8 +133,13 @@ export type LinkOptions = {
 	revalidateEveryMs?: number;
 	/** The features `attached` names; absent when the client asked for none. */
 	features?: string[];
-	/** The client reported what it offers, which may be nothing now; read it from `catalog`. */
+	/**
+	 * The client reported what it offers, which may be nothing now, or what it reported stopped
+	 * counting because the person's AI accounts changed; read it from `catalog`.
+	 */
 	catalogChanged?(): void;
+	/** Launches the sessions' AI, once the client offered `ai-credentials`. */
+	ai?: LinkAi;
 };
 
 const REFUSAL_CLOSE: Record<RefusalCode, number> = {
@@ -216,14 +255,10 @@ function usage(value: LinkUsage) {
 
 type Port = {
 	send(message: ServerMessage): boolean;
-	control(
-		session: string,
-		action: "stop" | "resume",
-		runId?: string,
-		sent?: (request: string) => void,
-	): Promise<void>;
 	/** Gives the client's running `turn` a person's message; rejects when it could not take it. */
 	steer(session: string, turn: string, prompt: string): Promise<void>;
+	/** Withdraws the questions asked while `turn` ran. */
+	withdraw(session: string, turn: string): void;
 	forget(session: string): void;
 	/** Whether the client's work in `session` goes on past a restart: it is kept, not destroyed. */
 	kept(session: string): boolean;
@@ -232,6 +267,18 @@ type Port = {
 	timeoutMs: number;
 	/** The features the client asked for that this server supports; absent when it asked for none. */
 	features?: readonly string[];
+	/** The sessions' AI launches, when the client offered `ai-credentials`. */
+	ai?: LinkAi;
+	/**
+	 * Ends a session's AI launch: present wherever launches are handed out, whatever the client
+	 * offers, so a launch a session kept across a restart ends with it.
+	 */
+	endAi?: (launchId: string) => void;
+	/**
+	 * Hears that a session holds an AI launch now (`holding`), or no longer does: what says a
+	 * session's launch is still owned, so one no session holds is ended (see `AiCredentials.retire`).
+	 */
+	aiHeld?: (launchId: string, holding: boolean) => void;
 };
 
 type Turn = {
@@ -244,6 +291,7 @@ type Turn = {
 	hostIds: Set<string>;
 	hostCalls: Map<string, string>;
 	stopped: boolean;
+	withdrawn: boolean;
 	ended: boolean;
 	settle: PromiseWithResolvers<void>;
 	/** Aborted when the turn ends, so the server's host tools still running for it stop too. */
@@ -253,21 +301,6 @@ type Turn = {
 };
 
 type TurnMessage = ClientMessageOf<"tools" | "part" | "host-tool-call" | "turn-end">;
-
-/** The client answered a Stop or Resume with a refusal: it heard the request, so nothing is owed. */
-class ControlRefused extends Error {}
-
-/**
- * A Stop sent to the client and not yet answered, naming its run (none: every run). `origin` is
- * the Stop of every run this one stands for after a Resume of another run undid part of it.
- */
-type OwedStop = {
-	run: string | undefined;
-	held?: true;
-	origin?: OwedStop;
-	/** The control request that carries it, so a late answer finds it. */
-	request?: string;
-};
 
 /** An answer the client has not acknowledged, and the claim that keeps its session until it has. */
 type Owed = {
@@ -281,6 +314,8 @@ type Owed = {
 /** A request waiting on the document's members, and the decisions it asked once they exist. */
 type OpenInput = {
 	session: string;
+	/** The turn that ran when it was asked: Chopin stopping that turn withdraws it. */
+	turn?: string;
 	controller: AbortController;
 	method: InputMethod;
 	decisions: string[];
@@ -311,16 +346,7 @@ export type RejoinHost = {
 	 * Asks the document's members, as Decisions, a question a rebuilt session's client asks after
 	 * the restart. No turn of this process opened that session, so nothing else can.
 	 */
-	humanInput?(
-		hold: (workflowRunId: string, signal: AbortSignal) => Promise<void>,
-		report: (status: HumanInputStatus) => void,
-	): HumanInput;
-	/**
-	 * Shows what a rebuilt session's client reports of its workflow runs as the document's run
-	 * cards, `down` while its link has dropped again. Nothing in this process retains that session,
-	 * so its reports reach Chat only this way.
-	 */
-	runs?(session: string, runs: PlannerRuns, down: boolean): void;
+	humanInput?(report: (status: HumanInputStatus) => void): HumanInput;
 };
 
 /**
@@ -341,7 +367,6 @@ const METHODS = ["questionnaire", "confirm", "select", "input", "editor"] as con
  * client asks after the restart becomes a Decision as one asked before it did.
  */
 function rebuiltInput(
-	planner: RemotePlanner,
 	document: RebuiltDocument,
 	report: (status: HumanInputStatus) => void,
 ): HumanInput {
@@ -354,9 +379,7 @@ function rebuiltInput(
 		try {
 			let host = live();
 			if (!host) throw new Error("Decisions are not available to this session.");
-			return await ask(
-				host.humanInput!((runId, signal) => untilUnpaused(planner, runId, signal), report),
-			);
+			return await ask(host.humanInput!(report));
 		} finally {
 			release?.();
 		}
@@ -380,23 +403,24 @@ class RemoteSession {
 	#acknowledged = false;
 	#current: Turn | undefined;
 	#closed = false;
-	#roots = new Map<string, string>();
-	/** Every reported stage of each run, by id, in the order first reported. */
-	#stages = new Map<string, Map<string, Wire.RunStage>>();
+	/** The session's AI launch: the one the client holds, ended when the session is. */
+	#launchId: string | undefined;
+	/** When the AI launch is next prepared again, ahead of its deadline or after a failure. */
+	#renewal: ReturnType<typeof setTimeout> | undefined;
+	/** Stops hearing of the person's credential changes. */
+	#unwatch: (() => void) | undefined;
+	/** The renewal under way, so renewals run one at a time. */
+	#renewing: Promise<void> = Promise.resolve();
 	/**
-	 * Stops asked for while the link was down, each naming its run (none: every run), for the
-	 * client to hear first when it resumes. A Stop is never lost to a network failure.
+	 * The person's AI accounts changed before the client acknowledged `start` or `fork`: the
+	 * acknowledgement prepares the session's launch again, once, from what they have then.
 	 */
-	#held: Array<{ run: string | undefined }> = [];
+	#aiDirty = false;
 	/**
-	 * Stops sent to the client that it has not answered. The client may never have heard one, or
-	 * have applied it and lost only its answer, so a link that drops before the answer still owes
-	 * the client the Stop: `suspend` moves these to `#held`. A Stop that went unanswered for as
-	 * long as the server waits stays here too, for a link that is only noticed to be dead later.
+	 * A restart's hold named the session's launch: it changes no more here, and a launch prepared
+	 * for it meanwhile is ended unsent, so the hold names the very launch its client holds.
 	 */
-	#unanswered = new Set<OwedStop>();
-	/** The Stops sent and not yet answered, by control request, for an answer that comes late. */
-	#requests = new Map<string, OwedStop>();
+	#aiFrozen = false;
 
 	constructor(id: string, planner: RemotePlanner, port: Port) {
 		this.id = id;
@@ -410,15 +434,37 @@ class RemoteSession {
 		return this.#current !== undefined;
 	}
 
+	/** The id of the turn under way, if one is. */
+	get turn(): string | undefined {
+		let turn = this.#current;
+		return turn && !turn.ended ? turn.id : undefined;
+	}
+
+	get withdrawing(): boolean {
+		let turn = this.#current;
+		return turn !== undefined && turn.withdrawn && !turn.ended;
+	}
+
 	async start(): Promise<HarnessV1Session> {
 		let mode = this.planner.isolated ? "isolated" as const : "planner" as const;
 		let forkFrom = this.#port.features?.includes(AGENT_FEATURES.sessionForks)
 			? this.planner.forkFrom
 			: undefined;
+		let choice = this.#port.features?.includes(AGENT_FEATURES.sessionChoice)
+				&& this.#port.features.includes(AGENT_FEATURES.capabilityCatalog)
+			? this.planner.choice
+			: undefined;
+		let ai = await this.#launch();
+		let chosen = {
+			...(choice?.model ? { model: choice.model } : {}),
+			...(choice?.thinkingLevel ? { thinkingLevel: choice.thinkingLevel } : {}),
+			...(ai ? { ai } : {}),
+		};
 		let message = forkFrom
-			? { type: "fork" as const, session: this.id, mode, from: forkFrom }
-			: { type: "start" as const, session: this.id, mode };
+			? { type: "fork" as const, session: this.id, mode, from: forkFrom, ...chosen }
+			: { type: "start" as const, session: this.id, mode, ...chosen };
 		if (!this.#port.send(message)) {
+			this.#releaseAi();
 			throw new Error("The agent connection is closed.");
 		}
 		await within(
@@ -427,8 +473,6 @@ class RemoteSession {
 			"The machine did not start the session.",
 		);
 		if (forkFrom) this.planner.forkedNatively = true;
-		this.planner.control = (action, runId) => this.#command(action, runId);
-		this.planner.rootOf = runId => this.#roots.get(runId) ?? runId;
 		return this.#session();
 	}
 
@@ -436,62 +480,14 @@ class RemoteSession {
 		if (message.type === "started") {
 			this.#acknowledged = true;
 			this.#started.resolve();
+			// What changed while the session was starting reaches it now, once, as it is now.
+			if (this.#aiDirty) {
+				this.#aiDirty = false;
+				this.renewAi();
+			}
 		} else {this.#started.reject(
 				new Error(`The machine refused the session: ${message.message}`),
 			);}
-	}
-
-	/** The root run a workflow question belongs to, so a paused root holds its answers. */
-	rememberRoot(runId: string, rootRunId: string): void {
-		this.#roots.set(runId, rootRunId);
-	}
-
-	/**
-	 * Takes a report: a full card's stages replace the run's, a delta card's are added by id to
-	 * them. A full card with no stages for a run that has some keeps them, as a client that
-	 * reattaches may report an ended run without its stages. The Planner always sees every stage
-	 * of each run.
-	 */
-	reportRuns(message: Pick<ClientMessageOf<"runs">, "active" | "paused" | "cards">): void {
-		if (this.#closed || this.planner.isolated) return;
-		let previous = new Map(this.planner.runs?.cards.map(card => [card.id, card]));
-		let cards = message.cards.map((card): Wire.Run => {
-			if (!("stagesDelta" in card)) {
-				let kept = this.#stages.get(card.id);
-				if (!card.stages.length && kept?.size) {
-					let { earlierStages: _, ...fields } = card;
-					let earlierStages = previous.get(card.id)?.earlierStages;
-					return {
-						...fields,
-						stages: [...kept.values()],
-						...(earlierStages ? { earlierStages } : {}),
-					};
-				}
-				this.#stages.set(card.id, new Map(card.stages.map(stage => [stage.id, stage])));
-				return card;
-			}
-			let { stagesDelta: _, stages: delta, ...fields } = card;
-			let stages = this.#stages.get(card.id) ?? new Map<string, Wire.RunStage>();
-			this.#stages.set(card.id, stages);
-			for (let stage of delta) stages.set(stage.id, stage);
-			let earlierStages = previous.get(card.id)?.earlierStages;
-			return {
-				...fields,
-				stages: [...stages.values()],
-				...(earlierStages ? { earlierStages } : {}),
-			};
-		});
-		let reported = new Set(cards.map(card => card.id));
-		for (let id of this.#stages.keys()) if (!reported.has(id)) this.#stages.delete(id);
-		this.planner.runs = { active: message.active, paused: message.paused, cards };
-		this.planner.onRuns?.(this.planner.runs);
-		for (let wake of this.planner.waiters ?? []) wake();
-	}
-
-	/** Whether the session has a live or paused run: work the client carries on while unseen. */
-	get working(): boolean {
-		let runs = this.planner.runs;
-		return !this.#closed && !!runs && (runs.active.length > 0 || runs.paused.length > 0);
 	}
 
 	/** Whether the client could take the session back: it started, and is not an isolated job. */
@@ -501,18 +497,12 @@ class RemoteSession {
 
 	/**
 	 * The link dropped unexpectedly and the session waits for its client to come back. The turn
-	 * under way fails, as it always did, and its host tools stop; the session, its reported runs
-	 * and its open questions are left exactly as they were. A Stop cannot reach the client now,
-	 * so it is held for the client to hear first when it resumes: one pressed from now on, and
-	 * one already sent whose answer never came.
+	 * under way fails, as it always did, and its host tools stop; the session and its open
+	 * questions are left exactly as they were.
 	 */
 	suspend(): void {
-		// A server going down is not the client dropping: nothing is announced as disconnected.
-		if (!this.planner.stopping) {
-			this.planner.suspended = true;
-			this.planner.keptStop = this.#unanswered.size > 0;
-			this.planner.linkChanged?.();
-		}
+		// A server going down is not the client dropping: the session is not suspended.
+		if (!this.planner.stopping) this.planner.suspended = true;
 		let turn = this.#current;
 		if (turn) {
 			this.#finish(
@@ -520,89 +510,6 @@ class RemoteSession {
 				turn.stopped ? undefined : new Error("The machine disconnected during the turn."),
 			);
 		}
-		for (let owed of this.#unanswered) {
-			owed.held = true;
-			if (owed.origin) owed.origin.held = true;
-			this.#hold("stop", owed.run);
-		}
-		this.#unanswered.clear();
-		this.#requests.clear();
-	}
-
-	/**
-	 * Stops or resumes the client's runs, as Chat's Stop and a run's pause and Resume do. Resolves
-	 * `held` instead of an answer for a Stop the link's drop kept for the client's return, and
-	 * `unconfirmed` for one the client did not answer in time, which stays owed: the caller must
-	 * not report either as done. A Resume cannot be promised, so it is refused while the link is
-	 * down and rejects when unanswered.
-	 */
-	async #command(
-		action: "stop" | "resume",
-		run: string | undefined,
-	): Promise<void | "held" | "unconfirmed"> {
-		if (this.planner.suspended) {
-			this.#hold(action, run);
-			return "held";
-		}
-		let owed: OwedStop | undefined = action === "stop" ? { run } : undefined;
-		if (owed) this.#unanswered.add(owed);
-		try {
-			await this.#port.control(this.id, action, run, request => {
-				if (!owed) return;
-				owed.request = request;
-				this.#requests.set(request, owed);
-			});
-		} catch (error) {
-			if (owed?.held) return "held";
-			// A refusal is an answer. Silence is not, and keeps the Stop owed.
-			if (owed && error instanceof ControlRefused) this.#answered(owed);
-			if (owed && error instanceof Unanswered) return "unconfirmed";
-			throw error;
-		}
-		if (owed) this.#answered(owed);
-		if (action === "resume") this.#undoStops(run);
-	}
-
-	/** The client answered a Stop, in time or late: it, and the Stops split from it, are not owed. */
-	#answered(owed: OwedStop): void {
-		this.#unanswered.delete(owed);
-		if (owed.request) this.#requests.delete(owed.request);
-		for (let other of this.#unanswered) if (other.origin === owed) this.#unanswered.delete(other);
-	}
-
-	/** An answer to a Stop arrived after the wait for it ended. */
-	answeredLate(request: string): void {
-		let owed = this.#requests.get(request);
-		if (owed) this.#answered(owed);
-	}
-
-	/**
-	 * A Resume the client answered came after a Stop it never answered, so that Stop is undone for
-	 * the runs the Resume covers, and stands for the rest: sending it again must not pause a run a
-	 * person resumed, and dropping it must not lose its pause of another. A Stop of every run is
-	 * kept as a Stop of each run the client reports except the one resumed.
-	 */
-	#undoStops(resumed: string | undefined): void {
-		for (let owed of this.#unanswered) {
-			if (resumed !== undefined && owed.run !== undefined && owed.run !== resumed) continue;
-			this.#unanswered.delete(owed);
-			if (resumed === undefined || owed.run !== undefined) continue;
-			for (let card of this.planner.runs?.cards ?? []) {
-				if (card.id === resumed || !LIVE_RUN.has(card.status)) continue;
-				this.#unanswered.add({ run: card.id, origin: owed.origin ?? owed });
-			}
-		}
-	}
-
-	/** Keeps a Stop for the client's return; a Resume cannot be promised, so it is refused. */
-	#hold(action: "stop" | "resume", run: string | undefined): void {
-		if (action !== "stop") {
-			throw new Error("The machine is disconnected, so its runs cannot be resumed yet.");
-		}
-		// Stopping every run covers each one, and a run already named is not named twice.
-		if (this.#held.some(held => held.run === undefined || held.run === run)) return;
-		if (run === undefined) this.#held = [];
-		this.#held.push({ run });
 	}
 
 	/** The server is going down: nothing is reported about this session from here on. */
@@ -610,69 +517,166 @@ class RemoteSession {
 		this.planner.stopping = true;
 	}
 
+	/**
+	 * Prepares the session's AI launch for `start` or `fork`, and keeps it current: prepared again
+	 * before its deadline and whenever the person's credentials change, a change while it starts
+	 * included. Undefined when the client did not offer `ai-credentials`. A launch that would be
+	 * given no provider starts nothing: the start is refused, as a message from someone with no AI
+	 * account is (`NoAiAccountError`), and no `start` or `fork` is sent.
+	 */
+	async #launch(): Promise<AiGrants | undefined> {
+		let ai = this.#port.ai;
+		if (!ai) return undefined;
+		this.#unwatch ??= ai.watch(() => this.renewAi());
+		let launched: { launchId?: string; grants: AiGrants };
+		try {
+			launched = await ai.launch(this.planner.channelId, this.id);
+		} catch (error) {
+			this.#releaseAi();
+			if (error instanceof AiLaunchRefused && error.code === "no-ai-account") {
+				throw new NoAiAccountError(
+					error.unchecked ? AI_ACCOUNT_UNCHECKED_SESSION : NO_AI_ACCOUNT_SESSION,
+				);
+			}
+			throw error;
+		}
+		if (this.#closed) {
+			if (launched.launchId) ai.end(launched.launchId);
+			throw new Error("The agent connection is closed.");
+		}
+		if (!launched.grants.providers.length) {
+			if (launched.launchId) ai.end(launched.launchId);
+			this.#releaseAi();
+			throw new NoAiAccountError(NO_AI_ACCOUNT_SESSION);
+		}
+		this.#adopt(ai, launched);
+		return launched.grants;
+	}
+
+	#adopt(ai: LinkAi, launched: { launchId?: string; grants: AiGrants }): void {
+		let previous = this.#launchId;
+		this.#holding(launched.launchId);
+		if (previous && previous !== launched.launchId) ai.end(previous);
+		this.#unwatch ??= ai.watch(() => this.renewAi());
+		let { expiresAt } = launched.grants;
+		if (expiresAt !== undefined) this.#renewAt(expiresAt - AI_RENEW_BEFORE_MS - Date.now());
+		else clearTimeout(this.#renewal);
+	}
+
+	/** The session holds `launchId` now, in place of any it held, as `aiHeld` hears. */
+	#holding(launchId: string | undefined): void {
+		let previous = this.#launchId;
+		if (previous === launchId) return;
+		this.#launchId = launchId;
+		if (launchId) this.#port.aiHeld?.(launchId, true);
+		if (previous) this.#port.aiHeld?.(previous, false);
+	}
+
+	#renewAt(delay: number): void {
+		clearTimeout(this.#renewal);
+		this.#renewal = setTimeout(() => this.renewAi(), Math.min(Math.max(delay, 0), 2 ** 31 - 1));
+		this.#renewal.unref?.();
+	}
+
+	/**
+	 * Prepares the session's AI launch again and hands the client the new grants in `ai`; the earlier
+	 * launch ends once they are sent. A link that is down sends nothing and keeps the earlier launch,
+	 * for its client's return to renew; a launch that could not be prepared is tried again soon.
+	 */
+	renewAi(): void {
+		if (!this.#acknowledged && !this.#closed && !this.#aiFrozen) {
+			this.#aiDirty = true;
+			return;
+		}
+		this.#renewing = this.#renewing.then(async () => {
+			let ai = this.#port.ai;
+			if (this.#closed || this.#aiFrozen) return;
+			if (!ai) {
+				this.#releaseAi();
+				return;
+			}
+			let launched: { launchId?: string; grants: AiGrants };
+			try {
+				launched = await ai.launch(this.planner.channelId, this.id);
+			} catch (error) {
+				if (error instanceof AiLaunchRefused) {
+					// Nothing is left to give it: the session hears it has no grant now, and its launch ends.
+					launched = { grants: { providers: [], withheld: error.withheld } };
+				} else {
+					console.error("[agent] a session's AI launch could not be prepared again:", error);
+					this.#renewAt(AI_RETRY_MS);
+					return;
+				}
+			}
+			// Frozen for a restart's hold meanwhile: the hold names the launch the client holds, so this
+			// one is never sent.
+			if (
+				this.#closed || this.#aiFrozen
+				|| !this.#port.send({ type: "ai", session: this.id, ai: launched.grants })
+			) {
+				if (launched.launchId) ai.end(launched.launchId);
+				return;
+			}
+			this.#adopt(ai, launched);
+		});
+	}
+
+	/**
+	 * A restart's hold is about to name the session's launch: it changes no more in this process, and
+	 * a renewal under way ends what it prepared rather than send it.
+	 */
+	freezeAi(): void {
+		this.#aiFrozen = true;
+		this.#aiDirty = false;
+		clearTimeout(this.#renewal);
+		this.#renewal = undefined;
+		this.#unwatch?.();
+		this.#unwatch = undefined;
+	}
+
+	/**
+	 * Ends the session's AI launch, or, when `ended` is false, only stops keeping it current: the
+	 * launch stays the session's, for a hold to keep and the next process to end or replace.
+	 */
+	#releaseAi(ended = true): void {
+		clearTimeout(this.#renewal);
+		this.#renewal = undefined;
+		this.#unwatch?.();
+		this.#unwatch = undefined;
+		if (!ended) return;
+		let launchId = this.#launchId;
+		this.#holding(undefined);
+		if (launchId) this.#port.endAi?.(launchId);
+	}
+
+	/** The id of the session's AI launch, for a hold to keep across a restart. */
+	get aiLaunchId(): string | undefined {
+		return this.#launchId;
+	}
+
 	/** The client is back on another link, which carries the session from here on. */
 	rebind(port: Port): void {
 		this.#port = port;
 		this.planner.suspended = false;
-		this.planner.keptStop = false;
-		this.planner.linkChanged?.();
 	}
 
 	/**
 	 * A session a process that has since restarted kept for its client: the client started it, and
-	 * its link is down. The Stops it was owed are held for its return.
+	 * its link is down. Its AI launch is the session's again, ended when the session ends or the
+	 * client's return replaces it.
 	 */
-	restore(stops: JsonValue[]): void {
+	restore(aiLaunchId?: string): void {
 		this.#acknowledged = true;
+		this.#holding(aiLaunchId);
 		this.planner.suspended = true;
-		// A workflow question names its root, so a paused root holds its answer, as after `start`.
-		this.planner.rootOf = runId => this.#roots.get(runId) ?? runId;
-		for (let stop of stops) {
-			let run = (stop as { run?: string | null } | null)?.run;
-			this.#hold("stop", typeof run === "string" ? run : undefined);
-		}
-	}
-
-	/** The Stops the client has yet to hear, held or sent and unanswered, for a hold to keep. */
-	heldStops(): JsonValue[] {
-		let stops: Array<{ run: string | undefined }> = [];
-		let add = (run: string | undefined) => {
-			if (stops.some(held => held.run === undefined || held.run === run)) return;
-			if (run === undefined) stops = [];
-			stops.push({ run });
-		};
-		for (let { run } of this.#held) add(run);
-		for (let { run } of this.#unanswered) add(run);
-		return stops.map(({ run }) => ({ run: run ?? null }));
-	}
-
-	/** Gives the client each Stop held while its link was down, once. */
-	deliverHeldStops(): void {
-		for (let { run } of this.#held.splice(0)) {
-			// A link that drops again before the client answers keeps the Stop for the next one.
-			this.#command("stop", run).catch(error => {
-				if (!this.#closed && !this.planner.suspended) {
-					console.error("[agent] a held Stop failed:", error);
-				}
-			});
-		}
 	}
 
 	/** The link is gone for good: nothing more will arrive for this session. */
 	linkClosed(): void {
+		// A session the cut keeps for its client keeps its launch, which the hold names.
+		let held = this.planner.stopping === true && this.#port.kept(this.id);
 		this.planner.suspended = false;
 		this.#started.reject(new Error("The agent connection closed."));
-		let reported = this.planner.runs;
-		// A server going down stopped nothing: its cards are left as they were reported.
-		if (reported && !this.planner.stopping) {
-			this.reportRuns({
-				active: [],
-				paused: [],
-				cards: reported.cards.map(card =>
-					LIVE_RUN.has(card.status) ? { ...card, status: "stopped" as const } : card
-				),
-			});
-		}
 		let turn = this.#current;
 		if (turn) {
 			this.#finish(
@@ -681,7 +685,7 @@ class RemoteSession {
 			);
 		}
 		this.#closed = true;
-		this.planner.control = undefined;
+		this.#releaseAi(!held);
 	}
 
 	receive(message: TurnMessage): void {
@@ -864,10 +868,23 @@ class RemoteSession {
 		else turn.settle.resolve();
 	}
 
+	/**
+	 * Chopin stopped the turn. A question it asked for itself ends with it, as a full Atomic
+	 * Planner's does, so neither its card nor the session stays behind waiting on it. A server
+	 * that is restarting withdraws nothing.
+	 */
+	#stopped(turn: Turn): void {
+		if (!turn.stopped && !turn.ended && !this.planner.stopping) {
+			turn.withdrawn = true;
+			this.#port.withdraw(this.id, turn.id);
+		}
+		this.#stop(turn);
+	}
+
 	#listen(turn: Turn, signal: AbortSignal | undefined): void {
 		if (!signal) return;
-		if (signal.aborted) return this.#stop(turn);
-		let abort = () => this.#stop(turn);
+		if (signal.aborted) return this.#stopped(turn);
+		let abort = () => this.#stopped(turn);
 		signal.addEventListener("abort", abort, { once: true });
 		turn.listeners.push(() => signal.removeEventListener("abort", abort));
 	}
@@ -951,6 +968,7 @@ class RemoteSession {
 			hostIds: new Set(),
 			hostCalls: new Map(),
 			stopped: false,
+			withdrawn: false,
 			ended: false,
 			settle: Promise.withResolvers<void>(),
 			...(hostTools ? { hostTools } : {}),
@@ -1002,7 +1020,9 @@ class RemoteSession {
 				this.#stop(turn);
 				this.#finish(turn);
 			}
-			this.planner.control = undefined;
+			// Its launch stays the session's, for the hold: the next process ends it, or replaces it once
+			// the client resumes.
+			this.#releaseAi(false);
 			return;
 		}
 		this.#closed = true;
@@ -1011,7 +1031,7 @@ class RemoteSession {
 			this.#stop(turn);
 			this.#finish(turn);
 		}
-		this.planner.control = undefined;
+		this.#releaseAi();
 		this.#port.send({ type: "destroy", session: this.id });
 		this.#port.forget(this.id);
 	}
@@ -1062,9 +1082,8 @@ export class AgentLink {
 	#inputs = new Map<string, OpenInput>();
 	/** Recent `input-request` ids, oldest first, so a settled one cannot be reused. */
 	#inputIds = new Set<string>();
+	/** The steers sent and not yet answered, by request. */
 	#controls = new Map<string, PromiseWithResolvers<void>>();
-	/** Controls whose wait ended unanswered, by request, with their session: an answer may still come. */
-	#late = new Map<string, string>();
 	#watch: ReturnType<typeof setInterval> | undefined;
 	#port: Port;
 	/**
@@ -1099,19 +1118,54 @@ export class AgentLink {
 	#resumed = false;
 	/** Whether the server or the client chose to end this link, rather than the network failing. */
 	#planned = false;
+	/** What the client last reported that counted (see `#counts`), for `#catalogAccounts`. */
 	#catalog: CapabilityCatalog | undefined;
+	/**
+	 * The person's AI accounts as this link knows them, counted up each time they change while its
+	 * catalog launch watches them, and the count `#catalog` was reported under: a report counts only
+	 * for the accounts it was made for, so one made before they changed is no longer what the client
+	 * offers.
+	 */
+	#accounts = 0;
+	#catalogAccounts = 0;
 	/** Whether a turn has run without the catalog this client offered, so it is not waited for. */
 	#ranWithoutCatalog = false;
-	/** Set on a link rebuilt after a restart: told when its sessions are given back or end. */
-	#rebuilt: { ended(): void; resumed(): void } | undefined;
+	/** Settles once nothing is pending: the client reported, a turn ran without it, or the link ended. */
+	#offered = Promise.withResolvers<void>();
+	/** What owns the link's catalog launch: `link:<this>`, whose end ends it. */
+	readonly #id = crypto.randomUUID();
+	/**
+	 * The link's catalog launch, once its client asked for one (`ai-catalog`): the launch it holds,
+	 * its renewal, how to stop watching the person's credentials, and the preparation under way.
+	 */
+	#catalogAi:
+		| {
+			launchId?: string;
+			renewal?: ReturnType<typeof setTimeout>;
+			unwatch: () => void;
+			work: Promise<void>;
+			/** Whether a catalog launch has been handed to the client yet. */
+			handed: boolean;
+			/** Whether the latest one handed was prepared for the person's accounts as they are now. */
+			current: boolean;
+			/** The `catalogLaunch` of each one handed for the person's accounts as they are now. */
+			launches: Set<string>;
+		}
+		| undefined;
 
 	constructor(socket: LinkSocket, options: LinkOptions) {
 		this.#socket = socket;
 		this.#options = options;
 		this.#port = {
 			send: message => this.#send(message),
-			control: (session, action, runId, sent) => this.#control(session, action, runId, sent),
 			steer: (session, turn, prompt) => this.#steer(session, turn, prompt),
+			withdraw: (session, turn) => {
+				for (let [request, input] of this.#inputs) {
+					if (input.session !== session || input.turn !== turn) continue;
+					input.controller.abort();
+					this.#inputs.delete(request);
+				}
+			},
 			forget: session => {
 				this.#sessions.delete(session);
 				this.#cancelInputs(session);
@@ -1129,6 +1183,13 @@ export class AgentLink {
 			revalidate: () => this.#recheck(),
 			timeoutMs: options.timeoutMs ?? OPERATION_TIMEOUT_MS,
 			...(options.features ? { features: options.features } : {}),
+			...(options.ai && options.features?.includes(AGENT_FEATURES.aiCredentials)
+				? { ai: options.ai }
+				: {}),
+			...(options.ai ? { endAi: (launchId: string) => options.ai!.end(launchId) } : {}),
+			...(options.ai?.held
+				? { aiHeld: (launchId: string, holding: boolean) => options.ai!.held!(launchId, holding) }
+				: {}),
 		};
 	}
 
@@ -1138,7 +1199,7 @@ export class AgentLink {
 
 	/**
 	 * A link standing in for one a process that has since restarted lost: suspended, holding the
-	 * sessions, answers and Stops the cut wrote for its client, and no socket. A client's `resume`
+	 * sessions and answers the cut wrote for its client, and no socket. A client's `resume`
 	 * takes them from it as from any link that dropped.
 	 */
 	static rebuilt(
@@ -1146,10 +1207,12 @@ export class AgentLink {
 		held: PlannerHeldSession[],
 		hooks: {
 			lapse(): void;
-			ended(): void;
-			resumed(): void;
 			/** Opens the document for a question its client asks, until the returned function is called. */
 			open?: () => Promise<() => void>;
+			/** Ends an AI launch a held session kept, once nothing will take it back. */
+			endAi?: (launchId: string) => void;
+			/** Hears that a held session holds an AI launch, or no longer does. */
+			aiHeld?: (launchId: string, holding: boolean) => void;
 		},
 	): AgentLink {
 		let link = new AgentLink({ send() {}, close() {} }, {
@@ -1163,20 +1226,16 @@ export class AgentLink {
 		link.#channelId = channelId;
 		link.#state = "suspended";
 		link.#lapse = hooks.lapse;
-		link.#rebuilt = hooks;
+		if (hooks.endAi) link.#port.endAi = hooks.endAi;
+		if (hooks.aiHeld) link.#port.aiHeld = hooks.aiHeld;
 		for (let item of held) {
 			// No turn of this process opens the session, so it reaches its document through the room's
-			// host: what its client reports and asks after the restart is shown and asked as before.
+			// host: what its client asks after the restart is asked as before.
 			let document: RebuiltDocument = hooks.open ? { open: hooks.open } : {};
 			let planner: RemotePlanner = { channelId, isolated: false, rebuilt: document };
-			planner.humanInput = report => rebuiltInput(planner, document, report);
-			let show = () => {
-				if (planner.runs) document.host?.runs?.(item.id, planner.runs, planner.suspended === true);
-			};
-			planner.onRuns = show;
-			planner.linkChanged = show;
+			planner.humanInput = report => rebuiltInput(document, report);
 			let session = new RemoteSession(item.id, planner, link.#port);
-			session.restore(item.stops);
+			session.restore(item.aiLaunchId);
 			link.#sessions.set(item.id, session);
 			for (let owed of item.owed) {
 				link.#outbox.push({
@@ -1200,9 +1259,16 @@ export class AgentLink {
 	}
 
 	/**
-	 * What the client keeps in this link across a restart: each session that has a live or paused
-	 * run, a question it asked, or an answer it has not acknowledged, with those questions, answers
-	 * and Stops. A suspended link holds only such sessions already. A question is listed with the
+	 * A restart's hold is about to name each session's AI launch: none changes any more here (see
+	 * `RemoteSession.freezeAi`).
+	 */
+	freezeAi(): void {
+		for (let session of this.#sessions.values()) session.freezeAi();
+	}
+
+	/**
+	 * What the client keeps in this link across a restart: each session that has a question it
+	 * asked, or an answer it has not acknowledged, with those questions and answers. A suspended link holds only such sessions already. A question is listed with the
 	 * decisions it asked, so the process that takes over can wait for their answers again.
 	 */
 	snapshot(): PlannerHeldSession[] {
@@ -1228,8 +1294,10 @@ export class AgentLink {
 					owed: owed
 						.filter(item => item.session === session.id)
 						.map(item => item.result as unknown as JsonValue),
-					stops: session.heldStops(),
+					// An earlier release reads it on a rollback; nothing is held for it now.
+					stops: [],
 					...(asked.length > 0 ? { asked } : {}),
+					...(session.aiLaunchId ? { aiLaunchId: session.aiLaunchId } : {}),
 				};
 			});
 	}
@@ -1242,13 +1310,10 @@ export class AgentLink {
 	rejoinInputs(host: RejoinHost): void {
 		if (this.#successor) return this.#successor.rejoinInputs(host);
 		if (this.#state === "closed") return;
-		// A session the restart rebuilt asks and reports through this room from now on, and its
-		// cards show what its client last reported.
+		// A session the restart rebuilt asks through this room from now on.
 		for (let session of this.#sessions.values()) {
 			let rebuilt = session.planner.rebuilt;
-			if (!rebuilt) continue;
-			rebuilt.host = host;
-			if (session.planner.runs) session.planner.onRuns?.(session.planner.runs);
+			if (rebuilt) rebuilt.host = host;
 		}
 		for (let [request, input] of this.#inputs) {
 			if (!input.restored || input.joined === host) continue;
@@ -1289,27 +1354,10 @@ export class AgentLink {
 		}
 	}
 
-	/**
-	 * Whether the link holds a session a restart rebuilt that still has work: a live or paused run,
-	 * an open question, or no report yet of what it kept. Nothing in this process retains such a
-	 * session, so the run cards Chat stored are its own, and live, when the document opens.
-	 */
-	get keepsRebuilt(): boolean {
-		if (this.#successor) return this.#successor.keepsRebuilt;
-		if (this.#state === "closed") return false;
-		for (let session of this.#sessions.values()) {
-			if (!session.planner.rebuilt) continue;
-			let runs = session.planner.runs;
-			if (!runs || runs.active.length > 0 || runs.paused.length > 0) return true;
-			if (this.#waitingOn(session.id) > 0) return true;
-		}
-		return false;
-	}
-
 	/** Whether the client's work in `session` is kept when this link drops without being ended. */
 	#keeps(session: RemoteSession): boolean {
 		return this.resumable && session.resumable
-			&& (session.working || this.#waitingOn(session.id) > 0 || this.#owedOn(session.id) > 0);
+			&& (this.#waitingOn(session.id) > 0 || this.#owedOn(session.id) > 0);
 	}
 
 	get attached(): boolean {
@@ -1317,10 +1365,19 @@ export class AgentLink {
 	}
 
 	/**
-	 * What the client last reported with `capabilities`; absent until it does, and for a link whose
-	 * client offered no `capability-catalog`.
+	 * What the client last reported with `capabilities` for the person's AI accounts as they are
+	 * now; absent until it does, while a report made before they last changed is all there is, and
+	 * for a link whose client offered no `capability-catalog`.
 	 */
 	get catalog(): CapabilityCatalog | undefined {
+		return this.#catalogAccounts === this.#accounts ? this.#catalog : undefined;
+	}
+
+	/**
+	 * What the client last reported that counted, whether or not it still counts for the person's
+	 * accounts: its commands are the client's own, not the accounts', so they outlast a change.
+	 */
+	get lastReport(): CapabilityCatalog | undefined {
 		return this.#catalog;
 	}
 
@@ -1336,8 +1393,21 @@ export class AgentLink {
 	 * everything is still a report.
 	 */
 	get catalogPending(): boolean {
-		return this.#catalog === undefined && !this.#ranWithoutCatalog
+		return this.catalog === undefined && (!this.#ranWithoutCatalog || this.outdated)
 			&& this.#options.features?.includes(AGENT_FEATURES.capabilityCatalog) === true;
+	}
+
+	/**
+	 * Whether the client can't be told to list the models of the person's AI accounts as they are
+	 * now: it lists them through the link's catalog launches without naming which
+	 * (`catalog-launches`), and what it last reported was of accounts the person has since changed,
+	 * with nothing since. A client that names its launches lists them again through the new one. What
+	 * it offers stays unknown until it reports, and is not waited for.
+	 */
+	get outdated(): boolean {
+		return this.#catalog !== undefined && this.#catalogAccounts !== this.#accounts
+			&& this.#listsThroughLaunches
+			&& !this.#options.features?.includes(AGENT_FEATURES.catalogLaunches);
 	}
 
 	/**
@@ -1347,6 +1417,16 @@ export class AgentLink {
 	 */
 	settleWithoutCatalog(): void {
 		this.#ranWithoutCatalog = true;
+		this.#offered.resolve();
+	}
+
+	/**
+	 * Settles when what the client offers is no longer pending (`catalogPending`): it reported, a
+	 * turn ran without it, or the link ended. Already settled for a client that offered no catalog.
+	 */
+	get offered(): Promise<void> {
+		if (!this.catalogPending) return Promise.resolve();
+		return this.#offered.promise;
 	}
 
 	/** Whether this link offered `resumable-sessions`. */
@@ -1368,30 +1448,20 @@ export class AgentLink {
 		for (let session of this.#sessions.values()) session.shutdown();
 	}
 
-	/**
-	 * Whether the client waits on the document's members: a question it asked is still open, or
-	 * one of its workflow runs is live or paused.
-	 */
+	/** Whether the client waits on the document's members: a question it asked is still open. */
 	get waiting(): boolean {
 		if (this.#state === "closed" || this.#state === "suspended") return false;
-		if (this.#inputs.size > 0) return true;
-		for (let session of this.#sessions.values()) {
-			let runs = session.planner.runs;
-			if (runs && (runs.active.length > 0 || runs.paused.length > 0)) return true;
-		}
-		return false;
+		return this.#inputs.size > 0;
 	}
 
 	/**
-	 * Whether the client is in the middle of work for the document's members: a reply under way,
-	 * a question still open, or a live workflow run. A paused run alone is not; it waits on people.
+	 * Whether the client is in the middle of work for the document's members: a reply under way, or
+	 * a question still open.
 	 */
 	get busy(): boolean {
 		if (this.#state === "closed" || this.#state === "suspended") return false;
 		if (this.#inputs.size > 0) return true;
-		for (let session of this.#sessions.values()) {
-			if (session.replying || (session.planner.runs?.active.length ?? 0) > 0) return true;
-		}
+		for (let session of this.#sessions.values()) if (session.replying) return true;
 		return false;
 	}
 
@@ -1539,6 +1609,8 @@ export class AgentLink {
 	 */
 	disconnected(): void {
 		if (this.#state === "closed" || this.#state === "suspended") return;
+		// The catalog launch is the link's: it ends with the link, whatever its sessions keep.
+		this.#endCatalog();
 		let kept = !this.#planned && this.#state === "attached"
 				&& this.#options.features?.includes(AGENT_FEATURES.resumableSessions)
 			? [...this.#sessions.values()].filter(session => this.#keeps(session))
@@ -1561,7 +1633,6 @@ export class AgentLink {
 		this.#state = "closed";
 		this.#teardown();
 		this.#lapse?.();
-		this.#rebuilt?.ended();
 	}
 
 	/** Ends a suspended link for good: nothing will take back what it kept. */
@@ -1569,7 +1640,6 @@ export class AgentLink {
 		if (this.#state !== "suspended") return;
 		this.#state = "closed";
 		this.#teardown();
-		this.#rebuilt?.ended();
 	}
 
 	#waitingOn(session: string): number {
@@ -1601,7 +1671,6 @@ export class AgentLink {
 			control.reject(new Error("The agent connection closed."));
 		}
 		this.#controls.clear();
-		this.#late.clear();
 		// An answer written to a link that dropped may never have arrived: it is sent again to the
 		// client that returns and still waits on it.
 		for (let owed of this.#unacked.values()) {
@@ -1615,6 +1684,7 @@ export class AgentLink {
 
 	/** Every session and open question this link still holds ends, as when any link closes. */
 	#teardown(): void {
+		this.#offered.resolve();
 		for (let session of this.#sessions.values()) session.linkClosed();
 		this.#sessions.clear();
 		if (!this.#stopping) { for (let input of this.#inputs.values()) input.controller.abort(); }
@@ -1627,7 +1697,6 @@ export class AgentLink {
 			control.reject(new Error("The agent connection closed."));
 		}
 		this.#controls.clear();
-		this.#late.clear();
 		// The answers waiting for a client that is not coming back can never be delivered.
 		for (let { delivered, unsent } of this.#outbox.splice(0)) {
 			unsent?.();
@@ -1645,8 +1714,7 @@ export class AgentLink {
 	/**
 	 * The client resumes: it names the sessions it still holds and the questions each still waits
 	 * on. Those sessions, with the questions that are still open or were answered meanwhile, move
-	 * to this link; whatever it does not name ends. Each Stop pressed while the link was down is
-	 * the first thing the client hears after `resumed`.
+	 * to this link; whatever it does not name ends.
 	 */
 	#resume(message: ClientMessageOf<"resume">): void {
 		let earlier = this.#claim?.();
@@ -1656,8 +1724,169 @@ export class AgentLink {
 		let results: Owed[] = [];
 		if (earlier) results = earlier.#hand(this, held, resumed);
 		this.#send({ type: "resumed", sessions: resumed });
-		for (let { session } of resumed) this.#sessions.get(session)?.deliverHeldStops();
+		// The launch a resumed session held may have ended with its link, or with the process.
+		for (let { session } of resumed) this.#sessions.get(session)?.renewAi();
 		for (let { result, session, delivered } of results) this.#answer(result, session, delivered);
+	}
+
+	/**
+	 * The client asked for the link's catalog grants: they are handed out now and again whenever
+	 * the person's credentials change or the launch nears its deadline, until the link ends. A link
+	 * whose client did not offer `ai-credentials`, or a server that hands out no launches, is sent
+	 * none; asking again changes nothing.
+	 */
+	#askCatalog(): void {
+		let ai = this.#port.ai;
+		if (!ai?.catalog || this.#catalogAi || this.#state !== "attached") return;
+		this.#catalogAi = {
+			unwatch: ai.watch(() => this.#accountsChanged()),
+			work: Promise.resolve(),
+			handed: false,
+			current: false,
+			launches: new Set(),
+		};
+		this.#renewCatalog();
+	}
+
+	/**
+	 * The person's AI accounts changed: what the client reported was listed through a catalog
+	 * launch of the accounts they had, so it no longer counts (`catalog`), and what it offers is
+	 * waited for again, until it reports through a launch of the accounts they have now, which is
+	 * prepared at once. Whoever shows the catalog is told.
+	 */
+	#accountsChanged(): void {
+		let held = this.#catalogAi;
+		if (!held) return;
+		let pending = this.catalogPending;
+		let counted = this.catalog !== undefined;
+		this.#accounts++;
+		held.current = false;
+		held.launches.clear();
+		this.#ranWithoutCatalog = false;
+		// A client that lists through launches without naming them may never report again: nothing
+		// waits for it.
+		if (!pending && this.catalogPending && this.#state === "attached" && !this.outdated) {
+			this.#offered = Promise.withResolvers<void>();
+		}
+		if (counted) this.#options.catalogChanged?.();
+		this.#renewCatalog();
+	}
+
+	/** Whether the client lists its models through the catalog launches this link hands it. */
+	get #listsThroughLaunches(): boolean {
+		return this.#port.ai?.catalog !== undefined
+			&& this.#options.features?.includes(AGENT_FEATURES.aiCatalog) === true;
+	}
+
+	/**
+	 * Whether a report counts for the person's AI accounts as they are now. From a client that lists
+	 * its models through the link's catalog launches, only one made through a launch handed for them:
+	 * one naming such a launch, where it names them (`catalog-launches`), and otherwise one that
+	 * arrives while the latest launch handed is for them, never one before any was handed, which can
+	 * only be a list it kept from accounts nobody can name. From any other client, every report.
+	 */
+	#counts(catalogLaunch: string | undefined): boolean {
+		if (!this.#listsThroughLaunches) return true;
+		let held = this.#catalogAi;
+		if (this.#options.features?.includes(AGENT_FEATURES.catalogLaunches)) {
+			return catalogLaunch !== undefined && held?.launches.has(catalogLaunch) === true;
+		}
+		return held?.handed === true && held.current;
+	}
+
+	/**
+	 * Prepares the link's catalog launch, and in the same step as it is sent, once the link is
+	 * still attached, holds it and ends the one it replaces; a launch the link can no longer take is
+	 * ended unsent. Nothing left to give hands the client an empty `providers`. One at a time.
+	 */
+	#renewCatalog(): void {
+		let held = this.#catalogAi;
+		let ai = this.#port.ai;
+		if (!held || !ai?.catalog) return;
+		let catalog = ai.catalog.bind(ai);
+		held.work = held.work.then(async () => {
+			if (this.#catalogAi !== held || this.#state !== "attached") return;
+			// The accounts it is prepared for: a change while it is prepared makes another.
+			let accounts = this.#accounts;
+			let launched: { launchId?: string; grants: AiGrants };
+			try {
+				launched = await catalog(this.#channelId!, this.#id);
+			} catch (error) {
+				if (!(error instanceof AiLaunchRefused)) {
+					console.error("[agent] a link's catalog launch could not be prepared:", error);
+					this.#renewCatalogAt(AI_RETRY_MS);
+					return;
+				}
+				launched = { grants: { providers: [], withheld: error.withheld } };
+			}
+			if (launched.launchId && !launched.grants.providers.length) {
+				ai.end(launched.launchId);
+				launched = { grants: { providers: [], withheld: launched.grants.withheld } };
+			}
+			if (this.#catalogAi !== held || this.#state !== "attached") {
+				if (launched.launchId) ai.end(launched.launchId);
+				return;
+			}
+			// Held before it is sent, so the client's first request finds its owner live.
+			if (launched.launchId) ai.held?.(launched.launchId, true);
+			let catalogLaunch = this.#options.features?.includes(AGENT_FEATURES.catalogLaunches)
+				? crypto.randomUUID()
+				: undefined;
+			if (
+				!this.#send({
+					type: "ai-catalog",
+					ai: launched.grants,
+					...(catalogLaunch ? { catalogLaunch } : {}),
+				})
+			) {
+				if (launched.launchId) {
+					ai.held?.(launched.launchId, false);
+					ai.end(launched.launchId);
+				}
+				return;
+			}
+			// A report counts for these accounts only through a launch prepared for them.
+			held.handed = true;
+			held.current = accounts === this.#accounts;
+			if (catalogLaunch && held.current) held.launches.add(catalogLaunch);
+			let previous = held.launchId;
+			held.launchId = launched.launchId;
+			if (previous && previous !== launched.launchId) {
+				ai.held?.(previous, false);
+				ai.end(previous);
+			}
+			let { expiresAt } = launched.grants;
+			if (expiresAt !== undefined) {
+				this.#renewCatalogAt(expiresAt - AI_RENEW_BEFORE_MS - Date.now());
+			} else clearTimeout(held.renewal);
+		}).catch(error =>
+			console.error("[agent] a link's catalog launch could not be handed out:", error)
+		);
+	}
+
+	#renewCatalogAt(delay: number): void {
+		let held = this.#catalogAi;
+		if (!held) return;
+		clearTimeout(held.renewal);
+		held.renewal = setTimeout(
+			() => this.#renewCatalog(),
+			Math.min(Math.max(delay, 0), 2 ** 31 - 1),
+		);
+		held.renewal.unref?.();
+	}
+
+	/** Ends the link's catalog launch, in force the moment it is asked, and stops renewing it. */
+	#endCatalog(): void {
+		let held = this.#catalogAi;
+		if (!held) return;
+		this.#catalogAi = undefined;
+		clearTimeout(held.renewal);
+		held.unwatch();
+		let ai = this.#port.ai;
+		if (held.launchId) {
+			ai?.held?.(held.launchId, false);
+			ai?.end(held.launchId);
+		}
 	}
 
 	/** Gives `next` the sessions the client still holds; returns the answers it is still owed. */
@@ -1669,6 +1898,7 @@ export class AgentLink {
 		let owed = this.#outbox;
 		this.#outbox = [];
 		this.#state = "closed";
+		this.#offered.resolve();
 		this.#successor = next;
 		next.#inputs = this.#inputs;
 		next.#inputIds = this.#inputIds;
@@ -1705,8 +1935,6 @@ export class AgentLink {
 			answer.unsent?.();
 			answer.delivered();
 		}
-		if (resumed.length > 0) this.#rebuilt?.resumed();
-		else this.#rebuilt?.ended();
 		return delivered;
 	}
 
@@ -1838,6 +2066,15 @@ export class AgentLink {
 				if (!this.#options.features?.includes(AGENT_FEATURES.capabilityCatalog)) {
 					return this.#violate("protocol", "capabilities needs the capability-catalog feature.");
 				}
+				if (
+					message.catalogLaunch !== undefined
+					&& !this.#options.features.includes(AGENT_FEATURES.catalogLaunches)
+				) {
+					return this.#violate("protocol", "catalogLaunch needs the catalog-launches feature.");
+				}
+				// A report of other accounts than the person's now, or one that names no launch from a
+				// client that names them, is not what the client offers them: it changes nothing.
+				if (!this.#counts(message.catalogLaunch)) return;
 				// What nobody can ask for (a model with no id, an empty level) is left out here, once,
 				// so every reader of the catalog sees only what can be chosen; the rest and the link stay.
 				let { catalog, skipped } = usableCatalog(message.catalog);
@@ -1848,9 +2085,16 @@ export class AgentLink {
 					);
 				}
 				this.#catalog = catalog;
+				this.#catalogAccounts = this.#accounts;
+				this.#offered.resolve();
 				this.#options.catalogChanged?.();
 				return;
 			}
+			case "ai-catalog":
+				if (!this.#options.features?.includes(AGENT_FEATURES.aiCatalog)) {
+					return this.#violate("protocol", "ai-catalog needs the ai-catalog feature.");
+				}
+				return this.#askCatalog();
 			case "attach":
 				return this.#violate("protocol", "This link is already attached.");
 			case "detach":
@@ -1875,20 +2119,11 @@ export class AgentLink {
 				});
 				return;
 			}
-			case "runs":
-				return this.#sessions.get(message.session)?.reportRuns(message);
 			case "control-result": {
 				let control = this.#controls.get(message.request);
 				this.#controls.delete(message.request);
-				let late = this.#late.get(message.request);
-				if (late !== undefined) {
-					this.#late.delete(message.request);
-					this.#sessions.get(late)?.answeredLate(message.request);
-				}
 				if (message.ok) control?.resolve();
-				else {control?.reject(
-						new ControlRefused(message.message ?? "The machine refused."),
-					);}
+				else control?.reject(new Error(message.message ?? "The machine refused."));
 				return;
 			}
 			case "input-request":
@@ -1905,37 +2140,6 @@ export class AgentLink {
 				owed.delivered();
 				return;
 			}
-		}
-	}
-
-	async #control(
-		session: string,
-		action: "stop" | "resume",
-		runId?: string,
-		sent?: (request: string) => void,
-	): Promise<void> {
-		let request = crypto.randomUUID();
-		let pending = Promise.withResolvers<void>();
-		this.#controls.set(request, pending);
-		if (!this.#send({ type: action, request, session, ...(runId ? { run: runId } : {}) })) {
-			this.#controls.delete(request);
-			throw new Error("The agent connection is closed.");
-		}
-		sent?.(request);
-		try {
-			await within(
-				pending.promise,
-				this.#port.timeoutMs,
-				`The machine did not answer ${action}.`,
-			);
-		} catch (error) {
-			if (error instanceof Unanswered) {
-				this.#late.set(request, session);
-				if (this.#late.size > MAX_LATE_CONTROLS) this.#late.delete(this.#late.keys().next().value!);
-			}
-			throw error;
-		} finally {
-			this.#controls.delete(request);
 		}
 	}
 
@@ -1989,6 +2193,9 @@ export class AgentLink {
 		if (!session || !humanInput) {
 			return void reply("failed", undefined, "Decisions are not available to this session.");
 		}
+		if (session.withdrawing) {
+			return void reply("cancelled", withdrawnValue(message.input.method));
+		}
 		if (this.#inputs.size >= MAX_OPEN_INPUTS) {
 			return void reply("failed", undefined, "Too many questions are already open.");
 		}
@@ -1996,16 +2203,15 @@ export class AgentLink {
 		// The session outlives the question until its answer reaches the client: an answer given
 		// to a session with nothing else to keep it would otherwise find it already let go.
 		delivered = session.planner.holdInput?.() ?? delivered;
+		let asking = session.turn;
 		let open: OpenInput = {
 			session: message.session,
+			...(asking ? { turn: asking } : {}),
 			controller,
 			method: message.input.method,
 			decisions: [],
 		};
 		this.#inputs.set(message.request, open);
-		if (message.workflowRunId && message.rootRunId) {
-			session.rememberRoot(message.workflowRunId, message.rootRunId);
-		}
 		let status: HumanInputStatus = "cancelled";
 		let host = humanInput(outcome => {
 			status = outcome;
@@ -2017,8 +2223,6 @@ export class AgentLink {
 			asked: (decisions: string[]) => {
 				open.decisions = decisions;
 			},
-			...(message.workflowRunId ? { workflowRunId: message.workflowRunId } : {}),
-			...(message.workflowStageId ? { workflowStageId: message.workflowStageId } : {}),
 			...(message.block ? { block: message.block } : {}),
 		};
 		let input = message.input;

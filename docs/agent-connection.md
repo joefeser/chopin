@@ -99,7 +99,7 @@ feature instead of a new version. The client names the features it wants,
 comma-separated, in the upgrade request's `Chopin-Agent-Features` header:
 
 ```http
-Chopin-Agent-Features: run-stage-deltas, decision-option-previews
+Chopin-Agent-Features: decision-option-previews, resumable-sessions
 ```
 
 The server ignores names it does not know. When the request has the header,
@@ -111,15 +111,18 @@ client must then use none of them.
 
 | Feature                    | What it allows                                                                                                                                                                |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `run-stage-deltas`         | [Delta run cards](#run-stage-deltas), with no stage count limit                                                                                                               |
 | `decision-option-previews` | An option's [`preview`](#option-previews) as its own visual, and the `upload_plan_image` host tool                                                                            |
-| `resumable-sessions`       | [Resuming](#resuming-after-a-dropped-link) the sessions, runs and questions of a link that dropped unexpectedly                                                               |
+| `resumable-sessions`       | [Resuming](#resuming-after-a-dropped-link) the sessions and questions of a link that dropped unexpectedly                                                                     |
 | `restart-notice`           | A [`restarting`](#server-to-client) message before the server closes the link with 1012, and the [client rule](#when-the-server-is-restarting) that follows it                |
 | `capability-catalog`       | A [`capabilities`](#capability-catalog) report of the models, thinking levels and commands the client offers, and a person's choice of model and thinking level in the `turn` |
 | `attachments`              | The images and text files a person sent with a message, in the `turn`'s [`attachments`](#images-and-files-in-a-turn)                                                          |
 | `session-forks`            | A [`fork`](#server-to-client) message to branch a thread's Planner session from an earlier session and turn, multiplexed over the same connection                             |
 | `steer-turn`               | A [`steer`](#server-to-client) message: a person's message for the turn the client is running, read at its next step                                                          |
 | `retry-turn`               | A `turn`'s `message`, the Chat message it answers, and `retry` when it [runs a failed message again](#retrying-a-failed-turn)                                                 |
+| `session-choice`           | With `capability-catalog`, the document's chosen `model` and `thinkingLevel` in [`start` and `fork`](#server-to-client), so a session the client makes opens on them          |
+| `ai-credentials`           | An [AI launch](#models-through-chopin) in `start` and `fork`, and an `ai` message whenever it changes: stand-ins for the person's own AI accounts, reached through Chopin     |
+| `ai-catalog`               | With `ai-credentials`, a [catalog launch](#listing-models-before-a-session) for the link, asked for with `ai-catalog`, that lists the account's models and runs none          |
+| `catalog-launches`         | With `ai-catalog`, each `ai-catalog`'s `catalogLaunch`, and a `capabilities` report naming the one it was [listed through](#when-the-persons-accounts-change)                 |
 
 ### Pings
 
@@ -182,13 +185,13 @@ a field this page does not list is refused, except inside a
 
 Shared limits, in characters unless stated:
 
-| Kind  | Fields                                                                                                                                                                                        | Limit      |
-| ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| id    | `session`, `turn`, `request`, `toolCallId`, part `id`, run and stage `id`, `run`, `workflowRunId`, `workflowStageId`, `rootRunId`, `active` and `paused` entries, `document.id` in `attached` | 1 to 128   |
-| name  | tool names, `toolName`, `names` entries, `responseFormat.name`                                                                                                                                | 1 to 128   |
-| short | question `header`, `finishReason.raw`                                                                                                                                                         | up to 128  |
-| note  | `message`, every `title`, `error`, `responseFormat.description`, question text, option `label` and `description`, `choices` entries, `placeholder`, `initial`, run and stage `name`           | up to 4000 |
-| text  | `prompt`, `instructions`, `delta`, `input`, and the model and level fields of the [capability catalog](#capability-catalog): `modelId`, `turn.model`, `turn.thinkingLevel`                    | the frame  |
+| Kind  | Fields                                                                                                                                                                     | Limit      |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| id    | `session`, `turn`, `request`, `toolCallId`, part `id`, `document.id` in `attached`                                                                                         | 1 to 128   |
+| name  | tool names, `toolName`, `names` entries, `responseFormat.name`                                                                                                             | 1 to 128   |
+| short | question `header`, `finishReason.raw`                                                                                                                                      | up to 128  |
+| note  | `message`, every `title`, `error`, `responseFormat.description`, question text, option `label` and `description`, `choices` entries, `placeholder`, `initial`              | up to 4000 |
+| text  | `prompt`, `instructions`, `delta`, `input`, and the model and level fields of the [capability catalog](#capability-catalog): `modelId`, `turn.model`, `turn.thinkingLevel` | the frame  |
 
 Other fields state their own limits where they appear.
 
@@ -268,7 +271,7 @@ link waited for its first message is refused `document-archived`.
 A browser-bearer client and a paired machine's backend never take each other's links.
 
 When the connection closes by `detach`, or a socket drops with no
-workflow run or open question for the server to keep, its account keeps
+open question for the server to keep, its account keeps
 the ownership for a grace period, 2 minutes unless the operator sets
 `PLANNER_ATTACH_GRACE_MS`. During it the same account can attach again and keeps
 the ownership; another account is refused with `planner-attached`, and the
@@ -284,8 +287,8 @@ no longer there, not a timeout on active work: it is 2 minutes by default and at
 most one hour (`PLANNER_ATTACH_GRACE_MS` accepts 0 to 3600000), and it never runs
 while a connection is attached.
 
-A link that offered `resumable-sessions` and dropped unexpectedly while it held a
-live or paused workflow run or an open question runs no grace period at all. Its
+A link that offered `resumable-sessions` and dropped unexpectedly while it held an
+open question, or an answer its client had not acknowledged, runs no grace period at all. Its
 account keeps the ownership, as the document's **disconnected** Planner, for as long
 as its work is kept: until its client [resumes](#resuming-after-a-dropped-link) or something
 explicit ends it (see [What still ends it for good](#resuming-after-a-dropped-link)).
@@ -312,13 +315,13 @@ rests on ends or the document's Planner is reset. The server then sends
 `refused` and closes an attached connection at once, and any eligible account,
 including the same one, can attach again immediately:
 
-| Cause                                                                                                                                                                                                                                                            | Refusal code       | Close code |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ---------- |
-| The owner's browser sign-in signs out or expires                                                                                                                                                                                                                 | `sign-in-required` | 4401       |
-| The machine whose credential attached it is disconnected, or GitHub refuses its authorization                                                                                                                                                                    | `access-revoked`   | 4403       |
-| Chopin started it on a machine and moved it to another, or stopped it: a new machine choice or favorite, the document unused for 30 minutes (a Planner replying, or waiting on a question or a live or paused run, is using it), or the machine lost push access | `access-revoked`   | 4403       |
-| A repository writer resets the document's Planner                                                                                                                                                                                                                | `access-revoked`   | 4403       |
-| The stored ownership no longer names this attachment's sign-in                                                                                                                                                                                                   | `access-revoked`   | 4403       |
+| Cause                                                                                                                                                                                                                                  | Refusal code       | Close code |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ | ---------- |
+| The owner's browser sign-in signs out or expires                                                                                                                                                                                       | `sign-in-required` | 4401       |
+| The machine whose credential attached it is disconnected, or GitHub refuses its authorization                                                                                                                                          | `access-revoked`   | 4403       |
+| Chopin started it on a machine and moved it to another, or stopped it: a new machine choice or favorite, the document unused for 30 minutes (a Planner replying or waiting on a question is using it), or the machine lost push access | `access-revoked`   | 4403       |
+| A repository writer resets the document's Planner                                                                                                                                                                                      | `access-revoked`   | 4403       |
+| The stored ownership no longer names this attachment's sign-in                                                                                                                                                                         | `access-revoked`   | 4403       |
 
 The same checks before every `start` and `turn`, and the periodic one, also
 find an expired sign-in or a released ownership that nothing reported; an
@@ -402,7 +405,7 @@ Connect a machine to get a reply. Connect an agent client to <document URL> over
 A document whose Planner is disconnected, or stepped away within its grace period, is refused
 with the machine named by its owner's login, never by its own name. It says what happened to the message and what to do,
 and nothing of keeping it, since nothing is kept for a machine that is away (the machine's own
-work, its runs and open questions, is kept, and the document says so where it shows the machine):
+work, its open questions and the answers it has not received, is kept, and the document says so where it shows the machine):
 
 ```text
 @<login>'s machine is offline, so this message wasn't sent. Send it again when it's back.
@@ -421,15 +424,15 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 ## Server to client
 
 ```text
-{ "type": "start", "session": "", "mode": "planner" }
-{ "type": "fork", "session": "", "mode": "planner", "from": { "session": "", "turn?": "" } }
+{ "type": "start", "session": "", "mode": "planner", "model?": "", "thinkingLevel?": "", "ai?": {} }
+{ "type": "fork", "session": "", "mode": "planner", "from": { "session": "", "turn?": "" }, "model?": "", "thinkingLevel?": "", "ai?": {} }
+{ "type": "ai", "session": "", "ai": { "launch?": "", "expiresAt?": 0, "providers": [], "withheld": [] } }
+{ "type": "ai-catalog", "ai": { "launch?": "", "expiresAt?": 0, "providers": [], "withheld": [] }, "catalogLaunch?": "" }
 { "type": "turn", "session": "", "turn": "", "prompt": "", "instructions?": "", "model?": "", "thinkingLevel?": "", "attachments?": [{ "id": "", "name": "", "kind": "image", "mediaType": "", "size": 0, "data": "" }], "message?": "", "retry?": true, "tools": [], "responseFormat?": {} }
 { "type": "abort", "session": "", "turn": "" }
 { "type": "steer", "request": "", "session": "", "turn": "", "prompt": "" }
 { "type": "host-tool-result", "session": "", "turn": "", "toolCallId": "", "output": json, "isError?": true }
 { "type": "input-result", "request": "", "status": "answered", "value?": json, "message?": "" }
-{ "type": "stop", "request": "", "session": "", "run?": "" }
-{ "type": "resume", "request": "", "session": "", "run?": "" }
 { "type": "destroy", "session": "" }
 { "type": "restarting", "reconnectWithinMs": 0 }
 { "type": "error", "code": "malformed-message", "message": "" }
@@ -441,6 +444,29 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   session refused with `start-failed` or not answered in time gets `destroy`,
   and any question asked for it meanwhile is withdrawn and answered
   `cancelled`.
+- `model` and `thinkingLevel` on `start` and `fork` are sent only to a client
+  that offered both `capability-catalog` and `session-choice`: the document's
+  chosen model and level when the session opens, checked against the catalog
+  the client last reported, as it spelled them, and the same `model` and
+  `thinkingLevel` the session's first `turn` carries. Where nobody chose a
+  model, `model` is the operator's `MODEL` when it is set, as in `turn`. A
+  session that opens before a client that offered `capability-catalog` has sent
+  `capabilities`, such as the first after it attaches or resumes, waits for the
+  report, up to **10 seconds**, before `start` or `fork` is sent. They only
+  open the session: make it on them, so whatever it does before its first
+  turn, and any session the client makes again for the document on its own
+  (after its process restarts, say), starts on them. A field present is what
+  to run; a field absent means neither the document nor the operator names
+  one, or the catalog no longer offers it: use the client's own default. They
+  never outlast a turn. Every `turn` carries what it runs by the same rule, and
+  a turn's absent `model` or `thinkingLevel` means the client's own default for
+  it, even where `start` or `fork` named one: that is how a person choosing
+  Default, or clearing the level, reaches a session Chopin keeps, as no new
+  `start` is sent for it. Run each turn on its own fields alone.
+- `ai` on `start` and `fork`, and the `ai` message, are sent only to a client that
+  offered `ai-credentials`: see [Models through Chopin](#models-through-chopin).
+- `ai-catalog`, with `ai-catalog`, carries the link's catalog grants once the client asked for
+  them: see [Listing models before a session](#listing-models-before-a-session).
 - `fork`, with `session-forks`, opens a thread's Planner session branched from
   `from.session` (and `from.turn` when named), preserving the conversation,
   tool results, compaction state and session memory up to that point. Answer
@@ -466,10 +492,17 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   `json`, the turn's text must be that JSON.
 - `abort` stops the turn. Answer with `turn-end`; after **10 seconds** the
   server ends the turn anyway. The server sends no `host-tool-result` for the
-  turn's calls after `abort`, so settle any call still waiting as failed.
+  turn's calls after `abort`, so settle any call still waiting as failed. A
+  question the turn asked while it ran ends with it:
+  the server withdraws its Decision and answers its `input-request` with
+  `input-result` status `cancelled`, as a full Atomic Planner's Stop does, so a
+  client whose question is still waiting can end the turn. One the turn asks
+  after `abort`, before its `turn-end`, is answered `cancelled` at once, with its
+  method's `cancelled` value (see [Questions](#questions)), and opens no
+  Decision.
 - `steer`, with `steer-turn`, gives the turn that is running a message a person sent to Chopin
-  while it works. Chopin never holds a message for the next turn, so this is how a person talks to
-  a Planner mid-reply: `prompt` is the message as the model should read it (the sender's handle
+  while it works. Chopin never holds a message behind a turn that is working, so this is how a
+  person talks to a Planner mid-reply: `prompt` is the message as the model should read it (the sender's handle
   first, `@bo: ...`), to be read at the turn's next step, after the tool calls of the step it is
   in and before its next call to the model, as an ordinary user message in the same turn. Answer
   with `control-result` within **10 seconds**: `ok: true` once the turn has taken it, `ok: false`
@@ -477,7 +510,11 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   it on. A refusal is final: Chat then says the message was not read, and it is not sent again.
   A client that did not offer the feature never receives one, and a message sent while it works
   is refused in Chat ("chopin can't take messages while it works on this machine. Stop it to ask
-  now.") rather than kept for later.
+  now.") rather than kept for later. A message sent once its turn is being stopped or finishing
+  (after `abort`, or after its `turn-end` while Chopin finishes recording it) is kept, and starts
+  the next turn as that one ends, with the message as its `prompt`; one sent while that next turn waits to start is
+  refused ("chopin is about to answer another message and can't take more while it works on this
+  machine. Send yours again once it has answered.").
 - `host-tool-result` answers a `host-tool-call`. `output` is the tool's result
   as JSON. A failed call has `"isError": true` and `output`
   `{ "error": "<message>" }`; that includes a tool that threw, invalid input, a
@@ -487,15 +524,6 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 - `input-result` answers an `input-request` (see [Questions](#questions)). With
   `resumable-sessions`, the client acknowledges every `input-result` it receives with
   `input-received` (see below).
-- `stop` and `resume` are **Stop Planner** and **Resume Planner**: pause or
-  resume every workflow run of the session, or only `run`. Answer with
-  `control-result` within **10 seconds**; an answer that comes later is still an
-  answer and clears the Stop on the server. A `stop` may arrive again for a run it
-  already paused, because the server cannot tell an answer it never received from a
-  `stop` the client never heard (see
-  [Resuming](#resuming-after-a-dropped-link)). It pauses, so a repeat changes
-  nothing; answer it `ok: true`. A client that answers `ok: false`, for a run that
-  has since ended, only has the refusal logged for a `stop` sent again.
 - `destroy` ends the session; abandon its turn, its waiting host calls, and its
   questions. A client offering `session-forks` may retain the finished session's
   conversation history so a later `fork` naming `from.session` can branch from
@@ -515,16 +543,18 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 { "type": "part", "session": "", "turn": "", "part": {} }
 { "type": "host-tool-call", "session": "", "turn": "", "toolCallId": "", "toolName": "", "input": "{}" }
 { "type": "turn-end", "session": "", "turn": "", "status": "finished", "message?": "" }
-{ "type": "input-request", "request": "", "session": "", "workflowRunId?": "", "workflowStageId?": "", "rootRunId?": "", "block?": { "index": 0, "digest": "sha256:<64 hex>" }, "input": {} }
+{ "type": "input-request", "request": "", "session": "", "block?": { "index": 0, "digest": "sha256:<64 hex>" }, "input": {} }
 { "type": "input-cancel", "request": "" }
-{ "type": "runs", "session": "", "active": [], "paused": [], "cards": [] }
 { "type": "control-result", "request": "", "ok": true, "message?": "" }
 { "type": "detach" }
 { "type": "resume", "sessions": [{ "session": "", "requests": [""] }] }
 { "type": "input-received", "request": "" }
-{ "type": "capabilities", "catalog": {} }
+{ "type": "capabilities", "catalog": {}, "catalogLaunch?": "" }
+{ "type": "ai-catalog" }
 ```
 
+`ai-catalog` belongs to the `ai-catalog` feature and is defined in
+[Listing models before a session](#listing-models-before-a-session).
 `resume` and `input-received` belong to the `resumable-sessions` feature and are defined in
 [Resuming after a dropped link](#resuming-after-a-dropped-link) and below. `capabilities` belongs to
 `capability-catalog` and is defined in [Capability catalog](#capability-catalog).
@@ -567,13 +597,7 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
   The server remembers every open id and the last 1,024 ids it received; a
   remembered id sent again is a `protocol` violation that closes the connection. Use
   fresh ids, such as UUIDs.
-- `runs` reports the session's workflow runs whenever they change. Report them
-  before `turn-end` so the server keeps the session while runs are live. Reports
-  only change run cards and Chat notices; they never start a Planner turn. To
-  have the Planner act on a run that ended, call `invoke_planner` with
-  `as: "system"` and a GitHub token of the account holding the Planner; see
-  [Automatic follow-ups](local-agent-mcp.md#automatic-follow-ups).
-- `control-result` answers `stop`, `resume` or, with `steer-turn`, `steer`.
+- `control-result` answers a `steer`, with `steer-turn`.
 - `detach` closes the connection with code 1000. The account keeps the document's
   Planner for the grace period in [Ownership](#ownership). It ends everything the
   link held, even with `resumable-sessions`: only a link that drops without it keeps
@@ -585,6 +609,13 @@ how `invoke_planner` returns it. Once a client is attached, both arrive as
 Messages for a session or turn that has ended are ignored, except a
 `host-tool-call`, which gets an error result (`The turn has ended.` or
 `The session has ended.`).
+
+Chopin keeps no workflow runs of a client's: there is no message that reports one. An earlier
+version of this connection had a `runs` report, the `run-stage-deltas` feature, `stop` and `resume`
+for a session's runs, and `workflowRunId`, `workflowStageId` and `rootRunId` on `input-request`. A
+server of this version refuses each of those fields and messages as `malformed-message`, and lists
+no `run-stage-deltas` in `attached.features`, so a client that still sends them must stop first. A
+client's own work that outlives its turn is its own to report in its replies.
 
 ### Capability catalog
 
@@ -619,7 +650,7 @@ level can therefore never be chosen, and a turn never carries one.
       "default?": { "id": "", "thinkingLevel?": "" }
     },
     "commands?": [{ "name": "", "description?": "", "kind": "" }]
-} }
+}, "catalogLaunch?": "" }
 ```
 
 - **When.** Send it right after `attached`, and after the `resume` of a resumable link, which stays
@@ -629,7 +660,9 @@ level can therefore never be chosen, and a turn never carries one.
   feature and does not report offers no choice, the same as a client from before the feature. Sending
   `capabilities` without having offered the feature is a `protocol` violation, and a catalog whose fields have the
   wrong type (listed below), a `malformed-message` one. The catalog is held with the link, not stored: after a
-  server restart a resumed client sends it again.
+  server restart a resumed client sends it again. A client that lists its models through
+  [catalog launches](#listing-models-before-a-session) reports them through one of the person's
+  accounts as they are now: see [When the person's accounts change](#when-the-persons-accounts-change).
 - **`models.available`** lists the models in the order to show them within a provider, as many as the
   frame holds (Atomic's own list runs past 1,700).
   `id` is the exact string the client wants back as a turn's `model`; Chopin never parses, bounds
@@ -658,27 +691,30 @@ level can therefore never be chosen, and a turn never carries one.
   records a model and a level together where the catalog says which level runs, so a client should
   report the `thinkingLevel` its default model runs at. An operator's `MODEL` takes its place when it is set. A default with an
   empty `id` is ignored, and an empty `thinkingLevel` is dropped from it.
-- **`commands`** is reserved for the commands a client offers, such as skills,
-  prompt templates and workflows: `name`, `description` and `kind`, a string the client defines
-  (`skill`, `prompt`, `workflow`). Chopin keeps them with the catalog, as written (order, spelling,
+- **`commands`** is reserved for the commands a client offers, such as skills and
+  prompt templates: `name`, `description` and `kind`, a string the client defines
+  (`skill`, `prompt` or any other). Chopin keeps them with the catalog, as written (order, spelling,
   repeated entries and a missing `description` included), and tells the room's composers what the
   attached client holds in the `commands` of `chat:model`. They are the attached client's alone:
   nothing a client reported is offered once it has left, and another machine's are never sent to
   this document. Send them only when they are real: a client that has none omits the field, and
   its composer then offers Chopin's own commands only. A person's message that runs one reaches
-  the client as the `prompt` of an ordinary `turn`: `/name args` for a `skill`, a `prompt` or any
-  kind other than `workflow`, as the client reported the name, and a request to start the
-  workflow of that name, with the words after it as its input, for a `workflow`. Chopin checks the
-  name and kind against the last report when the message is sent and refuses an unknown one.
+  the client as the `prompt` of an ordinary `turn`: `/name args`, whatever its kind, as the
+  client reported the name. Chopin checks the name and kind against the last report when the
+  message is sent and refuses an unknown one.
 
-A person's choice reaches the client in the next turn: `model` is the chosen model's `id`, and
+A person's choice reaches the client in every turn, whoever or whatever started it, a background
+job's (in an `isolated` session) included: `model` is the chosen model's `id`, and
 `thinkingLevel` one of that model's levels (or the default model's, when no model was chosen),
 each exactly as the client spelled it. Neither is ever empty: an empty model `id` or level is
 skipped when the catalog is read (above), so no one can choose it, and a `model` that is absent
 means no model was chosen (an operator's empty `MODEL` reads the same way).
 Chopin checks both against the last catalog the client reported when it accepts the choice and
 again when the turn starts. A model the catalog no longer lists, or a level its model no longer
-lists, is not sent: the turn runs with the client's default, and the document's Chat says so. The
+lists, is not sent: the turn runs with the client's default, and the document's Chat says so. A
+turn that starts before a client that offered the feature has sent `capabilities`, such as the
+first after it attaches or resumes, waits for the report, up to **10 seconds**, before it checks
+the choice, so a client that reports promptly runs the choice from its first turn. The
 catalog name is saved with the choice so that notice can name it even after it disappears. The
 browser's `chat:model` state includes an optional `modelName` for that saved name; older choices
 without a name use the current catalog's name if known, otherwise the id. Older browsers can ignore
@@ -759,13 +795,139 @@ With `retry-turn`, every `turn` that a person's Chat message began names it:
   (which is the prompt) and without anything of the failed attempt, which is no longer in the
   transcript. A client that does not offer the feature therefore still gets a clean context for an
   ordinary retry; only a client that keeps its own memory beyond Chopin's sessions, or a session
-  Chopin kept because it owns a workflow run or an open question, needs `message` and `retry` to
+  Chopin kept because it waits on an open question, needs `message` and `retry` to
   drop the attempt itself.
 - A thread forked later from the retried message branches from the retried turn, never the failed
   one: Chopin forgets the fork point the failed attempt recorded.
 
 Nothing here changes an existing message for a client that did not offer the feature, so the
 subprotocol stays `chopin.agent.v1`.
+
+### Models through Chopin
+
+People connect their AI accounts in Chopin once (see
+[AI credentials](hosted-agent.md#ai-credentials)). A client that offers
+`ai-credentials` runs its sessions' models on the account of the person the link
+acts for, without a key or sign-in of its own: the account that attached, which for
+a paired machine's [Planner credential](#credential) is the machine's owner. Each
+session is one launch, prepared before its `start` or `fork` and carried in `ai`:
+
+```json
+{
+	"launch": "chopin_launch_…",
+	"expiresAt": 1700000000000,
+	"providers": [
+		{
+			"provider": "openai",
+			"baseUrl": "https://chopin.example/api/v1/ai/openai/v1",
+			"placeholder": "chopin_ai_…",
+			"keyVariable": "OPENAI_API_KEY"
+		}
+	],
+	"withheld": [{ "provider": "github-copilot", "reason": "no-copilot-access" }]
+}
+```
+
+- Each of `providers` is a provider the session may call: send its requests to
+  `baseUrl` with `placeholder` as the key, where the provider takes it
+  (`Authorization: Bearer`, or `x-api-key` for Anthropic). `keyVariable` is the
+  environment variable that provider's clients read their key from, for an agent
+  that takes its key from there. `withheld` names each provider the person
+  connected that the launch was not given, and why.
+- `launch` is the launch's own credential. The client adds it, in
+  `x-chopin-launch`, to every request to Chopin's credential proxy, and keeps it
+  in its own process: it is never in the environment, files or arguments of the
+  agent's tools, so a stand-in copied out of them reaches nothing. `launch` and
+  `expiresAt`, the launch's deadline in milliseconds since the epoch (12 hours
+  after it began), are present exactly when `providers` is not empty.
+- A session whose person has no AI account Chopin can use (no Copilot seat and no
+  key) is never started: Chopin sends no `start` or `fork` for it, and the turn that
+  needed it says why, as a message from such a person is refused. A `start` or `fork`
+  always carries at least one provider.
+- An `ai` message replaces the session's grants whole: when what a launch for the
+  person may be given changes (they connect, replace or remove a provider, a provider
+  refuses one of their keys as invalid, or GitHub confirms their Copilot seat lost or
+  back), half an hour before the launch's deadline, and after a
+  [resume](#resuming-after-a-dropped-link), because the launch a session held may have
+  ended with its link or with the server's process. A change while the session starts
+  is sent once the client answers `started`, as the accounts are then. The earlier
+  launch ends once the new one is sent, so use the new grants from then on: a request
+  still waiting at Chopin on the earlier one is refused. An empty `providers` says the
+  session has no grant now.
+- A launch ends with its session (`destroy`, or a link that closes for good), and
+  when its machine is revoked or its document archived; Chopin's proxy then answers
+  `launch-ended`, or `unknown-placeholder` once its placeholders are gone (401, `{
+  "error": { "type": "chopin_proxy", "code": … } }`). To tell an ended launch from a
+  stand-in sent wrong, ask `GET /api/v1/ai/launch` with `x-chopin-launch`, which
+  answers `{ "state": "live" }` or `{ "state": "ended" }` (see
+  [Handing launches to runners](hosted-agent.md#handing-launches-to-runners)). A
+  session a server restart keeps for a resume keeps its launch: the next server
+  replaces it when the client resumes, or ends it with the session. A launch that
+  Chopin could not prepare (the person's accounts kept changing) fails the session's
+  start with the reason, which can be tried again.
+
+A client that does not offer the feature is sent none of this and uses its own
+models, as before.
+
+#### Listing models before a session
+
+A session's launch arrives only with its `start` or `fork`, so a client that lists its models
+from its launches would offer none in the document's composer until a turn has run. With
+`ai-catalog` too, the client asks for the link's catalog grants once it is attached (after
+`resumed` on a link that resumes), and Chopin answers with them:
+
+```text
+{ "type": "ai-catalog" }
+{ "type": "ai-catalog", "ai": { "launch?": "", "expiresAt?": 0, "providers": [], "withheld": [] }, "catalogLaunch?": "" }
+```
+
+- They are a launch for the same account a session's would be, on the same machine and
+  document, in the same shape, with the person's providers as a session would be given them.
+  Use them only to read each provider's model list and the model catalog, so the
+  [capability catalog](#capability-catalog) reports that account's models as soon as the link
+  attaches. The proxy serves such a launch each provider's model list (`GET` of `/models` for
+  GitHub Copilot, `/v1/models` and `/v1/models/<id>` for the others) and the model catalog, and
+  refuses every other request on it, a model call included, with `catalog-only` (403) before it
+  reads any credential. Run each turn on its own session's launch.
+- A later `ai-catalog` replaces them whole, whenever a session's launch would be replaced: the
+  person connects, replaces or removes a provider, a provider refuses one of their keys as
+  invalid, GitHub confirms their Copilot seat lost or back, and half an hour before the
+  deadline. The earlier launch ends once the new one is sent. An empty `providers` says the
+  account has nothing to list now: report no models of it.
+- They end with the link, however it closes, a drop whose sessions Chopin keeps included, and
+  with every cutoff that ends a session's launch (see
+  [Handing launches to runners](hosted-agent.md#handing-launches-to-runners)). A new link asks
+  again.
+- Asking without having offered the feature is a `protocol` violation; asking again on the same
+  link changes nothing. A Chopin that hands out no launches answers nothing. Like every launch,
+  the client keeps the launch credential in its own process and adds it to each request in
+  `x-chopin-launch`.
+
+#### When the person's accounts change
+
+What a client lists through a catalog launch is the models of the accounts that launch was
+prepared for. The moment the person connects, replaces or removes a provider (or a key is
+refused, or GitHub confirms their Copilot seat lost or back), what the client reported no longer
+counts as what it offers: the composer shows the models of the person's new accounts, as Chopin
+lists them itself, marked as from their accounts, and a pick waits for the client's report (as on
+attach) and is refused if none comes. Its commands stay. The report that counts again is one made
+through a catalog launch of the accounts as they are now:
+
+- With `catalog-launches` too, every `ai-catalog` carries `catalogLaunch`, an opaque id that is
+  no credential, new with each one, renewals and one with no providers included. Name in
+  `capabilities` the `catalogLaunch` whose grants its models were listed through, read with
+  them, never a list saved or read under another; on each new `catalogLaunch`, list the models
+  again through it and report them naming it, even when they are the same, since the client
+  can't tell a renewal from a change. A report counts only while the launch it names was handed
+  since the person's accounts last changed: one naming an earlier launch, one that arrives late
+  among them, and one naming none, the report sent on attach included, change nothing.
+  `catalogLaunch` without the feature is a `protocol` violation.
+- Without it, a report counts for the latest catalog launch handed when it arrives, never one
+  that arrives before the first is handed or between a change and the launch handed for it. A
+  report through the old launch that arrives after the new one was handed can't be told apart,
+  so such a client needs `catalog-launches` to switch accounts reliably: until it reports again,
+  the composer says _The machine needs an update to switch AI accounts._, a pick is refused in
+  those words, and nothing waits for it.
 
 ### Stream parts
 
@@ -1062,90 +1224,6 @@ order; an unanswered question has no entry. Each entry is one of:
 - `chat`: the same written answer for a `multiSelect` question or one whose
   options have a `preview`.
 
-A workflow-stage question names its `workflowRunId` and, when it differs, the
-`rootRunId` of the run that owns it. While the latest `runs` report lists that
-root as paused, an answer is held and sent only once the root is no longer
-paused, so a paused run stays stopped.
-
-`runs.cards` are run cards as Chat shows them, at most 64. Each `runs` is a
-complete report: it lists every card of the session. A full card is:
-
-```text
-{ "id": "", "name": "", "status": "running", "started": 0, "updated": 0, "ended?": 0, "stages": [], "earlierStages?": 0, "waiting": 0 }
-```
-
-`status` is one of `running`, `waiting`, `paused`, `finished`, `blocked`,
-`failed`, `stopped`; times are whole seconds since the epoch; `waiting` counts
-open questions. Up to 64 `stages`, the most recent, are
-`{ "id": "", "name": "", "parentIds?": [], "kind?": "tool", "status": "", "started?": 0, "ended?": 0 }`
-with `status` one of `pending`, `running`, `awaiting_input`, `paused`, `blocked`,
-`completed`, `failed`, `skipped`, `stopped`. `earlierStages` counts the stages
-the run reached before the listed ones; Chat lists every reported stage when
-someone expands the card and says how many it was not sent. Optional
-`parentIds` names the parent stages by their IDs in this report (at most 64 IDs,
-each 1–128 characters). Send these links for nested work; older reports without
-them remain valid on version 1.
-Chat renders unfinished descendants of stopped, failed, blocked or skipped stages
-as stopped, while preserving finished outcomes. A stopped, failed or blocked run
-stops all unfinished stage displays even without parent links. `active` and
-`paused` list at most 64 root run IDs. List a launched run in `active` from the
-moment the workflow tool admits it, or its root reports running, until its root
-run ends: Atomic delivers activity and lifecycle events in no shared order, so
-a run can start before its activity does. A `finished` card is finished only
-with `ended`, the time its root run ended; without it, Chat shows the run as
-still live and posts no finish notice. When the connection closes, the server
-shows the reported live runs as stopped, except where a link with
-`resumable-sessions` dropped unexpectedly and its session is [kept](#resuming-after-a-dropped-link).
-
-A full card's `stages` replace every stage Chopin stores for the run, unless
-it has none (see [Run stage deltas](#run-stage-deltas)). Chopin stores all of a
-run's stages, not only those a card lists, and keeps them across reconnects and
-restarts until Chat stops showing the run's card, when a later run replaces
-ended cards.
-
-### Run stage deltas
-
-With the `run-stage-deltas` [feature](#features), a card may instead be a delta
-card, with `stagesDelta` and without `earlierStages`:
-
-```text
-{ "id": "", "name": "", "status": "running", "started": 0, "updated": 0, "ended?": 0, "stagesDelta": true, "stages": [], "waiting": 0 }
-```
-
-- `stagesDelta` is always `true`. A delta card's other fields replace the
-  card's, as a full card's do.
-- `stages` holds only the run's new and changed stages, in the stage shape
-  above, with no count limit; only the frame's 2 MiB bounds them. Chopin adds
-  them by `id` within the run: a known `id` is replaced whole, where it stands,
-  so an optional field left out is gone; a new one follows the run's other
-  stages, in the order sent. A repeated `id` keeps its last value. Stages a
-  delta does not name are kept, and `"stages": []` changes none.
-- The run keeps the `earlierStages` of its last full card.
-- A delta never removes a stage. To start a run's stages over, send a full card
-  with the new first stages, then delta cards.
-- A full card with `"stages": []` for a run that already has stages keeps them,
-  with or without this feature. Its other fields, such as `status` and the
-  times, change the card as usual, and its `earlierStages` is ignored, so a
-  client that reattaches can report an ended run whose stages it no longer
-  holds without wiping the ones Chopin stores. A full card with any stages
-  still replaces them all.
-- `parentIds` may name any stage of the same run, sent in this message, an
-  earlier one or a later one. Chopin refuses no parent ID; Chat shows a stage
-  whose parent it does not know at the top level until the parent arrives, and
-  applies the stopped rule above over all of the run's stages.
-- A report too large for one frame goes as several `runs` in a row, each a
-  complete report with the same `active`, `paused` and cards, splitting the
-  stages between them. Make every card of every part after the first a delta
-  card (`"stages": []` when nothing is left for it), so no full card replaces
-  the run's stages twice. The package client's `reportRuns` does this.
-- After each `attach`, send every stage of each run once, then only what
-  changes; adding a stage Chopin already stores again changes nothing.
-
-A server that did not list `run-stage-deltas` in `attached.features`, including
-every server from before features, refuses a delta card as `malformed-message`
-and closes the connection with 1008. Send such a server full cards: the 64 most
-recent stages, with `earlierStages` counting the rest.
-
 ### Option previews
 
 With the `decision-option-previews` [feature](#features), an option's `preview`
@@ -1189,9 +1267,9 @@ itself, so it fits a document's images), an unsupported type, bytes that are not
 declared type, an archived document, or a call outside a live Planner turn. The
 image loads only for people who can read this document. Chat also shows the
 image, with its `alt`, as a generated image on the turn's message, like the
-[images a tool made](#images-a-tool-made). A workflow stage has no
-turn of its own, so from a stage use the MCP `upload_image` tool with the same
-bytes, or pass the Markdown down from a Planner turn.
+[images a tool made](#images-a-tool-made). Work the client runs outside a turn has
+none of its own, so from there use the MCP `upload_image` tool with the same bytes, or pass the
+Markdown down from a Planner turn.
 
 A server that did not list `decision-option-previews` in `attached.features`
 joins `preview` onto the end of the option's `description` and offers no image
@@ -1269,13 +1347,12 @@ not apply to it.
 - **What drops.** The socket closes with no `detach` and no `refused`, or the
   server closes it as `unresponsive` (see [Pings](#pings)). The turn under way
   still fails with an error and its host tools stop, as on any close.
-- **What is kept.** Each started session that has a live or paused run, or a
-  question the client asked and nobody has answered, stays as it was: its run
-  cards keep the status last reported, not `stopped`, marked `disconnected` for the
-  people reading them, its Decisions stay open in the document and can be answered,
-  and an answer given meanwhile is held. Other sessions end as they always did.
-  Chat says nothing of the connection itself: the machine button, its menu and
-  the run cards carry that state, and nothing confirms it came back.
+- **What is kept.** Each started session that has a question the client asked and
+  nobody has answered, or an answer its client has not acknowledged, stays as it was:
+  its Decisions stay open in the document and can be answered, and an answer given
+  meanwhile is held. Other sessions end as they always did. Chat says nothing of the
+  connection itself: the machine button and its menu carry that state, and nothing
+  confirms it came back.
   Nothing waits on the client in the meantime: `@chopin` and `invoke_planner` are
   refused as [without an attached Planner](#without-an-attached-planner), and no
   other account can attach. The document is not let go either: a Default machine's
@@ -1284,35 +1361,13 @@ not apply to it.
 - **Nothing but an explicit end.** There is no deadline. The operator's
   `PLANNER_ATTACH_GRACE_MS` leases only a connection that detached, or dropped with
   nothing to keep. A client may be away for minutes or for days; it resumes the same
-  session, receives what was answered or cancelled meanwhile, and its runs go on.
+  session and receives what was answered or cancelled meanwhile.
 - **A question the client withdraws.** Cancelling a question while the link is down
   ends the client's wait at once, with a local `cancelled` result, and the next link
   does not name it, which withdraws the Decision in Chopin before anything else
   happens. A client that sent `input-cancel` on a link that then dropped is
   treated the same way.
-- **Stop is held, not lost.** A Stop Planner, or one run's pause, that cannot
-  reach the client is held for its return, and Chat says that the workflows will
-  pause when the machine reconnects; the run cards keep their last reported status
-  until the client reports otherwise. That covers a Stop pressed while the link is
-  down and one already sent whose `control-result` had not come when the link
-  dropped. A `stop` the client did not answer within 10 seconds while the link was
-  still attached is kept too: Chat says Chopin has not confirmed it, never that
-  it stopped, and that the workflows will pause when the machine reconnects, and
-  says nothing more when the link is found dead (see [Pings](#pings)). Chat says a Stop
-  stopped Chopin only when the client confirmed it, that it was asked to when
-  its connection is known to be down, and that it was not confirmed otherwise. After `resumed`, before anything else,
-  the server sends the client one `stop` for every run (or one per run named),
-  however many times it was pressed, and the client answers `control-result` as
-  for any `stop`. The client may already have applied the original, whose answer
-  was lost, so it can receive a `stop` for runs that are paused; repeating it
-  changes nothing. A `stop` the client answered, whether it applied or refused it,
-  is not sent again. One it never answered stays owed, and a `resume` the client did
-  answer undoes it only for the runs that `resume` covers: a Stop of every run
-  stands for the other runs, and a Stop of one run is undone only by a `resume` of
-  that run or of every run. A held Stop whose answer is lost because the link dropped once
-  more is sent again with the next `resume`. A Resume pressed meanwhile is not
-  held: Chat says the workflows could not be resumed, and it can be pressed again
-  once the client is back. Stop on a Planner that only waits on a question
+- **Stop withdraws a question.** Stop on a Planner that only waits on a question
   withdraws the question explicitly, and Chat says so; the client learns of it when it
   resumes. That ends what the link kept, and the account holds the document for the
   grace period as a detached one does.
@@ -1323,8 +1378,7 @@ not apply to it.
   answers `resumed` in the same shape: the sessions it kept and gave back, each with
   the requests it still holds, whether open or answered while the link was down. It
   then sends each answered request's `input-result` the client has not acknowledged,
-  and the client acknowledges it with `input-received`. The client sends `runs`
-  again for the sessions it got back, as after any `attach`. A session or request the client does not name has
+  and the client acknowledges it with `input-received`. A session or request the client does not name has
   ended and is withdrawn; one the server does not list has ended there: the client
   settles its questions as cancelled and calls its `destroy` handler for the session.
   A client that sends anything else first, or does not offer the feature, holds
@@ -1334,8 +1388,8 @@ not apply to it.
   succeed. Any other `refused` (`planner-attached` included, whoever holds the
   document) and any `error` ends them.
 - **A client that does not offer the feature.** It behaves as it always did: when its
-  link drops, Chopin ends the turn, withdraws the questions the client asked, shows
-  its live runs as `stopped` and forgets its sessions. Such a client settles its own
+  link drops, Chopin ends the turn, withdraws the questions the client asked and
+  forgets its sessions. Such a client settles its own
   waiting questions when its socket closes and holds nothing it could resume, so
   keeping them open would promise answers nobody can receive. A client that wants its
   work to survive a drop must offer `resumable-sessions`; the package client does by
@@ -1344,19 +1398,16 @@ not apply to it.
   and check that `attached` lists it; acknowledge every `input-result` with
   `input-received`, including one for a request already settled; keep each session and
   its waiting `input-request` ids across a drop; on the next connection send `resume`
-  first and handle `resumed`, then the redelivered `input-result`s and `stop`s, then
-  `runs`; retry the same `resume` on a `refused` with `retry`, and treat any other
-  `refused` or `error` as final.
+  first and handle `resumed`, then the redelivered `input-result`s; retry the same
+  `resume` on a `refused` with `retry`, and treat any other `refused` or `error` as final.
 - **What still ends it for good.** Its own `detach`; any definitive `refused` (every
   one without `retry`) or protocol error; the owner's sign-out or its expiry; a Planner reset; revoking or unpairing
   the machine that attached it; the document's owner choosing another machine for it;
   archiving or deleting the document; a Stop that withdraws its last question; and the
   same account attaching with a client that does not resume, which includes a browser
   sign-in attaching over a paired machine's parked work, since that client cannot
-  resume it. All of these withdraw the questions and show the runs as `stopped`, and a
-  later `resume` finds nothing. Archiving stops the document's run cards itself, before it
-  releases the link, so they end even when the Planner is disconnected or a deploy is handing
-  over and its link reports nothing; an archived document always opens with its runs stopped. A server restart does not end it: see below. A person
+  resume it. All of these withdraw the questions, and a later `resume` finds nothing. A
+  server restart does not end it: see below. A person
   with write access can always end a disconnected Planner by resetting it.
 
 #### When the server is restarting
@@ -1390,8 +1441,8 @@ the rule is for the backend to follow. The test client in `apps/server/src/testi
 The server keeps links, sessions and open requests in memory, and writes what a restart
 must carry over to storage: when a link drops with work kept, and for every live link at
 its cut, one `planner_link_holds` row per document with each session's waiting request
-ids, for each question the decisions it asked and the kind of request it was, the answers the
-client has not acknowledged and the Stops it has not heard. The
+ids, for each question the decisions it asked and the kind of request it was, and the answers
+the client has not acknowledged. The
 server tells every link it is going down before it closes any socket, closes each with 1012
 (with `restarting`, whose `reconnectWithinMs` is the hold's window, for a client that offered
 `restart-notice`), and no link withdraws a question on the way out, so the Decisions the
@@ -1400,7 +1451,7 @@ Planner had asked stay open and answerable in the document.
 The next process rebuilds each hold as a suspended one. Until its **hand-over window**
 (`HANDOVER_PLANNER_WINDOW_MS`, 10 seconds by default, counted from the release of the lease: the
 next process starts it as it rebuilds the hold, after the release) ends, the
-document's members see the Planner attached and the run cards Chat stored stay as they were; a
+document's members see the Planner attached; a
 `@chopin` message, comment note or task draft sent before the client resumes is refused saying
 it is still connecting, with nothing kept for later.
 A returning client attaches, and sends `resume` as usual:
@@ -1424,10 +1475,8 @@ A returning client attaches, and sends `resume` as usual:
   sent, once. An answer given before the client is back waits and is sent after `resumed`; one
   given after goes straight to it. No turn of its own follows, because the question is waited
   on. A question a client resumes without, because it no longer waits on it, is withdrawn, as
-  `input-cancel` withdraws it. Each Stop held for the client is sent first. No turn of the new
-  process opened a resumed session, yet it is the document's as before: its `runs` are Chat's
-  run cards, and a document that opens after the client is back shows them live, never stopped,
-  with what the client last reported. A question it asks after the restart, an `input-request`
+  `input-cancel` withdraws it. No turn of the new process opened a resumed session, yet it is
+  the document's as before. A question it asks after the restart, an `input-request`
   on the resumed session, becomes Decisions as one asked before it did, and its answer goes to
   that request; the document is opened for it if nobody has it open, and kept open until the
   question ends.
@@ -1437,14 +1486,12 @@ A returning client attaches, and sends `resume` as usual:
   its own that names the question, the option chosen and who chose it, started when the Planner
   is attached (see [Decisions](decisions.md)). A question of a request that was not kept, one
   asked while the old process was stopping or after a crash, is not waited on at all, and its
-  answer is handled the same way. Exactly one of the two delivers an answer. What is not
-  carried over is a workflow run's pause: an answer to a question a workflow run asked is sent
-  when it is given, without the wait that keeps a paused run stopped.
+  answer is handled the same way. Exactly one of the two delivers an answer.
 - **A client that sends anything else first,** or resumes with nothing, holds nothing to
-  resume: the kept sessions end and the run cards stop.
+  resume: the kept sessions end.
 
 When the window ends with no `resume`, the hold is disconnected, as a dropped link is
-today: the document's members are told, its run cards say the Planner is disconnected, and the
+today: the document's members are told, and the
 hand-over logs a miss naming the cause, the owner's sign-in or the client not back. It stays
 for the client's return and nothing times it out. A hold that was already disconnected when the
 cut came keeps its state and gets no window, and one in its grace period is not kept. An
@@ -1457,8 +1504,8 @@ its client's `resume` finds it disconnected; the live link's work is lost as it 
 crash of the process a cut handed over to leaves the same: it rewrote the row without the window
 when it rebuilt the hold, so the process after it finds the hold disconnected and keeps the
 sessions for the client's `resume`.
-Neither the link closing nor the shutdown posts a Chat line: no "disconnected" notice
-and no "was stopped after" line, since nobody stopped anything and Chopin merely restarted. An answer given to a Decision nobody
+Neither the link closing nor the shutdown posts a Chat line: no "disconnected" notice,
+since nobody stopped anything and Chopin merely restarted. An answer given to a Decision nobody
 waits on any more reaches the Planner as a turn of its own once a Planner is attached
 (see [Decisions](decisions.md)). Nothing is reported as the Planner stopping its work
 because of a network drop.
@@ -1509,38 +1556,26 @@ Each launch gets the connector's environment, your `--env` values, and these:
 | `CHOPIN_PLANNER_TOKEN`           | This launch's [credential](#credential).                                                           |
 | `CHOPIN_PLANNER_TOKEN_FILE`      | A file (mode `0600`) that always holds a current credential, replaced before it expires.           |
 | `CHOPIN_CHECKOUT`                | The absolute root of the document's repository's checkout or clone.                                |
-| `CHOPIN_WORKTREE`                | The command's own worktree path, `<base dir>/planners/<owner>/<repo>/<document id>`.               |
+| `CHOPIN_WORKTREE`                | The command's own clone of the repository, in its microVM: `/work/<repository name>`.              |
 | `CHOPIN_GITHUB_TOKEN`            | A token of Chopin's GitHub App for the document's repository, for pushing and draft pull requests. |
 | `CHOPIN_GITHUB_TOKEN_EXPIRES_AT` | When that token expires, in ISO 8601.                                                              |
 | `CHOPIN_GITHUB_TOKEN_FILE`       | A file (mode `0600`) that always holds the current token.                                          |
 | `CHOPIN_MCP_TOKEN_FILE`          | A file (mode `0600`) holding the token for Chopin's tools at `/mcp`, renewed with the credential.  |
 
-`CHOPIN_WORKTREE` stays the same across launches. The connector makes its
-parent folders but never removes the worktree itself. Whether the backend or the
-connector makes it depends on the [sandbox](chopin-cli.md#sandbox):
-
-- **Without a sandbox** (none works on the machine, or `--no-sandbox`), the folder is
-  not there on the first launch and the command makes the worktree, for example:
-
-  ```sh
-  git -C "$CHOPIN_CHECKOUT" worktree add "$CHOPIN_WORKTREE" -b <branch>
-  ```
-
-- **In the sandbox** the worktree already exists on every launch, the first too: the
-  connector makes it on the host before the backend starts, as a linked worktree of
-  `CHOPIN_CHECKOUT` detached at its `HEAD`, and leaves it as it finds it on later
-  launches. The backend must use it, as it must after its first launch anyway:
-  `git -C "$CHOPIN_WORKTREE" checkout -b <branch>` starts a branch, and it can commit
-  and push from there. `git worktree add` fails in the sandbox, because the sandbox
-  lets the backend write that one worktree's git directory and not the list of
-  worktrees in the checkout's. **`CHOPIN_CHECKOUT` is read-only**: it is the
-  person's own checkout, and the sandbox never lets an agent write its files, its
-  submodules, its `.git`, its index or `HEAD`, whether it is a regular checkout or a
-  linked worktree of theirs, and no path its owner adds with `--sandbox-write` changes
-  that. A backend reads it, and does its work and its edits in
-  `CHOPIN_WORKTREE`, from where its changes reach the person as commits and a
-  pushed branch. See [Git in the sandbox](chopin-cli.md#git-in-the-sandbox). A
-  folder at `CHOPIN_WORKTREE` that holds something and is no worktree is left as it is.
+`CHOPIN_WORKTREE` stays the same across launches. The backend runs in a microVM of its
+own (see [Sandbox](chopin-cli.md#sandbox)), and `CHOPIN_WORKTREE` is its own clone of the
+repository there, on a disk that lasts between its launches: its first launch clones
+`CHOPIN_CHECKOUT`'s repository at its `HEAD` before the backend starts, and later
+launches find the clone as the backend left it. The backend works, commits and pushes
+there; `git -C "$CHOPIN_WORKTREE" checkout -b <branch>` starts a branch.
+**`CHOPIN_CHECKOUT` is read-only**: it is the person's own checkout, shared with the
+microVM read-only, uncommitted files included, and nothing writes it. A backend reads
+it, and does its work and its edits in `CHOPIN_WORKTREE`, from where its changes reach
+the person as commits and a pushed branch. The disk goes when Chopin says its document
+is archived or gone, when a writer resets the document's Planner in Chopin (the
+credential's `reset` names when; a disk from before goes before the next launch), when
+no Planner has run on it for 30 days, or when the machine is unpaired or revoked;
+commits never pushed go with it.
 
 The connector renews the Planner credential in `CHOPIN_PLANNER_TOKEN_FILE` 5 minutes
 before it expires, for as long as the backend runs and Chopin still lets the machine run
@@ -1567,7 +1602,7 @@ POST /api/connector/planner
 Authorization: Bearer <machine token>
 { "document": "<document id or URL>" }
 
-200 { "token": "chopin_p_…", "expiresAt": <milliseconds since the epoch>, "document": { "id": "", "url": "" } }
+200 { "token": "chopin_p_…", "expiresAt": <milliseconds since the epoch>, "document": { "id": "", "url": "" }, "ai?": "chopin" }
 ```
 
 Chopin issues it only when it runs `HARNESS=remote` with `AGENT` on and not
@@ -1602,6 +1637,17 @@ pull request (see
   [environment](#environment). The token is never in its arguments; do not log
   it.
 - Keep any worktree of its own at `CHOPIN_WORKTREE`.
+- To run its models on its owner's AI accounts in Chopin, rather than a sign-in
+  of the machine's, offer `ai-credentials` and use each session's
+  [grants](#models-through-chopin), adding the launch's credential itself. When
+  Chopin hands its Planners' sessions AI launches, it says so in the Planner
+  credential's answer and in `/api/connector/version` (`"ai": "chopin"`), and the
+  connector starts the backend, cold or as a spare, with
+  `CHOPIN_AI=chopin` and nothing of its owner's agent setup: an allow-listed
+  environment, its agents' state in `<worktree>.agent`, and none of the owner's agent
+  directories in sight (see
+  [AI accounts through Chopin](chopin-cli.md#ai-accounts-through-chopin)). Such a
+  backend has no models but its grants.
 - Open `/api/v1/agent` on `CHOPIN_URL` offering the `chopin.agent.v1`
   subprotocol, with `Authorization: Bearer <CHOPIN_PLANNER_TOKEN>`, and `attach`
   to `CHOPIN_DOCUMENT`.
@@ -1611,10 +1657,9 @@ pull request (see
   dropped socket; after that the credential is refused and it must exit. Chopin
   forgets a credential once it has expired.
 - A backend that offers `resumable-sessions` does not exit when its link drops
-  unexpectedly: it keeps its process, its sessions and its runs, and attaches again
+  unexpectedly: it keeps its process and its sessions, and attaches again
   with `resume`, however long the network or the machine is away. Chopin keeps the
-  document's Planner, its run cards and its open Decisions for it, and holds any
-  Stop meanwhile. Because the credential it was launched with is good for 15 minutes,
+  document's Planner and its open Decisions for it. Because the credential it was launched with is good for 15 minutes,
   it reads `CHOPIN_PLANNER_TOKEN_FILE` before each attempt and again whenever the upgrade
   is refused with 401, retrying on its own backoff. The connector replaces the file
   before its credential expires; a machine that slept through that renewal gets the

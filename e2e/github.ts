@@ -45,10 +45,11 @@ const repositories = [
 
 const CREATOR_WRITABLE = new Set(["archive-1", "archive-8", "archive-9"]);
 
-// A reader of octo-org/score whose access is whatever the file named for it says whenever GitHub is
-// asked: "revoked" takes the repository away, "unavailable" answers as GitHub does when it cannot be
-// reached, and anything else, or no file, leaves the access as it was. The test that owns the
-// handle writes the file; the same path is made in e2e/reaction-access.e2e.ts.
+// A person of octo-org/score whose access is whatever the file named for it says whenever GitHub is
+// asked: "writer" lets them push, "revoked" takes the repository away, "unavailable" answers as
+// GitHub does when it cannot be reached, and anything else, or no file, leaves them a reader. The
+// test that owns the handle writes the file; the same path is made in e2e/reaction-access.e2e.ts
+// and e2e/chat-typing.e2e.ts.
 const ACCESS_GATED = "gated-access-";
 
 function accessGate(handle: string): string {
@@ -59,10 +60,91 @@ function accessGate(handle: string): string {
 // octo-org/score: a reader may pull but not push, and an outsider cannot see it.
 const SCORE_READER = "score-reader-";
 const SCORE_OUTSIDER = "score-outsider-";
+// An administrator of octo-org/score, who may delete anyone's document in it.
+const SCORE_ADMIN = "score-admin-";
 // Someone who shares a machine in a test sees one repository, a private one of their own, so the
 // machine is listed to nobody else on the server: a shared machine serves every repository its
 // owner can push to, and a teammate sees it wherever they can push to one too.
 const MACHINE_SHARER = "machine-sharer-";
+// Someone GitHub gives no Copilot token: no Copilot subscription. Everyone else has Copilot.
+const NO_COPILOT = "no-copilot-";
+// GitHub's answer for an account with no Copilot subscription, as it tells Copilot's own clients.
+const NO_SEAT = {
+	message: "You do not have access to GitHub Copilot.",
+	error_details: {
+		notification_id: "no_copilot_access",
+		message: "No access to GitHub Copilot found.",
+		title: "Account unavailable",
+		url: "https://github.com/features/copilot",
+	},
+};
+// An OpenAI key the fake OpenAI accepts; any other is refused.
+const OPENAI_KEY = "sk-e2e-";
+// Someone whose Copilot account lists models a picker offers (see `listedModels`); everyone
+// else's list offers none, so no list is drawn from their accounts.
+const COPILOT_LISTER = "copilot-lister-";
+
+/** One entry of Copilot's model list, as it lists a chat model with tool calls. */
+function listedModel(id: string, name: string, picker: boolean, efforts: string[] = []) {
+	return {
+		id,
+		name,
+		model_picker_enabled: picker,
+		policy: { state: "enabled" },
+		supported_endpoints: ["/chat/completions"],
+		capabilities: {
+			type: "chat",
+			family: id,
+			limits: { max_context_window_tokens: 128_000, max_output_tokens: 16_000 },
+			supports: { tool_calls: true, ...(efforts.length ? { reasoning_effort: efforts } : {}) },
+		},
+	};
+}
+
+/** The lister's Copilot models: one the public catalog names, one only its list has, one hidden. */
+const LISTED_MODELS = {
+	data: [
+		listedModel("e2e-large", "E2E Large (account)", true),
+		listedModel("e2e-own", "E2E Own", true, ["low", "high"]),
+		listedModel("e2e-hidden", "E2E Hidden", false),
+	],
+};
+
+// A personal access token of another account than the person's sign-in, whose Copilot list has a
+// preview model the lister's lacks (see `PREVIEW_MODELS`).
+const PREVIEW_ACCOUNT = /^github_pat_e2e_preview_/;
+
+/** The other account's Copilot models: the one the catalog names, and a preview of its own. */
+const PREVIEW_MODELS = {
+	data: [
+		listedModel("e2e-large", "E2E Large (account)", true),
+		{ ...listedModel("e2e-neon", "E2E Neon", true, ["low", "high"]), preview: true },
+	],
+};
+
+/** The public model catalog (models.dev's `api.json`), with the one Copilot model it describes. */
+const MODEL_CATALOG = {
+	"github-copilot": {
+		id: "github-copilot",
+		name: "GitHub Copilot",
+		api: "https://api.githubcopilot.com",
+		npm: "@ai-sdk/openai-compatible",
+		models: {
+			"e2e-large": {
+				id: "e2e-large",
+				name: "E2E Large",
+				attachment: true,
+				reasoning: true,
+				reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }],
+				tool_call: true,
+				modalities: { input: ["text", "image"], output: ["text"] },
+				limit: { context: 400_000, output: 64_000 },
+				cost: { input: 1, output: 2 },
+				provider: { npm: "@ai-sdk/openai" },
+			},
+		},
+	},
+};
 
 function sharerRepository(handle: string) {
 	let name = `relay-${handle.slice(MACHINE_SHARER.length)}`;
@@ -177,6 +259,61 @@ const references = new Map<string, unknown>([
 // invalidates before asking the server to recheck this identity.
 const revokedViewerRepositoryReads = new Map<string, number>();
 
+function copilotGate(handle: string): string {
+	return join(tmpdir(), "chopin-e2e-copilot", handle);
+}
+
+/**
+ * What GitHub says of a token's Copilot access, by its person's gate: `none` (no seat), `unknown`
+ * (GitHub failing), `refused` (a seat-holder's sign-in GitHub won't exchange, as it refuses a GitHub
+ * App's user token, which Copilot's model API takes itself), or empty, a seat. A token pasted in is
+ * `none` when it says `no-copilot`, and `refused` when it says `refused`, which Copilot's model API
+ * refuses too unless it is a personal access token.
+ */
+async function copilotGateFor(token: string): Promise<string> {
+	let handle = /^ghu_e2e_(.+)_\d+$/.exec(token)?.[1];
+	return handle?.startsWith(NO_COPILOT)
+		? "none"
+		: handle
+		? (await readFile(copilotGate(handle), "utf8").catch(() => "")).trim()
+		: token.includes("no-copilot")
+		? "none"
+		: token.includes("refused")
+		? "refused"
+		: "";
+}
+
+async function copilotToken(authorization: string): Promise<Response> {
+	let token = /^token (\S+)$/.exec(authorization)?.[1] ?? "";
+	let access = await copilotGateFor(token);
+	if (access === "none") return json(NO_SEAT, { status: 403 });
+	// GitHub exchanges only Copilot's own clients' tokens. It refuses a GitHub App's user token with
+	// a page that says nothing about the account, and a personal access token as not found.
+	if (access === "refused") {
+		return new Response(
+			"403 Forbidden. For more on scraping GitHub, see the Terms of Service.\n",
+			{ status: 403, headers: { "content-type": "text/plain; charset=utf-8" } },
+		);
+	}
+	if (/^(ghp|github_pat)_/.test(token)) return json({ message: "Not Found" }, { status: 404 });
+	if (access === "unknown") return json({ message: "Service Unavailable" }, { status: 503 });
+	return json({ token: `tid=e2e;${token}`, expires_at: Math.floor(Date.now() / 1000) + 1_800 });
+}
+
+/** Copilot's model list, asked with a GitHub token itself, which it takes from a seat-holder. */
+async function copilotModels(authorization: string): Promise<Response> {
+	// A GitHub token Copilot takes itself, or the Copilot token GitHub exchanged one for.
+	let token = (/^Bearer (\S+)$/.exec(authorization)?.[1] ?? "").replace(/^tid=e2e;/, "");
+	let access = await copilotGateFor(token);
+	if (access === "unknown") return new Response("service unavailable", { status: 503 });
+	if (access === "none" || !/^(ghu_e2e|ghp|github_pat)_/.test(token)) {
+		return new Response("unauthorized: token authentication failed", { status: 401 });
+	}
+	let handle = /^ghu_e2e_(.+)_\d+$/.exec(token)?.[1];
+	if (PREVIEW_ACCOUNT.test(token)) return json(PREVIEW_MODELS);
+	return json(handle?.startsWith(COPILOT_LISTER) ? LISTED_MODELS : { data: [{ id: "gpt-e2e" }] });
+}
+
 function json(value: unknown, init: ResponseInit = {}): Response {
 	return Response.json(value, init);
 }
@@ -229,6 +366,7 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 	if (url.origin === "https://api.github.com") {
 		let requestHeaders = new Headers(init?.headers);
 		let authorization = requestHeaders.get("authorization") ?? "";
+		if (url.pathname === "/copilot_internal/v2/token") return copilotToken(authorization);
 		let app = await asTheApp(url, authorization, init);
 		if (app) return app;
 		let authorized = /^Bearer ghu_e2e_(.+)_\d+$/.exec(authorization);
@@ -238,6 +376,9 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 			if (handle.startsWith(SCORE_OUTSIDER) && repository.name === "score") return [];
 			if (handle.startsWith(SCORE_READER) && repository.name === "score") {
 				return [{ ...repository, permissions: { ...repository.permissions, push: false } }];
+			}
+			if (handle.startsWith(SCORE_ADMIN) && repository.name === "score") {
+				return [{ ...repository, permissions: { ...repository.permissions, admin: true } }];
 			}
 			return handle.startsWith("document-creator-") && CREATOR_WRITABLE.has(repository.name)
 				? [{ ...repository, permissions: { ...repository.permissions, push: true } }]
@@ -300,7 +441,7 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 					permissions: {
 						...value.permissions,
 						pull: gate === "revoked" ? false : value.permissions.pull,
-						push: false,
+						push: gate === "writer",
 					},
 				}));
 			}
@@ -358,6 +499,18 @@ let fake = async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof f
 		);
 		if (repository) return json(repository);
 		return json({ message: "Not Found" }, { status: 404 });
+	}
+	if (url.origin === "https://models.dev" && url.pathname === "/api.json") {
+		return json(MODEL_CATALOG);
+	}
+	if (url.origin === "https://api.githubcopilot.com" && url.pathname === "/models") {
+		return copilotModels(new Headers(init?.headers).get("authorization") ?? "");
+	}
+	if (url.origin === "https://api.openai.com" && url.pathname === "/v1/models") {
+		let key = new Headers(init?.headers).get("authorization") ?? "";
+		return key.startsWith(`Bearer ${OPENAI_KEY}`)
+			? json({ object: "list", data: [] })
+			: json({ error: { message: "Incorrect API key provided." } }, { status: 401 });
 	}
 	return network(input, init);
 };

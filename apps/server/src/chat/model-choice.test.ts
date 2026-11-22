@@ -7,12 +7,19 @@ import { openPlan } from "../testing/plan";
 import { expectPlain } from "../testing/plain-words";
 import { broadcast, tell } from "../wire";
 import { authenticatedMemory } from "./job-authenticated-memory.test-fixtures";
-import { chooseModel, modelState, publishModelState, turnModel } from "./model-choice";
+import {
+	chooseModel,
+	modelState,
+	publishModelState,
+	sessionModel,
+	turnModel,
+} from "./model-choice";
 import * as Chat from "./service";
 
 import type { HarnessV1 } from "@ai-sdk/harness";
 import type { Chat as Wire } from "@chopin/protocol";
 import type { ModelChoiceDeps } from "./model-choice";
+import type { PlannerChoice } from "../harness/session";
 import type { Socket } from "../wire";
 
 afterEach(() => Chat.holdStarts(false));
@@ -568,6 +575,94 @@ describe("what the next turn runs", () => {
 		});
 	});
 
+	test("waits for a harness that has yet to say what it offers, then runs the stored choice", async () => {
+		let offered: Wire.ModelCatalog | undefined = catalog;
+		let { deps, opened, choose } = await sets(() => offered);
+		await choose({ model: "acme/large", thinkingLevel: "high" });
+		// A client attached after a restart and has yet to report its models.
+		offered = undefined;
+		let reported = Promise.withResolvers<void>();
+		let fellBack = 0;
+		deps.known = () => offered !== undefined;
+		deps.offered = () => reported.promise;
+		deps.fellBack = () => fellBack++;
+		let settled = false;
+		let turn = turnModel(deps, opened.channel.id).then(value => {
+			settled = true;
+			return value;
+		});
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+		offered = catalog;
+		reported.resolve();
+		expect(await turn).toEqual({ model: "acme/large", thinkingLevel: "high" });
+		expect(fellBack).toBe(0);
+	});
+
+	test("falls back, and says so, when the wait ends with nothing offered", async () => {
+		let offered: Wire.ModelCatalog | undefined = catalog;
+		let { deps, opened, choose } = await sets(() => offered);
+		await choose({ model: "acme/large", thinkingLevel: "high" });
+		offered = undefined;
+		let fellBack = 0;
+		deps.known = () => false;
+		deps.offered = async () => {};
+		deps.fellBack = () => fellBack++;
+		expect(await turnModel(deps, opened.channel.id)).toEqual({
+			notice: "Large is no longer available, so chopin used its default model.",
+		});
+		expect(fellBack).toBe(1);
+	});
+
+	test("opens a session on the stored choice once a harness that has yet to say what it offers does", async () => {
+		let offered: Wire.ModelCatalog | undefined = catalog;
+		let { deps, opened, choose } = await sets(() => offered);
+		await choose({ model: "acme/large", thinkingLevel: "high" });
+		offered = undefined;
+		let reported = Promise.withResolvers<void>();
+		deps.known = () => offered !== undefined;
+		deps.offered = () => reported.promise;
+		let settled = false;
+		let session = sessionModel(deps, opened.channel.id).then(value => {
+			settled = true;
+			return value;
+		});
+		await Bun.sleep(10);
+		expect(settled).toBe(false);
+		offered = catalog;
+		reported.resolve();
+		expect(await session).toEqual({ model: "acme/large", thinkingLevel: "high" });
+	});
+
+	test("waits once when nothing is offered in time: the session opens and the turn runs on the default", async () => {
+		let offered: Wire.ModelCatalog | undefined = catalog;
+		let { deps, opened, choose } = await sets(() => offered);
+		await choose({ model: "acme/large", thinkingLevel: "high" });
+		offered = undefined;
+		let known = false;
+		let waits = 0;
+		let fellBack = 0;
+		deps.known = () => known;
+		deps.offered = async () => void waits++;
+		deps.fellBack = () => {
+			fellBack++;
+			known = true;
+		};
+		expect(await sessionModel(deps, opened.channel.id)).toEqual({});
+		expect(await turnModel(deps, opened.channel.id)).toEqual({
+			notice: "Large is no longer available, so chopin used its default model.",
+		});
+		expect({ waits, fellBack }).toEqual({ waits: 1, fellBack: 1 });
+	});
+
+	test("does not wait for what a harness offers when no choice is stored", async () => {
+		let { deps, opened } = await sets(() => undefined);
+		deps.known = () => false;
+		deps.offered = () => new Promise<void>(() => {});
+		expect(await sessionModel(deps, opened.channel.id)).toEqual({});
+		expect(await turnModel(deps, opened.channel.id)).toEqual({});
+	});
+
 	test("falls back when the harness offers no catalog at all", async () => {
 		let offered: Wire.ModelCatalog | undefined = catalog;
 		let { deps, opened, choose } = await sets(() => offered);
@@ -866,5 +961,363 @@ describe("a document's commands in its model state", () => {
 		} finally {
 			console.error = error;
 		}
+	});
+});
+
+describe("a Planner session made again", () => {
+	/**
+	 * A document whose stored choice is not the harness's default, opened as after a restart: no
+	 * Planner session is held, so the next turn of any kind makes a new one.
+	 */
+	async function restarted() {
+		let { opened, deps, choose } = await sets();
+		await choose({ model: "acme/large", thinkingLevel: "high" });
+		let identity = await authenticatedMemory(opened);
+		let { fake, models, levels } = recordingPlanner();
+		let opens: Array<PlannerChoice | undefined> = [];
+		identity.context.modelChoice = () => turnModel(deps, opened.channel.id);
+		identity.context.sessionChoice = () => sessionModel(deps, opened.channel.id);
+		identity.context.openPlannerSession = (owner, channel) => {
+			opens.push(channel.choice);
+			return openPlannerSession(owner, channel, {
+				agent: createPlannerAgent(fake),
+				githubTools: async () => ({ ok: true, value: {} }),
+				createSandbox: async () =>
+					({
+						defaultWorkingDirectory: "/tmp",
+						async run() {
+							return { exitCode: 0, stdout: "", stderr: "" };
+						},
+						async destroy() {},
+					}) as never,
+				registerCredential: () => () => {},
+			});
+		};
+		let settle = async () => {
+			for (let attempt = 0; attempt < 300 && opened.plan.chat.busy; attempt++) await Bun.sleep(10);
+			await opened.plan.chat.running;
+		};
+		let finish = async () => {
+			identity.revokeAll();
+			await Plan.close(opened.plan);
+		};
+		return { opened, deps, identity, models, levels, opens, settle, finish };
+	}
+
+	let kinds: Record<string, (room: Awaited<ReturnType<typeof restarted>>) => Promise<unknown>> = {
+		"a person's message": async ({ identity, settle }) => {
+			let socket = { data: { handle: "ana", principalId: "U_test" }, send() {} } as never;
+			await Chat.send(identity.context, socket, {
+				kind: "chat:send",
+				rid: crypto.randomUUID(),
+				requestId: crypto.randomUUID(),
+				text: "hello",
+				to: "planner",
+				ts: 0,
+			});
+			await settle();
+		},
+		"an instruction nobody typed": async ({ identity, settle }) => {
+			await Chat.instruct(identity.context, "ana", "Finish existing work.", "Work finished.");
+			await settle();
+		},
+		"a background job": ({ identity }) =>
+			Chat.job(
+				identity.context,
+				{
+					id: "heading:document:m0",
+					kind: "heading",
+					target: "document",
+					trigger: "m0",
+					status: "running",
+					attempts: 0,
+					at: "2026-09-25T10:00:00.000Z",
+				},
+				"Draft the title and goal",
+				identity.sessionId,
+			),
+	};
+
+	for (let [kind, run] of Object.entries(kinds)) {
+		test(`runs the stored choice from its first turn: ${kind}`, async () => {
+			let room = await restarted();
+			let silenced = console.error;
+			console.error = () => {};
+			try {
+				// The pill shows the stored choice, not the default, before anything has run.
+				expect((await modelState(room.deps, room.opened.channel.id)).choice).toEqual({
+					model: "acme/large",
+					thinkingLevel: "high",
+				});
+				await run(room);
+			} finally {
+				console.error = silenced;
+				await room.finish();
+			}
+			expect(room.opens).toEqual([{ model: "acme/large", thinkingLevel: "high" }]);
+			expect(room.models).toEqual(["acme/large"]);
+			expect(room.levels).toEqual(["high"]);
+			// Making the session again never changed what is stored.
+			expect(await room.opened.storage.plannerModelChoices.get(room.opened.channel.id))
+				.toMatchObject({ model: "acme/large", thinkingLevel: "high", modelName: "Large" });
+		});
+	}
+});
+
+describe("the models a document's Planner last reported, while it has yet to say what it offers now", () => {
+	let earlier: Wire.ModelCatalog = {
+		models: [
+			{ id: "acme/large", name: "Large", thinkingLevels: ["low", "high"] },
+			{ id: "acme/retired", name: "Retired" },
+		],
+		default: { model: "acme/large" },
+	};
+	const MONA = "U_mona";
+	const HUBOT = "U_hubot";
+
+	async function unknownOffer() {
+		let offered: Wire.ModelCatalog | undefined;
+		let known = false;
+		let arrived: () => void = () => {};
+		let set = await sets(() => offered);
+		set.deps.known = () => known;
+		set.deps.lastKnown = async (_channelId, userId) =>
+			userId === MONA ? { catalog: earlier, reportedAt: new Date(1_000) } : undefined;
+		set.deps.offered = () => new Promise<void>(resolve => arrived = resolve);
+		let report = (catalog: Wire.ModelCatalog | undefined) => {
+			offered = catalog;
+			known = true;
+			arrived();
+		};
+		return { ...set, report };
+	}
+
+	test("are told to the account they were reported for alone, marked, and never once the offer is known", async () => {
+		let { deps, opened, report } = await unknownOffer();
+		let channel = opened.channel.id;
+		expect(await modelState(deps, channel, MONA)).toEqual({
+			kind: "chat:model",
+			ts: 0,
+			waiting: {},
+			lastKnown: { catalog: earlier, reportedAt: 1_000 },
+		});
+		// Nobody else is told mona's list, and the room's state names no one's.
+		expect(await modelState(deps, channel, HUBOT)).toEqual({
+			kind: "chat:model",
+			ts: 0,
+			waiting: {},
+		});
+		expect(await modelState(deps, channel)).toEqual({ kind: "chat:model", ts: 0, waiting: {} });
+		// Once the Planner reports, its list is the catalog, unmarked, and the old one is gone.
+		report(catalog);
+		expect(await modelState(deps, channel, MONA)).toEqual({ kind: "chat:model", ts: 0, catalog });
+		// It reported nothing to choose: still no old list, since the offer is known to be nothing.
+		report(undefined);
+		expect(await modelState(deps, channel, MONA)).toEqual({ kind: "chat:model", ts: 0 });
+	});
+
+	test("are given per person to whoever tells the room, only while the offer is unknown", async () => {
+		let { deps, opened, report } = await unknownOffer();
+		let channel = opened.channel.id;
+		let told: Array<{ state: Wire.ModelState; own?: Wire.ModelState; other?: Wire.ModelState }> =
+			[];
+		let deliver = async (
+			state: Wire.ModelState,
+			personal?: (viewer: string) => Promise<Wire.ModelState>,
+		) => {
+			told.push({
+				state,
+				...(personal ? { own: await personal(MONA), other: await personal(HUBOT) } : {}),
+			});
+		};
+		await publishModelState(deps, channel, deliver);
+		report(catalog);
+		await publishModelState(deps, channel, deliver);
+		expect(told).toEqual([
+			{
+				state: { kind: "chat:model", ts: 0, waiting: {} },
+				own: {
+					kind: "chat:model",
+					ts: 0,
+					waiting: {},
+					lastKnown: { catalog: earlier, reportedAt: 1_000 },
+				},
+				other: { kind: "chat:model", ts: 0, waiting: {} },
+			},
+			// Known: one state for everyone, broadcast as it is.
+			{ state: { kind: "chat:model", ts: 0, catalog } },
+		]);
+	});
+
+	test("a list that can't be read leaves the room's state as it is", async () => {
+		let { deps, opened } = await unknownOffer();
+		deps.lastKnown = () => Promise.reject(new Error("storage is down"));
+		let errors = console.error;
+		console.error = () => {};
+		try {
+			expect(await modelState(deps, opened.channel.id, MONA)).toEqual({
+				kind: "chat:model",
+				ts: 0,
+				waiting: {},
+			});
+		} finally {
+			console.error = errors;
+		}
+	});
+
+	test("a pick from them waits for what the Planner offers now, and is saved only if it offers it", async () => {
+		let { opened, replies, choose, broadcasts, report } = await unknownOffer();
+		let channel = opened.channel.id;
+		// Picked from the old list while the Planner starts: it waits for the Planner's own list.
+		let picking = choose({ model: "acme/large", thinkingLevel: "high" });
+		await Bun.sleep(5);
+		expect(replies).toEqual([]);
+		report(catalog);
+		await picking;
+		expect(await opened.storage.plannerModelChoices.get(channel)).toMatchObject({
+			model: "acme/large",
+			thinkingLevel: "high",
+		});
+		expect(replies.at(-1)).toMatchObject({ kind: "chat:model", catalog });
+		expect(broadcasts().at(-1)).toMatchObject({ kind: "chat:model", catalog });
+	});
+
+	test("a pick the Planner's list now lacks is refused, and nothing is saved", async () => {
+		let { opened, replies, choose, report } = await unknownOffer();
+		let picking = choose({ model: "acme/retired" });
+		report(catalog);
+		await picking;
+		expect(replies.map(reply => reply.message)).toEqual(["That model isn't available."]);
+		expect(await opened.storage.plannerModelChoices.get(opened.channel.id)).toBeUndefined();
+	});
+
+	test("a pick while no Planner has said anything is refused in plain words, and nothing is saved", async () => {
+		let { deps, opened, replies, choose, broadcasts } = await unknownOffer();
+		// Nothing attached to wait for: the wait ends at once, and the offer is still unknown.
+		deps.offered = async () => {};
+		await choose({ model: "acme/large" });
+		expect(replies.map(reply => reply.message)).toEqual([
+			"The machine's models are still loading, so this choice wasn't saved. Choose again once they're in.",
+		]);
+		expectPlain(String(replies[0]!.message), "a refused model choice");
+		expect(await opened.storage.plannerModelChoices.get(opened.channel.id)).toBeUndefined();
+		expect(broadcasts()).toEqual([]);
+	});
+});
+
+describe("the models a person's own AI accounts offer, while the Planner has yet to say what it offers", () => {
+	let fromAccounts: Wire.ModelCatalog = {
+		models: [
+			{ id: "acme/large", name: "Large", thinkingLevels: ["low", "high"] },
+			{ id: "acme/new", name: "New" },
+		],
+	};
+	let earlier: Wire.ModelCatalog = {
+		models: [{ id: "acme/large", name: "Large", thinkingLevels: ["low", "high"] }],
+		default: { model: "acme/large", thinkingLevel: "high" },
+	};
+	const MONA = "U_mona";
+	const HUBOT = "U_hubot";
+
+	async function unknownOffer() {
+		let offered: Wire.ModelCatalog | undefined;
+		let known = false;
+		let set = await sets(() => offered);
+		set.deps.known = () => known;
+		set.deps.accounts = async userId => userId === MONA ? fromAccounts : undefined;
+		set.deps.lastKnown = async (_channelId, userId) =>
+			userId === MONA || userId === HUBOT
+				? { catalog: earlier, reportedAt: new Date(1_000) }
+				: undefined;
+		let report = (catalog: Wire.ModelCatalog | undefined) => {
+			offered = catalog;
+			known = true;
+		};
+		return { ...set, report };
+	}
+
+	test("are told to that person alone, ahead of the list from last time, with its default where they offer it", async () => {
+		let { deps, opened, report } = await unknownOffer();
+		let channel = opened.channel.id;
+		expect(await modelState(deps, channel, MONA)).toEqual({
+			kind: "chat:model",
+			ts: 0,
+			waiting: {},
+			accounts: {
+				catalog: { ...fromAccounts, default: { model: "acme/large", thinkingLevel: "high" } },
+			},
+		});
+		// Hubot's own accounts gave nothing Chopin can list: his list from last time, never Mona's.
+		expect(await modelState(deps, channel, HUBOT)).toEqual({
+			kind: "chat:model",
+			ts: 0,
+			waiting: {},
+			lastKnown: { catalog: earlier, reportedAt: 1_000 },
+		});
+		expect(await modelState(deps, channel)).toEqual({ kind: "chat:model", ts: 0, waiting: {} });
+		// The Planner's own list replaces both, unmarked.
+		report(catalog);
+		expect(await modelState(deps, channel, MONA)).toEqual({ kind: "chat:model", ts: 0, catalog });
+		expect(await modelState(deps, channel, HUBOT)).toEqual({ kind: "chat:model", ts: 0, catalog });
+	});
+
+	test("take no default their accounts don't offer, and none with no list from last time", async () => {
+		let { deps, opened } = await unknownOffer();
+		let channel = opened.channel.id;
+		deps.lastKnown = async () => ({
+			catalog: { models: [{ id: "acme/gone", name: "Gone" }], default: { model: "acme/gone" } },
+			reportedAt: new Date(1_000),
+		});
+		expect(await modelState(deps, channel, MONA)).toMatchObject({
+			accounts: { catalog: fromAccounts },
+		});
+		deps.lastKnown = async () => undefined;
+		expect(await modelState(deps, channel, MONA)).toEqual({
+			kind: "chat:model",
+			ts: 0,
+			waiting: {},
+			accounts: { catalog: fromAccounts },
+		});
+	});
+
+	test("that can't be read leave the list from last time, and the room's state, as they are", async () => {
+		let { deps, opened } = await unknownOffer();
+		deps.accounts = () => Promise.reject(new Error("GitHub is down"));
+		let errors = console.error;
+		console.error = () => {};
+		try {
+			expect(await modelState(deps, opened.channel.id, MONA)).toEqual({
+				kind: "chat:model",
+				ts: 0,
+				waiting: {},
+				lastKnown: { catalog: earlier, reportedAt: 1_000 },
+			});
+		} finally {
+			console.error = errors;
+		}
+	});
+
+	test("are given per person to whoever tells the room", async () => {
+		let { deps, opened } = await unknownOffer();
+		deps.lastKnown = undefined;
+		let told: Array<Wire.ModelState | undefined> = [];
+		await publishModelState(deps, opened.channel.id, async (state, personal) => {
+			told.push(state, await personal?.(MONA), await personal?.(HUBOT));
+		});
+		expect(told).toEqual([
+			{ kind: "chat:model", ts: 0, waiting: {} },
+			{ kind: "chat:model", ts: 0, waiting: {}, accounts: { catalog: fromAccounts } },
+			{ kind: "chat:model", ts: 0, waiting: {} },
+		]);
+	});
+
+	test("a pick from them is saved only once the Planner offers it", async () => {
+		let { deps, opened, replies, choose } = await unknownOffer();
+		deps.offered = async () => {};
+		await choose({ model: "acme/new" });
+		expect(replies.map(reply => reply.message)).toEqual([
+			"The machine's models are still loading, so this choice wasn't saved. Choose again once they're in.",
+		]);
+		expect(await opened.storage.plannerModelChoices.get(opened.channel.id)).toBeUndefined();
 	});
 });

@@ -4,6 +4,7 @@ import * as Chat from "../chat/service";
 import { handler, TOOLS } from "../mcp";
 import { rooted } from "../testing/rooted";
 import { invokeRouted, MAX_SYSTEM_TURNS_PER_HOUR, SystemTurns } from "./invoke";
+import { testLease } from "../storage/contract-support";
 
 let cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -61,6 +62,23 @@ test("invoke_planner is available only with its capability and returns the docum
 	expect(received).toEqual([{ caller: "octocat", input }]);
 });
 
+test("tools/list declares invoke_planner's optional idempotencyKey, so a client can tell retries replay", async () => {
+	let mcp = endpoint({
+		async invoke() {
+			return { kind: "invoked", document: { id: "id", title: "Document", url: "/document" } };
+		},
+	});
+	let listed = (await call(mcp, "tools/list")).result.tools.find(
+		(tool: { name: string }) => tool.name === "invoke_planner",
+	);
+	expect(listed.inputSchema.properties.idempotencyKey).toMatchObject({
+		type: "string",
+		minLength: 1,
+		maxLength: 128,
+	});
+	expect(listed.inputSchema.required).not.toContain("idempotencyKey");
+});
+
 test("invoke_planner validates strict arguments and counts instruction bytes without rewriting text", async () => {
 	let received: InvokePlannerInput[] = [];
 	let mcp = endpoint({
@@ -84,6 +102,11 @@ test("invoke_planner validates strict arguments and counts instruction bytes wit
 			{ ...valid, extra: true },
 			{ ...valid, as: "member" },
 			{ ...valid, as: true },
+			{ ...valid, idempotencyKey: "" },
+			{ ...valid, idempotencyKey: " \t" },
+			{ ...valid, idempotencyKey: "k".repeat(129) },
+			{ ...valid, idempotencyKey: 7 },
+			{ ...valid, idempotencyKey: null },
 		]
 	) {
 		let result = await call(mcp, "tools/call", { name: "invoke_planner", arguments: args });
@@ -100,6 +123,11 @@ test("invoke_planner validates strict arguments and counts instruction bytes wit
 		(await call(mcp, "tools/call", { name: "invoke_planner", arguments: system })).result.isError,
 	).toBeUndefined();
 	expect(received).toEqual([exact, system]);
+	let keyed = { ...valid, idempotencyKey: "é".repeat(128) };
+	expect(
+		(await call(mcp, "tools/call", { name: "invoke_planner", arguments: keyed })).result.isError,
+	).toBeUndefined();
+	expect(received).toEqual([exact, system, keyed]);
 });
 
 test("invoke_planner exposes each refusal as an object code", async () => {
@@ -115,6 +143,7 @@ test("invoke_planner exposes each refusal as an object code", async () => {
 			"planner-busy",
 			"system-turn-forbidden",
 			"system-turn-limited",
+			"idempotency-conflict",
 		] as const
 	) {
 		let mcp = endpoint({ invoke: async () => ({ kind: "refused", code }) });
@@ -294,7 +323,11 @@ test("invoke_planner on a root runs on its own Chat without a focus", async () =
 
 test("invoke_planner on a child that no longer belongs to its root fails closed", async () => {
 	let { child, invoke, opened, released, root, storage } = await routed();
-	await storage.channels.archive({ id: root.channel.id, now: new Date() });
+	await storage.channels.archive({
+		id: root.channel.id,
+		now: new Date(),
+		lease: await testLease(storage),
+	});
 	expect(await invoke(child.channel.id)).toBe("document-archived");
 	await storage.channels.restore({ id: root.channel.id, now: new Date() });
 	// The caller's located repository is not the root's: ChildDocuments refuses it.

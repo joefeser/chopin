@@ -70,7 +70,9 @@ and the WebSocket intersect that identity's repository role with repositories
 selected in a GitHub App installation. The external MCP endpoint and the
 agent connection instead check their caller-supplied GitHub bearer token directly.
 Every path applies the instance admission policy. Under `HARNESS=remote` the
-server calls no model provider; the attached client does.
+server runs no model itself; the attached client does, and a client that takes
+people's AI accounts in Chopin reaches its providers through the server's AI
+credential proxy, which alone holds their keys.
 
 The application holds an exclusive database-wide writer lease and stops if it can
 no longer renew it. By default it refuses to start beside another active Chopin
@@ -154,13 +156,13 @@ the `chopin.agent.v1` subprotocol and carries a GitHub bearer, checked like
 needs push or administration access to its repository, rechecked before every
 session and turn and periodically while attached. Attaching makes the account's
 live browser login the document's Planner owner, one client per document; a
-document without one saves `@chopin` and `invoke_planner` until a client attaches. The connection closes when that login ends or the document's
-Planner is reset.
+document without one refuses `@chopin` and `invoke_planner` with
+`planner-not-attached` and keeps nothing for when a client attaches. The
+connection closes when that login ends or the document's Planner is reset.
 Turns run on the client's model; Chopin's host
 tools, Decisions, and room writes still run in the server under the document's
 Planner owner and the permission checks above. The client sees what a turn sees
-and steers its document writes during turns writers start; its run reports never
-start a turn. See [Remote Planner](hosted-agent.md#remote-planner) and
+and steers its document writes during turns writers start. See [Remote Planner](hosted-agent.md#remote-planner) and
 [Agent connection](agent-connection.md).
 
 ## State ownership

@@ -17,14 +17,12 @@ export declare namespace Chat {
 		| Request<Retry>
 		| Request<OpenThread>
 		| Request<Abort>
-		| Request<Resume>
-		| Request<PauseRun>
-		| Request<ResumeRun>
 		| Request<Wake>
 		| Request<React>
 		| Request<SetParticipation>
 		| Request<SetModel>
-		| Request<Typing>;
+		| Request<Typing>
+		| Request<Pacing>;
 
 	export type Outgoing =
 		| History
@@ -46,7 +44,8 @@ export declare namespace Chat {
 		| Reactions
 		| ParticipationState
 		| ModelState
-		| ModelUnreadable;
+		| ModelUnreadable
+		| Typists;
 
 	/** Who said something. The agent is not a member, so it is named apart. */
 	export type Author =
@@ -195,6 +194,18 @@ export declare namespace Chat {
 		refused?: true;
 		/** Milliseconds, once finished. */
 		took?: number;
+		/**
+		 * Where the call goes among its entry's tool calls: how many the server had filed under the
+		 * entry before it. It never changes. Absent on a call saved before it existed, which keeps
+		 * its place in the stored list.
+		 */
+		order?: number;
+		/**
+		 * How many times the server has reported the call, this report included. A `chat:tool` with
+		 * one carries the whole call as the server held it then, so the report of the larger one is
+		 * the newer, whichever arrives first. Absent on a call saved before it existed.
+		 */
+		rev?: number;
 	};
 
 	/**
@@ -236,6 +247,13 @@ export declare namespace Chat {
 		author: Author;
 		text: string;
 		ts: number;
+		/**
+		 * Where the server put the entry among those of its second: entries are read by `ts`, then
+		 * by `seq`. It only grows in a transcript, past every entry and snapshot (`History.seq`)
+		 * before it, and an entry also in a thread has the same one in both. Absent on an entry saved
+		 * before it existed, which keeps its place in the stored list among those of its second.
+		 */
+		seq?: number;
 		/**
 		 * Images the agent's turn made or showed, in order, on the turn's first message that has one.
 		 * Absent on any other entry.
@@ -279,6 +297,11 @@ export declare namespace Chat {
 		 * `channelId` the child document holding the thread, absent when it is this one.
 		 */
 		comment?: { thread: string; excerpt: string; note: string; channelId?: string };
+		/**
+		 * A system notice that the Planner created a top-level document; text remains its fallback.
+		 * `path` is the document's address when it was created, which still opens it after a rename.
+		 */
+		document?: { channelId: string; title: string; path: string };
 		/** True while the agent is still writing this one. */
 		streaming?: boolean;
 		tools?: Activity[];
@@ -310,6 +333,11 @@ export declare namespace Chat {
 		 * Only a member's or the Planner's message carries any.
 		 */
 		reactions?: Reaction[];
+		/**
+		 * Grows each time `reactions` changes: of two copies of the message, the one with the larger
+		 * `reactionsSeq` has the newer list. Absent until someone first reacts.
+		 */
+		reactionsSeq?: number;
 	};
 
 	/**
@@ -319,12 +347,15 @@ export declare namespace Chat {
 	 * reached, and `dropped` the machine's connection going while it replied (the connection's to
 	 * tell, not a failure to retry). `request` is the member message that began the turn, and
 	 * `focus` the child document that was open when it was sent, so a retry is the same turn.
+	 * `code` is `no-ai-account` where the session was not started because the account its AI
+	 * launch is for has no AI account Chopin can use, as a message is refused with that code.
 	 */
 	export type TurnFailure = {
 		kind: "error" | "refused" | "tool" | "timed-out" | "unreachable" | "dropped";
 		detail?: string;
 		request?: string;
 		focus?: string;
+		code?: "no-ai-account";
 	};
 
 	/** One emoji on a message and everyone who used it. The emoji is kept exactly as sent. */
@@ -349,53 +380,6 @@ export declare namespace Chat {
 		 */
 		quiet?: boolean;
 	};
-
-	/** One stage of a workflow run, in the order the run reached it. */
-	export type RunStage = {
-		id: string;
-		name: string;
-		/** IDs of parent stages in this report; absent in older or topology-free reports. */
-		parentIds?: string[];
-		/** A `ctx.tool` step rather than an agent stage. */
-		kind?: "tool";
-		status:
-			| "pending"
-			| "running"
-			| "awaiting_input"
-			| "paused"
-			| "blocked"
-			| "completed"
-			| "failed"
-			| "skipped"
-			| "stopped";
-		/** Seconds since the epoch. */
-		started?: number;
-		ended?: number;
-	};
-
-	/** An Atomic workflow run the Planner started and still carries after its turn. */
-	export type Run = {
-		id: string;
-		name: string;
-		status: "running" | "waiting" | "paused" | "finished" | "blocked" | "failed" | "stopped";
-		/** Seconds since the epoch. */
-		started: number;
-		updated: number;
-		ended?: number;
-		/** The most recent stages, in the order the run reached them. */
-		stages: RunStage[];
-		/** Stages reached before the ones listed. */
-		earlierStages?: number;
-		/** Decisions questions the run is waiting on. */
-		waiting: number;
-		/**
-		 * The Planner's connection dropped while this run was live: Chopin keeps the card as
-		 * last reported, and the run goes on when the Planner reconnects. Absent otherwise.
-		 */
-		disconnected?: true;
-	};
-
-	export type Runs = Run[];
 
 	/**
 	 * Shared automatic participation; direct Planner messages still work while paused. `alone` says
@@ -461,9 +445,30 @@ export declare namespace Chat {
 		 * attached, or one that offered its models and has yet to report them), with the stored
 		 * choice and its name, if any: what a composer shows while it waits for the models. It is
 		 * not `choice`, which says only what a known offer honours or not. Absent once the offer is
-		 * known, though it may be nothing, and for every harness that always knows.
+		 * known, though it may be nothing, and for every harness that always knows. `outdated` says
+		 * the document's Planner can't list the models of the AI accounts it runs on as they are now
+		 * without an update, so they are not on their way.
 		 */
-		waiting?: { choice?: ModelChoice; modelName?: string };
+		waiting?: { choice?: ModelChoice; modelName?: string; outdated?: true };
+		/**
+		 * Sent to one person only, while what the harness offers is not known: the models the
+		 * document's Planner last reported for that person's own account, and when (milliseconds
+		 * since the epoch). It is not `catalog`: a composer shows it marked as the last known list
+		 * until a catalog arrives, and the server checks a choice against the catalog alone, so one
+		 * picked from this list is saved only if the Planner offers it once it reports. Absent once
+		 * the offer is known, and where no list was kept for that account.
+		 */
+		lastKnown?: { catalog: ModelCatalog; reportedAt: number };
+		/**
+		 * Sent to one person only, while what the harness offers is not known, ahead of `lastKnown`
+		 * and in its place: the models that person's own AI accounts offer, as Chopin lists them
+		 * itself, with no agent, the way an agent on a launch for them lists its own. Its default is
+		 * the one of their list from last time, where it offers that model. It is not `catalog`
+		 * either: a composer shows it marked as the models from their accounts until a catalog
+		 * arrives, and a choice picked from it is checked against the catalog alone. Absent once the
+		 * offer is known, and where Chopin can list nothing of their accounts.
+		 */
+		accounts?: { catalog: ModelCatalog };
 		/**
 		 * What `/` offers beyond Chopin's own commands: the commands the document's agent reports,
 		 * in the order, spelling and with the duplicates it reported them. Absent where it
@@ -475,8 +480,8 @@ export declare namespace Chat {
 
 	/**
 	 * One command the document's agent offers. `kind` says what it is, as the agent defines it:
-	 * `skill`, `prompt` (a prompt template) and `workflow` are the ones Chopin knows. A command
-	 * is run as `/name args`, except a workflow, which is asked for by name.
+	 * `skill` and `prompt` (a prompt template) are the ones Chopin knows. A command of any kind is
+	 * run as `/name args`.
 	 */
 	export type CommandOption = { name: string; description?: string; kind: string };
 
@@ -496,15 +501,76 @@ export declare namespace Chat {
 	 */
 	export type SetModel = KIND<"chat:model"> & ModelChoice;
 
-	/** Ephemeral composer activity, with no draft content. */
-	export type Typing = KIND<"chat:typing"> & { active: boolean };
+	/**
+	 * Ephemeral composer activity, with no draft content, for the person and document of the
+	 * connection it is sent on. `active` is true from an edit and false once the sender sends, clears
+	 * the draft, leaves the field or makes no edit for five seconds. While edits keep coming a report
+	 * is sent at most every two seconds, the last of them carrying the latest edit. `at`, required
+	 * while active, is when that edit was made in the server's milliseconds: the client places it by
+	 * taking the `now` of its connection's `session:hello` as the server's time when the hello arrived,
+	 * so it is never later than the edit was on the server's clock (but for the client's clock gaining
+	 * since) and earlier by the hello's transit at most. The writer is shown until five seconds after
+	 * `at`: a report that arrives later than that shows no one and changes nothing, and so does one
+	 * whose `at` is more than a second past the server's clock (one within it counts as now).
+	 * `thread` names the thread's root message when the composer is a thread's, and is absent for
+	 * Chat. `seq` rises with each report a tab sends: the server keeps each connection's newest per
+	 * place and ignores an older or repeated one. A report is never kept to send again on another
+	 * connection. It is shown and nothing more: automatic participation reads `Pacing`.
+	 */
+	export type Typing = KIND<"chat:typing"> & {
+		active: boolean;
+		thread?: string;
+		seq?: number;
+		at?: number;
+	};
+
+	/**
+	 * Whether the sender is writing in Chat, for automatic participation alone: who counts as alone
+	 * with the Planner and when a reply waiting for silence starts. Sent by Chat's composer while
+	 * automatic participation is on, with no draft content: `true` on an edit, at most every two
+	 * seconds while edits keep coming, and `false` once the sender sends, leaves the field or makes
+	 * no edit for two and a half seconds. Never shown.
+	 */
+	export type Pacing = KIND<"chat:pacing"> & { active: boolean };
+
+	/**
+	 * Someone writing in Chat (`thread` absent) or in a thread: a person whose composer says so, or
+	 * the Planner while a turn there is writing its reply. `since` is when they began, in the server's
+	 * milliseconds, and orders them.
+	 */
+	export type Typist = {
+		author: { kind: "member"; handle: string } | { kind: "agent" };
+		thread?: string;
+		since: number;
+	};
+
+	/**
+	 * Everyone writing in Chat and its threads now, but the person it is sent to: presence, never
+	 * saved. Sent to everyone who can read the document when it changes, and on join after the
+	 * history, empty or not, each time once a fresh check of the recipient's access allows it; a
+	 * roster names a person only once a fresh check finds they can still write. Each replaces the one
+	 * before. They are ordered by `generation`, which a later opening of the document's room has
+	 * larger, then by `seq`, which rises with each change: an older one is ignored.
+	 */
+	export type Typists = KIND<"chat:typists"> & {
+		generation: number;
+		seq: number;
+		typists: Typist[];
+	};
 
 	/** Everything said so far, sent on join. */
 	export type History = KIND<"chat:history"> & {
 		entries: Entry[];
+		/**
+		 * At least every entry's `seq` in `entries` and smaller than any appended after, and larger
+		 * once an entry is taken out: an entry whose `seq` is at most this and that `entries` lacks
+		 * had been taken out. A history with a smaller one than a history already applied is older
+		 * than it. The server saves it with the transcript, so it never goes back, even across a
+		 * restart whose clock is behind.
+		 */
+		seq?: number;
 		busy: boolean;
 		turn?: Turn;
-		runs?: Runs;
 		participation?: Participation;
 	};
 
@@ -512,16 +578,24 @@ export declare namespace Chat {
 	export type Message = KIND<"chat:message"> & { entry: Entry };
 
 	/** Text appended to an entry still being written. */
-	export type Delta = KIND<"chat:delta"> & { id: string; text: string };
+	export type Delta = KIND<"chat:delta"> & {
+		id: string;
+		text: string;
+		/**
+		 * Where in the entry's text the piece begins. A client that already holds it, after a
+		 * reconnect or a second copy, does not add it again, and keeps one that begins past its text
+		 * until the text before it arrives. Absent from older servers.
+		 */
+		at?: number;
+	};
 
 	/** A tool call starting, or finishing. */
 	export type Tool = KIND<"chat:tool"> & { entry: string; activity: Activity };
 
-	/** Whether a turn is running, and for whom, and any workflow runs outliving it. */
+	/** Whether a turn is running, and for whom. */
 	export type State = KIND<"chat:state"> & {
 		busy: boolean;
 		turn?: Turn;
-		runs?: Runs;
 	};
 
 	export type Destination = "room" | "planner";
@@ -531,9 +605,15 @@ export declare namespace Chat {
 	 *
 	 * To the room, always accepted. To the Planner: with no turn running it starts one; while a
 	 * turn runs it is posted at once and given to that turn, to be read at its next step, when
-	 * the document's harness takes input mid-run. Otherwise it is refused (`planner-busy` while
-	 * a turn runs that cannot take it, `planner-not-attached` where no machine can), and nothing
-	 * is held for later. The same write access as starting a turn is required.
+	 * the document's harness takes input mid-run. While a background job's turn runs, a turn is
+	 * being stopped or finishing, or one of Chopin's own turns is being handed the Chat, it is saved
+	 * and acknowledged at once and starts the next turn, ahead of anything waiting. While another
+	 * person's turn waits to start, it is saved and given to that turn once it can take one.
+	 * Otherwise it is refused and saves nothing: `planner-busy` where a harness that takes no input
+	 * mid-run cannot be given it while a turn runs, `planner-starting` where another person's turn
+	 * waits to start on such a harness, `planner-not-attached` where no machine can take it,
+	 * `no-ai-account` where the sender has no AI account the Planner can use. A refusal is never
+	 * kept to send later. The same write access as starting a turn is required.
 	 */
 	export type Send = KIND<"chat:send"> & {
 		requestId: string;
@@ -579,7 +659,8 @@ export declare namespace Chat {
 	 * with `Retried`, tells the room with `Removed`, and runs the turn for `message` as it began the
 	 * first time. The agent is given the message once and nothing of the failed attempt (see
 	 * `retry-turn` in the agent connection). It takes the same write access as `Send`, and is
-	 * refused like it (`planner-not-attached`, `planner-busy`, or a passing trouble); nothing is held.
+	 * refused like it (`planner-not-attached`, `no-ai-account` or a passing trouble) and while a
+	 * turn runs; nothing is held.
 	 */
 	export type Retry = KIND<"chat:retry"> & {
 		message: string;
@@ -644,9 +725,10 @@ export declare namespace Chat {
 		root: Entry;
 		forkedAt: number;
 		entries: Entry[];
+		/** As `History.seq`, for the thread's entries; absent when the thread has none yet. */
+		seq?: number;
 		busy: boolean;
 		turn?: Turn;
-		runs?: Runs;
 		usage?: ContextUsage;
 		compactions?: CompactionRecord[];
 		compacting?: boolean;
@@ -700,19 +782,10 @@ export declare namespace Chat {
 	export type Sent = KIND<"chat:send"> & { id: string };
 
 	/**
-	 * Stop the running turn and pause the Planner's workflow runs. Anyone may;
-	 * the transcript records who did.
+	 * Stop the running turn, or withdraw the question a Planner waits on. Anyone may; the
+	 * transcript records who did.
 	 */
 	export type Abort = KIND<"chat:abort"> & { thread?: string };
-
-	/** Resume the workflow runs the Planner paused. Anyone may; the transcript records who did. */
-	export type Resume = KIND<"chat:resume"> & { thread?: string };
-
-	/** Pause one workflow run. Anyone may; the transcript records who did. */
-	export type PauseRun = KIND<"chat:pause-run"> & { runId: string; thread?: string };
-
-	/** Resume one paused workflow run. Anyone may; the transcript records who did. */
-	export type ResumeRun = KIND<"chat:resume-run"> & { runId: string; thread?: string };
 
 	/**
 	 * Ask a machine to start the document's Planner now, as sending it a message does, without
@@ -779,6 +852,8 @@ export declare namespace Chat {
 	export type Reactions = KIND<"chat:reactions"> & {
 		id: string;
 		reactions: Reaction[];
+		/** The message's `reactionsSeq` with this list. */
+		reactionsSeq?: number;
 		by?: string;
 		emoji?: string;
 		seq?: number;

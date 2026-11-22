@@ -196,6 +196,9 @@ test("account menu closes on Escape and outside click, and returns focus", async
 	await expect(menu).toBeVisible();
 	await page.keyboard.press("ArrowDown");
 	await expect(menu.getByRole("menuitem", { name: "Keyboard shortcuts" })).toBeFocused();
+	// The Theme row is one stop, at its chosen segment (theme.e2e.ts walks it).
+	await page.keyboard.press("ArrowDown");
+	await expect(menu.getByRole("menuitemradio", { name: "System", exact: true })).toBeFocused();
 	await page.keyboard.press("ArrowDown");
 	await expect(menu.getByRole("menuitem", { name: "Sign out" })).toBeFocused();
 	await page.keyboard.press("Escape");
@@ -609,10 +612,12 @@ test("a stale catalogue response cannot remove a newly created document", async 
 	let created = projects.locator('a[aria-current="page"]');
 	await expect(created).toBeVisible();
 	let createdTitle = (await created.textContent())!.trim();
-	await expect(projects.getByText("Loading more…", { exact: true })).toBeVisible();
+	// The catalogue read is held, so the list says it is busy, and says nothing on screen.
+	await expect(projects.locator('ul[aria-busy="true"]')).toHaveCount(1);
+	await expect(projects.getByText(/^Loading/)).toHaveCount(0);
 
 	release.resolve();
-	await expect(projects.getByText("Loading more…", { exact: true })).toHaveCount(0);
+	await expect(projects.locator('ul[aria-busy="true"]')).toHaveCount(0);
 	await expect(projects.getByRole("link", { name: createdTitle, exact: true }))
 		.toHaveAttribute("aria-current", "page");
 	await expect(projects.locator('a[aria-current="page"]')).toHaveCount(1);
@@ -667,7 +672,7 @@ test("document switches preserve navigation state and avoid catalogue reloads", 
 	await expect.poll(() => latestVisit()?.documentId).not.toBeUndefined();
 	let createdDocumentId = latestVisit()!.documentId!;
 	await announced;
-	await expect(projects.getByText("Loading more…", { exact: true })).toHaveCount(0);
+	await expect(projects.locator('ul[aria-busy="true"]')).toHaveCount(0);
 
 	let documentRoutePattern = "**/api/repositories/octo-org/score/documents/*";
 	let release = Promise.withResolvers<void>();
@@ -1093,9 +1098,10 @@ test("archiving offers Undo and archived mode names itself", async ({ join, room
 	await expect(projects.getByText("Projects", { exact: true })).toHaveCount(0);
 });
 
-test("writers can archive, restore, and permanently delete a document", async ({ join, room }) => {
+test("writers can archive and restore a document, and its creator can delete it", async ({ join, room }) => {
 	let ana = await join("ana");
 	let bo = await join("bo");
+	let creator = await join("e2e");
 	let title = `Test ${room.slice(0, 8)}`;
 	let path = roomPath(room);
 	let projects = sidebar(ana);
@@ -1142,9 +1148,17 @@ test("writers can archive, restore, and permanently delete a document", async ({
 
 	await headerAction(ana, "Archive");
 	await expect(content(ana)).toHaveAttribute("contenteditable", "false");
-	await headerAction(ana, "Delete permanently");
-	let confirmation = ana.getByRole("dialog", { name: "Delete document permanently?" });
-	await confirmation.getByRole("button", { name: "Delete permanently", exact: true }).click();
+	// A writer who didn't create it may archive it, never delete it.
+	await headerActions(ana).click();
+	await expect(ana.getByRole("menuitem", { name: "Restore", exact: true })).toBeVisible();
+	await expect(ana.getByRole("menuitem", { name: "Delete…", exact: true })).toHaveCount(0);
+	await ana.keyboard.press("Escape");
+
+	// Its creator may, archived as it is.
+	await headerAction(creator, "Delete…");
+	let confirmation = creator.getByRole("dialog", { name: "Delete document?" });
+	await confirmation.getByRole("button", { name: "Delete document", exact: true }).click();
+	await expect(creator).not.toHaveURL(path);
 	await expect(ana).not.toHaveURL(path);
 	await expect(bo).not.toHaveURL(path);
 	let unavailable = await ana.request.get(`/api/channels/${room}`);

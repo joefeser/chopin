@@ -1,7 +1,9 @@
 import { summarizeThread } from "@chopin/protocol/threads";
 
 import { broadcast, fail, PASSING, reply, tell } from "../wire";
+import { appendEntries, snapshotSeq, takeOut } from "./chronology";
 import * as Chat from "./service";
+import { NOTE_SENT, threadNote, threadNotesContext } from "./thread-notes";
 
 import type { Chat as Wire, Frame, Outgoing, Request } from "@chopin/protocol";
 import type { Server } from "bun";
@@ -9,6 +11,7 @@ import type { PlannerForkHooks } from "../harness/session";
 import type {
 	ChatSessionState,
 	ChatThreadForkState,
+	ChatThreadNote,
 	ChatThreadRecord,
 	EntryForkPoint,
 	JsonValue,
@@ -16,6 +19,7 @@ import type {
 } from "../storage/model";
 import type { ChatThreadStore } from "../storage/port";
 import type { Socket, SocketData } from "../wire";
+import type { TellChat } from "./thread-notes";
 
 export type ThreadPersistence = {
 	store: ChatThreadStore;
@@ -32,10 +36,11 @@ type ManagedThread = {
 	 * with Also send to Chat, and the Planner's answers to those sent to it, with their failures.
 	 */
 	copied: Set<string>;
-	/** The request id of a reply being sent with Also send to Chat, until the thread announces it. */
-	copyNext?: string;
+	/** The request ids of replies being sent with Also send to Chat, until the thread announces them. */
+	copyNext: Set<string>;
 	/** The reply to the Planner, also sent to Chat, whose turn's answer is copied into Chat. */
 	answering?: string;
+	saving?: Promise<void>;
 	/** Where the thread's session stood before the first turn for each message: a Retry goes back there. */
 	beforeTurn: Map<
 		string,
@@ -51,6 +56,16 @@ type ChannelThreads = {
 	atomicEntries?: JsonValue[];
 	atomicLeafId?: string | null;
 	lastRemoteTurn?: { session: string; turn: string };
+	/** What threads' Planners told the Chat's Planner, saved, that it has not read yet. */
+	notes: ChatThreadNote[];
+	/** Notes being saved: counted against the limits, and never given to a turn before they are. */
+	staged: ChatThreadNote[];
+	/** Every Decision card a thread's Planner sent a note for. */
+	notedQuestions: Set<string>;
+	/** The notes the Chat's last turn was given, for a Retry of that turn to be given again. */
+	given?: { entryId: string; notes: ChatThreadNote[] };
+	/** The session state's saves and the turns' taking of notes, one after another. */
+	sessionQueue: Promise<unknown>;
 };
 
 let channels = new WeakMap<Chat.Chat, ChannelThreads>();
@@ -62,6 +77,10 @@ function channelState(topChat: Chat.Chat): ChannelThreads {
 			loaded: false,
 			threads: new Map(),
 			entryForks: {},
+			notes: [],
+			staged: [],
+			notedQuestions: new Set(),
+			sessionQueue: Promise.resolve(),
 		};
 		channels.set(topChat, found);
 	}
@@ -91,11 +110,18 @@ function nowSeconds(): number {
 
 function buildManagedThread(topChat: Chat.Chat, record: ChatThreadRecord): ManagedThread {
 	let threadChat = Chat.restore(record.entries);
+	if (record.lastSeq !== undefined) {
+		threadChat.lastSeq = record.lastSeq;
+		// Chat holds copies of the thread's entries, stamped past both transcripts' last sequence.
+		topChat.lastSeq = Math.max(topChat.lastSeq ?? 0, record.lastSeq);
+	}
 	threadChat.forkBootstrap = structuredClone(record.forkState.bootstrapEntries);
 	threadChat.compactions = structuredClone(record.compactions);
 	threadChat.usage = record.usage ? structuredClone(record.usage) : undefined;
 	if (record.usage?.contextWindow) threadChat.contextWindow = record.usage.contextWindow;
 	(topChat.childChats ??= new Map()).set(record.rootId, threadChat);
+	threadChat.composing = (turn, writing) =>
+		topChat.typists?.composing(record.rootId, turn, writing);
 	// What is in both transcripts is one object, so what streams into the thread streams into Chat.
 	let copied = new Set<string>();
 	topChat.entries = topChat.entries.map(entry => {
@@ -105,13 +131,28 @@ function buildManagedThread(topChat: Chat.Chat, record: ChatThreadRecord): Manag
 		copied.add(entry.id);
 		return own;
 	});
-	return {
+	let managed: ManagedThread = {
 		record: structuredClone(record),
 		chat: threadChat,
 		untrackedAfterFork: [],
 		copied,
+		copyNext: new Set(),
 		beforeTurn: new Map(),
 	};
+	// An entry Chat will hold too is given a time and sequence that are right in both, before saving.
+	threadChat.sharedWith = entry => goesToChat(managed, entry) ? topChat : undefined;
+	return managed;
+}
+
+/**
+ * Whether a thread's entry is also in the top-level Chat: a reply sent with Also send to Chat, the
+ * Planner's answer to one sent to it, and the notice that its turn failed.
+ */
+function goesToChat(managed: ManagedThread, entry: Wire.Entry): boolean {
+	if (managed.copied.has(entry.id)) return true;
+	if (entry.author.kind === "member") return managed.copyNext.has(entry.id);
+	return entry.author.kind === "agent" && managed.answering !== undefined
+		|| entry.turnFailure?.request !== undefined && managed.copied.has(entry.turnFailure.request);
 }
 
 async function ensureLoaded(
@@ -136,6 +177,9 @@ async function ensureLoaded(
 				? structuredClone(sessionState.atomicEntries)
 				: undefined;
 			state.atomicLeafId = sessionState.atomicLeafId;
+			state.notes = structuredClone(sessionState.threadNotes ?? []);
+			state.notedQuestions = new Set(sessionState.notedQuestions ?? []);
+			state.given = sessionState.givenNotes ? structuredClone(sessionState.givenNotes) : undefined;
 			context.chat.compactions = structuredClone(sessionState.compactions);
 			context.chat.usage = sessionState.usage
 				? structuredClone(sessionState.usage)
@@ -159,14 +203,48 @@ async function ensureLoaded(
 	return state;
 }
 
-async function saveTopSessionState(
+/** Runs `work` after every save of the session state and taking of notes queued before it. */
+function inSessionQueue<T>(state: ChannelThreads, work: () => Promise<T> | T): Promise<T> {
+	let done = state.sessionQueue.catch(() => {}).then(work);
+	state.sessionQueue = done;
+	return done;
+}
+
+/**
+ * Saves the top-level session state. With `note`, the note is saved with it and only then joins
+ * the notes the next turn is given, before anything queued after it runs.
+ */
+function saveTopSessionState(
 	context: Chat.Room,
 	state: ChannelThreads,
 	override?: ThreadPersistence,
+	note?: ChatThreadNote,
 ): Promise<void> {
-	let persistence = resolvePersistence(context, override);
-	if (!persistence) return;
-	let record: ChatSessionState = {
+	return inSessionQueue(state, async () => {
+		await ensureLoaded(context, override);
+		let persistence = resolvePersistence(context, override);
+		if (persistence) {
+			await persistence.store.putSessionState(
+				persistence.lease(),
+				sessionRecord(context, state, note),
+			);
+		}
+		if (note) {
+			state.notes.push(note);
+			if (note.question) state.notedQuestions.add(note.question);
+		}
+	});
+}
+
+function sessionRecord(
+	context: Chat.Room,
+	state: ChannelThreads,
+	note?: ChatThreadNote,
+): ChatSessionState {
+	let notes = note ? [...state.notes, note] : state.notes;
+	let noted = new Set(state.notedQuestions);
+	if (note?.question) noted.add(note.question);
+	return {
 		channelId: context.room,
 		compactions: structuredClone(context.chat.compactions ?? []),
 		...(context.chat.usage ? { usage: structuredClone(context.chat.usage) } : {}),
@@ -177,25 +255,34 @@ async function saveTopSessionState(
 			}
 			: {}),
 		entryForks: structuredClone(state.entryForks),
+		...(notes.length ? { threadNotes: structuredClone(notes) } : {}),
+		...(noted.size ? { notedQuestions: [...noted] } : {}),
+		...(state.given ? { givenNotes: structuredClone(state.given) } : {}),
 		updatedAt: new Date(),
 	};
-	await persistence.store.putSessionState(persistence.lease(), record);
 }
 
 async function saveThreadRecord(
 	context: Chat.Room,
 	managed: ManagedThread,
 	override?: ThreadPersistence,
-	entries: readonly Wire.Entry[] = managed.chat.entries,
+	entries?: readonly Wire.Entry[],
 ): Promise<void> {
-	managed.record.entries = entries.map(Chat.publicEntry);
-	managed.record.compactions = structuredClone(managed.chat.compactions ?? []);
-	if (managed.chat.usage) managed.record.usage = structuredClone(managed.chat.usage);
-	else delete managed.record.usage;
-	managed.record.updatedAt = new Date();
-	let persistence = resolvePersistence(context, override);
-	if (!persistence) return;
-	await persistence.store.putThread(persistence.lease(), managed.record);
+	let task = async () => {
+		let current = entries ?? managed.chat.entries;
+		managed.record.entries = current.map(Chat.storedThreadEntry);
+		if (managed.chat.lastSeq !== undefined) managed.record.lastSeq = managed.chat.lastSeq;
+		managed.record.compactions = structuredClone(managed.chat.compactions ?? []);
+		if (managed.chat.usage) managed.record.usage = structuredClone(managed.chat.usage);
+		else delete managed.record.usage;
+		managed.record.updatedAt = new Date();
+		let persistence = resolvePersistence(context, override);
+		if (!persistence) return;
+		await persistence.store.putThread(persistence.lease(), managed.record);
+	};
+	let run = (managed.saving ?? Promise.resolve()).then(task, task);
+	managed.saving = run.catch(() => {});
+	return run;
 }
 
 /**
@@ -269,32 +356,38 @@ const THREAD_FRAME_KINDS = new Set<string>([
  * Their entries are one object in both transcripts, marked `fromThread`. What a Retry takes out of
  * the thread leaves Chat too.
  */
-function copyToChat(top: Chat.Room, managed: ManagedThread, frame: Frame): Outgoing | undefined {
+function copyToChat(
+	top: Chat.Room,
+	managed: ManagedThread,
+	frame: Frame,
+	override?: ThreadPersistence,
+): Outgoing | undefined {
 	let rootId = managed.record.rootId;
 	let topChat = top.chat;
 	let shared = (id: string) => managed.chat.entries.find(entry => entry.id === id);
 	switch (frame.kind) {
 		case "chat:message": {
 			let entry = (frame as Wire.Message).entry;
-			let copy = managed.copied.has(entry.id);
-			if (!copy && entry.author.kind === "member" && entry.id === managed.copyNext) {
-				managed.copyNext = undefined;
-				copy = true;
+			if (!goesToChat(managed, entry)) return undefined;
+			if (entry.author.kind === "member" && managed.copyNext.delete(entry.id)) {
 				if (entry.to === "planner") managed.answering = entry.id;
-			} else if (!copy) {
-				copy = entry.author.kind === "agent" && managed.answering !== undefined
-					|| entry.turnFailure?.request !== undefined
-						&& managed.copied.has(entry.turnFailure.request);
 			}
-			if (!copy) return undefined;
 			entry.fromThread = rootId;
 			let own = shared(entry.id);
 			if (own) own.fromThread = rootId;
 			if (!managed.copied.has(entry.id)) {
 				managed.copied.add(entry.id);
-				topChat.entries.push(own ?? structuredClone(entry));
+				let copied = own ?? structuredClone(entry);
+				appendEntries(topChat, copied);
+				entry.ts = copied.ts;
+				if (copied.seq !== undefined) entry.seq = copied.seq;
 			}
 			if (!entry.streaming) {
+				if (managed.record.lastSeq !== managed.chat.lastSeq) {
+					void saveThreadRecord(top, managed, override).catch(err =>
+						console.error("[chat] could not save a thread's message:", err)
+					);
+				}
 				void top.persist().catch(err =>
 					console.error("[chat] could not save a thread's message in Chat:", err)
 				);
@@ -309,8 +402,7 @@ function copyToChat(top: Chat.Room, managed: ManagedThread, frame: Frame): Outgo
 			let ids = (frame as Wire.Removed).ids.filter(id => managed.copied.has(id));
 			if (!ids.length) return undefined;
 			for (let id of ids) managed.copied.delete(id);
-			let gone = new Set(ids);
-			topChat.entries = topChat.entries.filter(entry => !gone.has(entry.id));
+			takeOut(topChat, ids);
 			void top.persist().catch(err =>
 				console.error("[chat] could not take a thread's retried reply out of Chat:", err)
 			);
@@ -334,6 +426,7 @@ function copyToChat(top: Chat.Room, managed: ManagedThread, frame: Frame): Outgo
 function wrapThreadServer(
 	top: Chat.Room,
 	managed: ManagedThread,
+	override?: ThreadPersistence,
 ): Server<SocketData> {
 	let server = top.server;
 	let room = top.room;
@@ -365,7 +458,7 @@ function wrapThreadServer(
 					try {
 						let parsed = JSON.parse(data) as Frame;
 						if (THREAD_FRAME_KINDS.has(parsed.kind)) {
-							let copied = copyToChat(top, managed, parsed);
+							let copied = copyToChat(top, managed, parsed, override);
 							let wrapped: Wire.InThread = {
 								kind: "chat:in-thread",
 								ts: parsed.ts || nowSeconds(),
@@ -452,6 +545,22 @@ export function bindTopLevel(
 					untrackedEntries,
 				};
 			},
+			async load() {
+				await ensureLoaded(context, override);
+			},
+			takeNotes(currentEntryId, retry) {
+				return inSessionQueue(state, async () => {
+					await ensureLoaded(context, override);
+					let replayed = retry && currentEntryId && state.given?.entryId === currentEntryId
+						? state.given.notes
+						: [];
+					let notes = [...replayed, ...state.notes];
+					if (!notes.length) return undefined;
+					state.notes = [];
+					state.given = currentEntryId ? { entryId: currentEntryId, notes } : undefined;
+					return threadNotesContext(notes);
+				});
+			},
 			async finishTurn(requestEntryId, turnEntries) {
 				let point: EntryForkPoint = {
 					...(state.atomicEntries?.length ? { atomicLeafId: state.atomicLeafId ?? null } : {}),
@@ -473,12 +582,60 @@ export function bindTopLevel(
 	};
 }
 
+/**
+ * How a thread's Planner tells the Chat Planner of its own document what a person decided in the
+ * thread. The note is saved with the document's Chat session before any turn can be given it or
+ * the Planner is told it was sent, and waits there for the Chat Planner's next turn.
+ */
+function tellChat(
+	topContext: Chat.Room,
+	managed: ManagedThread,
+	override?: ThreadPersistence,
+): TellChat {
+	return async request => {
+		let state = channelState(topContext.chat);
+		if (!state.loaded) await ensureLoaded(topContext, override);
+		let note = threadNote(
+			request,
+			{
+				rootId: managed.record.rootId,
+				root: managed.record.root,
+				entries: managed.chat.entries,
+				requester: managed.chat.activeRequest?.handle,
+			},
+			{
+				asked: new Set(managed.record.askedQuestions ?? []),
+				answeredBy: id => {
+					let record = topContext.plan.records.get(id);
+					return record?.status === "answered" ? record.resolver ?? "" : undefined;
+				},
+				noted: new Set([
+					...state.notedQuestions,
+					...state.staged.flatMap(value => value.question ? [value.question] : []),
+				]),
+			},
+			state.notes.length + state.staged.length,
+			nowSeconds(),
+		);
+		state.staged.push(note);
+		try {
+			await saveTopSessionState(topContext, state, override, note);
+		} catch (err) {
+			console.error("[chat] could not save a thread's note to the Chat Planner:", err);
+			throw new Error("The note could not be saved. Nothing was sent.", { cause: err });
+		} finally {
+			state.staged = state.staged.filter(value => value.id !== note.id);
+		}
+		return NOTE_SENT;
+	};
+}
+
 function buildThreadRoom(
 	topContext: Chat.Room,
 	managed: ManagedThread,
 	override?: ThreadPersistence,
 ): Chat.Room {
-	let wrappedServer = wrapThreadServer(topContext, managed);
+	let wrappedServer = wrapThreadServer(topContext, managed, override);
 	return {
 		investigations: topContext.investigations,
 		chat: managed.chat,
@@ -492,6 +649,7 @@ function buildThreadRoom(
 		claimantSessionId: topContext.claimantSessionId,
 		repository: topContext.repository,
 		plannerNotAttached: topContext.plannerNotAttached,
+		aiAccount: topContext.aiAccount,
 		plannerStarting: topContext.plannerStarting,
 		// A reply in a thread is the document's conversation too: alone, it goes to the Planner.
 		people: topContext.people,
@@ -499,6 +657,7 @@ function buildThreadRoom(
 		activeOwner: topContext.activeOwner,
 		openPlannerSession: topContext.openPlannerSession,
 		modelChoice: topContext.modelChoice,
+		sessionChoice: topContext.sessionChoice,
 		commands: topContext.commands,
 		fileExists: topContext.fileExists,
 		readsImages: topContext.readsImages,
@@ -506,11 +665,21 @@ function buildThreadRoom(
 		references: topContext.references,
 		hold: topContext.hold,
 		children: topContext.children,
+		createDocument: topContext.createDocument,
 		// A reaction saves the transcript it is about to make, before it changes the live one.
 		persist: async next => {
 			await saveThreadRecord(topContext, managed, override, next?.().entries);
 		},
 		threadRoot: managed.record.rootId,
+		tellChat: tellChat(topContext, managed, override),
+		threadAsked: ids => {
+			let asked = new Set(managed.record.askedQuestions ?? []);
+			if (ids.every(id => asked.has(id))) return;
+			managed.record.askedQuestions = [...new Set([...asked, ...ids])];
+			saveThreadRecord(topContext, managed, override).catch(err =>
+				console.error("[chat] could not save the Decision cards a thread asked:", err)
+			);
+		},
 		sessionForks: {
 			prepareTurn(currentEntryId, retry) {
 				let forkState = managed.record.forkState;
@@ -709,9 +878,9 @@ export async function openThread(
 		root: result.root,
 		forkedAt: managed?.record.forkedAt ?? nowSeconds(),
 		entries: managed ? managed.chat.entries.map(Chat.publicEntry) : [],
+		...(managed ? { seq: snapshotSeq(managed.chat) } : {}),
 		busy: managed?.chat.busy ?? false,
 		...(managed?.chat.turn ? { turn: managed.chat.turn } : {}),
-		...(managed?.chat.runs ? { runs: managed.chat.runs } : {}),
 		...(managed?.chat.usage ? { usage: managed.chat.usage } : {}),
 		...(managed?.chat.compactions?.length ? { compactions: managed.chat.compactions } : {}),
 		...(managed?.chat.compacting ? { compacting: true } : {}),
@@ -794,12 +963,12 @@ export async function sendMessage(
 	let requestId = (msg as { requestId?: unknown }).requestId;
 	let also = msg.alsoToChat === true && typeof requestId === "string"
 		&& !managed.copied.has(requestId);
-	if (also) managed.copyNext = requestId as string;
+	if (also) managed.copyNext.add(requestId as string);
 	let tRoom = buildThreadRoom(boundTop, managed, override);
 	try {
 		await Chat.send(tRoom, ws, msg);
 	} finally {
-		if (also && managed.copyNext === requestId) managed.copyNext = undefined;
+		if (also) managed.copyNext.delete(requestId as string);
 	}
 	let copy = also
 		? boundTop.chat.entries.find(entry => entry.id === requestId && entry.fromThread === msg.thread)
@@ -809,22 +978,16 @@ export async function sendMessage(
 	}
 }
 
-/** Route turn-control frames (`abort`, `resume`, run controls) for threads or top-level Chat. */
+/** Route a Stop (`chat:abort`) to a thread or to top-level Chat. */
 export async function controlMessage(
 	topContext: Chat.Room,
 	ws: Socket,
-	frame:
-		| Request<Wire.Abort>
-		| Request<Wire.Resume>
-		| Request<Wire.PauseRun>
-		| Request<Wire.ResumeRun>,
+	frame: Request<Wire.Abort>,
 	override?: ThreadPersistence,
 ): Promise<void> {
 	let boundTop = bindTopLevel(topContext, override);
 	if (frame.thread === undefined) {
-		if (frame.kind === "chat:abort") await Chat.abort(boundTop, ws);
-		else if (frame.kind === "chat:resume") await Chat.resume(boundTop, ws);
-		else await Chat.controlRun(boundTop, ws, frame);
+		await Chat.abort(boundTop, ws);
 		return;
 	}
 	if (typeof frame.thread !== "string" || !frame.thread || frame.thread.length > 128) {
@@ -838,9 +1001,7 @@ export async function controlMessage(
 		return;
 	}
 	let tRoom = buildThreadRoom(boundTop, managed, override);
-	if (frame.kind === "chat:abort") await Chat.abort(tRoom, ws);
-	else if (frame.kind === "chat:resume") await Chat.resume(tRoom, ws);
-	else await Chat.controlRun(tRoom, ws, frame);
+	await Chat.abort(tRoom, ws);
 }
 
 /**

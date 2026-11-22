@@ -29,6 +29,14 @@
 			"types": "./attachment.ts",
 			"default": "./attachment.ts"
 		},
+		"./ai-credentials": {
+			"types": "./ai-credentials.ts",
+			"default": "./ai-credentials.ts"
+		},
+		"./ai-usage": {
+			"types": "./ai-usage.ts",
+			"default": "./ai-usage.ts"
+		},
 		"./commands": {
 			"types": "./commands.ts",
 			"default": "./commands.ts"
@@ -45,9 +53,17 @@
 			"types": "./connector.ts",
 			"default": "./connector.ts"
 		},
+		"./machine-store": {
+			"types": "./machine-store.ts",
+			"default": "./machine-store.ts"
+		},
 		"./document-url": {
 			"types": "./document-url.ts",
 			"default": "./document-url.ts"
+		},
+		"./document-delete": {
+			"types": "./document-delete.ts",
+			"default": "./document-delete.ts"
 		},
 		"./github-reference": {
 			"types": "./github-reference.ts",
@@ -68,10 +84,6 @@
 		"./restart": {
 			"types": "./restart.ts",
 			"default": "./restart.ts"
-		},
-		"./run-stages": {
-			"types": "./run-stages.ts",
-			"default": "./run-stages.ts"
 		},
 		"./threads": {
 			"types": "./threads.ts",

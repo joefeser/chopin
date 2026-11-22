@@ -6,12 +6,15 @@ import {
 	ATOMIC_RESULT_TOOL_NAME,
 	atomicTurnExtension,
 	createAtomicAdapter,
+	FULL_PLANNER_TOOLS,
 	hostLeak,
 	inputParts,
 	ownToolParts,
+	PLANNER_WITHHELD_TOOLS,
 	resolveModel,
 	resultText,
 	turnSystemPrompt,
+	WRITING_TOOLS,
 } from "./adapter";
 
 import type { AgentSessionEvent, ExtensionAPI } from "@bastani/atomic";
@@ -42,7 +45,8 @@ function fakeExtensionApi(policy: TurnPolicy) {
 		},
 		start: (systemPrompt?: string) =>
 			handlers.get("before_agent_start")!({ type: "before_agent_start", systemPrompt }),
-		call: (toolName: string) => handlers.get("tool_call")!({ type: "tool_call", toolName }),
+		call: (toolName: string, parentToolCallId?: string) =>
+			handlers.get("tool_call")!({ type: "tool_call", toolName, parentToolCallId }),
 	};
 }
 
@@ -77,7 +81,7 @@ test("blocks, for a worker, the result tool off structured turns and anything ou
 	expect(atomic.call(ATOMIC_RESULT_TOOL_NAME)).toBeUndefined();
 });
 
-test("a Planner turn keeps Atomic's tools and prompt but still refuses the result tool on plain turns", () => {
+test("a Planner turn keeps Atomic's read-only tools and prompt but refuses the result tool on plain turns", () => {
 	let policy: TurnPolicy = {
 		full: true,
 		hostNames: ["first_host"],
@@ -87,11 +91,50 @@ test("a Planner turn keeps Atomic's tools and prompt but still refuses the resul
 	let atomic = fakeExtensionApi(policy);
 	expect(atomic.start("Atomic.")).toEqual({ systemPrompt: "Atomic.\n\nPlan." });
 	expect(atomic.active).toEqual([]);
-	expect(atomic.call("bash")).toBeUndefined();
+	expect(atomic.call("read")).toBeUndefined();
 	expect(atomic.call("first_host")).toBeUndefined();
 	expect(atomic.call(ATOMIC_RESULT_TOOL_NAME)).toMatchObject({ block: true });
 	policy.structured = true;
 	expect(atomic.call(ATOMIC_RESULT_TOOL_NAME)).toBeUndefined();
+});
+
+test("a full Planner turn refuses Atomic's intercom however it is called", () => {
+	let policy: TurnPolicy = {
+		full: true,
+		withheld: PLANNER_WITHHELD_TOOLS,
+		hostNames: ["tell_chat_planner"],
+		structured: false,
+		systemPrompt: "Plan.",
+	};
+	let atomic = fakeExtensionApi(policy);
+	expect(atomic.call("intercom")).toMatchObject({
+		block: true,
+		reason: "intercom is not available to a Chopin Planner.",
+	});
+	expect(atomic.call("tell_chat_planner")).toBeUndefined();
+	expect(atomic.call("read")).toBeUndefined();
+});
+
+test("a full Planner turn refuses every tool that writes, runs commands or starts agents, a script's call included", () => {
+	let policy: TurnPolicy = {
+		full: true,
+		withheld: PLANNER_WITHHELD_TOOLS,
+		hostNames: ["first_host"],
+		structured: false,
+		systemPrompt: "Plan.",
+	};
+	let atomic = fakeExtensionApi(policy);
+	// Atomic hooks a codemode script's call as a model's, with its script's call as the parent.
+	for (let name of WRITING_TOOLS) {
+		expect(atomic.call(name), name).toMatchObject({
+			block: true,
+			reason: `${name} is not available to a Chopin Planner.`,
+		});
+		expect(atomic.call(name, "codemode-call"), name).toMatchObject({ block: true });
+	}
+	for (let name of [...FULL_PLANNER_TOOLS, "first_host", "operator_code_search"]) {
+		expect(atomic.call(name, "codemode-call"), name).toBeUndefined();
+	}
 });
 
 test("builds the system prompt from instructions and the structured response format", () => {

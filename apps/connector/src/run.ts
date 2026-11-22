@@ -1,11 +1,12 @@
 import { requestSchema } from "@chopin/experiment";
 import { activityText } from "@chopin/protocol/activity";
 import type { BuildRequest } from "@chopin/protocol/implementation";
-import { remote } from "./mcp";
+import { ConnectorError, remote } from "./mcp";
 import { ConnectorStopped, failureKind, redacted } from "./connection";
 import { errorCode } from "./machine";
 import { backoff, delay, forgottenMessage, RUN_GRACE_MS, runReports } from "./reconnect";
-import { bridgeCommand } from "./bridge";
+import { guestRepositoryPath } from "./nvx";
+import type { RunWorktrees } from "./implementation";
 import {
 	gitCredentials,
 	githubEnvironment,
@@ -14,21 +15,22 @@ import {
 	githubToken,
 	withoutGitHub,
 } from "./github-token";
-import type { GitHubGrantRequest } from "./machine";
+import type { GitHubGrantRequest, RunAiLaunch } from "./machine";
+import { endMachineAiLaunch, machineAiLaunch, NoAiAccount } from "./machine";
+import { type AiRelay, type RelayedLaunch, startAiRelay } from "./ai-relay";
+import { agentAiEnvironment, managedEnvironment } from "./ai-agent";
 import { type McpTokenFile, mcpTokenFile } from "./mcp-token";
 import { AgentTimedOut, runAgent, timedOut } from "./acp";
 import type { AgentInfo } from "./acp";
-import { serveLocalBridge } from "./local-bridge";
 import { createOutput } from "./output";
 import { blockedText, endingOf } from "./ending";
 import type { Output } from "./output";
 import { ask, describePermission, permissionMemory } from "./permission";
 import type { Sandbox } from "./sandbox";
-import { stopProcessesIn } from "./processes";
+import { type AgentStore, keepSessionsIn } from "./machine-store";
 import {
-	discardWorkspace,
+	agentFolder,
 	endWorkspace,
-	git,
 	noPushEnvironment,
 	prepareWorkspace,
 	runAttempt,
@@ -36,15 +38,10 @@ import {
 	tokenFolder,
 } from "./workspace";
 import type { Checkouts } from "./checkouts";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { RunOutcome } from "./workspace";
-import {
-	implementationPrompt,
-	liveImplementationPrompt,
-	rebuildPrompt,
-	relay,
-} from "./implementation";
+import { implementationPrompt, liveImplementationPrompt, rebuildPrompt } from "./implementation";
 
 type Options = {
 	/** Called with the agent's name and version once it has answered ACP initialize. */
@@ -83,11 +80,29 @@ type Options = {
 	 * with neither is refused, as one Chopin gave no token is.
 	 */
 	github?: (request: GitHubGrantRequest & { folder: string }) => Promise<GitHubToken>;
-	/** Where the agent starts: the machine's process sandbox, else plainly. */
-	sandbox?: Sandbox;
+	/** Where the agent starts: a microVM of its own. */
+	sandbox: Sandbox;
+	agentStore?: AgentStore;
 	/** How long a build's or rebuild's agent may work, for tests; `BUILD_LIMIT_MS` by default. */
 	buildLimitMs?: number;
+	/**
+	 * Asks Chopin for the run's AI launch with the run's credential, and ends it with the launch's own;
+	 * by default with `machine`. A run with neither, or against a Chopin that hands out no launch
+	 * (undefined), starts its agent on its own models, as before. One Chopin answers has no AI account
+	 * to run on (`NoAiAccount`) starts no agent at all and ends saying so.
+	 */
+	ai?: {
+		launch(run: string, signal: AbortSignal): Promise<RunAiLaunch | undefined>;
+		end(launch: string): Promise<void>;
+	};
 };
+/** Chopin could not give a run its AI launch: the run starts no agent, and its end says why. */
+class AiLaunchFailed extends Error {
+	override name = "AiLaunchFailed";
+}
+
+/** How long the end of a run's AI launch may take before it is left to its deadline. */
+const AI_END_MS = 10_000;
 /** How long an investigation's or prototype's agent may work before it is stopped. */
 export const INVESTIGATION_LIMIT_MS = 60 * 60 * 1000;
 /**
@@ -245,10 +260,6 @@ export async function runWork(
 			}
 		}
 	})();
-	let local: ReturnType<typeof serveLocalBridge> | undefined;
-	/** A spike's throwaway worktree and branch, removed when the run ends. */
-	let spikeWork: { path: string; branch: string } | undefined;
-	let bridgeApi: Promise<Awaited<ReturnType<typeof remote>>> | undefined;
 	let prepared: Awaited<ReturnType<typeof prepareWorkspace>> | undefined;
 	/** The checkout the run's worktree comes from. */
 	let root: string | undefined;
@@ -285,10 +296,25 @@ export async function runWork(
 	};
 	/** The token the agent's backend shows Chopin's own tools, minted from the run's credential. */
 	let mcp: McpTokenFile | undefined;
+	let ai = options.ai ?? (options.machine
+		? {
+			launch: (run: string, signal: AbortSignal) =>
+				machineAiLaunch(options.url, options.machine!, run, signal),
+			end: (launch: string) =>
+				endMachineAiLaunch(options.url, options.machine!, launch, AbortSignal.timeout(AI_END_MS)),
+		}
+		: undefined);
+	/** What Chopin handed the run for its agent's models: kept here, and its stand-ins relayed. */
+	let launched: RunAiLaunch | undefined;
+	let relayed: RelayedLaunch | undefined;
+	/** A relay of the run's own, where its sandbox has none. */
+	let ownRelay: AiRelay | undefined;
 	let secrets = () => [
 		...Object.values(options.env ?? {}),
 		...github?.secrets() ?? [],
 		...mcp?.secrets() ?? [],
+		...launched?.launch ? [launched.launch] : [],
+		...launched?.providers.map(grant => grant.placeholder) ?? [],
 	];
 	let agentStop: string | undefined;
 	/** How the run ended, for its journal; a run cut short before it ends says nothing. */
@@ -316,17 +342,15 @@ export async function runWork(
 		// where it could read it: the one that fetched its commit is gone before the agent starts.
 		if (claim.spike) await issued?.then(value => value.stop()).catch(() => {});
 		let path = prepared.path;
-		// A sandboxed agent can't add worktrees, which its prompt says (see `RunWorktrees`).
-		let confined = options.sandbox !== undefined && options.sandbox.report.engine !== "none";
-		let worktrees = { root: path, extras: prepared.extras, confined };
+		// The agent works in its microVM's own clone of the repository, made as it starts.
+		let work = guestRepositoryPath(repository, options.sandbox.work);
+		let worktrees: RunWorktrees = { root: work, extras: options.sandbox.work };
 		// A rebuild commits onto the existing pull request branches the agent checks out itself.
-		if (implementation && !rebuild) {
-			git(path, "checkout", "-b", `chopin/implement-${input.id.slice(0, 8)}`);
-		}
-		if (claim.spike) {
-			spikeWork = { path, branch: `chopin/spike-${input.id.slice(0, 8)}` };
-			git(path, "checkout", "-b", spikeWork.branch);
-		}
+		let branch = implementation && !rebuild
+			? `chopin/implement-${input.id.slice(0, 8)}`
+			: claim.spike
+			? `chopin/spike-${input.id.slice(0, 8)}`
+			: undefined;
 		if (!claim.spike) {
 			github = await token();
 			github.expired.addEventListener("abort", lapsed, { once: true });
@@ -338,6 +362,44 @@ export async function runWork(
 					credential: { run: claim.runToken },
 					scheduled: true,
 				});
+			}
+		}
+		// The agent's models are reached with stand-ins through the relay, which adds the launch's own
+		// credential; it gets a state directory of its own and nothing of the owner's agent setup.
+		try {
+			launched = await ai?.launch(claim.runToken, abort.signal);
+		} catch (error) {
+			// Never the machine owner's sign-ins in place of the person's accounts: no agent starts.
+			if (abort.signal.aborted || error instanceof NoAiAccount) throw error;
+			throw new AiLaunchFailed(
+				errorCode(error) === "unavailable"
+					? "Chopin couldn't give this run its AI models now. Start it again in a moment."
+					: `Chopin couldn't give this run its AI models: ${
+						(error instanceof ConnectorError ? error.said : undefined) ?? refusalMessage(error)
+							?? "it refused"
+					}`,
+				{ cause: error },
+			);
+		}
+		let agentHome: string | undefined;
+		let agentAi: Record<string, string> = {};
+		if (launched) {
+			let relay = options.sandbox.aiRelay ?? (ownRelay = startAiRelay());
+			relayed = relay.open(launched.launch, launched.providers, () => {
+				ended ??= "Chopin ended this run's access to its AI models.";
+				abort.abort();
+			});
+			agentHome = agentFolder(path);
+			await rm(agentHome, { recursive: true, force: true });
+			await mkdir(agentHome, { recursive: true, mode: 0o700 });
+			agentAi = agentAiEnvironment({
+				command: options.command,
+				home: agentHome,
+				providers: launched.providers,
+				relayed,
+			});
+			if (options.agentStore) {
+				keepSessionsIn(options.agentStore, agentAi.ATOMIC_CODING_AGENT_DIR!, options.output);
 			}
 		}
 		output.job(
@@ -354,15 +416,23 @@ export async function runWork(
 		let stop = await runAgent({
 			...(options.onAgent ? { onInfo: options.onAgent } : {}),
 			limitMs: limit,
-			...(options.sandbox
-				? { sandbox: options.sandbox, writable: [prepared.extras], own: [path, tokenFolder(path)] }
-				: {}),
+			sandbox: options.sandbox,
+			own: [tokenFolder(path), ...agentHome ? [agentHome] : []],
+			...(agentHome ? { agentHome } : {}),
+			repository: {
+				source: prepared.source,
+				path: work,
+				commit: prepared.commit,
+				...branch ? { branch } : {},
+				origin: `https://github.com/${repository}.git`,
+			},
 			command: options.command,
-			cwd: path,
+			cwd: work,
 			env: {
-				...withoutGitHub(options.env ?? {}),
-				// Where a build's agent adds any extra worktrees, as its prompt says.
-				...(implementation ? { CHOPIN_RUN_WORKTREES: prepared.extras } : {}),
+				...(agentHome
+					? managedEnvironment({}, options.env)
+					: withoutGitHub(options.env ?? {})),
+				...agentAi,
 				...(github ? githubEnvironment(github, repository) : {}),
 				...(mcp ? { CHOPIN_MCP_TOKEN_FILE: mcp.file } : {}),
 				// A spike's agent reaches GitHub with nothing: no gh login, credential helper or SSH key
@@ -402,44 +472,23 @@ export async function runWork(
 					+ "upload_image_file({path}), and embed the returned "
 					+ "paths as Markdown images in result.report. "
 					+ "Do not commit or push unless the authorized brief specifically requests it.",
-			// Investigations need the local upload_image_file, so their tools come from this process:
-			// a loopback HTTP bridge when the agent accepts HTTP servers, the stdio bridge otherwise.
-			mcpServers(accepted) {
-				let http = accepted && !confined;
+			// Chopin's tools come from the bridge in the run's microVM, through its proxy; an
+			// investigation's upload_image_file reads an image in the guest's repository.
+			mcpServers() {
 				let name = implementation ? "chopin-implementation" : "chopin-investigation";
-				if (http && !implementation) {
-					let tools: ReturnType<typeof relay> | undefined;
-					local = serveLocalBridge(() => {
-						tools ??= (bridgeApi ??= remote(options.url, claim.runToken))
-							.then(api => relay(api, path))
-							.catch(error => {
-								tools = bridgeApi = undefined;
-								throw error;
-							});
-						return tools.then(make => make());
-					});
-					return [{
-						name,
-						type: "http",
-						url: local.url,
-						headers: [{ name: "Authorization", value: `Bearer ${local.token}` }],
-					}];
-				}
-				if (http) {
-					return [{
-						name,
-						type: "http",
-						url: options.url + "/connector/mcp",
-						headers: [{ name: "Authorization", value: `Bearer ${claim.runToken}` }],
-					}];
-				}
 				return [{
 					name,
-					...bridgeCommand(),
+					...options.sandbox.bridge,
 					env: [
 						{ name: "CHOPIN_BRIDGE_ORIGIN", value: options.url },
 						{ name: "CHOPIN_BRIDGE_TOKEN", value: claim.runToken },
-						...(!implementation ? [{ name: "CHOPIN_BRIDGE_ROOT", value: path }] : []),
+						...(!implementation ? [{ name: "CHOPIN_BRIDGE_ROOT", value: work }] : []),
+						...options.sandbox.guestEnvironment
+							? Object.entries(options.sandbox.guestEnvironment).map(([name, value]) => ({
+								name,
+								value,
+							}))
+							: [],
 					],
 				}];
 			},
@@ -528,8 +577,9 @@ export async function runWork(
 		// journal and in Chopin, never as an unexplained failure.
 		let late = error instanceof AgentTimedOut
 			|| error instanceof Error && error.message === timedOut(limit);
-		// Chopin gave no GitHub token, and its reason names the repository and what fixes it.
-		let refused = error instanceof GitHubRefused;
+		// Chopin gave no GitHub token, or no AI account to run on, and its reason says what fixes it.
+		let refused = error instanceof GitHubRefused || error instanceof NoAiAccount
+			|| error instanceof AiLaunchFailed;
 		let message = stopped
 			? STOPPED
 			: ended
@@ -570,23 +620,13 @@ export async function runWork(
 		// Retrying cannot reach a server that forgot this connection, so the connector stops too.
 		if (forgotten && !stopped) throw new ConnectorStopped("forgotten", message);
 	} finally {
-		// Servers the agent started (often in their own process group) end with its run.
-		if (prepared) {
-			await stopProcessesIn(prepared.path).catch(() => {});
-			await stopProcessesIn(prepared.extras).catch(() => {});
-		}
-		local?.close();
-		await bridgeApi?.then(api => api.close()).catch(() => {});
-		if (spikeWork && root) {
-			await discardWorkspace(root, spikeWork.path, spikeWork.branch).catch(() => {});
-		}
+		relayed?.close();
+		await ownRelay?.close().catch(() => {});
+		if (launched && ai) await ai.end(launched.launch).catch(() => {});
 		github?.expired.removeEventListener("abort", lapsed);
 		await mcp?.stop().catch(() => {});
 		await issued?.then(value => value.stop()).catch(() => {});
-		// Extra worktrees end with the run; the run's own stays for inspection.
-		if (prepared && root) {
-			await endWorkspace(root, prepared, outcome).catch(() => {});
-		}
+		if (prepared) await endWorkspace(prepared, outcome).catch(() => {});
 		beating.abort();
 		await heartbeat;
 		reports.close();

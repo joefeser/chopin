@@ -1,3 +1,4 @@
+import { AiAccountsPlate } from "./plates/ai-accounts";
 import { AssistantUiPlate } from "./plates/assistant-ui";
 import { ChatMediaPlate } from "./plates/chat-media";
 import { EmojiPlate } from "./plates/emoji";
@@ -11,7 +12,7 @@ import { ListsPlate } from "./plates/lists";
 import { LoadingStatusPlate } from "./plates/loading-status";
 import { NavigationPlate } from "./plates/navigation";
 import { ResolvedCommentsPlate } from "./plates/resolved-comments";
-import { WorkflowRunsPlate } from "./plates/workflow-runs";
+import { RunningBuildPlate } from "./plates/running-build";
 
 /** Each plate owns a `plates/<name>.tsx` and `.css` pair; surfaces.css imports the styles. */
 export function Surfaces() {
@@ -20,8 +21,9 @@ export function Surfaces() {
 			<DialogsPlate />
 			<ListsPlate />
 			<NavigationPlate />
+			<AiAccountsPlate />
 			<ConversationPlate />
-			<WorkflowRunsPlate />
+			<RunningBuildPlate />
 			<IdentityPlate />
 			<DecisionsPlate />
 			<ResolvedCommentsPlate />

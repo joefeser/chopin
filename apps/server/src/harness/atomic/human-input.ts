@@ -152,6 +152,11 @@ function valueOf(method: InputMethod, result: QuestionnaireResult, choices: stri
 	return answer?.kind === "custom" ? answer.answer ?? undefined : undefined;
 }
 
+/** What a request of this method is given when it is withdrawn before any question is answered. */
+export function withdrawnValue(method: InputMethod): unknown {
+	return valueOf(method, { answers: [], cancelled: true }, []) ?? null;
+}
+
 /** The params of a request that asks one question with these choices. */
 function single(header: string, question: string, choices: string[]): QuestionParams {
 	return {
@@ -220,15 +225,14 @@ export type HumanInput = {
  * Atomic owns input requests; Chopin owns their shared decision records.
  *
  * A request has no time limit: it waits until a member answers it or it is
- * withdrawn, as when its Planner stops, its run is cancelled, or its link
- * closes. An answer to a workflow
- * question is returned only once `hold` allows it, so a paused run stays stopped.
- * `report` learns how each request ended, which the cancelled result alone
+ * withdrawn, as when its Planner stops or its link closes. `report` learns how each request ended, which the cancelled result alone
  * cannot tell apart.
  */
 export function createHumanInput(
-	room: Pick<DocumentRoom, "id" | "plan" | "server" | "anchors" | "focusedChild">,
-	hold?: (workflowRunId: string, signal: AbortSignal) => Promise<void>,
+	room: Pick<
+		DocumentRoom,
+		"id" | "plan" | "server" | "anchors" | "focusedChild" | "decisionsAsked"
+	>,
 	report?: (status: HumanInputStatus) => void,
 	pending?: PendingInputs,
 ): HumanInput {
@@ -264,18 +268,14 @@ export function createHumanInput(
 			options.block ? { near: options.block } : undefined,
 			room.anchors,
 			options.signal,
-			options.asked,
+			ids => {
+				options.asked?.(ids);
+				room.decisionsAsked?.(ids);
+			},
 		);
 		if (options.signal.aborted) {
 			report?.("cancelled");
 			return { answers: [], cancelled: true };
-		}
-		if (hold && options.workflowRunId !== undefined) {
-			await hold(options.workflowRunId, options.signal);
-			if (options.signal.aborted) {
-				report?.("cancelled");
-				return { answers: [], cancelled: true };
-			}
 		}
 		let result = resultOf(params, ended);
 		report?.(result.cancelled ? "cancelled" : "answered");

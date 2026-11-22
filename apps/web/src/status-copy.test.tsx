@@ -14,6 +14,14 @@ import { BuildPlanButton } from "./build-plan-button";
 import { SETUP } from "./build-connection-popover";
 import { SHARE_DETAIL, YourMachines } from "./experiments/machine-list";
 import { ChatComposer } from "./chat/composer";
+import {
+	ACCOUNTS_OUTDATED,
+	ACCOUNTS_STATUS,
+	LAST_KNOWN_OUTDATED,
+	LAST_KNOWN_STATUS,
+	MODELS_OUTDATED,
+	UNAVAILABLE_STATUS,
+} from "./chat/model-picker-state";
 import { QuietNote } from "./chat/quiet-note";
 import FixSteps from "./fix-steps";
 import { machineFix } from "./machine-fix";
@@ -24,7 +32,6 @@ import {
 	REPLIES_OFF,
 	repliesOffNotice,
 } from "./chat/references";
-import { disconnectedNote, RunStack, runStatusLabel } from "./chat/run-card";
 import { Transcript } from "./chat/transcript";
 import { destinationLabel } from "./workspace-navigation";
 import { documentActivityLabel } from "./document-activity";
@@ -54,7 +61,7 @@ import { ErrorState } from "./chat/error-state";
 import { AgentFace, PlanStatus } from "@chopin/editor";
 import { INTERNAL, INTERNAL_IN_STATUS } from "@chopin/protocol/plain-words";
 
-import type { Chat, ConversationPlan, Session } from "@chopin/protocol";
+import type { ConversationPlan, Session } from "@chopin/protocol";
 import type { ImplementationSnapshot } from "@chopin/protocol/implementation";
 import type { PlannerGlyph, PlannerStatus } from "./chat/planner-status";
 import type { MachineChoice } from "./machine-choice";
@@ -380,6 +387,15 @@ test("the busy labels, the agent's face and the composer's picker hints are plai
 		let cue = destinationCue(text, [], true);
 		if (cue) expectPlainWords("a picker hint", [cue.text]);
 	}
+	// The model pill's words about the machine's list: machine status words, none of Chopin's own.
+	expectPlain("the model pill's words", [
+		...Object.values(LAST_KNOWN_STATUS),
+		...Object.values(ACCOUNTS_STATUS),
+		...Object.values(UNAVAILABLE_STATUS),
+		MODELS_OUTDATED,
+		ACCOUNTS_OUTDATED,
+		LAST_KNOWN_OUTDATED,
+	]);
 	expect(destinationCue("should we ask about auth first?", [], true)?.text)
 		.toBe("Sent to people here. Type @ to ask chopin");
 	let empty = render(createElement(Transcript, {
@@ -390,58 +406,6 @@ test("the busy labels, the agent's face and the composer's picker hints are plai
 	}));
 	expect(empty).toContain("to ask chopin");
 	expectPlainWords("the empty Chat", words(empty));
-});
-
-test("a workflow run's status, notes and controls are plain, connected or away", () => {
-	let statuses = [
-		"running",
-		"waiting",
-		"paused",
-		"finished",
-		"blocked",
-		"failed",
-		"stopped",
-	] as const;
-	let run = (status: (typeof statuses)[number], away?: true): Chat.Run => ({
-		id: `run-${status}`,
-		name: `a-${status}-run`,
-		status,
-		started: 1,
-		updated: 2,
-		waiting: status === "waiting" ? 2 : 0,
-		stages: [],
-		...(away ? { disconnected: true } : {}),
-	} as Chat.Run);
-	for (let status of statuses) {
-		for (let away of [undefined, true] as const) {
-			let item = run(status, away);
-			expectPlainWords(`a ${status} run's label`, [runStatusLabel(item)]);
-			expectPlain(`a ${status} run's note about its machine`, [disconnectedNote(item)]);
-			for (let offline of [false, true]) {
-				let markup = render(createElement(RunStack, {
-					offline,
-					onPause: () => {},
-					onResume: () => {},
-					onShowDecisions: () => {},
-					runs: [item],
-				}));
-				expectPlainWords(`a ${status} run card`, words(markup));
-				// While the page's connection banner shows, nothing on a card is about the machine.
-				if (offline) {
-					expect(decode(markup), `a ${status} run card offline`).not.toMatch(
-						/disconnected|machine|reconnect|Last reported/i,
-					);
-				}
-			}
-		}
-	}
-	let away = render(createElement(RunStack, { onPause: () => {}, runs: [run("running", true)] }));
-	expect(decode(away)).toContain("Pause a-running-run when the machine reconnects");
-	expect(decode(away)).toContain("It carries on when the machine reconnects.");
-	let asking = render(
-		createElement(RunStack, { onShowDecisions: () => {}, runs: [run("waiting")] }),
-	);
-	expect(asking).toContain("Waiting on 2 Decisions");
 });
 
 test("what a message's analysis, its evidence and a failed background job say is plain", () => {

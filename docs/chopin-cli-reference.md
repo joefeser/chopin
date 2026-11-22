@@ -29,19 +29,22 @@ it connects.
 `$XDG_STATE_HOME/chopin/connector` when that is set. `--base-dir`,
 `CHOPIN_HOME` or `CHOPIN_CONNECTOR_STATE_DIR` moves it.
 
-| File or folder    | Holds                                                                                                                                                                                   |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `machine.json`    | The machine token for each server. Only you can read it (mode `0600`). `chopin` never prints it.                                                                                        |
-| `config.json`     | What `chopin connect` last ran, and the service with its own copy of that. Only you can read it (mode `0600`). It holds your `--env` values, so keep secrets in your agent's own login. |
-| `*.failures.json` | The latest failure to start of a running connector's agent and Planners, for `chopin status`.                                                                                           |
-| `*.chosen.json`   | The documents whose Planners a running connector runs because they chose this machine in Chopin, for `chopin status`.                                                                   |
-| `*.github.json`   | The repositories the GitHub App can't push to, for `chopin status`.                                                                                                                     |
-| `chopin.log`      | The service's output.                                                                                                                                                                   |
-| `*.lock`          | The running connector's lock, one for each base dir, as one connection serves every repository.                                                                                         |
-| `runs/`           | Each job's worktree, extra worktrees, journal, and GitHub token file while it runs. See [Where things live](chopin-cli.md#where-things-live-on-this-machine).                           |
-| `planners/`       | Each Planner command's worktree.                                                                                                                                                        |
-| `repos/`          | A clone of each repository work needed with no checkout named, as `repos/<owner>/<repo>`.                                                                                               |
-| `sandbox/`        | MXC's sandbox executor, written out of the `chopin` binary on first use, as `sandbox/<hash>/`. See [Sandbox](chopin-cli.md#sandbox).                                                    |
+| File or folder    | Holds                                                                                                                                                                                                                                              |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `machine.json`    | The machine token for each server. Only you can read it (mode `0600`). `chopin` never prints it.                                                                                                                                                   |
+| `config.json`     | What `chopin connect` last ran, and the service with its own copy of that. Only you can read it (mode `0600`). It holds your `--env` values, so keep secrets in your agent's own login.                                                            |
+| `*.failures.json` | The latest failure to start of a running connector's agent and Planners, for `chopin status`.                                                                                                                                                      |
+| `*.chosen.json`   | The documents whose Planners a running connector runs because they chose this machine in Chopin, for `chopin status`.                                                                                                                              |
+| `*.github.json`   | The repositories the GitHub App can't push to, for `chopin status`.                                                                                                                                                                                |
+| `chopin.log`      | The service's output.                                                                                                                                                                                                                              |
+| `*.lock`          | The running connector's lock, one for each base dir, as one connection serves every repository.                                                                                                                                                    |
+| `runs/`           | Each job's journal, its agent's state, and its tokens while it runs. See [Where things live](chopin-cli.md#where-things-live-on-this-machine).                                                                                                     |
+| `planners/`       | Each Planner's disk, with its own clone of the repository, its tokens and its agents' state.                                                                                                                                                       |
+| `images/`         | The agents' images its microVMs boot, built once each. See [Sandbox](chopin-cli.md#sandbox).                                                                                                                                                       |
+| `nvx/`            | The NVX release `chopin` pins, the MCP bridge its microVMs run, the records of the microVMs running, and the empty folder an agent's start check runs in.                                                                                          |
+| `git/`            | A folder for each running `chopin` with the copy of your git configuration's settings its own git commands use, removed as it exits, or by the next `chopin connect` once it is gone. Only you can read it.                                        |
+| `repos/`          | A clone of each repository work needed with no checkout named, as `repos/<owner>/<repo>`.                                                                                                                                                          |
+| `agent-store/`    | The machine's own database login for its agents' sessions, where Chopin gives one: `settings.json`, `password` (mode `0600`) and the storage adapter. See [Agent sessions in Chopin's database](chopin-cli.md#agent-sessions-in-chopins-database). |
 
 Chopin stores only a hash of the machine token, plus the machine's own GitHub
 authorization, encrypted like a browser login.
@@ -69,7 +72,7 @@ releases are made.
 ## Run without installing
 
 Every Chopin server also serves the connector as one script at
-`/connector.js`. It needs [Bun](https://bun.sh) 1.4.4. This is the command
+`/connector.js`. It needs [Bun](https://bun.sh) 1.4.5. This is the command
 Chopin shows when no local agent is connected:
 
 ```sh
@@ -91,7 +94,8 @@ the server needs a newer script, download it again.
 
 `chopin update` asks the saved server which release it wants. If it can't reach
 the server, it installs the newest release instead. `chopin update 0.2.0`
-installs that release.
+installs that release. A server never names a release older than the first one
+that runs agents in microVMs (0.0.32), which it would refuse too.
 
 Moving to an older release needs `--allow-downgrade`. Without it,
 `chopin update` prints the command with the flag and changes nothing. On a

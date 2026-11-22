@@ -26,7 +26,6 @@ import { withModelOutput } from "../model-output";
 import { openWorkerSession } from "../../jobs/worker-session";
 import { createHumanInput } from "../atomic/human-input";
 import { openPlannerSession } from "../session";
-import { untilUnpaused } from "../atomic/full";
 import { hostInputRoom, laterTimers } from "../../testing/decisions";
 import {
 	attach,
@@ -48,13 +47,28 @@ import {
 } from "../../testing/agent-link";
 import { refusedChoice } from "@chopin/protocol/model-choice";
 
+import { sessionModel } from "../../chat/model-choice";
 import { remoteCatalog } from "../catalog";
+import { plannerCatalog, plannerOffered, plannerOfferKnown } from "../harnesses";
 import { createRemoteAdapter } from "./adapter";
 import { admitAgent } from "./endpoint";
+import type { AgentAi, AgentHooks } from "./endpoint";
 import { remotePlanner } from "./registry";
+import { testLease } from "../../storage/contract-support";
+import { AiCredentials } from "../../ai/credentials";
+import {
+	AiLaunchRefused,
+	catalogOnly,
+	endLaunch,
+	handOut,
+	PLANNER_AI_LAUNCH_MS,
+} from "../../ai/launches";
+import { aiProxy } from "../../ai/proxy";
+import { turnFailureOf } from "../../chat/turn-failure";
 
 import type { AgentClient, AgentHandlers, TurnContext } from "@chopin/agent-link/client";
 import type { ActiveOwnerBinding } from "../../agent/active-owner";
+import type { PlannerChoice } from "../session";
 import type { PlannerTurn } from "../turn-level";
 import type { RemotePlanner } from "./registry";
 
@@ -238,7 +252,11 @@ describe("Agent connection admission", () => {
 		expect(await raw.next("refused")).toMatchObject({ code: "unsupported-version" });
 		expect((await raw.closed).code).toBe(LINK_CLOSE.unsupportedVersion);
 		expect(await storage.channels.get(channel.id)).toEqual(before);
-		await storage.channels.archive({ id: channel.id, now: new Date() });
+		await storage.channels.archive({
+			id: channel.id,
+			now: new Date(),
+			lease: await testLease(storage),
+		});
 		expect(await refusal(MEMBER_TOKEN, channel.id)).toBe("document-archived");
 		expect(server.links).toEqual([]);
 	});
@@ -884,6 +902,29 @@ describe("Agent connection protocol", () => {
 		expect(server.links).toEqual([]);
 	});
 
+	it("refuses a run report, and a question naming a workflow run, as malformed: it keeps no runs", async () => {
+		let { server, channel } = await setup();
+		for (
+			let frame of [
+				{ type: "runs", session: "s", active: [], paused: [], cards: [] },
+				{
+					type: "input-request",
+					request: "r",
+					session: "s",
+					workflowRunId: "run-1",
+					input: { method: "confirm", title: "Ship?", message: "Now." },
+				},
+			]
+		) {
+			let raw = await rawLink(server.url, undefined, "resumable-sessions");
+			raw.send({ type: "attach", version: 1, document: channel.id });
+			await raw.next("attached");
+			raw.send(frame);
+			expect(await raw.next("error")).toMatchObject({ code: "malformed-message" });
+			expect((await raw.closed).code).toBe(LINK_CLOSE.malformed);
+		}
+	});
+
 	it("closes the link on an oversized message", async () => {
 		let { server } = await setup();
 		let raw = await rawLink(server.url);
@@ -912,48 +953,16 @@ describe("Agent connection protocol", () => {
 		expect(server.links).toEqual([]);
 	});
 
-	it("stops the runs a dropped link reported, so nothing waits on them", async () => {
-		let { server, channel, client } = await setup({});
-		let planner: RemotePlanner = { channelId: channel.id, isolated: false };
-		let reports: unknown[] = [];
-		planner.onRuns = runs => reports.push(runs);
-		let session = await adapterFor(server, planner).doStart({
-			sessionId: "runs",
-			sandboxSession,
-			sessionWorkDir: "/tmp",
-		});
-		cleanups.push(() => session.doDestroy());
-		let card = {
-			id: "run",
-			name: "plan",
-			status: "running" as const,
-			started: 1,
-			updated: 1,
-			stages: [],
-			waiting: 0,
-		};
-		let done = { ...card, id: "done", status: "finished" as const, ended: 2 };
-		client.reportRuns("runs", { active: ["run"], paused: [], cards: [card, done] });
-		await Bun.sleep(20);
-		expect(planner.runs?.active).toEqual(["run"]);
-		await client.detach();
-		await Bun.sleep(20);
-		expect(planner.runs).toEqual({
-			active: [],
-			paused: [],
-			cards: [{ ...card, status: "stopped" }, done],
-		});
-		expect(reports).toHaveLength(2);
-	});
-
 	it("names the features a client asked for in attached, and nothing for a client that did not ask", async () => {
 		let { server, channel } = await setup();
 		for (
 			let [header, features] of [
 				[undefined, undefined],
-				["run-stage-deltas", ["run-stage-deltas"]],
-				["future-thing, run-stage-deltas", ["run-stage-deltas"]],
+				["decision-option-previews", ["decision-option-previews"]],
+				["future-thing, decision-option-previews", ["decision-option-previews"]],
 				["future-thing", []],
+				// Run reports are gone, so a client that still asks for their feature is not given it.
+				["run-stage-deltas", []],
 				["resumable-sessions, restart-notice", ["resumable-sessions", "restart-notice"]],
 			] as const
 		) {
@@ -981,9 +990,9 @@ describe("Agent connection protocol", () => {
 		for (
 			let [header, offered] of [
 				[undefined, ["read_plan"]],
-				["run-stage-deltas", ["read_plan"]],
+				["steer-turn", ["read_plan"]],
 				["decision-option-previews", ["read_plan", "upload_plan_image"]],
-				["run-stage-deltas, decision-option-previews", ["read_plan", "upload_plan_image"]],
+				["steer-turn, decision-option-previews", ["read_plan", "upload_plan_image"]],
 			] as const
 		) {
 			let raw = await rawLink(server.url, undefined, header);
@@ -1048,122 +1057,6 @@ describe("Agent connection protocol", () => {
 			raw.send({ type: "detach" });
 			await raw.closed;
 		}
-	});
-
-	it("merges stage deltas into a run's stages, and a full card replaces them", async () => {
-		let { server, channel, client } = await setup({});
-		expect(client.features).toEqual(["run-stage-deltas", "decision-option-previews"]);
-		let planner: RemotePlanner = { channelId: channel.id, isolated: false };
-		let session = await adapterFor(server, planner).doStart({
-			sessionId: "deltas",
-			sandboxSession,
-			sessionWorkDir: "/tmp",
-		});
-		cleanups.push(() => session.doDestroy());
-		let card = {
-			id: "run",
-			name: "plan",
-			status: "running" as const,
-			started: 1,
-			updated: 1,
-			waiting: 0,
-		};
-		let many = Array.from({ length: 500 }, (_, index) => ({
-			id: `s${index}`,
-			name: `stage ${index}`,
-			status: "completed" as const,
-		}));
-		let report = async (cards: Parameters<typeof client.reportRuns>[1]["cards"]) => {
-			client.reportRuns("deltas", { active: ["run"], paused: [], cards });
-			await Bun.sleep(30);
-			return planner.runs?.cards[0];
-		};
-		await report([{ ...card, stagesDelta: true, stages: many }]);
-		let merged = await report([{
-			...card,
-			updated: 5,
-			stagesDelta: true,
-			stages: [
-				{ id: "s1", name: "stage 1", status: "failed", ended: 4 },
-				{ id: "child", name: "child", status: "running", parentIds: ["s1", "s499"] },
-			],
-		}]);
-		expect(merged?.updated).toBe(5);
-		expect(merged?.stages).toHaveLength(501);
-		expect(merged?.stages[1]).toEqual({ id: "s1", name: "stage 1", status: "failed", ended: 4 });
-		expect(merged?.stages.at(-1)).toEqual({
-			id: "child",
-			name: "child",
-			status: "running",
-			parentIds: ["s1", "s499"],
-		});
-		expect(merged?.earlierStages).toBeUndefined();
-
-		let full = await report([{
-			...card,
-			stages: [{ id: "x", name: "x", status: "running" }],
-			earlierStages: 7,
-		}]);
-		expect(full).toMatchObject({ stages: [{ id: "x" }], earlierStages: 7 });
-		let after = await report([{
-			...card,
-			stagesDelta: true,
-			stages: [{ id: "y", name: "y", status: "pending", parentIds: ["x"] }],
-		}]);
-		expect(after?.stages.map(stage => stage.id)).toEqual(["x", "y"]);
-		expect(after?.earlierStages).toBe(7);
-	});
-
-	it("keeps a run's stages when a full card names none, and lets a full card with stages replace them", async () => {
-		let { server, channel, client } = await setup({});
-		let planner: RemotePlanner = { channelId: channel.id, isolated: false };
-		let session = await adapterFor(server, planner).doStart({
-			sessionId: "kept",
-			sandboxSession,
-			sessionWorkDir: "/tmp",
-		});
-		cleanups.push(() => session.doDestroy());
-		let card = {
-			id: "run",
-			name: "plan",
-			status: "running" as const,
-			started: 1,
-			updated: 1,
-			waiting: 0,
-		};
-		let stages = Array.from({ length: 16 }, (_, index) => ({
-			id: `s${index}`,
-			name: `stage ${index}`,
-			status: "completed" as const,
-		}));
-		let report = async (cards: Parameters<typeof client.reportRuns>[1]["cards"]) => {
-			client.reportRuns("kept", { active: [], paused: [], cards });
-			await Bun.sleep(30);
-			return planner.runs?.cards[0];
-		};
-		await report([{ ...card, stages, earlierStages: 3 }]);
-		let ended = await report([{
-			...card,
-			status: "finished",
-			updated: 9,
-			ended: 9,
-			stages: [],
-		}]);
-		expect(ended).toMatchObject({ status: "finished", updated: 9, ended: 9, earlierStages: 3 });
-		expect(ended?.stages).toEqual(stages);
-		let after = await report([{
-			...card,
-			stagesDelta: true,
-			stages: [{ id: "late", name: "late", status: "completed" }],
-		}]);
-		expect(after?.stages.map(stage => stage.id)).toEqual([
-			...stages.map(stage => stage.id),
-			"late",
-		]);
-
-		let replaced = await report([{ ...card, stages: [{ id: "x", name: "x", status: "running" }] }]);
-		expect(replaced?.stages.map(stage => stage.id)).toEqual(["x"]);
-		expect(replaced?.earlierStages).toBeUndefined();
 	});
 
 	it("runs Chopin's tools in the server and the client's own tools only once declared", async () => {
@@ -1352,32 +1245,6 @@ describe("Agent connection protocol", () => {
 		await expect(start("silent")).rejects.toThrow("did not start the session");
 		await Bun.sleep(20);
 		expect(destroyed).toEqual(["refused", "silent"]);
-	});
-
-	it("carries Stop and Resume to the client and reports a refusal", async () => {
-		let controls: unknown[] = [];
-		let { server, channel } = await setup({
-			control(message) {
-				controls.push({ type: message.type, run: message.run });
-				if (message.type === "resume") throw new Error("nothing to resume");
-			},
-		});
-		let planner: RemotePlanner = { channelId: channel.id, isolated: false };
-		let session = await adapterFor(server, planner).doStart({
-			sessionId: crypto.randomUUID(),
-			sandboxSession,
-			sessionWorkDir: "/tmp",
-		});
-		cleanups.push(() => session.doDestroy());
-		await planner.control!("stop", "run-1");
-		// Bun 1.4.4's pending `.rejects` matcher makes Bun.serve close a valid socket as
-		// fragmented (oven-sh/bun#45805), so the refusal is awaited before it is asserted.
-		let refusal = await planner.control!("resume").catch((error: unknown) => error);
-		expect(refusal).toBeInstanceOf(Error);
-		expect((refusal as Error).message).toContain("nothing to resume");
-		expect(controls).toEqual([{ type: "stop", run: "run-1" }, { type: "resume", run: undefined }]);
-		await session.doDestroy();
-		expect(planner.control).toBeUndefined();
 	});
 
 	it("rechecks the caller's access before every session and detaches one that lost it", async () => {
@@ -1665,8 +1532,12 @@ describe("Agent connection capability catalog", () => {
 	it("holds what the client last reported and tells the document each time, replacing it whole", async () => {
 		let { auth, channel } = await linkAuth();
 		let changed: string[] = [];
+		let reports: unknown[] = [];
 		let server = linkServer(auth, 300, undefined, undefined, undefined, undefined, {
-			catalogChanged: id => changed.push(id),
+			catalogChanged: (id, reported) => {
+				changed.push(id);
+				reports.push(reported);
+			},
 		});
 		cleanups.push(server.stop);
 		let raw = await rawLink(server.url, undefined, "capability-catalog");
@@ -1685,6 +1556,12 @@ describe("Agent connection capability catalog", () => {
 		await until(() => link.catalog?.models === undefined, 1_000);
 		expect(link.catalog).toEqual({});
 		expect(changed).toEqual([channel.id, channel.id, channel.id]);
+		// Each report names the account the client attached for, so its list is kept for it alone.
+		expect(reports).toEqual([
+			{ userId: "U_member", catalog },
+			{ userId: "U_member", catalog: next },
+			{ userId: "U_member", catalog: {} },
+		]);
 		raw.send({ type: "detach" });
 		await raw.closed;
 	});
@@ -1865,6 +1742,102 @@ describe("Agent connection capability catalog", () => {
 		}
 	});
 
+	/** A session opened through `openPlannerSession` on a client that offered `session-choice`. */
+	async function choosingSession(opens: { model?: string; choice?: PlannerChoice }) {
+		let f = await hostInputRoom();
+		cleanups.push(f.close);
+		let linked = await linkAuth(f.room.id);
+		let server = linkServer(linked.auth, 300);
+		cleanups.push(server.stop);
+		let starts: PlannerChoice[] = [];
+		let seen: PlannerChoice[] = [];
+		let client = await connectAgent({
+			url: server.url,
+			token: MEMBER_TOKEN,
+			document: f.room.id,
+			resumable: false,
+			capabilities: catalog,
+			sessionChoice: true,
+			handlers: {
+				start(message) {
+					starts.push({
+						...(message.model ? { model: message.model } : {}),
+						...(message.thinkingLevel ? { thinkingLevel: message.thinkingLevel } : {}),
+					});
+				},
+				async turn(context) {
+					seen.push({
+						...("model" in context.message ? { model: context.message.model } : {}),
+						...("thinkingLevel" in context.message
+							? { thinkingLevel: context.message.thinkingLevel }
+							: {}),
+					});
+					finishTurn(context);
+				},
+			},
+		});
+		cleanups.push(() => client.detach());
+		await until(() => !server.links.at(-1)!.catalogPending, 1_000);
+		let agent = createPlannerAgent(
+			createRemoteAdapter(sessionId => ({
+				link: server.links.at(-1)!,
+				planner: remotePlanner(sessionId)!,
+			})),
+		);
+		let owner = {
+			channelId: f.room.id,
+			token: "test-token",
+			repository: { id: "R_test", owner: "org", name: "repo", defaultBranch: "main" },
+			signal: new AbortController().signal,
+			currentToken: () => "test-token",
+			revalidate: async () => true,
+			release() {},
+		} as unknown as ActiveOwnerBinding;
+		let opened = await openPlannerSession(owner, {
+			room: f.room,
+			repository: owner.repository,
+			instructions: "Plan.",
+			harness: "remote",
+			...opens,
+		}, {
+			githubTools: async () => ({ ok: true, value: {} }),
+			createSandbox: async () => sandboxSession,
+			registerCredential: () => () => {},
+			agent,
+		});
+		if (!opened.ok) throw new Error("Planner unavailable");
+		let session = opened.value;
+		cleanups.push(() => session.destroy());
+		let run = async (choice?: PlannerChoice) => {
+			let result = await session.stream("go", new AbortController().signal, choice);
+			for await (let _part of result.fullStream);
+		};
+		return { starts, seen, run };
+	}
+
+	it("opens a session on the stored choice, and leaves out of a later turn a model or level set back to Default", async () => {
+		let { starts, seen, run } = await choosingSession({
+			choice: { model: "acme/large", thinkingLevel: "high" },
+		});
+		await run({ model: "acme/large", thinkingLevel: "high" });
+		await run();
+		await run({ model: "acme/large" });
+		expect(starts).toEqual([{ model: "acme/large", thinkingLevel: "high" }]);
+		expect(seen).toEqual([
+			{ model: "acme/large", thinkingLevel: "high" },
+			{},
+			{ model: "acme/large" },
+		]);
+	});
+
+	it("opens a session on the operator's MODEL where no model was chosen, as each such turn runs it", async () => {
+		let { starts, seen, run } = await choosingSession({ model: "acme/small" });
+		await run();
+		await run({ model: "acme/large", thinkingLevel: "high" });
+		expect(starts).toEqual([{ model: "acme/small" }]);
+		expect(seen).toEqual([{ model: "acme/small" }, { model: "acme/large", thinkingLevel: "high" }]);
+	});
+
 	it("carries a message's images and files to a client that offered attachments, and as words to one that did not", async () => {
 		let png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
 		let notes = new TextEncoder().encode("# Notes\n");
@@ -1975,7 +1948,7 @@ describe("Agent connection capability catalog", () => {
 
 	it("is a protocol violation from a client that did not offer the feature", async () => {
 		let { server, channel } = await setup();
-		for (let header of [undefined, "run-stage-deltas"]) {
+		for (let header of [undefined, "steer-turn"]) {
 			let raw = await rawLink(server.url, undefined, header);
 			raw.send({ type: "attach", version: 1, document: channel.id });
 			await raw.next("attached");
@@ -2094,7 +2067,7 @@ describe("Agent connection capability catalog", () => {
 		for (
 			let [header, sent] of [
 				[undefined, false],
-				["run-stage-deltas", false],
+				["steer-turn", false],
 				["capability-catalog", true],
 			] as const
 		) {
@@ -2130,6 +2103,111 @@ describe("Agent connection capability catalog", () => {
 			await raw.closed;
 		}
 	});
+
+	it("tells a client that offered session-choice the document's choice when it asks for a session", async () => {
+		let { server, channel } = await setup();
+		for (
+			let [header, told] of [
+				["capability-catalog", false],
+				["session-choice", false],
+				["capability-catalog, session-choice", true],
+			] as const
+		) {
+			let raw = await rawLink(server.url, undefined, header);
+			raw.send({ type: "attach", version: 1, document: channel.id });
+			await raw.next("attached");
+			let planner: RemotePlanner = {
+				channelId: channel.id,
+				isolated: false,
+				choice: { model: "acme/large", thinkingLevel: "high" },
+			};
+			let opening = adapterFor(server, planner).doStart({
+				sessionId: `session-choice-${header}`,
+				sandboxSession,
+				sessionWorkDir: "/tmp",
+			});
+			let start = await raw.next("start");
+			if (told) expect(start).toMatchObject({ model: "acme/large", thinkingLevel: "high" });
+			else {
+				expect("model" in start).toBe(false);
+				expect("thinkingLevel" in start).toBe(false);
+			}
+			raw.send({ type: "started", session: start.session });
+			let opened = await opening;
+			cleanups.push(() => opened.doDestroy());
+			raw.send({ type: "detach" });
+			await raw.closed;
+		}
+	});
+
+	it("opens a session on the stored choice when the client reports its catalog only after opening began", async () => {
+		let { server, channel } = await setup();
+		let raw = await rawLink(server.url, undefined, "capability-catalog, session-choice");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let deps = {
+			catalog: (id: string) => plannerCatalog("remote", id, undefined),
+			known: (id: string) => plannerOfferKnown("remote", id),
+			offered: (id: string) => plannerOffered("remote", id, 4_000),
+			storage: {
+				plannerModelChoices: {
+					get: async (channelId: string) => ({
+						channelId,
+						model: "acme/large",
+						modelName: "Large",
+						thinkingLevel: "high",
+						userId: "U_test",
+						updatedAt: new Date(),
+					}),
+				},
+			} as never,
+			lease: () => {
+				throw new Error("nothing is stored here");
+			},
+		};
+		let opening = sessionModel(deps, channel.id).then(choice =>
+			adapterFor(server, { channelId: channel.id, isolated: false, choice }).doStart({
+				sessionId: "opens-before-report",
+				sandboxSession,
+				sessionWorkDir: "/tmp",
+			})
+		);
+		await Bun.sleep(50);
+		expect(raw.messages.some(message => message.type === "start")).toBe(false);
+		raw.send({ type: "capabilities", catalog });
+		let start = await raw.next("start");
+		expect(start).toMatchObject({ model: "acme/large", thinkingLevel: "high" });
+		raw.send({ type: "started", session: start.session });
+		let opened = await opening;
+		cleanups.push(() => opened.doDestroy());
+		raw.send({ type: "detach" });
+		await raw.closed;
+	});
+
+	it("says a client's offer is settled once it reports, or once its link ends", async () => {
+		let { server, channel } = await setup();
+		let raw = await rawLink(server.url, undefined, "capability-catalog");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let link = server.links.at(-1)!;
+		let settled = false;
+		void link.offered.then(() => settled = true);
+		await Bun.sleep(20);
+		expect(settled).toBe(false);
+		raw.send({ type: "capabilities", catalog });
+		await until(() => settled, 1_000);
+		raw.send({ type: "detach" });
+		await raw.closed;
+
+		let gone = await rawLink(server.url, undefined, "capability-catalog");
+		gone.send({ type: "attach", version: 1, document: channel.id });
+		await gone.next("attached");
+		let ended = server.links.at(-1)!;
+		let waited = ended.offered;
+		gone.send({ type: "detach" });
+		await gone.closed;
+		await waited;
+	});
 });
 
 describe("Agent connection questions", () => {
@@ -2139,12 +2217,7 @@ describe("Agent connection questions", () => {
 		let { server, channel, client } = await setup({});
 		let planner: RemotePlanner = { channelId: channel.id, isolated: options.isolated ?? false };
 		if (!options.isolated) {
-			planner.humanInput = report =>
-				createHumanInput(
-					f.room,
-					(runId, signal) => untilUnpaused(planner, runId, signal),
-					report,
-				);
+			planner.humanInput = report => createHumanInput(f.room, report);
 		}
 		let sessionId = crypto.randomUUID();
 		let session = await adapterFor(server, planner).doStart({
@@ -2276,30 +2349,6 @@ describe("Agent connection questions", () => {
 		expect(Store.outstanding(f.plan.questions)).toHaveLength(0);
 	});
 
-	it("holds a workflow answer until the client reports its root run unpaused", async () => {
-		let { f, client, sessionId, planner } = await questions();
-		client.reportRuns(sessionId, { active: [], paused: ["root"], cards: [] });
-		await Bun.sleep(20);
-		expect(planner.runs?.paused).toEqual(["root"]);
-		let settled = false;
-		let asked = client.ask(sessionId, { method: "questionnaire", params }, {
-			workflowRunId: "stage-run",
-			rootRunId: "root",
-		}).then(result => {
-			settled = true;
-			return result;
-		});
-		let [card] = await f.cards(1);
-		await f.answer(card!.id, [1]);
-		await Bun.sleep(30);
-		expect(settled).toBe(false);
-		client.reportRuns(sessionId, { active: ["root"], paused: [], cards: [] });
-		expect(await asked).toMatchObject({
-			status: "answered",
-			value: { answers: [{ kind: "option", answer: "Memory" }] },
-		});
-	});
-
 	it("gives an isolated session no Decisions", async () => {
 		let { f, client, sessionId } = await questions({ isolated: true });
 		expect(await client.ask(sessionId, { method: "questionnaire", params })).toMatchObject({
@@ -2317,7 +2366,7 @@ describe("Agent connection questions", () => {
 		let opened = await adapterFor(server, {
 			channelId: channel.id,
 			isolated: false,
-			humanInput: report => createHumanInput(f.room, undefined, report),
+			humanInput: report => createHumanInput(f.room, report),
 		}).doStart({ sessionId: crypto.randomUUID(), sandboxSession, sessionWorkDir: "/tmp" });
 		cleanups.push(() => opened.doDestroy());
 		let request = {
@@ -2384,7 +2433,7 @@ describe("Agent connection questions", () => {
 		let planner: RemotePlanner = {
 			channelId: f.room.id,
 			isolated: false,
-			humanInput: report => createHumanInput(f.room, undefined, report),
+			humanInput: report => createHumanInput(f.room, report),
 		};
 		let harness = adapterFor(linked.server, planner);
 		let start = (sessionId: string) =>
@@ -2554,5 +2603,849 @@ describe("Agent connection background workers", () => {
 			aborted: new Promise<never>(() => {}),
 			openSandbox: async () => sandboxSession,
 		})).rejects.toThrow("No machine is connected to this document.");
+	});
+});
+
+describe("Agent connection AI launches", () => {
+	/** Launches as Chopin would hand them out, each with its own stand-in, recorded. */
+	function launches() {
+		let asked: Array<{ userId: string; machineId?: string; channelId: string; sessionId: string }> =
+			[];
+		let ended: string[] = [];
+		let listeners = new Set<(userId: string) => void>();
+		let ai: AgentAi = {
+			async launch(input) {
+				asked.push(input);
+				let n = asked.length;
+				return {
+					launchId: `launch-${n}`,
+					grants: {
+						launch: `chopin_launch_${n}`,
+						expiresAt: Date.now() + 60 * 60_000,
+						providers: [{
+							provider: "anthropic",
+							baseUrl: "https://chopin.test/api/v1/ai/anthropic",
+							placeholder: `chopin_ai_${n}`,
+							keyVariable: "ANTHROPIC_API_KEY",
+						}],
+						withheld: [],
+					},
+				};
+			},
+			end: launchId => void ended.push(launchId),
+			onChanged(listener) {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		};
+		let changed = (userId: string) => {
+			for (let listener of listeners) listener(userId);
+		};
+		return { ai, asked, ended, changed, listeners };
+	}
+
+	async function opened(header: string | undefined) {
+		let { auth, channel } = await linkAuth();
+		let made = launches();
+		let server = linkServer(auth, 2_000, undefined, 2_000, undefined, undefined, { ai: made.ai });
+		cleanups.push(server.stop);
+		let raw = await rawLink(server.url, undefined, header);
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let opening = adapterFor(server, { channelId: channel.id, isolated: false }).doStart({
+			sessionId: `ai-${header}`,
+			sandboxSession,
+			sessionWorkDir: "/tmp",
+		});
+		let start = await raw.next("start");
+		raw.send({ type: "started", session: start.session });
+		let session = await opening;
+		return { ...made, raw, start, session, channel };
+	}
+
+	it("hands a client that offered ai-credentials a launch for its account on start, and new grants when they change", async () => {
+		let { raw, start, session, channel, asked, ended, changed, listeners } = await opened(
+			"ai-credentials",
+		);
+		expect(asked).toEqual([{
+			userId: "U_member",
+			channelId: channel.id,
+			sessionId: start.session,
+		}]);
+		expect(start.ai).toEqual({
+			launch: "chopin_launch_1",
+			expiresAt: expect.any(Number),
+			providers: [{
+				provider: "anthropic",
+				baseUrl: "https://chopin.test/api/v1/ai/anthropic",
+				placeholder: "chopin_ai_1",
+				keyVariable: "ANTHROPIC_API_KEY",
+			}],
+			withheld: [],
+		});
+		// Someone else's credentials changing changes nothing here.
+		changed("U_rival");
+		await Bun.sleep(30);
+		expect(asked).toHaveLength(1);
+		changed("U_member");
+		let renewed = await raw.next("ai");
+		expect(renewed).toMatchObject({
+			session: start.session,
+			ai: { launch: "chopin_launch_2", providers: [{ placeholder: "chopin_ai_2" }] },
+		});
+		await until(() => ended.length === 1, 1_000);
+		expect(ended).toEqual(["launch-1"]);
+		await session.doDestroy();
+		await raw.next("destroy");
+		expect(ended).toEqual(["launch-1", "launch-2"]);
+		expect(listeners.size).toBe(0);
+		raw.send({ type: "detach" });
+		await raw.closed;
+	});
+
+	it("ends a session's launch when its link closes for good", async () => {
+		let { raw, ended } = await opened("ai-credentials");
+		raw.send({ type: "detach" });
+		await raw.closed;
+		await until(() => ended.length === 1, 1_000);
+		expect(ended).toEqual(["launch-1"]);
+	});
+
+	it("ends a launch prepared for a session whose link closed while it was being prepared, and sends it nowhere", async () => {
+		let { auth, channel } = await linkAuth();
+		let made = launches();
+		let preparing = Promise.withResolvers<void>();
+		let prepared = Promise.withResolvers<void>();
+		let launch = made.ai.launch;
+		made.ai.launch = async input => {
+			preparing.resolve();
+			await prepared.promise;
+			return launch(input);
+		};
+		let server = linkServer(auth, 2_000, undefined, 2_000, undefined, undefined, { ai: made.ai });
+		cleanups.push(server.stop);
+		let raw = await rawLink(server.url, undefined, "ai-credentials");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let opening = adapterFor(server, { channelId: channel.id, isolated: false }).doStart({
+			sessionId: "ai-closed-while-preparing",
+			sandboxSession,
+			sessionWorkDir: "/tmp",
+		});
+		let failed = opening.then(() => undefined, (error: unknown) => error);
+		await preparing.promise;
+		raw.send({ type: "detach" });
+		await raw.closed;
+		prepared.resolve();
+		expect(await failed).toBeInstanceOf(Error);
+		await until(() => made.ended.length === 1, 1_000);
+		expect(made.ended).toEqual(["launch-1"]);
+		expect(raw.messages.some(message => message.type === "start")).toBe(false);
+	});
+
+	/** A link whose client offered `features` and attached, on launches that hand out catalog launches too. */
+	async function attachedForCatalog(
+		features: string,
+		made = launches(),
+		hooks: { catalogChanged?: AgentHooks["catalogChanged"] } = {},
+	) {
+		let { auth, channel } = await linkAuth();
+		let catalogs: Array<{ userId: string; machineId?: string; channelId: string; linkId: string }> =
+			[];
+		let held: Array<[string, boolean]> = [];
+		made.ai.catalog = async input => {
+			catalogs.push(input);
+			let n = catalogs.length;
+			return {
+				launchId: `catalog-${n}`,
+				grants: {
+					launch: `chopin_launch_catalog_${n}`,
+					expiresAt: Date.now() + 60 * 60_000,
+					providers: [{
+						provider: "github-copilot",
+						baseUrl: "https://chopin.test/api/v1/ai/github-copilot",
+						placeholder: `chopin_ai_catalog_${n}`,
+						keyVariable: "COPILOT_GITHUB_TOKEN",
+					}],
+					withheld: [],
+				},
+			};
+		};
+		made.ai.held = (launchId, holding) => void held.push([launchId, holding]);
+		let server = linkServer(auth, 2_000, undefined, 2_000, undefined, undefined, {
+			ai: made.ai,
+			...hooks,
+		});
+		cleanups.push(server.stop);
+		let raw = await rawLink(server.url, undefined, features);
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		return { ...made, raw, channel, catalogs, held, server, link: server.links.at(-1)! };
+	}
+
+	it("hands a client that asks the link's catalog launch, owned by the link, again when the person's credentials change, and ends it with the link", async () => {
+		let { raw, channel, catalogs, held, ended, changed, listeners, asked } =
+			await attachedForCatalog(
+				"ai-credentials, ai-catalog",
+			);
+		await Bun.sleep(30);
+		expect(raw.messages.filter(message => message.type === "ai-catalog")).toEqual([]);
+		expect(catalogs).toEqual([]);
+
+		raw.send({ type: "ai-catalog" });
+		let first = await raw.next("ai-catalog");
+		expect(first.ai).toEqual({
+			launch: "chopin_launch_catalog_1",
+			expiresAt: expect.any(Number),
+			providers: [{
+				provider: "github-copilot",
+				baseUrl: "https://chopin.test/api/v1/ai/github-copilot",
+				placeholder: "chopin_ai_catalog_1",
+				keyVariable: "COPILOT_GITHUB_TOKEN",
+			}],
+			withheld: [],
+		});
+		expect(catalogs).toEqual([{
+			userId: "U_member",
+			channelId: channel.id,
+			linkId: expect.any(String),
+		}]);
+		expect(held).toEqual([["catalog-1", true]]);
+		expect(asked).toEqual([]);
+
+		// Asking again changes nothing.
+		raw.send({ type: "ai-catalog" });
+		changed("U_rival");
+		await Bun.sleep(30);
+		expect(catalogs).toHaveLength(1);
+
+		changed("U_member");
+		let renewed = await raw.next("ai-catalog");
+		expect(renewed.ai).toMatchObject({ launch: "chopin_launch_catalog_2" });
+		expect(catalogs[1]!.linkId).toBe(catalogs[0]!.linkId);
+		await until(() => ended.length === 1, 1_000);
+		expect(ended).toEqual(["catalog-1"]);
+		expect(held).toEqual([["catalog-1", true], ["catalog-2", true], ["catalog-1", false]]);
+
+		raw.send({ type: "detach" });
+		await raw.closed;
+		await until(() => ended.length === 2, 1_000);
+		expect(ended).toEqual(["catalog-1", "catalog-2"]);
+		expect(held.at(-1)).toEqual(["catalog-2", false]);
+		expect(listeners.size).toBe(0);
+	});
+
+	it("prepares the catalog launches of many documents attached at once side by side, none waiting on another", async () => {
+		let { auth, channel } = await linkAuth();
+		let documents = [channel.id];
+		for (let index = 1; index < 10; index++) {
+			let created = await auth.storage.channels.create({
+				id: crypto.randomUUID(),
+				repositoryId: "R_score",
+				repositoryOwner: "octo-org",
+				repositoryName: "score",
+				title: `Created document ${index}`,
+				createdBy: "U_member",
+				now: new Date(),
+			});
+			documents.push(created.id);
+		}
+		let made = launches();
+		let asked: string[] = [];
+		let answer = Promise.withResolvers<void>();
+		made.ai.catalog = async input => {
+			asked.push(input.channelId);
+			// Every launch waits on the one answer, as they all wait on GitHub's held question.
+			await answer.promise;
+			return {
+				launchId: `catalog-${input.channelId}`,
+				grants: { launch: "chopin_launch_catalog", providers: [], withheld: [] },
+			};
+		};
+		let server = linkServer(auth, 2_000, undefined, 2_000, undefined, undefined, { ai: made.ai });
+		cleanups.push(server.stop);
+		let links = await Promise.all(documents.map(async document => {
+			let raw = await rawLink(server.url, undefined, "ai-credentials, ai-catalog");
+			raw.send({ type: "attach", version: 1, document });
+			await raw.next("attached");
+			return raw;
+		}));
+		for (let raw of links) raw.send({ type: "ai-catalog" });
+		// Each link asked for its launch before any was handed out: none waits on another's.
+		await until(() => asked.length === documents.length, 2_000);
+		expect(new Set(asked)).toEqual(new Set(documents));
+		expect(links.flatMap(raw => raw.messages.filter(message => message.type === "ai-catalog")))
+			.toEqual([]);
+		answer.resolve();
+		for (let raw of links) {
+			expect((await raw.next("ai-catalog")).ai).toMatchObject({ providers: [] });
+		}
+		for (let raw of links) raw.send({ type: "detach" });
+	});
+
+	it("tells an account with nothing to list so in an empty catalog grant, and ends one prepared while its link closed unsent", async () => {
+		let refused = await attachedForCatalog("ai-credentials, ai-catalog");
+		refused.ai.catalog = async () => {
+			throw new AiLaunchRefused("no-ai-account", [{
+				provider: "github-copilot",
+				reason: "no-copilot-access",
+			}]);
+		};
+		refused.raw.send({ type: "ai-catalog" });
+		expect((await refused.raw.next("ai-catalog")).ai).toEqual({
+			providers: [],
+			withheld: [{ provider: "github-copilot", reason: "no-copilot-access" }],
+		});
+		refused.raw.send({ type: "detach" });
+		await refused.raw.closed;
+
+		let closing = await attachedForCatalog("ai-credentials, ai-catalog");
+		let preparing = Promise.withResolvers<void>();
+		let prepared = Promise.withResolvers<void>();
+		let catalog = closing.ai.catalog!;
+		closing.ai.catalog = async input => {
+			preparing.resolve();
+			await prepared.promise;
+			return catalog(input);
+		};
+		closing.raw.send({ type: "ai-catalog" });
+		await preparing.promise;
+		closing.raw.send({ type: "detach" });
+		await closing.raw.closed;
+		prepared.resolve();
+		await until(() => closing.ended.length === 1, 1_000);
+		expect(closing.ended).toEqual(["catalog-1"]);
+		expect(closing.held).toEqual([]);
+		expect(closing.raw.messages.filter(message => message.type === "ai-catalog")).toEqual([]);
+	});
+
+	it("hands no catalog launch to a client that did not offer ai-catalog, or ai-credentials, and takes an ask without the feature as a protocol violation", async () => {
+		let without = await attachedForCatalog("ai-credentials");
+		without.raw.send({ type: "ai-catalog" });
+		expect(await without.raw.next("error")).toMatchObject({ code: "protocol" });
+		await without.raw.closed;
+		expect(without.catalogs).toEqual([]);
+
+		let noCredentials = await attachedForCatalog("ai-catalog");
+		noCredentials.raw.send({ type: "ai-catalog" });
+		await Bun.sleep(50);
+		expect(noCredentials.raw.messages.filter(message => message.type === "ai-catalog")).toEqual([]);
+		expect(noCredentials.catalogs).toEqual([]);
+		noCredentials.raw.send({ type: "detach" });
+		await noCredentials.raw.closed;
+	});
+
+	/** What the old account's Copilot offers, and what the token connected in its place offers. */
+	const OLD = {
+		models: { available: [{ id: "github-copilot/gpt-old", name: "GPT Old" }] },
+		commands: [{ name: "release-notes", kind: "skill" }],
+	};
+	const NEW = {
+		models: { available: [{ id: "github-copilot/gemini-4-neon", name: "Gemini 4 Neon" }] },
+		commands: [{ name: "release-notes", kind: "skill" }],
+	};
+
+	it("counts a report only through a catalog launch of the person's accounts as they are now, with catalog-launches", async () => {
+		let told: unknown[] = [];
+		let { raw, link, changed, ai } = await attachedForCatalog(
+			"capability-catalog, ai-credentials, ai-catalog, catalog-launches",
+			launches(),
+			{ catalogChanged: (_id, reported) => void told.push(reported.catalog) },
+		);
+		// A list told on attach names no launch: kept from accounts nobody can name now.
+		raw.send({ type: "capabilities", catalog: OLD });
+		raw.send({ type: "ai-catalog" });
+		let first = await raw.next("ai-catalog");
+		expect(first.catalogLaunch).toEqual(expect.any(String));
+		expect(link.catalog).toBeUndefined();
+		expect(link.catalogPending).toBe(true);
+		raw.send({ type: "capabilities", catalog: OLD, catalogLaunch: first.catalogLaunch });
+		await until(() => link.catalog !== undefined, 1_000);
+		expect(link.catalog).toEqual(OLD);
+		expect(link.catalogPending).toBe(false);
+
+		// Someone else's accounts changing changes nothing here.
+		changed("U_rival");
+		expect(link.catalog).toEqual(OLD);
+
+		// The person connects a token of another account: the next launch waits, so the old one's
+		// report can arrive before it is handed.
+		let preparing = Promise.withResolvers<void>();
+		let release = Promise.withResolvers<void>();
+		let catalog = ai.catalog!;
+		ai.catalog = async input => {
+			preparing.resolve();
+			await release.promise;
+			return catalog(input);
+		};
+		changed("U_member");
+		// At once, before any new launch is handed: the old list is no longer what the client offers.
+		expect(link.catalog).toBeUndefined();
+		expect(link.catalogPending).toBe(true);
+		// It names its launches, so it lists them again through the new one: it is waited for.
+		expect(link.outdated).toBe(false);
+		expect(told).toEqual([OLD, undefined]);
+		// Its commands are the client's own, and stay.
+		expect(link.lastReport).toEqual(OLD);
+		let offered = false;
+		void link.offered.then(() => offered = true);
+		await preparing.promise;
+		raw.send({ type: "capabilities", catalog: OLD, catalogLaunch: first.catalogLaunch });
+		raw.send({ type: "capabilities", catalog: OLD });
+		await Bun.sleep(50);
+		expect(link.catalog).toBeUndefined();
+		expect(offered).toBe(false);
+
+		release.resolve();
+		let second = await raw.next("ai-catalog");
+		expect(second.catalogLaunch).toEqual(expect.any(String));
+		expect(second.catalogLaunch).not.toBe(first.catalogLaunch);
+		// A computation through the old launch that ends late still counts for nobody.
+		raw.send({ type: "capabilities", catalog: OLD, catalogLaunch: first.catalogLaunch });
+		raw.send({ type: "capabilities", catalog: NEW, catalogLaunch: second.catalogLaunch });
+		await until(() => link.catalog !== undefined, 1_000);
+		expect(link.catalog).toEqual(NEW);
+		expect(offered).toBe(true);
+		expect(told).toEqual([OLD, undefined, NEW]);
+		raw.send({ type: "capabilities", catalog: OLD, catalogLaunch: first.catalogLaunch });
+		await Bun.sleep(50);
+		expect(link.catalog).toEqual(NEW);
+		raw.send({ type: "detach" });
+		await raw.closed;
+	});
+
+	it("counts a report of a client that names no launch only while the latest catalog launch handed is for the person's accounts as they are now", async () => {
+		let { raw, link, changed, ai } = await attachedForCatalog(
+			"capability-catalog, ai-credentials, ai-catalog",
+		);
+		// Before any launch is handed, a report can only be a list kept from earlier accounts.
+		raw.send({ type: "capabilities", catalog: OLD });
+		raw.send({ type: "ai-catalog" });
+		let first = await raw.next("ai-catalog");
+		expect("catalogLaunch" in first).toBe(false);
+		expect(link.catalog).toBeUndefined();
+		raw.send({ type: "capabilities", catalog: OLD });
+		await until(() => link.catalog !== undefined, 1_000);
+		expect(link.catalog).toEqual(OLD);
+
+		let preparing = Promise.withResolvers<void>();
+		let release = Promise.withResolvers<void>();
+		let catalog = ai.catalog!;
+		ai.catalog = async input => {
+			preparing.resolve();
+			await release.promise;
+			return catalog(input);
+		};
+		changed("U_member");
+		expect(link.catalog).toBeUndefined();
+		// It may never report again: Chopin says it needs an update, and nothing waits for it.
+		expect(link.outdated).toBe(true);
+		expect(link.catalogPending).toBe(true);
+		expect(await Promise.race([link.offered.then(() => true), Bun.sleep(50).then(() => false)]))
+			.toBe(true);
+		// A turn that ran without its models leaves them unknown, so the room is still told why.
+		link.settleWithoutCatalog();
+		expect(link.catalogPending).toBe(true);
+		await preparing.promise;
+		// Between the change and the launch for the new accounts, nothing counts.
+		raw.send({ type: "capabilities", catalog: OLD });
+		await Bun.sleep(50);
+		expect(link.catalog).toBeUndefined();
+		release.resolve();
+		await raw.next("ai-catalog");
+		raw.send({ type: "capabilities", catalog: NEW });
+		await until(() => link.catalog !== undefined, 1_000);
+		expect(link.catalog).toEqual(NEW);
+		expect(link.outdated).toBe(false);
+		expect(link.catalogPending).toBe(false);
+
+		// Naming a launch is the feature's alone.
+		raw.send({ type: "capabilities", catalog: NEW, catalogLaunch: "c-1" });
+		expect(await raw.next("error")).toMatchObject({ code: "protocol" });
+		await raw.closed;
+	});
+
+	it("names even an empty catalog grant, and counts the report that answers it", async () => {
+		let { raw, link, ai } = await attachedForCatalog(
+			"capability-catalog, ai-credentials, ai-catalog, catalog-launches",
+		);
+		ai.catalog = async () => {
+			throw new AiLaunchRefused("no-ai-account", []);
+		};
+		raw.send({ type: "ai-catalog" });
+		let empty = await raw.next("ai-catalog");
+		expect(empty.ai).toEqual({ providers: [], withheld: [] });
+		expect(empty.catalogLaunch).toEqual(expect.any(String));
+		raw.send({ type: "capabilities", catalog: {}, catalogLaunch: empty.catalogLaunch });
+		await until(() => link.catalog !== undefined, 1_000);
+		expect(link.catalog).toEqual({});
+		expect(link.catalogPending).toBe(false);
+		raw.send({ type: "detach" });
+		await raw.closed;
+	});
+
+	it("leaves a client that did not offer ai-credentials as it was: no launch, and no grants", async () => {
+		for (let header of [undefined, "capability-catalog"]) {
+			let { raw, start, session, asked, changed } = await opened(header);
+			expect("ai" in start).toBe(false);
+			changed("U_member");
+			await Bun.sleep(30);
+			expect(asked).toEqual([]);
+			await session.doDestroy();
+			raw.send({ type: "detach" });
+			await raw.closed;
+		}
+	});
+});
+
+/** The providers a launch's grants name, in order. */
+function providers(grants: { providers: Array<{ provider: string }> }) {
+	return grants.providers.map(grant => grant.provider);
+}
+
+describe("Agent connection AI launches on the person's accounts in Chopin", () => {
+	/**
+	 * The member's AI accounts as Chopin keeps them, launched for sessions as `main.ts` launches
+	 * them, with GitHub answering their Copilot access as `copilot` says and a provider standing in
+	 * for OpenAI that answers each model request as `answer` says.
+	 */
+	async function accounts(storage: Parameters<typeof testLease>[0]) {
+		let lease = await testLease(storage);
+		let state = {
+			copilot: "none" as "access" | "none" | "unreachable",
+			answer: "ok" as "ok" | "invalid" | "throttled",
+		};
+		/** The requests that reached the provider standing in for OpenAI, by method and path. */
+		let reached: string[] = [];
+		let openai = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch(request) {
+				reached.push(`${request.method} ${new URL(request.url).pathname}`);
+				if (new URL(request.url).pathname === "/api.json") return Response.json({});
+				if (new URL(request.url).pathname === "/v1/models") return Response.json({ data: [] });
+				if (state.answer === "invalid") {
+					return Response.json({ error: { code: "invalid_api_key" } }, { status: 401 });
+				}
+				if (state.answer === "throttled") return Response.json({}, { status: 429 });
+				return Response.json({ choices: [] });
+			},
+		});
+		cleanups.push(() => openai.stop(true));
+		let upstream = `http://127.0.0.1:${openai.port}`;
+		let credentials = new AiCredentials({
+			storage,
+			lease: () => lease,
+			key: new Uint8Array(32).fill(3),
+			origin: "https://chopin.test",
+			githubToken: async () => "ghu_member",
+			copilotToken: async () => {
+				if (state.copilot === "unreachable") throw new Error("GitHub answered 502");
+				return state.copilot === "access"
+					? { token: "tid=member", expiresAt: Date.now() + 1_800_000 }
+					: undefined;
+			},
+			upstreams: { openai: upstream },
+			// A link's catalog launch is owned while a link of this process holds it, as in main.ts.
+			ownerLive: ({ launchId, owner }) => !catalogOnly(owner) || held.has(launchId),
+		});
+		let held = new Set<string>();
+		let ai: AgentAi = {
+			launch: ({ sessionId, ...input }) =>
+				handOut(credentials, {
+					...input,
+					owner: `session:${sessionId}`,
+					expiresAt: new Date(Date.now() + PLANNER_AI_LAUNCH_MS),
+				}),
+			catalog: ({ linkId, ...input }) =>
+				handOut(credentials, {
+					...input,
+					owner: `link:${linkId}`,
+					expiresAt: new Date(Date.now() + PLANNER_AI_LAUNCH_MS),
+				}),
+			end: launchId => endLaunch(credentials, launchId),
+			onChanged: listener => credentials.onChanged(listener),
+			held: (launchId, holding) => void (holding ? held.add(launchId) : held.delete(launchId)),
+		};
+		let proxy = aiProxy({ credentials, upstreams: { openai: upstream, catalog: upstream } });
+		return { credentials, state, ai, held, proxy, reached };
+	}
+
+	/** Opens a session on a raw link offering `features`, for the planner given. */
+	async function starting(
+		features: string | undefined,
+		prepare?: (made: Awaited<ReturnType<typeof accounts>>) => Promise<void>,
+		planner: Partial<RemotePlanner> = {},
+	) {
+		let { auth, channel, storage } = await linkAuth();
+		let made = await accounts(storage);
+		await prepare?.(made);
+		let server = linkServer(auth, 2_000, undefined, 2_000, undefined, undefined, { ai: made.ai });
+		cleanups.push(server.stop);
+		let raw = await rawLink(server.url, undefined, features);
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let opening = adapterFor(server, { channelId: channel.id, isolated: false, ...planner })
+			.doStart(
+				{ sessionId: crypto.randomUUID(), sandboxSession, sessionWorkDir: "/tmp" },
+			);
+		return { ...made, raw, opening, channel, storage };
+	}
+
+	it("hands a client that asks a catalog launch of its account that lists its models through Chopin's proxy and runs none, and ends it with the link", async () => {
+		let { auth, channel, storage } = await linkAuth();
+		let made = await accounts(storage);
+		await made.credentials.connect("U_member", "openai", {
+			kind: "api-key",
+			secret: "sk-member-openai-0123456789",
+		});
+		let server = linkServer(auth, 2_000, undefined, 2_000, undefined, undefined, { ai: made.ai });
+		cleanups.push(server.stop);
+		let raw = await rawLink(server.url, undefined, "ai-credentials, ai-catalog");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		raw.send({ type: "ai-catalog" });
+		let { ai } = await raw.next("ai-catalog");
+		expect(providers(ai)).toEqual(["openai"]);
+		let grant = ai.providers[0];
+		let ask = (method: string, path: string) => {
+			let url = new URL(`https://chopin.test/api/v1/ai/${path}`);
+			return made.proxy(
+				new Request(url, {
+					method,
+					headers: { authorization: `Bearer ${grant.placeholder}`, "x-chopin-launch": ai.launch },
+					...(method === "POST" ? { body: "{}" } : {}),
+				}),
+				url,
+			);
+		};
+
+		expect((await ask("GET", "openai/v1/models")).status).toBe(200);
+		expect((await ask("GET", "models.dev/api.json")).status).toBe(200);
+		let reached = [...made.reached];
+		for (
+			let [method, path] of [
+				["POST", "openai/v1/chat/completions"],
+				["POST", "openai/v1/responses"],
+				["GET", "openai/v1/responses/resp_1"],
+				["POST", "openai/v1/embeddings"],
+			]
+		) {
+			let refused = await ask(method!, path!);
+			expect(refused.status).toBe(403);
+			expect((await refused.json()).error.code).toBe("catalog-only");
+		}
+		expect(made.reached).toEqual(reached);
+		expect(reached).toContain("GET /v1/models");
+		expect(reached).not.toContain("POST /v1/chat/completions");
+
+		raw.send({ type: "detach" });
+		await raw.closed;
+		let after = await ask("GET", "openai/v1/models");
+		expect(after.status).toBe(401);
+		expect(["launch-ended", "unknown-placeholder"]).toContain((await after.json()).error.code);
+		let state = new URL("https://chopin.test/api/v1/ai/launch");
+		let launch = await made.proxy(
+			new Request(state, { headers: { "x-chopin-launch": ai.launch } }),
+			state,
+		);
+		expect(await launch.json()).toEqual({ state: "ended" });
+		expect(made.reached).toEqual(reached);
+	});
+
+	it("starts no session, and forks none, for someone with no Copilot seat and no key, refusing it with no-ai-account", async () => {
+		for (
+			let [features, planner, sent] of [
+				["ai-credentials", {}, "start"],
+				["ai-credentials, session-forks", { forkFrom: { session: "parent" } }, "fork"],
+			] as const
+		) {
+			let { raw, opening, state } = await starting(features, undefined, planner);
+			let failed = await opening.then(() => undefined, (error: unknown) => error);
+			expect(failed).toMatchObject({
+				code: "no-ai-account",
+				message:
+					"chopin needs an AI account to answer, so it didn't start. Add one, then try again.",
+			});
+			expect(turnFailureOf({ error: failed, suspended: false })).toMatchObject({
+				kind: "error",
+				code: "no-ai-account",
+			});
+			await Bun.sleep(30);
+			expect(raw.messages.filter(message => message.type === sent)).toEqual([]);
+			expect(state.copilot).toBe("none");
+			raw.send({ type: "detach" });
+			await raw.closed;
+		}
+	});
+
+	it("says a Copilot check that couldn't finish couldn't finish, never that there is no subscription", async () => {
+		let { raw, opening } = await starting("ai-credentials", async made => {
+			made.state.copilot = "unreachable";
+		});
+		let failed = await opening.then(() => undefined, (error: unknown) => error) as Error;
+		expect(failed.message).toBe(
+			"chopin couldn't finish checking your AI accounts, so it didn't start. Try again in a moment.",
+		);
+		expect(failed.message).not.toMatch(/subscription/i);
+		expect(raw.messages.filter(message => message.type === "start")).toEqual([]);
+		raw.send({ type: "detach" });
+		await raw.closed;
+	});
+
+	it("starts a session on one key, and a client that did not offer ai-credentials as before", async () => {
+		let withKey = await starting(
+			"ai-credentials",
+			made =>
+				made.credentials.connect("U_member", "openai", {
+					kind: "api-key",
+					secret: "sk-member-openai-0123456789",
+				}).then(() => {}),
+		);
+		let start = await withKey.raw.next("start");
+		expect(start.ai.providers.map((grant: { provider: string }) => grant.provider)).toEqual([
+			"openai",
+		]);
+		withKey.raw.send({ type: "started", session: start.session });
+		await (await withKey.opening).doDestroy();
+
+		let older = await starting(undefined);
+		let plain = await older.raw.next("start");
+		expect("ai" in plain).toBe(false);
+		older.raw.send({ type: "started", session: plain.session });
+		await (await older.opening).doDestroy();
+	});
+
+	it("takes Copilot away and back as GitHub confirms a seat lost and regained, and a key its provider refuses, but not a rate limit", async () => {
+		let { raw, opening, state, credentials, proxy } = await starting(
+			"ai-credentials",
+			async made => {
+				made.state.copilot = "access";
+				await made.credentials.connect("U_member", "openai", {
+					kind: "api-key",
+					secret: "sk-member-openai-0123456789",
+				});
+			},
+		);
+		let start = await raw.next("start");
+		raw.send({ type: "started", session: start.session });
+		let session = await opening;
+		expect(providers(start.ai)).toEqual(["github-copilot", "openai"]);
+
+		state.copilot = "none";
+		await credentials.check("U_member", "ghu_member");
+		let lost = await raw.next("ai");
+		expect(providers(lost.ai)).toEqual(["openai"]);
+
+		state.copilot = "access";
+		await credentials.check("U_member", "ghu_member");
+		let back = await raw.next("ai");
+		expect(providers(back.ai)).toEqual(["github-copilot", "openai"]);
+
+		// The same answer again changes nothing.
+		await credentials.check("U_member", "ghu_member");
+		await Bun.sleep(50);
+		expect(raw.messages.filter(message => message.type === "ai")).toEqual([]);
+
+		let openai = back.ai.providers.find((grant: { provider: string }) =>
+			grant.provider === "openai"
+		);
+		let ask = () => {
+			let url = new URL("https://chopin.test/api/v1/ai/openai/v1/chat/completions");
+			return proxy(
+				new Request(url, {
+					method: "POST",
+					headers: {
+						authorization: `Bearer ${openai.placeholder}`,
+						"x-chopin-launch": back.ai.launch,
+					},
+					body: "{}",
+				}),
+				url,
+			);
+		};
+		state.answer = "throttled";
+		expect((await ask()).status).toBe(429);
+		await Bun.sleep(50);
+		expect(raw.messages.filter(message => message.type === "ai")).toEqual([]);
+
+		state.answer = "invalid";
+		expect((await ask()).status).toBe(401);
+		let refused = await raw.next("ai");
+		expect(providers(refused.ai)).toEqual(["github-copilot"]);
+
+		await session.doDestroy();
+		raw.send({ type: "detach" });
+		await raw.closed;
+	});
+
+	it("hands a session the accounts as they are once it acknowledges its start, once, however often they changed while it started", async () => {
+		let { auth, channel } = await linkAuth();
+		let listeners = new Set<(userId: string) => void>();
+		let current = ["anthropic"];
+		let count = 0;
+		let ai: AgentAi = {
+			async launch() {
+				count++;
+				return {
+					launchId: `launch-${count}`,
+					grants: {
+						launch: `chopin_launch_${count}`,
+						expiresAt: Date.now() + 60 * 60_000,
+						providers: current.map(provider => ({
+							provider: provider as "anthropic" | "openai",
+							baseUrl: `https://chopin.test/api/v1/ai/${provider}`,
+							placeholder: `chopin_ai_${provider}_${count}`,
+							keyVariable: "KEY",
+						})),
+						withheld: [],
+					},
+				};
+			},
+			end: () => {},
+			onChanged(listener) {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		};
+		let changed = () => {
+			for (let listener of listeners) listener("U_member");
+		};
+		let server = linkServer(auth, 2_000, undefined, 2_000, undefined, undefined, { ai });
+		cleanups.push(server.stop);
+		let raw = await rawLink(server.url, undefined, "ai-credentials");
+		raw.send({ type: "attach", version: 1, document: channel.id });
+		await raw.next("attached");
+		let opening = adapterFor(server, { channelId: channel.id, isolated: false }).doStart({
+			sessionId: "starting-while-accounts-change",
+			sandboxSession,
+			sessionWorkDir: "/tmp",
+		});
+		let start = await raw.next("start");
+		current = ["anthropic", "openai"];
+		changed();
+		current = ["openai"];
+		changed();
+		await Bun.sleep(30);
+		expect(raw.messages.filter(message => message.type === "ai")).toEqual([]);
+		raw.send({ type: "started", session: start.session });
+		let session = await opening;
+		let renewed = await raw.next("ai");
+		expect(renewed.ai.providers.map((grant: { provider: string }) => grant.provider)).toEqual([
+			"openai",
+		]);
+		await Bun.sleep(50);
+		expect(raw.messages.filter(message => message.type === "ai")).toEqual([]);
+
+		// After the acknowledgement a change reaches it at once.
+		current = ["anthropic"];
+		changed();
+		let after = await raw.next("ai");
+		expect(after.ai.providers.map((grant: { provider: string }) => grant.provider)).toEqual([
+			"anthropic",
+		]);
+		await session.doDestroy();
+		raw.send({ type: "detach" });
+		await raw.closed;
 	});
 });

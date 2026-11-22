@@ -122,6 +122,13 @@ export declare namespace Session {
 		 * Absent when the server serves no built client.
 		 */
 		build?: string;
+		/**
+		 * The server's clock when it sent this hello, in milliseconds since the epoch. A client takes it
+		 * as the server's time when the hello arrived, which is never later than the server's clock was
+		 * then and earlier by the hello's transit at most, to place what it reports (`Chat.Typing.at`)
+		 * on the server's clock.
+		 */
+		now: number;
 	};
 
 	/** Durable channel metadata changed while this room was open. */
@@ -144,16 +151,21 @@ export declare namespace Session {
 		canManage: boolean;
 	};
 
-	/** The durable document was permanently deleted. This connection is terminal. */
+	/**
+	 * The durable document was permanently deleted, or its parent was. This connection is terminal.
+	 * `by` is the GitHub login of the person who deleted it, when the server knows; an older server
+	 * omits it.
+	 */
 	export type Deleted = KIND<"session:deleted"> & {
 		channelId: string;
+		by?: string;
 	};
 
 	/**
 	 * Who holds this document's remote Planner. `held` is a client that detached and
 	 * keeps the document until `until` (ISO 8601) unless it reattaches. `disconnected`
-	 * is a client whose connection dropped while it had workflow runs or open questions
-	 * Chopin keeps for it: there is no deadline, and it resumes them when it reconnects
+	 * is a client whose connection dropped while it had open questions, or answers it had not
+	 * received, that Chopin keeps for it: there is no deadline, and it resumes them when it reconnects
 	 * (see docs/agent-connection.md). `starting` is a paired machine of `login`'s asked to start it, which has yet to
 	 * attach; with `failure`, its backend has exited before attaching more than once in a
 	 * row, and with `attempt`, its backend has exited before attaching at least once, so the launch
@@ -235,19 +247,27 @@ export declare namespace Session {
 		 * Set for a refusal the client presents in full rather than as a generic
 		 * failure. `planner-not-attached`: a Planner request under `HARNESS=remote`
 		 * to a document no client is attached to; `message` says how to attach one.
-		 * `planner-busy`: a message to the Planner while its turn runs, and the harness cannot take
-		 * input mid-run (or the running turn is a background job's): it is refused, never held, and
-		 * `message` says to stop the turn to ask now. Final.
+		 * `planner-busy`: a message to the Planner while a turn runs on a harness taking no input
+		 * mid-run: it is refused, never held, and `message` says to stop the turn to ask now. Final.
+		 * `planner-starting`: a message to the Planner while another person's turn waits to start on a
+		 * harness taking no input mid-run: it is refused, never held, and `message` says to send again
+		 * once that turn has answered, and asks for no Stop. Final.
+		 * `no-ai-account`: a message to the Planner from a person with no AI account it can use (no
+		 * Copilot access and no API key), or whose Copilot access couldn't be checked and who has no
+		 * key: it is refused, never held, and `message` says which, to that person alone, with where
+		 * to add one (`AI_ACCOUNTS_PATH` in `ai-credentials`). Final.
 		 * `temporarily-unavailable`: a refusal of a `chat:send` for a passing reason (storage busy,
 		 * the room changing, too many sends being handled, a lookup of a reference or of the open
-		 * child that failed, a turn only beginning or finishing). The message is fine and is sent
-		 * again, with the same request id, and is kept once even if an earlier attempt was saved
-		 * before its answer was lost. Any refusal of a send without a code, or with
-		 * `planner-not-attached` or `planner-busy`, is final.
+		 * child that failed, the person's AI accounts changing while they were read). The message is
+		 * fine and is sent again, with the same request id, and is kept once even if an earlier
+		 * attempt was saved before its answer was lost. Any refusal of a send without a code, or with
+		 * `planner-not-attached`, `planner-busy`, `planner-starting` or `no-ai-account`, is final.
 		 */
 		code?:
 			| "planner-not-attached"
 			| "planner-busy"
+			| "planner-starting"
+			| "no-ai-account"
 			| "temporarily-unavailable";
 	};
 

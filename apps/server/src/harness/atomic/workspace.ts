@@ -5,8 +5,8 @@
  * the channel's repository, and remembered for the channel until the process
  * exits. Every later Planner session for that channel re-verifies it before use.
  * Without one, the session works in a directory Chopin keeps for that channel
- * alone under its per-user state directory, so files a paused or resumed
- * workflow wrote survive server restarts instead of filling the shared tmp.
+ * alone under its per-user state directory, so files its sessions wrote
+ * survive server restarts instead of filling the shared tmp.
  */
 
 import { chmod, lstat, mkdir } from "node:fs/promises";
@@ -48,17 +48,6 @@ export function stateDirectory(): string {
 		return join(homedir(), "Library", "Application Support", "Chopin");
 	}
 	return join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "chopin");
-}
-
-/**
- * Where Planner sessions journal their workflow runs. A run resumes only with
- * the journal and working directory it started with, so the journal lives
- * beside the channel directories rather than in Atomic's own home. An
- * operator's non-empty `ATOMIC_WORKFLOW_JOURNAL_PATH` still names the file.
- */
-export function workflowJournal(): string {
-	return process.env.ATOMIC_WORKFLOW_JOURNAL_PATH
-		|| join(stateDirectory(), "atomic", "workflows.sqlite");
 }
 
 /**

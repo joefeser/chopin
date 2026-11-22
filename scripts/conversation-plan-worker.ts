@@ -24,6 +24,7 @@ export function sourceHash(root: string): Promise<string> {
 	return treeHash(
 		root,
 		[
+			"apps/connector/package.json",
 			"apps/server",
 			"apps/web",
 			"packages",
@@ -309,8 +310,8 @@ async function namespace(report: Record<string, unknown>): Promise<void> {
 		});
 		socket.once("error", (error: NodeJS.ErrnoException) => {
 			clearTimeout(timer);
-			// Bun 1.4.4 maps kernel ENETUNREACH to ECONNREFUSED in this verified route-free namespace.
-			let mapped = Bun.version === "1.4.4" && error.code === "ECONNREFUSED";
+			// Bun 1.4.5 maps kernel ENETUNREACH to ECONNREFUSED in this verified route-free namespace.
+			let mapped = Bun.version === "1.4.5" && error.code === "ECONNREFUSED";
 			if (mapped || ["ENETUNREACH", "EHOSTUNREACH", "EACCES", "EPERM"].includes(error.code ?? "")) {
 				report.socketDenial = mapped ? "bun-mapped-unreachable" : "routing-denial";
 				resolve();
@@ -497,10 +498,11 @@ async function run(report: Record<string, unknown>, env: Record<string, string>)
 	};
 	process.on("SIGINT", stop);
 	process.on("SIGTERM", stop);
+	// The suite takes seven or eight minutes on a quiet machine; this leaves it room on a busy one.
 	let timer = setTimeout(() => {
 		report.deadline = true;
 		wake();
-	}, 600_000);
+	}, 1_200_000);
 	let failure = await Promise.race([child.exited, interrupted]).then(
 		() => undefined,
 		error => error,

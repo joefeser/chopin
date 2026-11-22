@@ -8,6 +8,8 @@
  * The words are a machine's and a person's own, none of Chopin's terms (`status-copy.test.tsx`).
  */
 
+import { AI_ACCOUNTS_PATH } from "@chopin/protocol/ai-credentials";
+
 import type { Chat } from "@chopin/protocol";
 import type { SendFailure } from "./references";
 
@@ -50,9 +52,13 @@ export function failureView(failure: Chat.TurnFailure): FailureView | undefined 
 	};
 }
 
+/** Where a refusal for want of an AI account sends the person to add one. */
+export const AI_ACCOUNTS_LINK = { label: "Open AI accounts", href: AI_ACCOUNTS_PATH };
+
 /**
- * The refused room message, in the server's words. Where no machine took it, sending it again
- * cannot help, so the action that can is offered instead: where to look at the machines.
+ * The refused room message, in the server's words. Where no machine took it, or the person has no
+ * AI account chopin can use, sending it again cannot help, so the action that can is offered
+ * instead: where to look at the machines, or at their AI accounts.
  */
 export function sendFailureView(
 	failure: Pick<SendFailure, "text">,
@@ -61,9 +67,14 @@ export function sendFailureView(
 	return {
 		kind: "send",
 		title: failure.text,
-		retry: code !== "planner-not-attached" && code !== "planner-busy",
+		retry: code !== "planner-not-attached"
+			&& code !== "planner-busy"
+			&& code !== "planner-starting"
+			&& code !== "no-ai-account",
 		...(code === "planner-not-attached"
 			? { link: { label: "Open machines", href: "/machines" } }
+			: code === "no-ai-account"
+			? { link: AI_ACCOUNTS_LINK }
 			: {}),
 	};
 }
@@ -103,11 +114,37 @@ export function failureBanner(
 				retry: view.retry && mine,
 				entry: entry.id,
 				...(view.retry && mine ? { request: asked!.id } : {}),
+				// Where chopin had no AI account to start on, the one who asked is pointed to theirs.
+				...(entry.turnFailure.code === "no-ai-account" && mine ? { link: AI_ACCOUNTS_LINK } : {}),
 			};
 		}
 		if (entry.author.kind !== "system") return undefined;
 	}
 	return undefined;
+}
+
+/** A Retry the server refused, in its words, with the refusal's code where it gave one. */
+export type RetryRefusal = { text: string; code?: string };
+
+export function retryRefusal(error: { message: string; code?: string | undefined }): RetryRefusal {
+	return { text: error.message, ...(error.code ? { code: error.code } : {}) };
+}
+
+/**
+ * The failure banner once its Retry was refused: the failed reply still stands, with the server's
+ * words for why it could not run again. Where the person has no AI account chopin can use, the
+ * banner points to AI accounts, and Retry stays for once they have added one.
+ */
+export function refusedRetryView(
+	failed: FailureBanner,
+	refusal: RetryRefusal | undefined,
+): FailureBanner {
+	if (!refusal) return failed;
+	return {
+		...failed,
+		detail: refusal.text,
+		...(refusal.code === "no-ai-account" ? { link: AI_ACCOUNTS_LINK } : {}),
+	};
 }
 
 /** The transcript without the failed reply's own line, which the banner tells instead. */

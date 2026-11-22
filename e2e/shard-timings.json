@@ -375,6 +375,10 @@
 		"ms": 42000,
 		"tests": 7
 	},
+	"storage-unavailable.e2e.ts": {
+		"ms": 7345,
+		"tests": 3
+	},
 	"syntax-contrast.e2e.ts": {
 		"ms": 5342,
 		"tests": 3
@@ -386,6 +390,14 @@
 	"table.e2e.ts": {
 		"ms": 33077,
 		"tests": 21
+	},
+	"theme-document.e2e.ts": {
+		"ms": 13295,
+		"tests": 4
+	},
+	"theme.e2e.ts": {
+		"ms": 12551,
+		"tests": 5
 	},
 	"toolbar.e2e.ts": {
 		"ms": 43143,

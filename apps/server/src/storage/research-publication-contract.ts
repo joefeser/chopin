@@ -5,6 +5,7 @@ import {
 	backgroundJob,
 	contractId as id,
 	openedStorage as opened,
+	testLease,
 	userAndChannel,
 } from "./contract-support";
 
@@ -196,6 +197,7 @@ export function researchPublicationContract(factory: StorageFactory): void {
 			await storage.channels.archive({
 				id: channelId,
 				now: new Date(input.now.getTime() + 1),
+				lease: await testLease(storage),
 			});
 			expect(
 				await storage.research.publishInitialReport({
@@ -208,10 +210,17 @@ export function researchPublicationContract(factory: StorageFactory): void {
 			await storage.channels.archive({
 				id: childId,
 				now: new Date(input.now.getTime() + 3),
+				lease: await testLease(storage),
 			});
-			await expect(storage.channels.delete(childId))
+			await expect(storage.channels.delete({ id: childId, lease }))
 				.rejects.toMatchObject({ failure: "conflict" });
 			expect(await storage.channels.get(childId)).toBeDefined();
+			// Its parent takes it, with the request that published it.
+			expect((await storage.channels.delete({ id: channelId, lease })).map(item => item.id))
+				.toEqual([channelId, childId]);
+			expect(await storage.channels.get(childId)).toBeUndefined();
+			expect(await storage.collaboration.load(childId, input.now)).toBeUndefined();
+			expect(await storage.research.get(channelId, ready.workspaceId)).toBeUndefined();
 		} finally {
 			await storage.close();
 		}
@@ -311,6 +320,7 @@ export function researchPublicationContract(factory: StorageFactory): void {
 			await storage.channels.archive({
 				id: channelId,
 				now: new Date("2026-01-07T03:07:04.000Z"),
+				lease: await testLease(storage),
 			});
 			paused.release();
 
@@ -418,6 +428,7 @@ export function researchPublicationContract(factory: StorageFactory): void {
 			await storage.channels.archive({
 				id: archivedParent.id,
 				now: new Date("2026-01-07T03:07:04.000Z"),
+				lease: await testLease(storage),
 			});
 			await expect(storage.research.publishInitialReport({
 				channelId: archivedParent.id,

@@ -1,4 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
+import { hostRecipes, hostSandbox, SUPPORTED_HOST } from "./testing/host-sandbox";
+import { ensureImages, type ImageBuilder } from "./images";
+import { machineRecipes } from "./machine-sandbox";
 import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +9,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { readConfig } from "./config";
-import { connect } from "./main";
+import { connect, type Injected } from "./main";
 import type { Outcome, ServiceHost } from "./service";
 import { git } from "./workspace";
 
@@ -25,6 +28,8 @@ async function setup(
 ) {
 	let tools: string[] = [];
 	let requests: string[] = [];
+	/** Whether each microVM sandbox opened, the connect's and the service check's, prunes images. */
+	let pruning: Array<boolean | undefined> = [];
 	let chopin = Bun.serve({
 		hostname: "127.0.0.1",
 		port: 0,
@@ -109,6 +114,7 @@ async function setup(
 		calls,
 		tools,
 		requests,
+		pruning,
 		home,
 		directory,
 		bin,
@@ -116,12 +122,33 @@ async function setup(
 			connect([root, "--install-service", ...flags, "--", "agent", "--acp"], {
 				host,
 				executable: "/opt/chopin/bin/chopin",
+				support: SUPPORTED_HOST,
+				recipes: hostRecipes,
+				openSandbox: async options => {
+					pruning.push(options.prune);
+					return hostSandbox();
+				},
+			}),
+		/** As `run`, with the real recipes and `openSandbox` making its microVMs. */
+		runWith: (openSandbox: NonNullable<Injected["openSandbox"]>, ...flags: string[]) =>
+			connect([root, "--install-service", ...flags, "--", "agent", "--acp"], {
+				host,
+				executable: "/opt/chopin/bin/chopin",
+				support: SUPPORTED_HOST,
+				recipes: machineRecipes,
+				openSandbox,
 			}),
 		/** As `run`, with `agent` as the ACP command instead. */
 		runAgent: (...agent: string[]) =>
 			connect([root, "--install-service", "--", ...agent], {
 				host,
 				executable: "/opt/chopin/bin/chopin",
+				support: SUPPORTED_HOST,
+				recipes: hostRecipes,
+				openSandbox: async options => {
+					pruning.push(options.prune);
+					return hostSandbox();
+				},
 			}),
 		async [Symbol.asyncDispose]() {
 			for (let [name, value] of Object.entries(saved)) {
@@ -153,6 +180,9 @@ test.skipIf(process.platform === "win32")(
 		expect(config.service?.executable).toBe("/opt/chopin/bin/chopin");
 		// Its own connection let go of the checkout before the service took it.
 		expect((await readdir(machine.directory)).filter(name => name.endsWith(".lock"))).toEqual([]);
+		// The connect, which held the base dir, pruned images; the service's check, beside a service
+		// that may run another agent's, removed none.
+		expect(machine.pruning).toEqual([undefined, false]);
 	},
 	20_000,
 );
@@ -232,7 +262,7 @@ test.skipIf(process.platform === "win32")(
 );
 
 test.skipIf(process.platform === "win32")(
-	"a known agent that won't start is named with its sign-in command, before the key is spent",
+	"a known agent that won't start in its microVM says so, before the key is spent",
 	async () => {
 		await using machine = await setup(systemd, { paired: false });
 		await writeFile(
@@ -245,8 +275,161 @@ test.skipIf(process.platform === "win32")(
 		expect(refused.message).toContain(
 			"copilot didn't answer ACP initialize (exit 1: Error: not logged in)",
 		);
-		expect(refused.message).toContain("sign in with `copilot login`, then run this command again");
+		expect(refused.message).toContain("Check that it starts in its microVM");
 		expect(machine.requests).toEqual([]);
 	},
 	30_000,
+);
+
+/**
+ * The microVMs of a connect whose images a stand-in builder makes: an install puts in its image the
+ * programs `installed` names, and a build of an install in `failing` fails with the build's words.
+ * Each build is recorded with whether Chopin had heard of the machine yet.
+ */
+function imagesBy(
+	requests: string[],
+	installed: Record<string, string[]>,
+	failing: Record<string, string> = {},
+) {
+	let builds: Array<{ install: string[]; connected: boolean }> = [];
+	let lines: string[][] = [];
+	let builder: ImageBuilder = {
+		async build(recipe, job) {
+			builds.push({
+				install: recipe.install,
+				connected: requests.includes("/api/connector/connections"),
+			});
+			let failure = failing[recipe.install.join("\n")];
+			if (failure) throw new Error(failure);
+			await writeFile(job.layer, recipe.install.join("\n"));
+		},
+		async missing(image, programs) {
+			let has = installed[await Bun.file(image.layer.path).text()] ?? [];
+			return programs.filter(program => !has.includes(program));
+		},
+	};
+	let openSandbox: NonNullable<Injected["openSandbox"]> = async options => {
+		await ensureImages(options.recipes, {
+			base: options.directory,
+			layer: "11111111-2222-4333-8444-555555555555",
+			user: { uid: 1000, gid: 1000 },
+			builder,
+			building: recipes => lines.push(recipes.map(item => item.name)),
+		});
+		return hostSandbox();
+	};
+	return { builds, lines, openSandbox };
+}
+
+test.skipIf(process.platform === "win32")(
+	"connect with a Planner command builds the agent's and the Planner's images before Chopin hears of the machine, and the service's check finds them built",
+	async () => {
+		await using machine = await setup(systemd);
+		let images = imagesBy(machine.requests, {
+			"npm install -g agent": ["agent"],
+			"npm install -g my-planner": ["my-planner"],
+		});
+		await machine.runWith(
+			images.openSandbox,
+			"--install",
+			"npm install -g agent",
+			"--planner-command",
+			"my-planner",
+			"--planner-install",
+			"npm install -g my-planner",
+			"--no-planner-spare",
+		);
+		expect(images.builds).toEqual([
+			{ install: ["npm install -g agent"], connected: false },
+			{ install: ["npm install -g my-planner"], connected: false },
+		]);
+		expect(images.lines).toEqual([["agent"], ["my-planner"]]);
+		expect(machine.requests).toContain("/api/connector/connections");
+		expect(machine.calls).toContain("systemctl --user enable --now chopin.service");
+	},
+	20_000,
+);
+
+test.skipIf(process.platform === "win32")(
+	"an agent and a Planner installed by the same commands share one image, built once as connect starts",
+	async () => {
+		await using machine = await setup(systemd);
+		let images = imagesBy(machine.requests, { "npm install -g agent": ["agent", "my-planner"] });
+		await machine.runWith(
+			images.openSandbox,
+			"--install",
+			"npm install -g agent",
+			"--planner-command",
+			"my-planner",
+			"--planner-install",
+			"npm install -g agent",
+			"--no-planner-spare",
+		);
+		expect(images.builds).toEqual([{ install: ["npm install -g agent"], connected: false }]);
+		expect(images.lines).toEqual([["agent", "my-planner"]]);
+	},
+	20_000,
+);
+
+test.skipIf(process.platform === "win32")(
+	"a Planner image that doesn't build fails connect with the build's words, and nothing connects or is installed",
+	async () => {
+		await using machine = await setup(systemd);
+		let images = imagesBy(
+			machine.requests,
+			{ "npm install -g agent": ["agent"] },
+			{
+				"npm install -g my-planner":
+					"Couldn't build my-planner's image (exit 1):\nnpm error 404 'my-planner' is not in this registry.",
+			},
+		);
+		let failed = await machine.runWith(
+			images.openSandbox,
+			"--install",
+			"npm install -g agent",
+			"--planner-command",
+			"my-planner",
+			"--planner-install",
+			"npm install -g my-planner",
+		).catch(error => error);
+		expect(failed.message).toBe(
+			"Couldn't build my-planner's image (exit 1):\nnpm error 404 'my-planner' is not in this registry.",
+		);
+		expect(machine.requests).not.toContain("/api/connector/connections");
+		expect(machine.calls).toEqual([]);
+		expect((await readConfig(machine.directory)).connect).toBeUndefined();
+	},
+	20_000,
+);
+
+test.skipIf(process.platform === "win32")(
+	"service install builds a missing image the saved settings need before it installs, with --skip-check too",
+	async () => {
+		await using machine = await setup(systemd);
+		let images = imagesBy(machine.requests, { "npm install -g agent": ["agent", "my-planner"] });
+		let opened = 0;
+		await machine.runWith(
+			async options => {
+				let sandbox = await images.openSandbox(options);
+				// Gone by the time install runs, as when a chopin with other settings pruned it.
+				if (++opened === 1) await rm(join(options.directory, "images"), { recursive: true });
+				return sandbox;
+			},
+			"--install",
+			"npm install -g agent",
+			"--planner-command",
+			"my-planner",
+			"--planner-install",
+			"npm install -g agent",
+			"--no-planner-spare",
+			"--skip-check",
+		);
+		expect(opened).toBe(2);
+		expect(images.builds.map(build => build.install)).toEqual([
+			["npm install -g agent"],
+			["npm install -g agent"],
+		]);
+		expect(machine.calls).toContain("systemctl --user enable --now chopin.service");
+	},
+	20_000,
 );

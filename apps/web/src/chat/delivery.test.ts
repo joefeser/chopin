@@ -11,6 +11,7 @@ import {
 	outboxReducer,
 	passing,
 	refusalText,
+	refusedByChopin,
 	restoreOutbox,
 } from "./delivery";
 
@@ -139,9 +140,8 @@ describe("refusals of a send", () => {
 	 * server's own tests inject each failure they can reach):
 	 * - passing, `temporarily-unavailable`: the room is busy with too many sends; the message could
 	 *   not be saved; the Chat or the room is closing or being replaced; the open child could not be
-	 *   looked up; a reference could not be looked up for storage's sake; a turn is only beginning or
-	 *   finishing and has no session to give the message to just now; authorization is temporarily
-	 *   unavailable; any failure the send itself threw.
+	 *   looked up; a reference could not be looked up for storage's sake; authorization is
+	 *   temporarily unavailable; any failure the send itself threw.
 	 * - final, no code: a request id that is invalid, reused with different content or in conflict;
 	 *   a message that was deleted; an invalid destination, text, focus or reference (a reference the
 	 *   server found at fault: malformed, outside this repository, or no longer there); an empty or
@@ -151,14 +151,30 @@ describe("refusals of a send", () => {
 	 *   is away), and nothing is kept for when one can.
 	 * - final, `planner-busy`: a turn is running and cannot be given a message (its harness takes
 	 *   none mid-run, or it is a background job's).
+	 * - final, `planner-starting`: another person's turn is about to start on a harness that takes no
+	 *   input mid-run, and cannot be given a message.
+	 * - final, `no-ai-account`: the sender has no AI account chopin can use, or their Copilot access
+	 *   couldn't be checked and they have no key; their AI accounts changing while they were read is
+	 *   `temporarily-unavailable`.
 	 * Not sends, and so with no code of their own to read: a task draft and a comment note sent to
 	 * Chopin have no outbox, say why in the page's own words and are pressed again.
 	 */
 	const CODES: Record<Code, "passing" | "final"> = {
 		"planner-not-attached": "final",
 		"planner-busy": "final",
+		"planner-starting": "final",
+		"no-ai-account": "final",
 		"temporarily-unavailable": "passing",
 	};
+
+	test("returns the draft to the composer and speaks in chopin's quiet row for every Planner refusal, including a starting turn", () => {
+		expect(refusedByChopin("planner-not-attached")).toBe(true);
+		expect(refusedByChopin("planner-busy")).toBe(true);
+		expect(refusedByChopin("planner-starting")).toBe(true);
+		expect(refusedByChopin("no-ai-account")).toBe(true);
+		expect(refusedByChopin("temporarily-unavailable")).toBe(false);
+		expect(refusedByChopin(undefined)).toBe(false);
+	});
 
 	test("every code in the protocol is classified, and only a passing one is sent again", async () => {
 		let source = await Bun.file(
@@ -284,6 +300,22 @@ describe("the words", () => {
 				"chopin can't take messages while it works on this machine. Stop it to ask now.",
 			),
 		).toBe("chopin can't take messages while it works on this machine. Stop it to ask now.");
+		expect(
+			refusalText(
+				"planner-starting",
+				"chopin is about to answer another message and can't take more while it works on this machine. Send yours again once it has answered.",
+			),
+		).toBe(
+			"chopin is about to answer another message and can't take more while it works on this machine. Send yours again once it has answered.",
+		);
+		expect(
+			refusalText(
+				"no-ai-account",
+				"chopin needs an AI account to answer, so this message wasn't sent. Add one, then send it again.",
+			),
+		).toBe(
+			"chopin needs an AI account to answer, so this message wasn't sent. Add one, then send it again.",
+		);
 	});
 });
 

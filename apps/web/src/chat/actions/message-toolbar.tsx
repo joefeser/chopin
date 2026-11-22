@@ -29,11 +29,13 @@ import {
 import { useMenuDismissal } from "../../menu-dismissal";
 import { LongPress } from "../long-press";
 import { QUICK_REACTIONS } from "../reactions";
+import { AIM_REST_MS, keepsHeadingForBar, leavesTowardsBar } from "./toolbar-aim";
 import { useCopyToClipboard } from "./use-copy-to-clipboard";
 
 import "./message-actions.css";
 
 import type { MessageActionItem } from "@/components/assistant-ui/elements/message-actions";
+import type { Bar, Point } from "./toolbar-aim";
 import type { CSSProperties, KeyboardEvent, RefObject } from "react";
 
 export let COPIED_MS = 1500;
@@ -135,6 +137,86 @@ function useAnchored(
 	return position;
 }
 
+function pointOf(event: PointerEvent): Point {
+	return { x: event.clientX, y: event.clientY };
+}
+
+function useToolbarAim(host: RefObject<HTMLElement | null>) {
+	useEffect(() => {
+		let element = host.current;
+		if (!element) return;
+		let lastInside: Point | undefined;
+		let heading: { bar: Bar; at: Point } | undefined;
+		let crossed: Element | undefined;
+		let restTimer = 0;
+		let uncross = () => {
+			crossed?.removeAttribute("data-chat-crossed");
+			crossed = undefined;
+		};
+		let rowAt = (target: EventTarget | null) => {
+			if (!(target instanceof Element)) return null;
+			let head = target.closest("[data-chat-head]");
+			return head ? head.nextElementSibling : target.closest(".chat-message-body");
+		};
+		let cross = (target: EventTarget | null) => {
+			let row = rowAt(target);
+			if (row === crossed) return;
+			uncross();
+			if (!row || row === element) return;
+			crossed = row;
+			crossed.setAttribute("data-chat-crossed", "");
+		};
+		let stop = () => {
+			clearTimeout(restTimer);
+			window.removeEventListener("pointermove", follow);
+			window.removeEventListener("pointerdown", stop);
+			heading = undefined;
+			uncross();
+			element.removeAttribute("data-chat-aiming");
+		};
+		let rest = () => {
+			clearTimeout(restTimer);
+			restTimer = window.setTimeout(stop, AIM_REST_MS);
+		};
+		let follow = (event: PointerEvent) => {
+			if (!heading) return;
+			let next = pointOf(event);
+			if (!keepsHeadingForBar(heading.bar, heading.at, next)) return stop();
+			heading.at = next;
+			cross(event.target);
+			rest();
+		};
+		let track = (event: PointerEvent) => {
+			lastInside = pointOf(event);
+		};
+		let leave = (event: PointerEvent) => {
+			let from = lastInside;
+			lastInside = undefined;
+			let leftAt = pointOf(event);
+			if (event.pointerType !== "mouse" || !from || leftAt.y >= from.y) return;
+			let toolbar = element.querySelector(":scope > .chat-toolbar-slot > .chat-message-toolbar");
+			if (!toolbar) return;
+			let bar = toolbar.getBoundingClientRect();
+			if (bar.width === 0 || !leavesTowardsBar(bar, from, leftAt)) return;
+			heading = { bar, at: leftAt };
+			element.setAttribute("data-chat-aiming", "");
+			cross(event.relatedTarget);
+			window.addEventListener("pointermove", follow, { passive: true });
+			window.addEventListener("pointerdown", stop, { passive: true });
+			rest();
+		};
+		element.addEventListener("pointermove", track);
+		element.addEventListener("pointerleave", leave);
+		element.addEventListener("pointerenter", stop);
+		return () => {
+			stop();
+			element.removeEventListener("pointermove", track);
+			element.removeEventListener("pointerleave", leave);
+			element.removeEventListener("pointerenter", stop);
+		};
+	}, [host]);
+}
+
 function CopyMenuIcon({ copied }: { copied: boolean }) {
 	return (
 		<MessageActions
@@ -177,6 +259,7 @@ export let MessageToolbar = memo(function MessageToolbar(
 	let { isCopied, isFailed, copyToClipboard } = useCopyToClipboard({ copiedDuration: COPIED_MS });
 	let engaged = pinned || menuOpen || pickerOpen || isCopied || isFailed;
 
+	useToolbarAim(host);
 	let pickerPosition = useAnchored(pickerOpen, addButton, picker);
 	let pickerPlaced = !!pickerPosition;
 	let closePicker = (restoreFocus = false) => {
@@ -389,7 +472,7 @@ export let MessageToolbar = memo(function MessageToolbar(
 				}}
 				open={menuOpen}
 			>
-				<div className="chat-toolbar-rail">
+				<div className="chat-toolbar-slot">
 					<MessageActions
 						aria-label="Reactions and actions"
 						aria-orientation="horizontal"

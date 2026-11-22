@@ -2,6 +2,12 @@ import type {
 	AddUserProject,
 	AddUserProjectResult,
 	AgentState,
+	AiAttempt,
+	AiAttemptResult,
+	AiAttemptStart,
+	AiCredentialRecord,
+	AiModelTotals,
+	AiPlaceholder,
 	AppendBackgroundJobProgress,
 	AppendResearchAgentMessage,
 	AppendResearchAgentMessageResult,
@@ -13,9 +19,11 @@ import type {
 	BackgroundJobPage,
 	CancelBackgroundJob,
 	ChannelAgent,
+	ChannelArchive,
 	ChannelArchiveInput,
 	ChannelArchiveResult,
 	ChannelDecisionCount,
+	ChannelDelete,
 	ChannelPage,
 	ChannelRecord,
 	ChannelScanCursor,
@@ -46,8 +54,12 @@ import type {
 	MachineCredentials,
 	MachineFavorite,
 	MachineRepository,
+	MachineVmProblem,
+	McpInvocation,
+	McpInvocationScope,
 	McpSession,
 	PauseBackgroundJob,
+	PlannerCatalog,
 	PlannerCredential,
 	PlannerLinkHold,
 	PlannerModelChoice,
@@ -57,7 +69,6 @@ import type {
 	PublishInitialResearchReportResult,
 	PutChatAttachment,
 	PutImage,
-	PutRunStages,
 	PutUser,
 	RecordDocumentVersion,
 	RecordNavigationVisit,
@@ -75,7 +86,6 @@ import type {
 	ResetInitialResearchAttempt,
 	ResetInitialResearchAttemptResult,
 	ResumeBackgroundJob,
-	RunStageRecord,
 	SaveCheckpoint,
 	SaveDecisionAnswer,
 	SessionCredentials,
@@ -88,6 +98,7 @@ import type {
 	StoredDocumentVersion,
 	StoredImage,
 	StoredMachine,
+	StoredMachineDatabase,
 	StoredPlannerLinkHold,
 	StoredWebSession,
 	SummarizeDocumentVersion,
@@ -142,10 +153,19 @@ export interface MachineStore {
 	rotate(id: string, expectedRevision: number, credentials: MachineCredentials): Promise<boolean>;
 	/** Drop credentials GitHub refused at `expectedRevision`; the owner must pair again. */
 	reauthorize(id: string, expectedRevision: number, now: Date): Promise<boolean>;
-	/** True only for the call that revoked the owner's live machine. */
-	revoke(id: string, userId: string, now: Date): Promise<boolean>;
+	/**
+	 * True only for the call that revoked the owner's live machine. Revoking ends its launches' AI
+	 * authority, which only the writer lease's holder counts, so it is written under `lease`, checked
+	 * in the same transaction: a process that no longer holds it is refused with a conflict.
+	 */
+	revoke(lease: Lease, id: string, userId: string, now: Date): Promise<boolean>;
 	/** Rename the owner's live machine; false for anyone else's, or a revoked one. */
 	rename(id: string, userId: string, label: string): Promise<boolean>;
+	/**
+	 * Record why a live machine can't run agents in microVMs, or with none clear it. A revoked
+	 * machine keeps what it had.
+	 */
+	vmProblem(id: string, problem?: MachineVmProblem): Promise<void>;
 	/** Add a repository the machine connected a checkout of, unless it already serves it. */
 	serve(id: string, repository: MachineRepository): Promise<void>;
 	/** The owner shares one of their machines with teammates, or stops; false when it isn't theirs. */
@@ -203,27 +223,6 @@ export interface ChatAttachmentStore {
 	discardEntry(channelId: string, entryId: string): Promise<number>;
 	/** Forgets uploads nobody sent that are older than `before`; how many it forgot. */
 	prune(before: Date): Promise<number>;
-}
-
-/**
- * Every stage of each workflow run a document's Chat shows, in the order the run first reported
- * them. Bounded per stage, not per run.
- */
-export interface RunStageStore {
-	/**
-	 * Adds stages by id: a known one is replaced whole where it stands, a new one follows the
-	 * run's others in input order; a repeated id keeps its last value. With `replace` the run keeps
-	 * exactly these. Returns how many stages the run then has.
-	 */
-	put(input: PutRunStages): Promise<number>;
-	/** The run's stages from `offset`, at most `limit`, and how many it has. */
-	list(
-		channelId: string,
-		runId: string,
-		page: { offset: number; limit: number },
-	): Promise<{ stages: RunStageRecord[]; total: number }>;
-	/** Forgets the stages of every run in the document but these. */
-	retain(channelId: string, runIds: string[]): Promise<void>;
 }
 
 /**
@@ -303,9 +302,27 @@ export interface ChannelStore {
 	rename(channel: RenameChannel): Promise<RenameResult>;
 	/** Sets Full width. Refused for an archived document, as a rename is. */
 	setFullWidth(input: ChannelWidthInput): Promise<RenameResult>;
-	archive(input: ChannelArchiveInput): Promise<ChannelArchiveResult>;
+	/**
+	 * Records that a writer reset the document's Planner at `now`, or a moment after the last reset,
+	 * so each reset reads as a new one. A machine removes its Planner's disk made before it.
+	 */
+	markPlannerReset(id: string, now: Date): Promise<void>;
+	/** When the document's Planner was last reset, if ever. */
+	plannerReset(id: string): Promise<Date | undefined>;
+	/**
+	 * Archives a document and ends, for good, the AI placeholders of every launch on it, moving its
+	 * archive generation on (see `AiPlaceholderStore.generation`). Written under `input.lease`, as
+	 * every cutoff is (see `AiPlaceholderStore.cutoffs`).
+	 */
+	archive(input: ChannelArchive): Promise<ChannelArchiveResult>;
 	restore(input: ChannelArchiveInput): Promise<ChannelArchiveResult>;
-	delete(id: string): Promise<boolean>;
+	/**
+	 * Deletes a top-level document, active or archived, with its children and every row tied to any
+	 * of them, in one transaction under `input.lease`: all of it or none. Answers what it deleted,
+	 * the document first, or nothing when it is already gone. A child is deleted only with its
+	 * parent, so deleting one directly is a conflict. Ends its launches' AI placeholders, a cutoff.
+	 */
+	delete(input: ChannelDelete): Promise<ChannelRecord[]>;
 	publishDescription(input: PublishChannelDescription): Promise<PublishChannelDescriptionResult>;
 	list(
 		repositoryId: string,
@@ -465,6 +482,17 @@ export interface PlannerModelChoiceStore {
 }
 
 /**
+ * The last models each document's remote Planner reported, kept per account. Writes are fenced by
+ * the writer lease and replace the row whole.
+ */
+export interface PlannerCatalogStore {
+	put(lease: Lease, catalog: PlannerCatalog): Promise<void>;
+	get(channelId: string, userId: string): Promise<PlannerCatalog | undefined>;
+	/** The list last reported for `userId`, on any of the documents their Planner ran for. */
+	latest(userId: string): Promise<PlannerCatalog | undefined>;
+}
+
+/**
  * Shared Chat threads and session-level fork, context-usage and compaction state, stored in
  * expand-only tables outside the document sidecar so an earlier release reads the sidecar
  * unchanged. Writes are fenced by the writer lease; rows go with their document.
@@ -475,6 +503,20 @@ export interface ChatThreadStore {
 	listThreads(channelId: string): Promise<ChatThreadRecord[]>;
 	putSessionState(lease: Lease, state: ChatSessionState): Promise<void>;
 	getSessionState(channelId: string): Promise<ChatSessionState | undefined>;
+}
+
+export interface MachineDatabaseStore {
+	get(machineId: string): Promise<StoredMachineDatabase | undefined>;
+	many(machineIds: readonly string[]): Promise<StoredMachineDatabase[]>;
+	claim(record: StoredMachineDatabase): Promise<StoredMachineDatabase>;
+	put(record: StoredMachineDatabase): Promise<boolean>;
+	report(machineId: string, problem: string | undefined): Promise<boolean>;
+	settling(dropBefore?: Date): Promise<StoredMachineDatabase[]>;
+	/**
+	 * The logins that may be on, ordered by machine: neither disabled nor dropped, of machines not
+	 * revoked (a revoked machine's are settled instead).
+	 */
+	active(): Promise<StoredMachineDatabase[]>;
 }
 
 /**
@@ -492,6 +534,142 @@ export interface PlannerCredentialStore {
 	deleteExpired(now: Date): Promise<number>;
 }
 
+/**
+ * The AI providers each person connected, one row per person and provider. Connecting, replacing
+ * and removing one are cutoffs, written under the writer lease (see `AiPlaceholderStore.cutoffs`).
+ */
+export interface AiCredentialStore {
+	/** Connects a provider, replacing what the person connected for it before, last use included. */
+	put(lease: Lease, record: AiCredentialRecord): Promise<void>;
+	get(
+		userId: string,
+		provider: AiCredentialRecord["provider"],
+	): Promise<AiCredentialRecord | undefined>;
+	/** A person's connected providers, ordered by provider. */
+	list(userId: string): Promise<AiCredentialRecord[]>;
+	/** False when the person had not connected it. */
+	delete(lease: Lease, userId: string, provider: AiCredentialRecord["provider"]): Promise<boolean>;
+	/**
+	 * Records that `record`, the credential as it was read, was used `at`. Never moves the time back,
+	 * and changes nothing once that credential was replaced or removed.
+	 */
+	used(record: AiCredentialRecord, at: Date): Promise<void>;
+	/**
+	 * Records that `record`'s provider refused it, the key as it was read, as invalid `at`. Changes
+	 * nothing once that key was replaced or removed, so a late refusal of a key never marks the one
+	 * that replaced it, nor one already marked, and for a sign-in nothing once a refresh saved tokens
+	 * newer than those it was read with. Returns whether it marked the key; a mark is counted
+	 * for its person as `version` counts a replacement, so a launch reading meanwhile reads again.
+	 */
+	rejected(record: AiCredentialRecord, at: Date): Promise<boolean>;
+	/**
+	 * Saves `tokens`, a sign-in's refreshed tokens, in place of those `record` was read with, only
+	 * while the connection is still `record`'s and its tokens are still the ones it was read with, so
+	 * a refresh that lost a race never replaces newer tokens. Returns whether it saved them. It is no
+	 * cutoff: the connection is the same.
+	 */
+	refreshed(lease: Lease, record: AiCredentialRecord, tokens: Uint8Array): Promise<boolean>;
+	/**
+	 * Connects a sign-in, `record`, in place of `replaced`, the connection stored for its person and
+	 * provider when the sign-in began exchanging its code (undefined when none was), only while that is
+	 * still the stored connection, refreshed or refused since or not, so a sign-in that finishes after
+	 * a newer one was saved, or after the one it began from was removed, saves nothing. Replaces it
+	 * whole, as `put` does, and is counted as `put` is. Returns whether it saved it.
+	 */
+	signedIn(
+		lease: Lease,
+		record: AiCredentialRecord,
+		replaced: AiCredentialRecord | undefined,
+	): Promise<boolean>;
+	/**
+	 * How many times this process has connected, replaced or removed one of `userId`'s credentials,
+	 * each counted once its write settles and before its caller hears so; one process serves a
+	 * database at a time, so while it holds the writer lease a count unchanged across a read says
+	 * none completed meanwhile.
+	 */
+	version(userId: string): number;
+}
+
+/**
+ * The placeholders launches were handed, by digest. Rows are written before a placeholder is
+ * handed out, so a process that starts later accepts it while its launch lasts.
+ */
+export interface AiPlaceholderStore {
+	/**
+	 * One launch's placeholders, together; throws a conflict for a digest already stored. Stores
+	 * nothing and returns false when a placeholder's document is archived, or is open in another
+	 * archive generation than its `generation`, so a launch prepared before an archive keeps nothing.
+	 */
+	put(placeholders: AiPlaceholder[]): Promise<boolean>;
+	/**
+	 * A document's archive generation while it is open: how many times it has been archived.
+	 * Undefined while it is archived, or once it is gone. Restoring it does not go back.
+	 */
+	generation(channelId: string): Promise<number | undefined>;
+	/** The placeholder for this digest while it has not expired at `now`. */
+	find(digest: Uint8Array, now: Date): Promise<AiPlaceholder | undefined>;
+	/**
+	 * One placeholder of the launch whose own credential has this digest, while it has not expired at
+	 * `now`; undefined once the launch ended, whatever ended it.
+	 */
+	findLaunch(launchDigest: Uint8Array, now: Date): Promise<AiPlaceholder | undefined>;
+	/**
+	 * Each launch with an owner whose placeholders have not expired at `now`, once: its id, its
+	 * owner, and its document, so the writer lease's holder can end those nothing owns now.
+	 */
+	owned(now: Date): Promise<Array<Pick<AiPlaceholder, "launchId" | "owner" | "channelId">>>;
+	/** Ends a launch: its placeholders stop working. Returns how many there were. */
+	deleteLaunch(lease: Lease, launchId: string): Promise<number>;
+	/**
+	 * Ends the launch whose own credential has this digest, when it was handed out on `machineId`,
+	 * as `deleteLaunch` does: what the machine that holds a launch ends it by, in any process.
+	 */
+	deleteHeldLaunch(lease: Lease, launchDigest: Uint8Array, machineId: string): Promise<number>;
+	/** Every launch on a machine, as revoking it does; returns how many placeholders went. */
+	deleteForMachine(lease: Lease, machineId: string): Promise<number>;
+	deleteExpired(now: Date): Promise<number>;
+	/**
+	 * How many writes this process has committed that end a placeholder's authority before it
+	 * expires: a launch ended, a machine revoked or its launches ended, a document archived, and a
+	 * credential connected, replaced or removed. Each is counted once its write settles and before
+	 * its caller hears so. Each is written under the writer lease, checked in its own transaction, so
+	 * a process that no longer holds the lease commits none, and is refused rather than acknowledge
+	 * one its successor would not count. One process serves a database at a time, so while it holds
+	 * the writer lease a count unchanged across a read says none completed meanwhile. Expiry is not
+	 * counted: a reader checks the deadline itself.
+	 */
+	cutoffs(): number;
+}
+
+/**
+ * Each request the AI proxy sends, recorded under the writer lease before it is sent and completed
+ * once when its answer ends. A request whose process stopped first is marked unknown by the next
+ * holder of the lease, never lost or counted twice.
+ */
+export interface AiUsageStore {
+	/** Records a request about to be sent, as pending. An id already stored keeps its first record. */
+	begin(lease: Lease, attempt: AiAttemptStart): Promise<void>;
+	/**
+	 * Completes a pending request with how it ended. Changes nothing, and returns false, for one
+	 * already completed or marked unknown, so a completion sent again is never counted twice.
+	 */
+	complete(lease: Lease, id: string, result: AiAttemptResult): Promise<boolean>;
+	/**
+	 * Marks unknown, at `at`, every request an earlier holder of `lease` left pending: its process
+	 * stopped between sending it and recording how it ended. Returns how many.
+	 */
+	retire(lease: Lease, at: Date): Promise<number>;
+	get(id: string): Promise<AiAttempt | undefined>;
+	/**
+	 * One person's requests started at or after `since`, by provider and model, most requested
+	 * first. Only requests sent and ended (`ok` or `error`) count as requests; pending and unknown
+	 * ones are counted apart, and unsent ones not at all.
+	 */
+	summary(userId: string, since: Date): Promise<AiModelTotals[]>;
+	/** Removes requests started before `before` that are no longer pending. Returns how many. */
+	deleteBefore(lease: Lease, before: Date): Promise<number>;
+}
+
 /** MCP sessions, which a restart no longer ends. Idle ones are swept. */
 export interface McpSessionStore {
 	/** Idempotent: an id already stored keeps its first record. */
@@ -501,6 +679,42 @@ export interface McpSessionStore {
 	touch(id: string, now: Date): Promise<boolean>;
 	/** Forgets sessions not seen since `before`; returns how many. */
 	deleteIdle(before: Date): Promise<number>;
+}
+
+/**
+ * `invoke_planner` calls made under an idempotency key, one record per caller, document and key.
+ * A call claims its key before its instruction is posted, naming the Chat entry the instruction
+ * becomes and the result it answers, then marks the claim invoked once it reached a turn, or
+ * uncertain when a running turn did not confirm taking it, or releases a claim under which
+ * nothing was posted. Writes are fenced by the writer lease. A record
+ * past `expiresAt` counts as absent, and a document's records go with it.
+ */
+export interface McpInvocationStore {
+	/**
+	 * Stores `invocation`, not invoked, unless an unexpired record holds its scope. Returns the
+	 * record that holds the scope afterwards, and whether it is this one.
+	 */
+	claim(
+		lease: Lease,
+		invocation: Omit<McpInvocation, "invokedAt" | "uncertainAt">,
+	): Promise<{ record: McpInvocation; claimed: boolean }>;
+	/** Marks the claim naming `entryId` invoked at `at`; false when no such claim waits for it. */
+	complete(
+		lease: Lease,
+		scope: McpInvocationScope & { entryId: string },
+		at: Date,
+	): Promise<boolean>;
+	/** Marks the claim naming `entryId` uncertain at `at`; false when no such claim waits for it. */
+	uncertain(
+		lease: Lease,
+		scope: McpInvocationScope & { entryId: string },
+		at: Date,
+	): Promise<boolean>;
+	/** Removes the claim naming `entryId` unless it is invoked or uncertain; false when there is none. */
+	release(lease: Lease, scope: McpInvocationScope & { entryId: string }): Promise<boolean>;
+	get(scope: McpInvocationScope): Promise<McpInvocation | undefined>;
+	/** Removes records that expired at or before `now`; returns how many. */
+	deleteExpired(now: Date): Promise<number>;
 }
 
 /**
@@ -538,15 +752,20 @@ export interface StorageAdapter {
 	readonly research: ResearchWorkspaceStore;
 	readonly images: ImageStore;
 	readonly chatAttachments: ChatAttachmentStore;
-	readonly runStages: RunStageStore;
 	readonly decisionAnswers: DecisionAnswerStore;
 	readonly versions: DocumentVersionStore;
 	readonly machines: MachineStore;
 	readonly plannerHolds: PlannerLinkHoldStore;
 	readonly plannerModelChoices: PlannerModelChoiceStore;
+	readonly plannerCatalogs: PlannerCatalogStore;
 	readonly chatThreads: ChatThreadStore;
 	readonly plannerCredentials: PlannerCredentialStore;
+	readonly machineDatabases: MachineDatabaseStore;
+	readonly aiCredentials: AiCredentialStore;
+	readonly aiPlaceholders: AiPlaceholderStore;
+	readonly aiUsage: AiUsageStore;
 	readonly mcpSessions: McpSessionStore;
+	readonly mcpInvocations: McpInvocationStore;
 	readonly deferredTurns: DeferredTurnStore;
 
 	migrate(): Promise<void>;

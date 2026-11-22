@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { contractId as id, openedStorage, userAndChannel } from "./contract-support";
+import { contractId as id, openedStorage, testLease, userAndChannel } from "./contract-support";
 import { StorageError } from "./errors";
 import { machine } from "./machine-contract";
 
@@ -82,6 +82,7 @@ export function plannerHoldContract(name: string, factory: StorageFactory) {
 						asked: [{ request: "request-2", method: "questionnaire", decisions: ["d-1", "d-2"] }],
 						owed: [{ request: "request-1", answer: { choice: "a" } }],
 						stops: [{ run: "run-1" }, { run: null }],
+						aiLaunchId: "launch-1",
 					}, { id: "session-2", waiting: [], owed: [], stops: [] }],
 				});
 				expect(await storage.plannerHolds.get(channelId)).toBeUndefined();
@@ -266,8 +267,8 @@ export function plannerHoldContract(name: string, factory: StorageFactory) {
 				expect(await storage.plannerHolds.get(b)).toBeUndefined();
 				expect(await storage.plannerHolds.get(c)).toBeDefined();
 
-				await storage.channels.archive({ id: c, now: AT });
-				expect(await storage.channels.delete(c)).toBe(true);
+				expect(await storage.channels.delete({ id: c, lease: await testLease(storage) }))
+					.toHaveLength(1);
 				expect(await storage.plannerHolds.get(c)).toBeUndefined();
 				expect(await storage.plannerHolds.get(d)).toBeDefined();
 			} finally {

@@ -708,17 +708,18 @@
 }
 
 /* Machines in the sidebar and the phone documents sheet: paired count, and a dot while connected. */
-.machines-entry-icon {
+.machines-entry-icon,
+.ai-accounts-entry-icon {
 	flex: none;
 	color: var(--color-text-tertiary);
 }
 
-/* On /machines the entry is the current page, marked as a current document is. */
+/* On /machines or /ai-accounts the entry is the current page, marked as a current document is. */
 .project-sidebar-primary-action[aria-current="page"] {
 	background: var(--project-sidebar-selected);
 	color: var(--color-text-primary);
 
-	& .machines-entry-icon {
+	& :is(.machines-entry-icon, .ai-accounts-entry-icon) {
 		color: var(--color-text-secondary);
 	}
 }
@@ -925,7 +926,7 @@
 	position: absolute;
 	inset: 0;
 	width: 100%;
-	background: rgb(0 0 0 / 20%);
+	background: var(--color-backdrop);
 }
 
 .navigation-drawer > .navigation-focus-scope {
@@ -952,7 +953,7 @@
 	max-width: calc(100% - 32px);
 	border: var(--edge-width) solid var(--color-edge);
 	border-radius: var(--radius-md);
-	background: var(--color-page);
+	background: var(--color-raised);
 	padding: 6px 12px;
 	box-shadow: var(--shadow-raised);
 	font-size: var(--text-sm);
@@ -1086,7 +1087,7 @@
 	position: absolute;
 	inset: 0;
 	width: 100%;
-	background: rgb(0 0 0 / 20%);
+	background: var(--color-backdrop);
 }
 
 .navigation-modal > .navigation-focus-scope {
@@ -1101,10 +1102,16 @@
 	position: relative;
 	width: min(100%, 28rem);
 	border-radius: var(--radius-lg);
-	background: var(--color-page);
+	background: var(--color-raised);
 	padding: 20px;
 	box-shadow: var(--shadow-overlay);
 	pointer-events: auto;
+}
+
+/* Found by its shadow by day; at night, where shadows hardly show, by a light hairline too. */
+:where(.navigation-modal-content) {
+	outline: var(--edge-width) solid var(--color-raised-edge);
+	outline-offset: calc(-1 * var(--edge-width));
 }
 
 .navigation-palette-list.keyboard-shortcuts {
@@ -1373,10 +1380,16 @@
 	left: var(--project-sidebar-inset);
 	z-index: 60;
 	border-radius: var(--radius-md);
-	background: var(--color-page);
+	background: var(--color-raised);
 	padding: var(--menu-padding);
 	box-shadow: var(--shadow-raised);
 	transform-origin: bottom left;
+}
+
+/* Found by its shadow by day; at night, where shadows hardly show, by a light hairline too. */
+:where(.navigation-account-menu) {
+	outline: var(--edge-width) solid var(--color-raised-edge);
+	outline-offset: calc(-1 * var(--edge-width));
 }
 
 .app-menu-item {
@@ -1456,6 +1469,81 @@
 	color: var(--color-destructive-ink);
 }
 
+/*
+ * The account menu's Theme row: a row's icon and label, then Light, Dark and System as one small
+ * segmented control at its end, in a row of the menu's own height. The chosen segment is the petrol
+ * wash inside a petrol edge, as the emoji picker's chosen skin tone, so a segment only pointed at
+ * (the hover surface) never reads as chosen.
+ */
+.account-theme {
+	--color-icon: currentColor;
+	display: flex;
+	align-items: center;
+	gap: var(--menu-item-gap-compact);
+	min-height: var(--menu-item-height-compact);
+	padding: calc((var(--menu-item-height-compact) - var(--control-height-compact)) / 2)
+		var(--menu-item-padding-inline-compact);
+	font-size: var(--text-sm);
+	line-height: var(--text-sm--line-height);
+	color: var(--color-text-secondary);
+}
+
+.account-theme-label {
+	display: flex;
+	min-width: 0;
+	align-items: center;
+	gap: var(--menu-item-gap-compact);
+}
+
+.account-theme-segments {
+	display: flex;
+	margin-inline-start: auto;
+	gap: var(--document-tab-gap);
+}
+
+.account-theme-segment {
+	display: grid;
+	width: var(--icon-button-size);
+	height: var(--control-height-compact);
+	place-items: center;
+	border-radius: var(--radius-md);
+	color: var(--color-text-secondary);
+	transition:
+		background-color var(--duration-fast) var(--ease-out),
+		color var(--duration-fast) var(--ease-out);
+}
+
+@media (hover: hover) {
+	.account-theme-segment:hover {
+		background: var(--color-hover);
+		color: var(--color-text-primary);
+	}
+}
+
+.account-theme-segment[aria-checked="true"] {
+	background: var(--color-brand-wash);
+	color: var(--color-brand-ink);
+}
+
+/* Without weight, so the keyboard's focus ring takes the outline's place while it shows. */
+:where(.account-theme-segment[aria-checked="true"]) {
+	outline: var(--edge-width) solid var(--color-brand);
+	outline-offset: calc(-1 * var(--edge-width));
+}
+
+/*
+ * On touch each segment keeps its box and grows the shared invisible target; the segments stand side
+ * by side, so none takes the pitch a stacked row does, and the row itself stands a target's pitch
+ * below the row before it.
+ */
+:root[data-plan-coarse-pointer] .account-theme {
+	margin-block-start: calc(var(--control-target-coarse) - var(--menu-item-height-normal));
+}
+
+:root[data-plan-coarse-pointer] .account-theme-segment {
+	margin-block-start: 0;
+}
+
 /* Runs through the panel's padding to its edges. */
 .app-menu-separator {
 	margin: var(--menu-separator-margin) calc(var(--menu-padding) * -1);
@@ -1488,9 +1576,15 @@
 	overflow-y: auto;
 	overscroll-behavior: contain;
 	border-radius: var(--radius-md);
-	background: var(--color-page);
+	background: var(--color-raised);
 	padding: var(--menu-padding);
 	box-shadow: var(--shadow-raised);
+}
+
+/* Found by its shadow by day; at night, where shadows hardly show, by a light hairline too. */
+:where(.document-actions-menu) {
+	outline: var(--edge-width) solid var(--color-raised-edge);
+	outline-offset: calc(-1 * var(--edge-width));
 }
 
 .document-status-badge {
@@ -1633,9 +1727,15 @@
 	z-index: 10;
 	border-radius: var(--radius-md);
 	padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 2.5);
-	background: var(--color-page);
+	background: var(--color-raised);
 	box-shadow: var(--shadow-raised);
 	white-space: nowrap;
+}
+
+/* Found by its shadow by day; at night, where shadows hardly show, by a light hairline too. */
+:where(.document-title-error) {
+	outline: var(--edge-width) solid var(--color-raised-edge);
+	outline-offset: calc(-1 * var(--edge-width));
 }
 
 .document-project-prefix {

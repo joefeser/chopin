@@ -11,6 +11,7 @@ export const PLANNER_TOOL_NAMES = [
 	"list_background_jobs",
 	"read_background_job",
 	"create_research_workspace",
+	"create_document",
 	"upload_plan_image",
 	"edit_plan",
 	"open_decision",
@@ -32,6 +33,9 @@ export const PLANNER_TOOL_NAMES = [
 	"pull_request_read",
 	"revise_open_decision",
 ];
+
+/** A thread's full Atomic Planner tells the Chat Planner of its own document what was decided. */
+export const THREAD_NOTE_TOOL_NAME = "tell_chat_planner";
 
 export const VISUAL_PLANNER_TOOL_NAMES = Object.freeze([
 	...PLANNER_TOOL_NAMES,

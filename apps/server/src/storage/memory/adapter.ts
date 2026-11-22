@@ -1,5 +1,5 @@
 import { finalizeTitleReceipt } from "../title";
-import { conflict, missing } from "../errors";
+import { conflict, missing, unavailable } from "../errors";
 import { documentSlug, documentSlugCandidate } from "../../channels/slug";
 import { sidecarUnansweredDecisions } from "../../questions/unanswered";
 import { childSidecarWithoutConversation } from "../child-conversation";
@@ -7,15 +7,20 @@ import { MemoryBackgroundJobStore } from "./jobs";
 import { MemoryExperimentStore } from "./experiments";
 import { MemoryChatAttachmentStore } from "./chat-attachments";
 import { MemoryImageStore } from "./images";
-import { MemoryRunStageStore } from "./run-stages";
 import { MemoryDecisionAnswerStore } from "./decision-answers";
 import { MemoryDocumentVersionStore } from "./versions";
 import { MemoryMachineStore } from "./machines";
 import { MemoryDeferredTurnStore } from "./deferred-turns";
+import { MemoryMcpInvocationStore } from "./mcp-invocations";
 import { MemoryMcpSessionStore } from "./mcp-sessions";
 import { MemoryPlannerCredentialStore } from "./planner-credentials";
+import { MemoryMachineDatabaseStore } from "./machine-databases";
+import { MemoryAiCredentialStore, MemoryAiPlaceholderStore } from "./ai-credentials";
+import { MemoryAiUsageStore } from "./ai-usage";
+import { AiCutoffs } from "../ai-cutoffs";
 import { MemoryChatThreadStore } from "./chat-threads";
 import { MemoryPlannerLinkHoldStore } from "./planner-holds";
+import { MemoryPlannerCatalogStore } from "./planner-catalogs";
 import { MemoryPlannerModelChoiceStore } from "./planner-model-choices";
 import { MemoryResearchWorkspaceStore } from "./research";
 import { researchProjectionAllowed, ResearchProjectionConflict } from "../model";
@@ -28,6 +33,7 @@ import type {
 	ChannelArchiveResult,
 	ChannelCursor,
 	ChannelDecisionCount,
+	ChannelDelete,
 	ChannelPage,
 	ChannelRecord,
 	ChannelScanCursor,
@@ -57,6 +63,9 @@ import type {
 	UserRecord,
 } from "../model";
 import type {
+	AiCredentialStore,
+	AiPlaceholderStore,
+	AiUsageStore,
 	BackgroundJobStore,
 	ChannelStore,
 	ChatAttachmentStore,
@@ -67,14 +76,16 @@ import type {
 	DocumentVersionStore,
 	ImageStore,
 	LeaseStore,
+	MachineDatabaseStore,
 	MachineStore,
+	McpInvocationStore,
 	McpSessionStore,
 	NavigationStore,
+	PlannerCatalogStore,
 	PlannerCredentialStore,
 	PlannerLinkHoldStore,
 	PlannerModelChoiceStore,
 	ResearchWorkspaceStore,
-	RunStageStore,
 	SessionStore,
 	StorageAdapter,
 	UserStore,
@@ -169,6 +180,8 @@ export class MemoryStorage implements StorageAdapter {
 	#projects = new Map<string, UserProject[]>();
 	#navigation = new Map<string, UserNavigation>();
 	#channels = new Map<string, ChannelRecord>();
+	/** When each document's Planner was last reset. */
+	#plannerResets = new Map<string, Date>();
 	#channelSlugs = new Map<string, Map<string, string>>();
 	#snapshots = new Map<string, ChannelSnapshot>();
 	#sequences = new Map<string, number>();
@@ -178,6 +191,8 @@ export class MemoryStorage implements StorageAdapter {
 	#operations = new Map<string, Map<string, Operation>>();
 	#agents = new Map<string, AgentState>();
 	#leases = new Map<string, Lease>();
+	/** How many times each document has been archived, which a restore never takes back. */
+	#archiveGenerations = new Map<string, number>();
 	readonly #images = new MemoryImageStore({
 		channelExists: id => this.#channels.has(id),
 		userExists: id => this.#users.has(id),
@@ -188,8 +203,6 @@ export class MemoryStorage implements StorageAdapter {
 		userExists: id => this.#users.has(id),
 	});
 	readonly chatAttachments: ChatAttachmentStore = this.#chatAttachments;
-	readonly #runStages = new MemoryRunStageStore(id => this.#channels.has(id));
-	readonly runStages: RunStageStore = this.#runStages;
 	readonly #decisionAnswers = new MemoryDecisionAnswerStore(id => this.#channels.has(id));
 	readonly decisionAnswers: DecisionAnswerStore = this.#decisionAnswers;
 	readonly #versions = new MemoryDocumentVersionStore({
@@ -197,9 +210,12 @@ export class MemoryStorage implements StorageAdapter {
 		user: id => this.#users.get(id),
 	});
 	readonly versions: DocumentVersionStore = this.#versions;
+	readonly #aiCutoffs = new AiCutoffs();
 	readonly #machines = new MemoryMachineStore(
 		id => this.#users.has(id),
 		id => this.#channels.has(id),
+		held => this.#assertLease(held),
+		() => this.#aiCutoffs.cut(),
 	);
 	readonly machines: MachineStore = this.#machines;
 	readonly #plannerHolds = new MemoryPlannerLinkHoldStore({
@@ -216,6 +232,12 @@ export class MemoryStorage implements StorageAdapter {
 		assertLease: held => this.#assertLease(held),
 	});
 	readonly plannerModelChoices: PlannerModelChoiceStore = this.#plannerModelChoices;
+	readonly #plannerCatalogs = new MemoryPlannerCatalogStore({
+		channelExists: id => this.#channels.has(id),
+		userExists: id => this.#users.has(id),
+		assertLease: held => this.#assertLease(held),
+	});
+	readonly plannerCatalogs: PlannerCatalogStore = this.#plannerCatalogs;
 	readonly #chatThreads = new MemoryChatThreadStore({
 		channelExists: id => this.#channels.has(id),
 		assertLease: held => this.#assertLease(held),
@@ -226,7 +248,37 @@ export class MemoryStorage implements StorageAdapter {
 		channelExists: id => this.#channels.has(id),
 	});
 	readonly plannerCredentials: PlannerCredentialStore = this.#plannerCredentials;
+	readonly machineDatabases: MachineDatabaseStore = new MemoryMachineDatabaseStore({
+		machineExists: id => this.#machines.has(id),
+		machineRevoked: id => this.#machines.isRevoked(id),
+	});
+	readonly aiCredentials: AiCredentialStore = new MemoryAiCredentialStore({
+		userExists: id => this.#users.has(id),
+		assertLease: held => this.#assertLease(held),
+		cutoffs: this.#aiCutoffs,
+	});
+	readonly #aiPlaceholders = new MemoryAiPlaceholderStore({
+		userExists: id => this.#users.has(id),
+		assertLease: held => this.#assertLease(held),
+		machineExists: id => this.#machines.has(id),
+		channelExists: id => this.#channels.has(id),
+		generation: id => {
+			let found = this.#channels.get(id);
+			return found && !found.archivedAt ? this.#archiveGenerations.get(id) ?? 0 : undefined;
+		},
+		cutoffs: this.#aiCutoffs,
+	});
+	readonly aiPlaceholders: AiPlaceholderStore = this.#aiPlaceholders;
+	readonly aiUsage: AiUsageStore = new MemoryAiUsageStore({
+		userExists: id => this.#users.has(id),
+		assertLease: held => this.#assertLease(held),
+	});
 	readonly mcpSessions: McpSessionStore = new MemoryMcpSessionStore();
+	readonly #mcpInvocations = new MemoryMcpInvocationStore({
+		channelExists: id => this.#channels.has(id),
+		assertLease: held => this.#assertLease(held),
+	});
+	readonly mcpInvocations: McpInvocationStore = this.#mcpInvocations;
 	readonly deferredTurns: DeferredTurnStore = new MemoryDeferredTurnStore({
 		assertLease: held => this.#assertLease(held),
 	});
@@ -414,9 +466,17 @@ export class MemoryStorage implements StorageAdapter {
 		},
 		rename: input => this.#renameChannel(input),
 		setFullWidth: input => this.#setChannelWidth(input),
-		archive: input => this.#setChannelArchived(input, true),
+		markPlannerReset: (id, now) => this.#markPlannerReset(id, now),
+		plannerReset: async id => {
+			let at = this.#plannerResets.get(id);
+			return at && new Date(at);
+		},
+		archive: async input => {
+			this.#assertLease(input.lease);
+			return this.#setChannelArchived(input, true);
+		},
 		restore: input => this.#setChannelArchived(input, false),
-		delete: id => this.#deleteChannel(id),
+		delete: input => this.#deleteChannel(input),
 		publishDescription: input => this.#publishChannelDescription(input),
 		list: (repositoryId, limit, after, query, includeArchived) =>
 			this.#listChannels(repositoryId, limit, after, query, includeArchived),
@@ -586,7 +646,18 @@ export class MemoryStorage implements StorageAdapter {
 	}
 
 	#createChannel(input: CreateChannel): ChannelRecord {
+		if (input.modelChoice) {
+			try {
+				this.#assertLease(input.modelChoice.lease);
+			} catch (err) {
+				throw unavailable("a document's model choice needs the writer lease", err);
+			}
+		}
 		if (!this.#users.has(input.createdBy)) throw missing(`user ${input.createdBy} does not exist`);
+		let chosen = input.modelChoice?.choice;
+		if (chosen && !this.#users.has(chosen.userId)) {
+			throw missing(`user ${chosen.userId} does not exist`);
+		}
 		if (this.#channels.has(input.id)) throw conflict(`channel ${input.id} already exists`);
 		if (input.parentChannelId !== undefined) {
 			if (input.parentChannelId.length === 0) throw missing("parent channel id is required");
@@ -599,7 +670,7 @@ export class MemoryStorage implements StorageAdapter {
 				throw conflict(`channel ${input.parentChannelId} cannot parent another child`);
 			}
 		}
-		let { initial, now, ...record } = input;
+		let { initial, now, modelChoice: _modelChoice, ...record } = input;
 		let slug = this.#reserveSlug(input.repositoryId, input.id, input.title);
 		let saved: ChannelRecord = {
 			...record,
@@ -623,6 +694,7 @@ export class MemoryStorage implements StorageAdapter {
 				createdAt: now,
 			});
 		}
+		if (chosen) this.#plannerModelChoices.create({ ...chosen, channelId: saved.id });
 		return channel(saved);
 	}
 
@@ -656,6 +728,12 @@ export class MemoryStorage implements StorageAdapter {
 		return { channel: channel(saved), changed: true };
 	}
 
+	async #markPlannerReset(id: string, now: Date): Promise<void> {
+		if (!this.#channels.has(id)) throw missing(`channel ${id} does not exist`);
+		let last = this.#plannerResets.get(id);
+		this.#plannerResets.set(id, last && now <= last ? new Date(last.getTime() + 1) : new Date(now));
+	}
+
 	async #setChannelArchived(
 		input: ChannelArchiveInput,
 		archived: boolean,
@@ -671,6 +749,8 @@ export class MemoryStorage implements StorageAdapter {
 		let saved: ChannelRecord;
 		if (archived) {
 			saved = { ...found, updatedAt, archivedAt: new Date(updatedAt) };
+			this.#archiveGenerations.set(input.id, (this.#archiveGenerations.get(input.id) ?? 0) + 1);
+			this.#aiPlaceholders.deleteChannel(input.id);
 		} else {
 			let { archivedAt: _, ...active } = found;
 			saved = { ...active, updatedAt };
@@ -679,52 +759,61 @@ export class MemoryStorage implements StorageAdapter {
 		return { channel: channel(saved), changed: true };
 	}
 
-	async #deleteChannel(id: string): Promise<boolean> {
-		let found = this.#channels.get(id);
-		if (!found) return false;
-		if (!found.archivedAt) throw conflict(`channel ${id} must be archived before deletion`);
-		if ([...this.#channels.values()].some(channel => channel.parentChannelId === id)) {
-			throw conflict(`channel ${id} still has child channels`);
+	async #deleteChannel(input: ChannelDelete): Promise<ChannelRecord[]> {
+		this.#assertLease(input.lease);
+		let found = this.#channels.get(input.id);
+		if (!found) return [];
+		if (found.parentChannelId) {
+			throw conflict(`channel ${input.id} is a child, deleted only with its parent`);
 		}
-		if (this.#research.referencesChannel(id)) {
-			throw conflict(`channel ${id} is still published by a research workspace`);
-		}
-		if (this.experiments.referencesChannel(id)) {
-			throw conflict(`channel ${id} is still published by an investigation`);
-		}
-
-		this.#channels.delete(id);
-		await this.#research.deleteChannel(id);
-		this.#jobs.deleteChannel(id);
-		this.#images.deleteChannel(id);
-		this.#chatAttachments.deleteChannel(id);
-		this.#runStages.deleteChannel(id);
-		this.#decisionAnswers.deleteChannel(id);
-		this.#versions.deleteChannel(id);
-		this.#plannerHolds.deleteChannel(id);
-		this.#plannerModelChoices.deleteChannel(id);
-		this.#chatThreads.deleteChannel(id);
-		this.#plannerCredentials.deleteChannel(id);
-		this.#snapshots.delete(id);
-		this.#sequences.delete(id);
-		this.#updates.delete(id);
-		this.#events.delete(id);
-		this.#sidecars.delete(id);
-		this.#operations.delete(id);
-		this.#agents.delete(id);
-		let aliases = this.#channelSlugs.get(found.repositoryId);
-		if (aliases) {
-			for (let [slug, owner] of aliases) {
-				if (owner === id) aliases.delete(slug);
+		let children = [...this.#channels.values()]
+			.filter(item => item.parentChannelId === input.id)
+			.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
+		let deleted = [found, ...children];
+		let ids = new Set(deleted.map(item => item.id));
+		// As one transaction: every row goes before anything is awaited.
+		this.experiments.deleteChannels(ids);
+		for (let item of deleted) {
+			let id = item.id;
+			this.#channels.delete(id);
+			this.#plannerResets.delete(id);
+			this.#jobs.deleteChannel(id);
+			this.#images.deleteChannel(id);
+			this.#chatAttachments.deleteChannel(id);
+			this.#decisionAnswers.deleteChannel(id);
+			this.#versions.deleteChannel(id);
+			this.#plannerHolds.deleteChannel(id);
+			this.#plannerModelChoices.deleteChannel(id);
+			this.#plannerCatalogs.deleteChannel(id);
+			this.#chatThreads.deleteChannel(id);
+			this.#plannerCredentials.deleteChannel(id);
+			this.#aiPlaceholders.deleteChannel(id);
+			this.#mcpInvocations.deleteChannel(id);
+			this.#machines.deleteChannel(id);
+			this.#archiveGenerations.delete(id);
+			this.#snapshots.delete(id);
+			this.#sequences.delete(id);
+			this.#updates.delete(id);
+			this.#events.delete(id);
+			this.#sidecars.delete(id);
+			this.#operations.delete(id);
+			this.#agents.delete(id);
+			let aliases = this.#channelSlugs.get(item.repositoryId);
+			if (aliases) {
+				for (let [slug, owner] of aliases) {
+					if (owner === id) aliases.delete(slug);
+				}
+				if (aliases.size === 0) this.#channelSlugs.delete(item.repositoryId);
 			}
-			if (aliases.size === 0) this.#channelSlugs.delete(found.repositoryId);
-		}
-		for (let [userId, saved] of this.#navigation) {
-			if (saved.lastDocumentId === id) {
-				this.#navigation.set(userId, { ...saved, lastDocumentId: undefined });
+			for (let [userId, saved] of this.#navigation) {
+				if (saved.lastDocumentId === id) {
+					this.#navigation.set(userId, { ...saved, lastDocumentId: undefined });
+				}
 			}
 		}
-		return true;
+		// Research staging is queued behind writes already under way, which find the document gone.
+		for (let item of deleted) await this.#research.deleteChannel(item.id);
+		return deleted.map(item => channel(item));
 	}
 
 	#publishChannelDescription(

@@ -87,26 +87,6 @@
 		]
 	},
 	{
-		"file": "apps/web/src/navigation.css",
-		"reason": "Sidebar resize affordance uses neutral 20% black; its interaction geometry owns this existing local treatment.",
-		"cases": [
-			[
-				"color",
-				"background",
-				"rgb(0 0 0 / 20%)",
-				"CSS > .navigation-drawer-backdrop",
-				1
-			],
-			[
-				"color",
-				"background",
-				"rgb(0 0 0 / 20%)",
-				"CSS > .navigation-modal-backdrop",
-				1
-			]
-		]
-	},
-	{
 		"file": "apps/web/src/local-login.css",
 		"reason": "Sign-in pulse is a continuous 1.6s status signal with its established curve; not a surface transition role.",
 		"cases": [
@@ -255,7 +235,7 @@
 	},
 	{
 		"file": "packages/editor/src/face.tsx",
-		"reason": "Participant identity color is derived from the account handle, not a semantic interface color; preserve collaborative presence distinction.",
+		"reason": "Participant identity color is derived from the account handle, not a semantic interface color; preserve collaborative presence distinction. The initial mixes less of it into the light ink at night (`mixInk`), for AA there.",
 		"cases": [
 			[
 				"color",
@@ -267,21 +247,21 @@
 			[
 				"color",
 				"color",
-				"`color-mix(in srgb, ${tone} 80%, var(--color-text-primary))`",
+				"`light-dark(${mixInk(tone, 80)}, ${mixInk(tone, 60)})`",
 				"style object > Portrait > <span>",
 				1
 			]
 		],
-		"sourceHash": "3522beb37db7dc36895276f664a9bb74410a5c0381b96bf0a375ef34011a049d"
+		"sourceHash": "87da38eb5ea71afef2b50f22aaa1817813ea17c485b08e3bfef0cb9ac9dc5aa4"
 	},
 	{
 		"file": "packages/editor/src/callout.css",
-		"reason": "Callout shadow combines a local inset highlight/semantic outline with depth; no equivalent elevation role preserves the appearance.",
+		"reason": "Callout shadow combines a local inset highlight (in the page's own colour, so it is white by day and goes into the page at night)/semantic outline with depth; no equivalent elevation role preserves the appearance.",
 		"cases": [
 			[
 				"shadow",
 				"box-shadow",
-				"inset 0 1px rgb(255 255 255 / 55%), var(--shadow-resting)",
+				"inset 0 1px color-mix(in oklch, var(--color-page) 55%, transparent),\n\t\tvar(--shadow-resting)",
 				"CSS > .plan-content [data-plan-type]",
 				1
 			],

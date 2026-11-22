@@ -1,4 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
+import { HOST_SANDBOX } from "./testing/host-sandbox";
 import * as Permission from "./permission";
 import {
 	chmod,
@@ -8,7 +9,6 @@ import {
 	readFile,
 	realpath,
 	rm,
-	stat,
 	writeFile,
 } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
@@ -23,7 +23,8 @@ import { BUILD_LIMIT_MS, INVESTIGATION_LIMIT_MS, runWork, STOPPED } from "./run"
 import { timedOut } from "./acp";
 import { git } from "./workspace";
 import { ConnectorError, remote } from "./mcp";
-import { register } from "./machine";
+import { machineAiLaunch, register } from "./machine";
+import { AI_ACCOUNT_UNCHECKED_RUN, NO_AI_ACCOUNT_RUN } from "@chopin/protocol/ai-credentials";
 import { BOT, STARTER, testGitHubToken } from "./testing/github-grant";
 import { githubRefusal } from "./github-token";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -77,6 +78,7 @@ async function run(
 			title: "Margin landing page",
 			runToken: "token",
 		}, {
+			sandbox: HOST_SANDBOX,
 			checkouts: checkouts({ directory: state, registered: { "org/repo": root } }),
 			directory: state,
 			command: [
@@ -192,7 +194,7 @@ test.skipIf(process.platform === "win32")(
 );
 
 test.each([true, false])(
-	"an investigation (spike=%s) serves image tools through an authenticated local bridge",
+	"an investigation (spike=%s) uploads an image from its own repository through its run's bridge, and none from outside it",
 	async spike => {
 		let root = await mkdtemp(join(tmpdir(), "chopin-spike-"));
 		let state = await mkdtemp(join(tmpdir(), "chopin-spike-state-"));
@@ -264,12 +266,12 @@ test.each([true, false])(
 					authorizer: "a",
 				},
 			}, {
+				sandbox: HOST_SANDBOX,
 				checkouts: checkouts({ directory: state, registered: { "org/repo": root } }),
 				directory: state,
 				command: [
 					process.execPath,
 					new URL("./testing/fake-agent.ts", import.meta.url).pathname,
-					"--http",
 					spike ? "--spike" : "--images",
 				],
 				url: `http://127.0.0.1:${chopin.port}`,
@@ -290,12 +292,6 @@ test.each([true, false])(
 				spike ? "submit_spike_result" : "submit_investigation_result",
 			]);
 			expect(received[0][1]).toEqual({ data: "iVBORw0KGgo=", mimeType: "image/png" });
-			// The bridge closes with the run.
-			let submitted = received[1][1];
-			let bridgeUrl = spike
-				? submitted.url
-				: (submitted.result as { provenance: { environment: string } }).provenance.environment;
-			await expect(fetch(bridgeUrl as string, { method: "POST" })).rejects.toThrow();
 		} finally {
 			await chopin.stop(true);
 			await rm(root, { recursive: true, force: true });
@@ -495,22 +491,11 @@ test("an agent that cancelled its own turn reads as stopped, not as a failure", 
 	expect(terminal.err()).not.toContain("Agent stopped: cancelled");
 });
 
-test("servers the agent left running in its worktree end with the run", async () => {
-	let file = join(await mkdtemp(join(tmpdir(), "chopin-orphan-")), "pid");
-	process.env.CHOPIN_TEST_ORPHAN_PID = file;
-	try {
-		await run({}, ["--orphan"]);
-		let pid = Number(await readFile(file, "utf8"));
-		expect(pid).toBeGreaterThan(0);
-		expect(() => process.kill(pid, 0)).toThrow();
-	} finally {
-		delete process.env.CHOPIN_TEST_ORPHAN_PID;
-		await rm(dirname(file), { recursive: true, force: true });
-	}
-});
+/** What the fake implementer saw as its turn began, recorded in a file. */
+type Seen = { prompt: string; cwd: string; head: string; branch: string; alternates: string };
 
-/** Records the prompt and CHOPIN_RUN_WORKTREES the fake implementer saw, through a file. */
-async function seeing<T>(body: (seen: () => Promise<{ prompt: string; worktrees: string }>) => T) {
+/** Records what the fake implementer saw (see `Seen`), through a file. */
+async function seeing<T>(body: (seen: () => Promise<Seen>) => T) {
 	let file = join(await mkdtemp(join(tmpdir(), "chopin-seen-")), "seen.json");
 	process.env.CHOPIN_TEST_SEEN = file;
 	try {
@@ -522,23 +507,26 @@ async function seeing<T>(body: (seen: () => Promise<{ prompt: string; worktrees:
 }
 
 test.each([
-	["a build", {}, ["--http"]],
+	["a build", {}, [] as string[]],
 	["a living document's first build", { live: true }, ["--live"]],
 	["a rebuild", { kind: "rebuild" as const }, ["--rebuild"]],
 ])(
-	"%s tells the agent its worktree and the one folder for any extra worktrees",
+	"%s tells the agent its repository, a clone of its own in its microVM, and where to add worktrees",
 	async (_name, build, flags) => {
 		await seeing(async seen => {
-			await run(build, flags, undefined, undefined, {}, async ({ state, id }) => {
-				let { prompt, worktrees } = await seen();
-				let runs = join(state, "runs");
-				expect(worktrees).toBe(join(runs, `${id}-worktrees`));
-				expect(prompt).toContain(`Your worktree is ${join(runs, id)}.`);
+			await run(build, flags, undefined, undefined, {}, async () => {
+				let { prompt, cwd } = await seen();
+				let work = HOST_SANDBOX.work;
+				expect(cwd).toBe(join(work, "repo"));
 				expect(prompt).toContain(
-					`create them only inside ${worktrees} (also in $CHOPIN_RUN_WORKTREES) with `
-						+ "`git worktree add`",
+					`Your repository is ${join(work, "repo")}, a clone of its own in this machine's microVM.`,
 				);
-				expect(prompt).not.toContain("sub-worktree");
+				expect(prompt).toContain(
+					`For extra worktrees, as for concurrent PRs, add them with \`git worktree add\` inside ${work}.`,
+				);
+				expect(prompt).toContain(
+					"Everything in the microVM, uncommitted changes included, is gone",
+				);
 				// Pull requests it opens are drafts; it never merges.
 				expect(prompt).toContain(
 					flags.includes("--rebuild")
@@ -558,35 +546,25 @@ test.each([
 );
 
 test.skipIf(process.platform === "win32")(
-	"extra worktrees end with the run, uncommitted changes and their servers too, and the run's own worktree stays",
+	"a build's agent works in a clone of its own at the run's commit, on its branch, reading the checkout's objects, and leaves nothing in the person's repository",
 	async () => {
-		let file = join(await mkdtemp(join(tmpdir(), "chopin-extra-")), "pid");
-		process.env.CHOPIN_TEST_ORPHAN_PID = file;
-		try {
-			await seeing(seen =>
-				run({}, ["--worktrees"], undefined, undefined, {}, async ({ root, state, id }) => {
-					let { worktrees } = await seen();
-					let runs = join(state, "runs");
-					let listed = git(root, "worktree", "list", "--porcelain").split("\n")
-						.filter(line => line.startsWith("worktree "))
-						.map(line => line.slice("worktree ".length));
-					expect(await Promise.all(listed.map(path => realpath(path).catch(() => path)))).toEqual([
-						await realpath(root),
-						await realpath(join(runs, id)),
-					]);
-					expect(await stat(worktrees).catch(() => "missing")).toBe("missing");
-					expect((await stat(join(runs, id))).isDirectory()).toBe(true);
-					// Their branches, pushed for their pull requests, stay.
-					expect(git(root, "branch", "--list", "chopin/task-*")).toContain("chopin/task-b");
-				})
-			);
-			let pid = Number(await readFile(file, "utf8"));
-			expect(pid).toBeGreaterThan(0);
-			expect(() => process.kill(pid, 0)).toThrow();
-		} finally {
-			delete process.env.CHOPIN_TEST_ORPHAN_PID;
-			await rm(dirname(file), { recursive: true, force: true });
-		}
+		await seeing(seen =>
+			run({}, [], undefined, undefined, {}, async ({ root, id }) => {
+				let { cwd, head, branch, alternates } = await seen();
+				expect(cwd).not.toBe(root);
+				expect(head).toBe(git(root, "rev-parse", "HEAD"));
+				expect(branch).toBe(`chopin/implement-${id.slice(0, 8)}`);
+				// Its objects are the checkout's, read where they are; nothing is copied or written there.
+				expect(await realpath((await readFile(join(cwd, alternates), "utf8")).trim())).toBe(
+					await realpath(join(root, ".git", "objects")),
+				);
+				expect(
+					git(root, "worktree", "list", "--porcelain").split("\n")
+						.filter(line => line.startsWith("worktree ")),
+				).toHaveLength(1);
+				expect(git(root, "branch", "--list", "chopin/*")).toBe("");
+			})
+		);
 	},
 );
 
@@ -802,6 +780,7 @@ async function connected(options: {
 			random: () => 0.01,
 			run: (api, kind, claim) =>
 				runWork(api, kind, claim, {
+					sandbox: HOST_SANDBOX,
 					checkouts: checkouts({ directory: state, registered: { "org/repo": root } }),
 					directory: state,
 					command: [
@@ -1195,6 +1174,7 @@ test("a run whose connection a restarted server forgot stops its agent and the c
 			random: () => 0.01,
 			run: (api, kind, claim) =>
 				runWork(api, kind, claim, {
+					sandbox: HOST_SANDBOX,
 					checkouts: checkouts({ directory: state, registered: { "org/repo": root } }),
 					directory: state,
 					command: [
@@ -1559,6 +1539,7 @@ exec "${real}" "$@"
 					authorizer: "a",
 				},
 			}, {
+				sandbox: HOST_SANDBOX,
 				checkouts: checkouts({ directory: state, registered: { "org/repo": root } }),
 				directory: state,
 				// What the agent has when it starts: its environment, and the folder its tokens are in.
@@ -1596,3 +1577,286 @@ exec "${real}" "$@"
 		}
 	},
 );
+
+test("a run Chopin hands no AI grant starts its agent on the owner's setup, as before", async () => {
+	let folder = await mkdtemp(join(tmpdir(), "chopin-ai-none-"));
+	let report = join(folder, "report.json");
+	try {
+		let asked: string[] = [];
+		await run({}, [], undefined, undefined, {
+			command: [process.execPath, new URL("./testing/ai-agent.ts", import.meta.url).pathname],
+			env: {
+				AI_AGENT_REPORT: report,
+				OPENAI_API_KEY: "sk-owner",
+				ATOMIC_CODING_AGENT_DIR: "/owner",
+			},
+			ai: {
+				launch: async run => void asked.push(run),
+				end: async () => {},
+			},
+		});
+		expect(asked).toEqual(["token"]);
+		let { env } = JSON.parse(await readFile(report, "utf8"));
+		expect(env.OPENAI_API_KEY).toBe("sk-owner");
+		expect(env.ATOMIC_CODING_AGENT_DIR).toBe("/owner");
+		expect(env.OPENAI_BASE_URL).toBeUndefined();
+	} finally {
+		await rm(folder, { recursive: true, force: true });
+	}
+});
+
+test("a run handed AI grants gives its agent stand-ins through the relay and its own state, and ends the launch", async () => {
+	let folder = await mkdtemp(join(tmpdir(), "chopin-ai-granted-"));
+	let report = join(folder, "report.json");
+	let seen: Array<{ path: string; launch: string | null; authorization: string | null }> = [];
+	let chopin = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request) {
+			seen.push({
+				path: new URL(request.url).pathname,
+				launch: request.headers.get("x-chopin-launch"),
+				authorization: request.headers.get("authorization"),
+			});
+			return Response.json({ choices: [{ message: { content: "relayed" } }] });
+		},
+	});
+	let ended: string[] = [];
+	try {
+		await run({}, [], undefined, undefined, {
+			command: [process.execPath, new URL("./testing/ai-agent.ts", import.meta.url).pathname],
+			env: {
+				AI_AGENT_REPORT: report,
+				OPENAI_API_KEY: "sk-owner",
+				ANTHROPIC_API_KEY: "sk-ant-owner",
+			},
+			ai: {
+				launch: async () => ({
+					launch: "chopin_launch_run",
+					expiresAt: Date.now() + 60_000,
+					providers: [{
+						provider: "openai",
+						baseUrl: `http://127.0.0.1:${chopin.port}/api/v1/ai/openai/v1`,
+						placeholder: "chopin_ai_run",
+						keyVariable: "OPENAI_API_KEY",
+					}],
+					withheld: [],
+				}),
+				end: async launch => void ended.push(launch),
+			},
+		});
+		let { env, answer, state } = JSON.parse(await readFile(report, "utf8"));
+		expect(answer).toMatchObject({
+			status: 200,
+			body: { choices: [{ message: { content: "relayed" } }] },
+		});
+		expect(seen).toEqual([{
+			path: "/api/v1/ai/openai/v1/chat/completions",
+			launch: "chopin_launch_run",
+			authorization: "Bearer chopin_ai_run",
+		}]);
+		expect(env.OPENAI_API_KEY).toBe("chopin_ai_run");
+		expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+		expect(env.ATOMIC_CODING_AGENT_DIR).toEndWith(".agent/atomic");
+		expect(JSON.stringify({ env, state })).not.toContain("chopin_launch_run");
+		expect(ended).toEqual(["chopin_launch_run"]);
+	} finally {
+		await chopin.stop(true);
+		await rm(folder, { recursive: true, force: true });
+	}
+});
+
+test("a run Chopin answers has no AI account to run on starts no agent, and ends in Chopin's words", async () => {
+	let answers: Array<[string, () => Response]> = [
+		[
+			NO_AI_ACCOUNT_RUN,
+			() => Response.json({ error: "no-ai-account", message: NO_AI_ACCOUNT_RUN }, { status: 409 }),
+		],
+		[
+			AI_ACCOUNT_UNCHECKED_RUN,
+			() =>
+				Response.json({ error: "no-ai-account", message: AI_ACCOUNT_UNCHECKED_RUN }, {
+					status: 409,
+				}),
+		],
+		// A Chopin that hands out a launch with no provider at all says the same, in the same words.
+		[
+			NO_AI_ACCOUNT_RUN,
+			() =>
+				Response.json({
+					providers: [],
+					withheld: [{ provider: "github-copilot", reason: "no-copilot-access" }],
+				}),
+		],
+		[
+			AI_ACCOUNT_UNCHECKED_RUN,
+			() =>
+				Response.json({
+					providers: [],
+					withheld: [{ provider: "github-copilot", reason: "copilot-unavailable" }],
+				}),
+		],
+	];
+	for (let [words, answer] of answers) {
+		let folder = await mkdtemp(join(tmpdir(), "chopin-ai-refused-"));
+		let report = join(folder, "report.json");
+		let chopin = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: answer });
+		let origin = `http://127.0.0.1:${chopin.port}`;
+		try {
+			let { calls } = await run({}, [], undefined, undefined, {
+				command: [process.execPath, new URL("./testing/ai-agent.ts", import.meta.url).pathname],
+				env: { AI_AGENT_REPORT: report, OPENAI_API_KEY: "sk-owner" },
+				ai: {
+					launch: (run, signal) => machineAiLaunch(origin, "chopin_m_machine", run, signal),
+					end: async () => {},
+				},
+			});
+			expect(existsSync(report), words).toBe(false);
+			expect(calls.filter(([name]) => name === "report_implementation_build"), words).toEqual([[
+				"report_implementation_build",
+				{ id: expect.any(String), state: "failed", error: words },
+			]]);
+		} finally {
+			await chopin.stop(true);
+			await rm(folder, { recursive: true, force: true });
+		}
+	}
+});
+
+test("a run whose AI launch can't be prepared now, or whose document ended first, starts no agent and says why", async () => {
+	for (
+		let [answer, error] of [
+			[
+				() => Response.json({ error: "unavailable" }, { status: 503 }),
+				"Chopin couldn't give this run its AI models now. Start it again in a moment.",
+			],
+			[
+				() =>
+					Response.json({
+						error: "launch-ended",
+						message: "This run's document or machine ended before it could start.",
+					}, { status: 409 }),
+				"Chopin couldn't give this run its AI models: This run's document or machine ended before it could start.",
+			],
+		] as const
+	) {
+		let folder = await mkdtemp(join(tmpdir(), "chopin-ai-busy-"));
+		let report = join(folder, "report.json");
+		let chopin = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: answer });
+		let origin = `http://127.0.0.1:${chopin.port}`;
+		try {
+			let { calls } = await run({}, [], undefined, undefined, {
+				command: [process.execPath, new URL("./testing/ai-agent.ts", import.meta.url).pathname],
+				env: { AI_AGENT_REPORT: report },
+				ai: {
+					launch: (run, signal) => machineAiLaunch(origin, "chopin_m_machine", run, signal),
+					end: async () => {},
+				},
+			});
+			expect(existsSync(report), error).toBe(false);
+			expect(calls.filter(([name]) => name === "report_implementation_build"), error).toEqual([[
+				"report_implementation_build",
+				{ id: expect.any(String), state: "failed", error },
+			]]);
+		} finally {
+			await chopin.stop(true);
+			await rm(folder, { recursive: true, force: true });
+		}
+	}
+});
+
+test("an agent that reads no provider's variables lists each granted provider's models with only the base URL and key Chopin published together, Copilot included", async () => {
+	let folder = await mkdtemp(join(tmpdir(), "chopin-ai-pairs-"));
+	let report = join(folder, "report.json");
+	// Named as Atomic's ACP command is, so the connector writes it a models.json too.
+	let atomic = join(folder, "atomic-acp");
+	await writeFile(
+		atomic,
+		`#!/bin/sh\nexec ${process.execPath} ${
+			new URL("./testing/ai-agent.ts", import.meta.url).pathname
+		}\n`,
+	);
+	await chmod(atomic, 0o755);
+	let seen: Array<{ path: string; key: string | null; launch: string | null }> = [];
+	let service = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		fetch(request) {
+			let key = request.headers.get("x-api-key")
+				?? request.headers.get("authorization")?.replace(/^Bearer /, "") ?? null;
+			seen.push({
+				path: new URL(request.url).pathname,
+				key,
+				launch: request.headers.get("x-chopin-launch"),
+			});
+			let valid = key?.startsWith("chopin_ai_")
+				&& request.headers.get("x-chopin-launch") === "chopin_launch_pairs";
+			return valid
+				? Response.json({ data: [{ id: "model" }] })
+				: Response.json({ error: "refused" }, { status: 401 });
+		},
+	});
+	let base = `http://127.0.0.1:${service.port}/api/v1/ai`;
+	let grant = {
+		"github-copilot": {
+			provider: "github-copilot" as const,
+			baseUrl: `${base}/github-copilot`,
+			placeholder: "chopin_ai_copilot",
+			keyVariable: "COPILOT_GITHUB_TOKEN",
+		},
+		anthropic: {
+			provider: "anthropic" as const,
+			baseUrl: `${base}/anthropic`,
+			placeholder: "chopin_ai_anthropic",
+			keyVariable: "ANTHROPIC_API_KEY",
+		},
+	};
+	try {
+		for (
+			let [name, command, providers] of [
+				["generic, Copilot only", [process.execPath], [grant["github-copilot"]]],
+				["generic, with Anthropic", [process.execPath], [grant["github-copilot"], grant.anthropic]],
+				["Atomic", [atomic], [grant["github-copilot"], grant.anthropic]],
+			] as const
+		) {
+			seen.length = 0;
+			let list = providers.map(value => value.provider).join(",");
+			await run({}, [], undefined, undefined, {
+				command: command.length === 1 && command[0] === atomic
+					? [atomic]
+					: [...command, new URL("./testing/ai-agent.ts", import.meta.url).pathname],
+				env: { AI_AGENT_REPORT: report, AI_AGENT_LIST: list },
+				ai: {
+					launch: async () => ({
+						launch: "chopin_launch_pairs",
+						expiresAt: Date.now() + 60_000,
+						providers: [...providers],
+						withheld: [],
+					}),
+					end: async () => {},
+				},
+			});
+			let { listed, env } = JSON.parse(await readFile(report, "utf8"));
+			for (let provider of providers) {
+				expect(listed[provider.provider], `${name}: ${provider.provider}`).toEqual({
+					status: 200,
+					body: { data: [{ id: "model" }] },
+				});
+			}
+			expect(seen.map(value => value.path).toSorted(), name).toEqual(
+				providers.map(value =>
+					value.provider === "anthropic"
+						? "/api/v1/ai/anthropic/v1/models"
+						: "/api/v1/ai/github-copilot/models"
+				).toSorted(),
+			);
+			expect(seen.every(value => value.launch === "chopin_launch_pairs"), name).toBe(true);
+			// The launch's own credential stays in the relay: never in what the agent was given.
+			expect(JSON.stringify(env), name).not.toContain("chopin_launch_pairs");
+			await rm(report, { force: true });
+		}
+	} finally {
+		await service.stop(true);
+		await rm(folder, { recursive: true, force: true });
+	}
+});

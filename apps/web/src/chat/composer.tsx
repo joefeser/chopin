@@ -23,19 +23,19 @@ import {
 } from "@chopin/icons";
 import { ComposerVoice, ComposerVoiceButton } from "@/components/assistant-ui/elements/composer";
 import { FormatBar } from "./format-bar";
+import { TypingLine } from "./typing-line";
 import { LinkForm } from "./link-form";
 import { sendStop } from "./assistant-ui/send-stop";
 import { SendStopButton } from "./assistant-ui/send-stop-button";
 import { motionContract } from "../motion-contract";
 import { currentShortcutPlatform, shortcutLabel } from "../shortcuts";
 import { draftPlaceholder } from "./ask-chopin";
-import { ModelPill, ModelPillPending } from "./assistant-ui/model-pill";
+import { ModelPill, ModelPillPending, ModelPillUnavailable } from "./assistant-ui/model-pill";
 import type { Format } from "./format";
 import type { FileView } from "./attachments/files";
 import type { ComposerModel } from "./use-model-choice";
 import type { DraftInputHandle, DraftInputProps } from "./draft-input";
 import type { RichDraftHandle } from "./rich/rich-draft-input";
-import plannerResume from "../assets/icons/planner-resume.svg";
 import "./composer.css";
 
 const MOTION = motionContract("collapse");
@@ -155,11 +155,11 @@ export type ChatComposerProps = {
 	sendDisabled: boolean;
 	onSubmit: () => void;
 	/**
-	 * What the Planner's run offers. Stop shares the round button with Send, which stops only while
-	 * the draft is empty and `disabled` is false; Resume is a button of its own.
+	 * What the Planner's turn offers: Stop, which shares the round button with Send and stops only
+	 * while the draft is empty and `disabled` is false.
 	 */
 	run?: {
-		action: "stop" | "resume";
+		action: "stop";
 		disabled: boolean;
 		refusedWhileBusy?: boolean;
 		onClick: () => void;
@@ -168,6 +168,8 @@ export type ChatComposerProps = {
 	pickers?: ReactNode;
 	/** What leads the row of controls: a thread's choice to also send the reply to Chat. */
 	rowStart?: ReactNode;
+	/** Who else is writing here (`typingWords`), under the box; absent where nobody can be shown. */
+	typing?: string;
 	input: Omit<
 		DraftInputProps,
 		| "role"
@@ -205,6 +207,7 @@ export function ChatComposer(
 		run,
 		pickers,
 		rowStart,
+		typing,
 		input,
 	}: ChatComposerProps,
 ) {
@@ -632,21 +635,11 @@ export function ChatComposer(
 									)}
 									{model && ("pending" in model
 										? <ModelPillPending model={model} />
+										: "unavailable" in model
+										? <ModelPillUnavailable model={model} />
 										: <ModelPill control={model} />)}
 								</div>
 								<div className="composer-actions">
-									{run?.action === "resume" && (
-										<button
-											aria-label={`Resume ${PLANNER_NAME}`}
-											disabled={run.disabled}
-											className="btn btn-icon btn-ghost"
-											onClick={run.onClick}
-											title={`Resume ${PLANNER_NAME}`}
-											type="button"
-										>
-											<img alt="" className="size-4" src={plannerResume} />
-										</button>
-									)}
 									<SendStopButton
 										busy={sending}
 										onClick={button.action === "stop" ? run!.onClick : onSubmit}
@@ -657,6 +650,7 @@ export function ChatComposer(
 						</>
 					)}
 			</div>
+			{typing !== undefined && <TypingLine words={typing} />}
 		</div>
 	);
 }

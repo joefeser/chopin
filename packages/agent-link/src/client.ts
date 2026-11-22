@@ -9,7 +9,6 @@ import type {
 	ClientMessage,
 	ClientMessageOf,
 	InputCall,
-	LinkRun,
 	RefusalCode,
 	ServerMessage,
 	ServerMessageOf,
@@ -26,7 +25,6 @@ export const WIRE = {
 	malformedClose: 4400,
 	/** The upgrade request header asking for optional features, and the ones this client knows. */
 	featuresHeader: "chopin-agent-features",
-	runStageDeltas: "run-stage-deltas",
 	decisionOptionPreviews: "decision-option-previews",
 	resumableSessions: "resumable-sessions",
 	restartNotice: "restart-notice",
@@ -35,6 +33,12 @@ export const WIRE = {
 	sessionForks: "session-forks",
 	steerTurn: "steer-turn",
 	retryTurn: "retry-turn",
+	sessionChoice: "session-choice",
+	aiCredentials: "ai-credentials",
+	aiCatalog: "ai-catalog",
+	catalogLaunches: "catalog-launches",
+	/** The header a runner sends the launch's own credential in, to Chopin's credential proxy. */
+	aiLaunchHeader: "x-chopin-launch",
 	/** How often a client retries a `resume` refused with `retry`, after a `restarting` notice. */
 	restartResumeRetryMs: 250,
 } as const;
@@ -83,14 +87,23 @@ export type AgentHandlers = {
 	/** Ends the turn as finished when it resolves without calling `end`, failed when it rejects. */
 	turn(context: TurnContext): void | Promise<void>;
 	destroy?(message: ServerMessageOf<"destroy">): void;
-	/** Stop or resume the session's workflow runs; throw to report that it could not. */
-	control?(message: ServerMessageOf<"stop"> | ServerMessageOf<"resume">): void | Promise<void>;
 	/**
 	 * Gives a person's message to the turn that is running, to read at its next step. Throw to say
 	 * the turn could not take it. Having it asks for `steer-turn`; a turn that has already ended is
 	 * answered without calling it.
 	 */
 	steer?(message: ServerMessageOf<"steer">): void | Promise<void>;
+	/**
+	 * Takes a session's new AI grants, which replace those its `start`, `fork` or an earlier `ai`
+	 * carried. Having it asks for `ai-credentials`: `start` and `fork` then carry `ai` too.
+	 */
+	ai?(message: ServerMessageOf<"ai">): void | Promise<void>;
+	/**
+	 * Takes the link's catalog grants, which list the person's models and run none, replacing any
+	 * earlier ones. Having it, with `ai`, asks for `ai-catalog`, and the client asks for them once
+	 * attached. With `AgentOptions.catalogLaunches`, each names its launch in `catalogLaunch`.
+	 */
+	aiCatalog?(message: ServerMessageOf<"ai-catalog">): void | Promise<void>;
 };
 
 export type AgentOptions = {
@@ -135,6 +148,21 @@ export type AgentOptions = {
 	 * the client can drop what the earlier turns for that message left in what it keeps.
 	 */
 	retryTurns?: boolean;
+	/**
+	 * Asks for `session-choice`, which takes effect only with `capabilities`: `start` and `fork` then
+	 * carry the document's chosen `model` and `thinkingLevel`, so a session the client makes starts
+	 * on them. They only open the session; each turn's own `model` and `thinkingLevel` still decide
+	 * what it runs, and a turn without them runs the client's defaults.
+	 */
+	sessionChoice?: boolean;
+	/**
+	 * Asks for `catalog-launches`, which takes effect only with `handlers.aiCatalog`: each
+	 * `ai-catalog` then names its launch (`catalogLaunch`), and Chopin takes a report as what this
+	 * client offers only once `AgentClient.report` names the launch its models were listed through,
+	 * while that launch is for the person's accounts as they are now. A report naming none, the
+	 * `capabilities` sent on attach among them, is no report.
+	 */
+	catalogLaunches?: boolean;
 };
 
 /** A question this client asked and still waits on, which a later link may carry on. */
@@ -172,9 +200,6 @@ export type LinkClosed = {
 };
 
 export type InputOptions = {
-	workflowRunId?: string;
-	workflowStageId?: string;
-	rootRunId?: string;
 	/**
 	 * The block the question concerns, from the Planner's latest read of the document; its card
 	 * goes beside that block. A block that has changed since leaves the card unlinked.
@@ -199,15 +224,12 @@ export type AgentClient = {
 		options?: InputOptions,
 	): Promise<ServerMessageOf<"input-result">>;
 	/**
-	 * Reports the session's runs. Delta cards need a server that offers `run-stage-deltas`; a
-	 * report too large for one frame is sent as several, splitting the delta cards' stages.
+	 * Reports a changed catalog, replacing the earlier one whole. With `catalog-launches`,
+	 * `catalogLaunch` names the `ai-catalog` its models were listed through; it is left out for a
+	 * server that did not accept the feature. False when the server did not accept
+	 * `capability-catalog` or the link is no longer open.
 	 */
-	reportRuns(session: string, runs: { active: string[]; paused: string[]; cards: LinkRun[] }): void;
-	/**
-	 * Reports a changed catalog, replacing the earlier one whole. False when the server did not
-	 * accept `capability-catalog` or the link is no longer open.
-	 */
-	report(catalog: CapabilityCatalog): boolean;
+	report(catalog: CapabilityCatalog, catalogLaunch?: string): boolean;
 	/** Sends one message; false when the link is no longer open. */
 	send(message: ClientMessage): boolean;
 	detach(): Promise<LinkClosed>;
@@ -259,12 +281,15 @@ export function linkSocket(
 	sessionForks = false,
 	steering = false,
 	retryTurns = false,
+	sessionChoice = false,
+	aiCredentials = false,
+	aiCatalog = false,
+	catalogLaunches = false,
 ): WebSocket {
 	return new (WebSocket as unknown as HeaderWebSocket)(url, {
 		headers: {
 			authorization: `Bearer ${token}`,
 			[WIRE.featuresHeader]: [
-				WIRE.runStageDeltas,
 				WIRE.decisionOptionPreviews,
 				...(resumable ? [WIRE.resumableSessions, WIRE.restartNotice] : []),
 				...(catalog ? [WIRE.capabilityCatalog] : []),
@@ -272,13 +297,15 @@ export function linkSocket(
 				...(sessionForks ? [WIRE.sessionForks] : []),
 				...(steering ? [WIRE.steerTurn] : []),
 				...(retryTurns ? [WIRE.retryTurn] : []),
+				...(sessionChoice ? [WIRE.sessionChoice] : []),
+				...(aiCredentials ? [WIRE.aiCredentials] : []),
+				...(aiCredentials && aiCatalog ? [WIRE.aiCatalog] : []),
+				...(aiCredentials && aiCatalog && catalogLaunches ? [WIRE.catalogLaunches] : []),
 			].join(", "),
 		},
 		protocols: [WIRE.subprotocol],
 	});
 }
-
-type RunsReport = { active: string[]; paused: string[]; cards: LinkRun[] };
 
 const bytes = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).byteLength;
 
@@ -394,42 +421,6 @@ export async function fitImages(
 	return message;
 }
 
-/**
- * `runs` messages that each fit a frame: every one a complete report, with the delta cards'
- * stages spread across them in order. Later parts carry every card as a delta, so a full card
- * replaces the run's stages only once.
- */
-export function splitRuns(session: string, runs: RunsReport): ClientMessageOf<"runs">[] {
-	let whole: ClientMessageOf<"runs"> = { type: "runs", session, ...runs };
-	if (bytes(whole) <= WIRE.maxMessageBytes) return [whole];
-	let pending = runs.cards.flatMap((card, index) =>
-		"stagesDelta" in card
-			? card.stages.map(stage => ({ index, stage, size: bytes(stage) + 1 }))
-			: []
-	);
-	let parts: ClientMessageOf<"runs">[] = [];
-	let next = 0;
-	while (next < pending.length || !parts.length) {
-		let cards: LinkRun[] = runs.cards.map(card => {
-			if (!parts.length && !("stagesDelta" in card)) return card;
-			let { earlierStages: _, ...fields } = card as Extract<LinkRun, { earlierStages?: number }>;
-			return { ...fields, stagesDelta: true, stages: [] };
-		});
-		let size = bytes({ type: "runs", session, ...runs, cards });
-		let start = next;
-		while (next < pending.length && size + pending[next]!.size <= WIRE.maxMessageBytes) {
-			let { index, stage, size: added } = pending[next++]!;
-			cards[index]!.stages.push(stage);
-			size += added;
-		}
-		if (next === start && next < pending.length) {
-			throw new Error("A run report exceeds the agent connection's size limit.");
-		}
-		parts.push({ type: "runs", session, ...runs, cards });
-	}
-	return parts;
-}
-
 const LINK_CLOSED = "The agent connection closed.";
 
 type TurnState = {
@@ -478,6 +469,10 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 		sessionForks,
 		options.handlers.steer !== undefined,
 		options.retryTurns === true,
+		options.sessionChoice === true,
+		options.handlers.ai !== undefined,
+		options.handlers.aiCatalog !== undefined,
+		options.catalogLaunches === true,
 	);
 	let turns = new Map<string, TurnState>();
 	let asks = new Map<string, PendingAsk>();
@@ -674,6 +669,21 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				}
 				return;
 			}
+			case "ai":
+				if (!sessions.has(message.session)) return;
+				try {
+					await options.handlers.ai?.(message);
+				} catch (error) {
+					console.error("[agent] the session's AI grants could not be applied:", reason(error));
+				}
+				return;
+			case "ai-catalog":
+				try {
+					await options.handlers.aiCatalog?.(message);
+				} catch (error) {
+					console.error("[agent] the link's catalog grants could not be applied:", reason(error));
+				}
+				return;
 			case "host-tool-result": {
 				let calls = turns.get(`${message.session}/${message.turn}`)?.calls;
 				calls?.get(message.toolCallId)?.({
@@ -693,21 +703,6 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				return;
 			case "restarting":
 				restartWithin = message.reconnectWithinMs;
-				return;
-			case "stop":
-			case "resume":
-				try {
-					if (!options.handlers.control) throw new Error("This Planner has no workflow runs.");
-					await options.handlers.control(message);
-					send({ type: "control-result", request: message.request, ok: true });
-				} catch (error) {
-					send({
-						type: "control-result",
-						request: message.request,
-						ok: false,
-						message: reason(error),
-					});
-				}
 				return;
 			case "destroy":
 				sessions.delete(message.session);
@@ -759,7 +754,7 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 		},
 		ask(session, input, inputOptions = {}) {
 			let request = crypto.randomUUID();
-			let { signal, ...workflow } = inputOptions;
+			let { signal, ...placed } = inputOptions;
 			let withdrawn = (text: string) =>
 				Promise.resolve<ServerMessageOf<"input-result">>({
 					type: "input-result",
@@ -773,7 +768,7 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 			asks.set(request, pending);
 			let sent: boolean;
 			try {
-				sent = send({ type: "input-request", request, session, ...workflow, input });
+				sent = send({ type: "input-request", request, session, ...placed, input });
 			} catch (error) {
 				asks.delete(request);
 				return Promise.reject(error);
@@ -802,17 +797,10 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 			return features;
 		},
 		resumption: resumption.promise,
-		reportRuns(session, runs) {
-			if (
-				!features.includes(WIRE.runStageDeltas) && runs.cards.some(card => "stagesDelta" in card)
-			) {
-				throw new Error("This Chopin does not accept stage deltas; report full run cards.");
-			}
-			for (let part of splitRuns(session, runs)) send(part);
-		},
-		report(catalog) {
+		report(catalog, catalogLaunch) {
 			if (!features.includes(WIRE.capabilityCatalog)) return false;
-			return send({ type: "capabilities", catalog });
+			let named = catalogLaunch !== undefined && features.includes(WIRE.catalogLaunches);
+			return send({ type: "capabilities", catalog, ...(named ? { catalogLaunch } : {}) });
 		},
 		send,
 		detach() {
@@ -896,6 +884,7 @@ export function connectAgent(options: AgentOptions): Promise<AgentClient> {
 				}
 				// After the `resume`, which must be a resumable link's first message.
 				if (options.capabilities) client.report(options.capabilities);
+				if (features.includes(WIRE.aiCatalog)) send({ type: "ai-catalog" });
 			} else if (message.type === "refused") {
 				failAttach(
 					message.retry === true,

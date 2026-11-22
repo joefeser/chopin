@@ -1,17 +1,26 @@
 import { randomBytes } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { freemem, totalmem } from "node:os";
 import { basename, join } from "node:path";
+import { clonePath } from "./checkouts";
 import { redacted } from "./connection";
 import { gitAsync } from "./git-host";
-import { githubPaths, withoutGitHub } from "./github-token";
+import { githubPaths } from "./github-token";
 import type { Output } from "./output";
-import { passMasked, stopBackend } from "./planner";
+import { passMasked, plannerEnvironment, plannerGuest, stopBackend } from "./planner";
+import { guestRepositoryPath } from "./nvx";
+import { holdDisk } from "./planner-disks";
+import type { LaunchGate } from "./launch-gate";
 import { backoff } from "./reconnect";
 import { type Sandbox, type Spawned, spawnIn } from "./sandbox";
+import type { AgentStore } from "./machine-store";
 import {
+	agentFolder,
 	assignedSlots,
+	plannerDisk,
 	plannerFolder,
-	preparePlannerWorktree,
+	plannerServer,
 	SPARE_SLOT,
 	type SpareState,
 	type SpareStates,
@@ -19,10 +28,11 @@ import {
 } from "./workspace";
 
 /**
- * Spare Planners: one Planner command per registered checkout's repository, started ahead in its
- * own sandbox with its code loaded, attached to nothing, so a new document's Planner only waits for
- * its hand-over and its attach instead of the command's whole start. The contract between the
- * connector and the command, spare protocol 1:
+ * Spare Planners: one Planner command per repository the machine recently ran a Planner in, its
+ * clones included, and per registered checkout's repository, started ahead in its own microVM with
+ * its code loaded, attached to nothing, so a new document's Planner only waits for its hand-over
+ * and its attach instead of the microVM's boot and the command's whole start. The contract
+ * between the connector and the command, spare protocol 1:
  *
  * - The connector offers spare mode by starting the command with `CHOPIN_PLANNER_SPARE=1` and no
  *   document or credential: only where its credentials will be, as files in its token folder.
@@ -34,9 +44,14 @@ import {
  *   is there, with who commits; `stop` with a refusal. End of stdin means stop now, so no spare
  *   outlives its connector. No line ever holds a secret.
  *
+ * A spare is bound to its repository from its start: its environment names the checkout
+ * (`CHOPIN_CHECKOUT`) and its own repository (`CHOPIN_WORKTREE`), and its microVM's shares and the
+ * clone on its disk are fixed when it boots. So there is no spare for a repository the machine has
+ * not served yet, and that document starts cold.
+ *
  * A spare is handed only a document with no Planner worktree on this machine yet; its slot becomes
- * that document's worktree for good (`assignSlot`). A replacement starts `replaceMs` after a
- * hand-over, so two never compete for the CPU while one attaches.
+ * that document's worktree for good (`assignSlot`), and it is never handed another. A replacement
+ * starts `replaceMs` after a hand-over, so two never compete for the CPU while one attaches.
  */
 
 /** The spare protocol this connector speaks. */
@@ -53,8 +68,27 @@ export const MAX_AGE_MS = 12 * 3_600_000;
 export const REPLACE_MS = 5_000;
 /** How long a command found not to take spare mode isn't offered it again, unless it changes. */
 export const UNSUPPORTED_MS = 24 * 3_600_000;
-/** At most this many spares run on a machine: one each for its first registered checkouts. */
+/** At most this many spares run on a machine. */
 export const MAX_SPARES = 4;
+/** A repository keeps its spare this long after a Planner last started in it. */
+export const RECENT_MS = 7 * 24 * 3_600_000;
+/** What one spare's microVM takes of the host's memory with its backend loaded: about 300 MB. */
+export const SPARE_BYTES = 300 * 1024 * 1024;
+/** Spares together take at most this share of the machine's memory. */
+export const MEMORY_SHARE = 0.1;
+/** A spare starts only while the machine would keep this much memory available beside it. */
+export const RESERVE_BYTES = 1024 * 1024 * 1024;
+/** How long Chopin's word that the machine can push to a repository holds, and how often it is asked again while its spare is kept. */
+export const CHECK_MS = 10 * 60_000;
+/**
+ * A new document that finds no spare ready this soon after another of its repository's asked starts
+ * a burst, in which the repository keeps more spares.
+ */
+export const BURST_MS = 10_000;
+/** A burst ends once no new document of its repository has asked for a spare for this long. */
+export const QUIET_MS = 2 * 60_000;
+/** How long a spare held back for memory waits before it is tried again. */
+const MEMORY_WAIT_MS = 60_000;
 /** The longest line written to a spare's stdin. */
 const LINE_BYTES = 65_536;
 /** What a spare whose stdin ended has to exit by itself before its processes are stopped. */
@@ -83,6 +117,11 @@ export type Spare = {
 	/** When it started (ms), and the identity of the command it runs. */
 	started: number;
 	identity: string;
+	/**
+	 * It started as a backend whose sessions run on people's AI accounts in Chopin, with nothing of
+	 * the owner's agent setup (see `plannerEnvironment`): only such a document's Planner takes it.
+	 */
+	managed: boolean;
 	/** How it ended: `exit 3`, `signal SIGTERM`, or why it couldn't start. */
 	exited: Promise<string>;
 	alive(): boolean;
@@ -93,7 +132,7 @@ export type Spare = {
 	listen(hooks: { secrets: () => string[]; stderr?: (text: string) => void }): Promise<unknown>;
 	/** Write one line to its stdin; false when it can't be written. */
 	send(message: Record<string, unknown>): boolean;
-	/** Detach its slot at the checkout's HEAD, on the host, when HEAD moved since it started. */
+	/** Throws when the checkout's HEAD moved since it started, so the document starts cold. */
 	refresh(): Promise<void>;
 	/** End its stdin and stop its processes; its slot stays. */
 	stop(): Promise<void>;
@@ -103,11 +142,28 @@ export type Spare = {
 
 export type PlannerSpares = {
 	/**
-	 * The repository's spare, ready and current, taken out of the pool for one document; its
-	 * replacement starts `replaceMs` later. Undefined when there is none to take: the document
-	 * starts cold.
+	 * The repository's spare, ready and current and started as `managed` says, taken out of the pool
+	 * for one document, for good; its replacement starts `replaceMs` later. Undefined when there is
+	 * none to take: the document starts cold.
 	 */
-	take(repository: string): Promise<Spare | undefined>;
+	take(repository: string, managed?: boolean): Promise<Spare | undefined>;
+	/**
+	 * A document's Planner started cold in `repository`, whose checkout (registered, or the
+	 * machine's clone) is there, with a GitHub token Chopin was `asked` for at that time: the
+	 * repository is served, and keeps a spare from `replaceMs` on, unless Chopin refused the machine
+	 * a token for it since.
+	 */
+	served(repository: string, asked?: number): void;
+	/**
+	 * Chopin refused this machine a GitHub token for `repository`: its spare goes at once, and it
+	 * gets none until Chopin says the machine can push there again.
+	 */
+	refused(repository: string): void;
+	/**
+	 * Chopin said whether its Planners' sessions run on people's AI accounts in Chopin: spares start
+	 * so from now on, and one started otherwise is replaced.
+	 */
+	managed(value: boolean): void;
 	/** Stop every spare that has no document and remove its slot. */
 	stop(): Promise<void>;
 };
@@ -135,8 +191,14 @@ export async function commandIdentity(command: string[]): Promise<string> {
 	return parts.join("|");
 }
 
-/** `<base>/planner-spare.json`: commands found not to take spare mode, by command line. */
-type SpareRecord = { unsupported?: Record<string, { identity: string; at: number }> };
+/**
+ * `<base>/planner-spare.json`: commands found not to take spare mode, by command line, and when a
+ * Planner last started in each repository (`served`), which the next connector keeps spares for.
+ */
+type SpareRecord = {
+	unsupported?: Record<string, { identity: string; at: number }>;
+	served?: Record<string, number>;
+};
 
 function recordFile(directory: string) {
 	return join(directory, "planner-spare.json");
@@ -158,108 +220,387 @@ async function writeRecord(directory: string, value: SpareRecord) {
 	await rename(temporary, path);
 }
 
-/** Remove a slot that never got a document: its linked worktree, its entry and its token folder. */
-async function removeSlot(checkout: string, slot: string) {
-	await gitAsync(["worktree", "remove", "--force", slot], { cwd: checkout }).catch(() => {});
+/** Remove a slot that never got a document: its disk, its token folder and its agents' state. */
+async function removeSlot(slot: string) {
+	await rm(plannerDisk(slot), { force: true });
+	await rm(plannerServer(slot), { force: true });
 	await rm(slot, { recursive: true, force: true });
 	await rm(tokenFolder(slot), { recursive: true, force: true });
-	await gitAsync(["worktree", "prune"], { cwd: checkout }).catch(() => {});
+	await rm(agentFolder(slot), { recursive: true, force: true });
+}
+
+const REPOSITORY = /^[\w.-]+\/[\w.-]+$/;
+
+/** The machine's memory in bytes: all of it, and what is available now. */
+export type Memory = () => { total: number; available: number };
+
+const MEMORY: Memory = () => ({ total: totalmem(), available: freemem() });
+
+/**
+ * How many spares a machine keeps: `cap`, and no more than take `MEMORY_SHARE` of its memory at
+ * `SPARE_BYTES` each.
+ */
+export function spareBound(total: number, cap = MAX_SPARES) {
+	return Math.max(0, Math.min(cap, Math.floor(total * MEMORY_SHARE / SPARE_BYTES)));
 }
 
 /**
- * The machine's spare Planners, for the repositories of its registered checkouts, while `signal`
- * lasts. With `off`, none starts, and status says so.
+ * The machine's spare Planners, while `signal` lasts: one for each of the repositories it most
+ * recently ran a Planner in, within `RECENT_MS`, its clones included, and for its registered
+ * checkouts' repositories, as many as `spareBound` allows. A repository whose new documents come in
+ * a burst (one finds no spare ready within `BURST_MS` of another) keeps up to `cap` until none has
+ * asked for `QUIET_MS`, within the same bound, each repository's first spare before any's second. A spare starts only
+ * once `check` says Chopin would give the machine a token to push to its repository, while the
+ * machine has the memory for it, and, with `gate`, only while no document's Planner waits to boot;
+ * one is let go as soon as Chopin refuses that. With `off`, none starts, and status says so.
  */
 export function plannerSpares(options: {
 	url: string;
 	command: string[];
-	/** The registered checkouts, by repository: only these get a spare. */
+	/** The registered checkouts, by repository. */
 	registered: Record<string, string>;
 	directory: string;
 	output: Output;
 	signal: AbortSignal;
 	env?: Record<string, string>;
-	sandbox?: Sandbox;
+	sandbox: Sandbox;
+	agentStore?: AgentStore;
 	states?: SpareStates;
 	off?: boolean;
 	readyMs?: number;
 	maxAgeMs?: number;
 	replaceMs?: number;
+	/**
+	 * Whether spares start as backends whose sessions run on people's AI accounts in Chopin, until
+	 * Chopin says otherwise (`managed`): not unless said.
+	 */
+	managed?: boolean;
+	/**
+	 * Whether Chopin would give this machine a token to push to `repository` (see
+	 * `machineGitHubCheck`): `ok`, a refusal's code, or `unknown` when Chopin couldn't be asked.
+	 * Asked before a spare starts, unless asked within `checkMs`, and every `checkMs` while one is
+	 * kept. Without it, every repository may have one.
+	 */
+	check?: (repository: string) => Promise<string>;
+	checkMs?: number;
+	memory?: Memory;
+	cap?: number;
+	recentMs?: number;
+	/** The machine's launch gate, which a spare's boot takes a slot of after any document's. */
+	gate?: LaunchGate;
+	burstMs?: number;
+	quietMs?: number;
 }): PlannerSpares {
 	let { output, directory, command } = options;
+	let managed = options.managed === true;
 	let readyMs = options.readyMs ?? READY_MS;
 	let maxAgeMs = options.maxAgeMs ?? MAX_AGE_MS;
 	let replaceMs = options.replaceMs ?? REPLACE_MS;
+	let checkMs = options.checkMs ?? CHECK_MS;
+	let recentMs = options.recentMs ?? RECENT_MS;
+	let burstMs = options.burstMs ?? BURST_MS;
+	let quietMs = options.quietMs ?? QUIET_MS;
+	let cap = options.cap ?? MAX_SPARES;
+	let memory = options.memory ?? MEMORY;
+	let check = options.check ?? (async () => "ok");
 	let key = JSON.stringify(command);
 	let values = Object.values(options.env ?? {});
-	type Entry = {
-		repository: string;
-		checkout: string;
+	/** One spare of a repository's, from its start until it is handed a document or let go. */
+	type Lane = {
 		spare?: Spare;
 		ready: boolean;
 		/** A start is under way, before its process is there. */
 		starting: boolean;
+		/** Counts the times its spare was let go: a start from before one goes too. */
+		epoch: number;
 		since: number;
 		attempt: number;
 		timer?: ReturnType<typeof setTimeout>;
+	};
+	type Entry = {
+		repository: string;
+		checkout: string;
+		/** A registered checkout's, which is a candidate however long ago it was served. */
+		registered: boolean;
+		/** Its place among the registered checkouts, which orders those never served. */
+		order: number;
+		/** When a Planner last started in it here, 0 for never. */
+		served: number;
+		lanes: Lane[];
+		/** How many spares it keeps: 1, or `cap` while its new documents come in a burst. */
+		depth: number;
+		/** Ends a burst once its documents stop coming. */
+		quiet?: ReturnType<typeof setTimeout>;
 		/** When the command was found not to take spare mode. */
 		unsupported?: number;
+		/** Since when its start waits for memory. */
+		memory?: number;
+		/** Chopin's last word on whether the machine can push to it, and when. */
+		checked?: { answer: string; at: number };
+		/** Since when Chopin refuses the machine a token for it: no spare until it says otherwise. */
+		refused?: number;
 	};
-	let entries = new Map<string, Entry>(
-		Object.entries(options.registered)
-			.filter(([repository]) => repository)
-			.slice(0, MAX_SPARES)
-			.map(([repository, checkout]) => [
-				repository.toLowerCase(),
-				{ repository, checkout, ready: false, starting: false, since: Date.now(), attempt: 0 },
-			]),
-	);
+	let entries = new Map<string, Entry>();
+	/** When each repository's latest new document asked for a spare, by lowercase name. */
+	let asked = new Map<string, number>();
+	/** When each repository's new documents last came in a burst, by lowercase name. */
+	let bursts = new Map<string, number>();
+	/**
+	 * When Chopin last refused the machine a token for each repository, by lowercase name: a word
+	 * that it may push there, asked before, is out of date (a clone's entry goes with the refusal).
+	 */
+	let refusedAt = new Map<string, number>();
+	let since = (repository: string, asked: number) =>
+		(refusedAt.get(repository.toLowerCase()) ?? -1) >= asked;
+	let lane = (): Lane => ({
+		ready: false,
+		starting: false,
+		epoch: 0,
+		since: Date.now(),
+		attempt: 0,
+	});
+	let add = (repository: string, checkout: string, registered: boolean, served = 0) => {
+		let entry: Entry = {
+			repository,
+			checkout,
+			registered,
+			order: entries.size,
+			served,
+			lanes: [],
+			depth: 1,
+		};
+		entries.set(repository.toLowerCase(), entry);
+		bursting(entry);
+		return entry;
+	};
+	for (let [repository, checkout] of Object.entries(options.registered)) {
+		if (repository) add(repository, checkout, true);
+	}
+	/** A clone the machine made of `repository`, by its real path, when it is there. */
+	function cloneOf(repository: string) {
+		if (!REPOSITORY.test(repository)) return undefined;
+		let path = clonePath(directory, repository);
+		if (!existsSync(join(path, ".git"))) return undefined;
+		try {
+			return realpathSync(path);
+		} catch {
+			return undefined;
+		}
+	}
 	let stopped = false;
+	/** Ends with the pool, however it is stopped: a spare waiting for the gate waits no more. */
+	let ending = new AbortController();
+	let ended = AbortSignal.any([options.signal, ending.signal]);
 	let pending = new Set<Promise<unknown>>();
 	let track = <T>(work: Promise<T>) => {
 		pending.add(work);
 		void work.finally(() => pending.delete(work));
 		return work;
 	};
+	// One change to the record at a time, each to what the last one wrote.
+	let writing: Promise<unknown> = Promise.resolve();
+	let update = (change: (record: SpareRecord) => SpareRecord) => {
+		writing = writing.then(async () => writeRecord(directory, change(await readRecord(directory))))
+			.catch(() => {});
+		return track(writing);
+	};
+	/** Keep when `repository` was served, and forget the repositories served too long ago. */
+	let remember = (repository: string, at: number | undefined) =>
+		update(record => {
+			let served = Object.fromEntries(
+				Object.entries(record.served ?? {}).filter(([name, when]) =>
+					name.toLowerCase() !== repository.toLowerCase() && Date.now() - when < recentMs
+				),
+			);
+			if (at !== undefined) served[repository] = at;
+			return { ...record, served };
+		});
+	let bound = () => spareBound(memory().total, cap);
+	/**
+	 * How many spares each entry keeps: the most recently served first, registered checkouts no
+	 * Planner ran in after them, one each to the bound, then a bursting entry's more.
+	 */
+	let quota = () => {
+		let ranked = [...entries.values()]
+			.filter(entry =>
+				entry.refused === undefined && (entry.registered || Date.now() - entry.served < recentMs)
+			)
+			.sort((a, b) => b.served - a.served || a.order - b.order);
+		let left = bound();
+		let quotas = new Map<Entry, number>();
+		for (let entry of ranked) {
+			if (left <= 0) break;
+			quotas.set(entry, 1);
+			left--;
+		}
+		for (let [entry, count] of quotas) {
+			let more = Math.min(entry.depth - count, left);
+			if (more <= 0) continue;
+			quotas.set(entry, count + more);
+			left -= more;
+		}
+		return quotas;
+	};
 	let publish = () =>
 		void options.states?.record(
-			[...entries.values()].map(entry => ({
-				repository: entry.repository,
-				state: options.off
-					? "off"
-					: entry.unsupported
-					? "unsupported"
-					: entry.ready
-					? "ready"
-					: "starting",
-				since: entry.unsupported ?? entry.since,
-				command: basename(command[0] ?? ""),
-			} satisfies SpareState)),
+			[...quota().keys()].map(entry => {
+				let ready = entry.lanes.filter(lane => lane.ready).length;
+				return {
+					repository: entry.repository,
+					state: options.off
+						? "off"
+						: entry.unsupported
+						? "unsupported"
+						: ready
+						? "ready"
+						: entry.memory
+						? "memory"
+						: "starting",
+					since: entry.unsupported ?? entry.memory
+						?? Math.min(...entry.lanes.map(lane => lane.since), Date.now()),
+					command: basename(command[0] ?? ""),
+					...(ready > 1 ? { count: ready } : {}),
+				} satisfies SpareState;
+			}),
 		);
 	let dim = (text: string) => output.say(output.style.dim(text));
-	let later = (entry: Entry, ms: number) => {
+	let later = (entry: Entry, lane: Lane, ms: number) => {
 		if (stopped) return;
-		clearTimeout(entry.timer);
-		entry.timer = setTimeout(() => {
-			entry.timer = undefined;
-			ensure(entry);
+		clearTimeout(lane.timer);
+		lane.timer = setTimeout(() => {
+			lane.timer = undefined;
+			ensure(entry, lane);
 		}, ms);
-		entry.timer.unref?.();
+		lane.timer.unref?.();
 	};
-	let ensure = (entry: Entry) => {
-		if (stopped || options.off || entry.spare || entry.starting || entry.timer) return;
-		entry.starting = true;
-		entry.ready = false;
-		entry.since = Date.now();
+	/** Let go of `lane`'s spare, or its start under way, and of its wait for the next. */
+	let release = (lane: Lane) => {
+		lane.epoch++;
+		clearTimeout(lane.timer);
+		lane.timer = undefined;
+		let spare = lane.spare;
+		lane.spare = undefined;
+		lane.ready = false;
+		if (spare) void track(spare.discard());
+	};
+	/**
+	 * Give each entry the lanes its quota allows, start the spares they lack, `delay` from now
+	 * where given, and let go of the lanes beyond it, keeping its ready spares longest.
+	 */
+	let plan = (delay = 0) => {
+		if (stopped) return;
+		let quotas = quota();
+		for (let entry of entries.values()) {
+			let wanted = quotas.get(entry) ?? 0;
+			if (entry.lanes.length > wanted) {
+				let rank = (lane: Lane) => lane.ready ? 0 : lane.spare || lane.starting ? 1 : 2;
+				entry.lanes.sort((a, b) => rank(a) - rank(b));
+				for (let gone of entry.lanes.splice(wanted)) release(gone);
+			}
+			while (entry.lanes.length < wanted) entry.lanes.push(lane());
+		}
+		for (let [entry] of quotas) {
+			for (let each of entry.lanes) {
+				if (each.spare || each.starting || each.timer) continue;
+				if (delay) later(entry, each, delay);
+				else ensure(entry, each);
+			}
+		}
+		publish();
+	};
+	/** Spares there are, or starting, on the machine. */
+	let busy = () =>
+		[...entries.values()].reduce(
+			(count, entry) => count + entry.lanes.filter(lane => lane.spare || lane.starting).length,
+			0,
+		);
+	/** Set once the slots a connector left are gone: no spare starts before. */
+	let settled = false;
+	let ensure = (entry: Entry, lane: Lane) => {
+		if (stopped || options.off || !settled || lane.spare || lane.starting || lane.timer) return;
+		// A command found not to take spare mode is offered it again by the next connector.
+		if (entry.unsupported !== undefined) return;
+		if (!entry.lanes.includes(lane) || entries.get(entry.repository.toLowerCase()) !== entry) {
+			return;
+		}
+		if (busy() >= bound()) return;
+		lane.starting = true;
+		lane.ready = false;
+		lane.since = Date.now();
 		publish();
 		void track(
-			start(entry).catch(() => {}).finally(() => {
-				entry.starting = false;
+			// A start that failed in a way no step above foresaw is tried again later, never at once.
+			start(entry, lane).catch(() => later(entry, lane, backoff(lane.attempt++))).finally(() => {
+				lane.starting = false;
+				// What it started, or let go of, may let another start.
+				plan();
 			}),
 		);
 	};
+	/** Chopin refuses the machine a token for `entry`'s repository: no spare for it, now or later. */
+	let refuse = (entry: Entry) => {
+		entry.refused = Date.now();
+		refusedAt.set(entry.repository.toLowerCase(), entry.refused);
+		entry.checked = undefined;
+		for (let each of entry.lanes.splice(0)) release(each);
+		void remember(entry.repository, undefined);
+		// A clone's entry goes; a registered checkout's is asked about again.
+		if (!entry.registered) entries.delete(entry.repository.toLowerCase());
+		plan();
+	};
+	/** Whether Chopin would give a token for `entry`'s repository now, asked unless known. */
+	let pushes = async (entry: Entry) => {
+		let known = entry.checked;
+		if (known?.answer === "ok" && Date.now() - known.at < checkMs) return "ok";
+		let asked = Date.now();
+		let answer = await check(entry.repository).catch(() => "unknown");
+		// A refusal that came meanwhile is newer than this answer.
+		if (since(entry.repository, asked)) return "unknown";
+		entry.checked = { answer, at: asked };
+		return answer;
+	};
+	/**
+	 * Whether `entry`'s new documents come in a burst now: one found no spare ready within
+	 * `burstMs` of another asking, and no more than `quietMs` has passed since one asked. It keeps up
+	 * to `cap` spares meanwhile, and one again once its burst is over.
+	 */
+	function bursting(entry: Entry) {
+		let at = bursts.get(entry.repository.toLowerCase());
+		let left = at === undefined ? 0 : quietMs - (Date.now() - at);
+		clearTimeout(entry.quiet);
+		if (left <= 0) {
+			entry.depth = 1;
+			return false;
+		}
+		entry.depth = cap;
+		entry.quiet = setTimeout(() => {
+			entry.depth = 1;
+			plan();
+		}, left);
+		entry.quiet.unref?.();
+		return true;
+	}
 
-	let start = async (entry: Entry) => {
+	let start = async (entry: Entry, lane: Lane) => {
+		let epoch = lane.epoch;
+		let current = () =>
+			!stopped && lane.epoch === epoch && entry.lanes.includes(lane)
+			&& entries.get(entry.repository.toLowerCase()) === entry;
+		let pushing = await pushes(entry);
+		if (!current()) return;
+		if (pushing !== "ok") {
+			if (pushing === "unknown") later(entry, lane, backoff(lane.attempt++));
+			else refuse(entry);
+			return;
+		}
+		// Room for its microVM and what it loads, beside what the machine keeps available.
+		if (memory().available < SPARE_BYTES + RESERVE_BYTES) {
+			entry.memory ??= Date.now();
+			publish();
+			later(entry, lane, MEMORY_WAIT_MS);
+			return;
+		}
+		entry.memory = undefined;
 		let identity = await commandIdentity(command).catch(() => "");
 		let refused = (await readRecord(directory)).unsupported?.[key];
 		if (refused && refused.identity === identity && Date.now() - refused.at < UNSUPPORTED_MS) {
@@ -268,44 +609,70 @@ export function plannerSpares(options: {
 			return;
 		}
 		entry.unsupported = undefined;
+		if (!current()) return;
+		// Its boot waits for any document's Planner waiting to boot, as the gate allows.
+		let slot = await options.gate?.acquire("spare", ended).catch(() => undefined);
+		if (options.gate && !slot) return;
+		let free = slot ?? (() => {});
+		if (!current()) return free();
 		let parent = await plannerFolder(directory, entry.repository);
-		let slot = join(parent, `spare-${randomBytes(6).toString("hex")}`);
-		let tokens = tokenFolder(slot);
+		let slotPath = join(parent, `spare-${randomBytes(6).toString("hex")}`);
+		let tokens = tokenFolder(slotPath);
 		let head: string;
+		// Its disk is held from its making until the spare stops, so no sweep removes it under it.
+		let releaseDisk: () => Promise<void> = async () => {};
 		try {
+			releaseDisk = await holdDisk(plannerDisk(slotPath));
 			await mkdir(tokens, { recursive: true, mode: 0o700 });
-			if (!await preparePlannerWorktree(entry.checkout, slot)) {
-				throw new Error(`${slot} holds files that are no worktree`);
-			}
+			await writeFile(plannerServer(slotPath), `${options.url}\n`, { mode: 0o600 });
+			await options.sandbox.makeDisk?.(plannerDisk(slotPath));
 			head = String((await gitAsync(["rev-parse", "HEAD"], { cwd: entry.checkout })).stdout).trim();
 		} catch (error) {
-			await removeSlot(entry.checkout, slot);
+			free();
+			await removeSlot(slotPath);
+			await releaseDisk();
+			if (!current()) return;
 			dim(
-				`… Couldn't make a spare Planner's worktree for ${entry.repository} (${
+				`… Couldn't make a spare Planner's disk for ${entry.repository} (${
 					redacted(error instanceof Error ? error.message : String(error)).split("\n")[0]
 				}); new documents' Planners start as before.`,
 			);
-			later(entry, backoff(entry.attempt++));
+			later(entry, lane, backoff(lane.attempt++));
 			return;
 		}
-		if (stopped) {
-			await removeSlot(entry.checkout, slot);
+		if (!current()) {
+			free();
+			await removeSlot(slotPath);
+			await releaseDisk();
 			return;
 		}
 		let spare: Spare;
 		try {
-			spare = spawnSpare({ ...options, values }, entry, slot, tokens, head, identity);
+			spare = spawnSpare(
+				{ ...options, values, managed },
+				entry,
+				slotPath,
+				tokens,
+				head,
+				identity,
+				releaseDisk,
+			);
 		} catch (error) {
-			await removeSlot(entry.checkout, slot);
+			free();
+			await removeSlot(slotPath);
+			await releaseDisk();
 			dim(
 				`… Couldn't start a spare Planner for ${entry.repository} (${
 					error instanceof Error ? error.message : String(error)
 				}).`,
 			);
-			later(entry, backoff(entry.attempt++));
+			later(entry, lane, backoff(lane.attempt++));
 			return;
 		}
-		entry.spare = spare;
+		// Its slot goes back once its workload starts in its microVM, or it is ready or gone.
+		spare.child.once("workload", free);
+		void spare.exited.then(free);
+		lane.spare = spare;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let ready = await Promise.race([
 			(spare as Spare & { ready: Promise<boolean> }).ready,
@@ -314,49 +681,49 @@ export function plannerSpares(options: {
 			}),
 		]);
 		clearTimeout(timer);
-		if (entry.spare !== spare) return;
+		free();
+		if (lane.spare !== spare) return;
 		if (ready && !stopped) {
-			entry.ready = true;
-			entry.since = Date.now();
-			entry.attempt = 0;
+			lane.ready = true;
+			lane.since = Date.now();
+			lane.attempt = 0;
 			publish();
 			let aged = setTimeout(() => {
-				if (entry.spare !== spare) return;
+				if (lane.spare !== spare) return;
 				// Too old to be handed a document: a new one takes its place.
-				entry.spare = undefined;
-				entry.ready = false;
+				lane.spare = undefined;
+				lane.ready = false;
 				void track(spare.discard());
-				ensure(entry);
+				ensure(entry, lane);
 			}, maxAgeMs);
 			aged.unref?.();
 			void spare.exited.then(how => {
 				clearTimeout(aged);
-				if (entry.spare !== spare) return;
-				entry.spare = undefined;
-				entry.ready = false;
+				if (lane.spare !== spare) return;
+				lane.spare = undefined;
+				lane.ready = false;
 				if (stopped) return;
 				dim(`… The spare Planner for ${entry.repository} exited (${how}); starting another.`);
 				void track(spare.discard());
-				later(entry, backoff(entry.attempt++));
+				later(entry, lane, backoff(lane.attempt++));
 			});
 			return;
 		}
 		// Never ready: it doesn't take spare mode, or not now.
-		entry.spare = undefined;
+		lane.spare = undefined;
 		let printed = (spare as Spare & { printed(): boolean }).printed();
 		await spare.discard();
 		if (stopped) return;
 		if (printed) {
 			// It took spare mode once, so this start failed, not the mode: tried again later.
-			later(entry, backoff(entry.attempt++));
+			later(entry, lane, backoff(lane.attempt++));
 			return;
 		}
 		let at = Date.now();
-		let record = await readRecord(directory);
-		await writeRecord(directory, {
+		await update(record => ({
 			...record,
 			unsupported: { ...record.unsupported, [key]: { identity, at } },
-		}).catch(() => {});
+		}));
 		entry.unsupported = at;
 		publish();
 		dim(
@@ -366,60 +733,195 @@ export function plannerSpares(options: {
 		);
 	};
 
-	// Slots a connector left that never got a document go before any spare starts.
-	let cleared = track(
+	// The repositories served recently, then the slots a connector left that never got a document,
+	// in every repository's Planner folder, go before any spare starts.
+	let loaded = track(
 		(async () => {
-			for (let entry of entries.values()) {
-				let parent = await plannerFolder(directory, entry.repository);
-				let assigned = await assignedSlots(parent);
-				for (let name of await readdir(parent).catch(() => [] as string[])) {
-					if (SPARE_SLOT.test(name) && !assigned.has(name)) {
-						await removeSlot(entry.checkout, join(parent, name));
-					}
+			let record = await readRecord(directory);
+			for (let [repository, at] of Object.entries(record.served ?? {})) {
+				if (typeof at !== "number" || Date.now() - at >= recentMs) continue;
+				let known = entries.get(repository.toLowerCase());
+				if (known) {
+					known.served = Math.max(known.served, at);
+					continue;
+				}
+				let checkout = cloneOf(repository);
+				if (checkout) add(repository, checkout, false, at);
+			}
+			let planners = join(directory, "planners");
+			let folders = async (path: string) =>
+				(await readdir(path, { withFileTypes: true }).catch(() => []))
+					.filter(item => item.isDirectory()).map(item => join(path, item.name));
+			for (let owner of await folders(planners)) {
+				for (let parent of await folders(owner)) {
+					let assigned = await assignedSlots(parent);
+					// A slot is its disk, token folder and agents' state, whichever are there.
+					let slots = new Set(
+						(await readdir(parent).catch(() => [] as string[]))
+							.map(name => name.replace(/\.(disk|tokens|agent|server)$/, ""))
+							.filter(name => SPARE_SLOT.test(name) && !assigned.has(name)),
+					);
+					for (let name of slots) await removeSlot(join(parent, name));
 				}
 			}
 		})().catch(() => {}),
 	);
 
+	// Chopin's word on each repository whose spare is kept, and on registered checkouts it refused,
+	// asked again now and then: a spare goes once the machine can't push there.
+	let asking = false;
+	let recheck = async () => {
+		if (asking || stopped) return;
+		asking = true;
+		try {
+			for (let entry of entries.values()) {
+				if (stopped) return;
+				let kept = entry.lanes.some(each => each.spare || each.starting);
+				if (!kept && entry.refused === undefined) continue;
+				let asked = Date.now();
+				let answer = await check(entry.repository).catch(() => "unknown");
+				if (stopped || entries.get(entry.repository.toLowerCase()) !== entry) continue;
+				// An answer asked before a refusal that came meanwhile says nothing of now.
+				if (answer === "unknown" || since(entry.repository, asked)) continue;
+				entry.checked = { answer, at: Date.now() };
+				if (answer !== "ok") {
+					if (entry.refused === undefined) refuse(entry);
+				} else if (entry.refused !== undefined) {
+					entry.refused = undefined;
+					plan();
+				}
+			}
+		} finally {
+			asking = false;
+		}
+	};
+	let rechecking = setInterval(() => void recheck(), checkMs);
+	rechecking.unref?.();
+
 	let stop = async () => {
 		stopped = true;
-		for (let entry of entries.values()) clearTimeout(entry.timer);
+		ending.abort(new Error("stopped"));
+		clearInterval(rechecking);
+		for (let entry of entries.values()) {
+			clearTimeout(entry.quiet);
+			for (let each of entry.lanes) clearTimeout(each.timer);
+		}
 		await Promise.all(pending);
 		await Promise.all(
-			[...entries.values()].map(async entry => {
-				let spare = entry.spare;
-				entry.spare = undefined;
-				entry.ready = false;
-				await spare?.discard();
-			}),
+			[...entries.values()].flatMap(entry =>
+				entry.lanes.map(async each => {
+					let spare = each.spare;
+					each.spare = undefined;
+					each.ready = false;
+					await spare?.discard();
+				})
+			),
 		);
+		await writing;
 		await options.states?.record([]);
 	};
 	let stopping: Promise<void> | undefined;
 	options.signal.addEventListener("abort", () => void (stopping ??= stop()), { once: true });
 	publish();
-	if (!options.off) void cleared.then(() => entries.forEach(entry => ensure(entry)));
+	void loaded.then(() => {
+		settled = true;
+		if (options.off) publish();
+		else plan();
+	});
 
+	/** Replaces each spare that did not start as `managed` says, so the next one does. */
+	let remake = () => {
+		for (let entry of entries.values()) {
+			for (let each of entry.lanes) {
+				let spare = each.spare;
+				if (!spare || spare.managed === managed) continue;
+				each.spare = undefined;
+				each.ready = false;
+				void track(spare.discard());
+				ensure(entry, each);
+			}
+		}
+		publish();
+	};
 	return {
-		async take(repository) {
-			let entry = entries.get(repository.toLowerCase());
-			let spare = entry?.spare;
-			if (stopped || !entry || !spare || !entry.ready || !spare.alive()) return undefined;
-			entry.spare = undefined;
-			entry.ready = false;
+		async take(repository, wanted = false) {
+			if (stopped) return undefined;
+			let name = repository.toLowerCase();
+			let now = Date.now();
+			let before = asked.get(name);
+			asked.set(name, now);
+			let entry = entries.get(name);
+			// One started otherwise is never handed such a document: it has, or lacks, the owner's
+			// setup. The first ready one is taken out of the pool at once, so no other document that
+			// asks meanwhile, in the same moment or not, is handed it.
+			let found = entry?.refused === undefined
+				? entry?.lanes.find(each =>
+					each.ready && each.spare?.alive() && each.spare.managed === wanted
+				)
+				: undefined;
+			let spare = found?.spare;
+			// More documents than spares, close together: a burst, which goes on while they keep coming.
+			let last = bursts.get(name);
+			if (
+				!spare && before !== undefined && now - before < burstMs
+				|| last !== undefined && now - last < quietMs
+			) bursts.set(name, now);
+			if (!entry || entry.refused !== undefined) return undefined;
+			let burst = bursting(entry);
+			if (found && spare) {
+				found.spare = undefined;
+				found.ready = false;
+			}
+			// In a burst the next spares start at once, this one's replacement among them, each after
+			// any document waiting to boot.
+			if (burst) plan();
+			if (!found || !spare) return undefined;
+			entry.served = now;
+			void remember(entry.repository, entry.served);
 			publish();
-			let current = Date.now() - spare.started < maxAgeMs
+			let current = now - spare.started < maxAgeMs
 				&& await commandIdentity(command).catch(() => "") === spare.identity;
 			if (!current) {
 				// A spare made by an older command, or too old, is never handed a document.
 				void track(spare.discard());
-				ensure(entry);
+				ensure(entry, found);
 				return undefined;
 			}
-			later(entry, replaceMs);
+			if (!burst) later(entry, found, replaceMs);
 			return spare;
 		},
+		served(repository, asked = Date.now()) {
+			if (stopped || !repository) return;
+			// Chopin gave this Planner its token before it refused the machine one: no word of now.
+			if (since(repository, asked)) return;
+			let entry = entries.get(repository.toLowerCase());
+			if (!entry) {
+				let checkout = cloneOf(repository);
+				if (!checkout) return;
+				entry = add(repository, checkout, false);
+			}
+			// Chopin gave this Planner a token for it: the machine can push there, as it was asked.
+			entry.served = Date.now();
+			entry.refused = undefined;
+			entry.checked = { answer: "ok", at: asked };
+			void remember(entry.repository, entry.served);
+			// Its spare starts once the Planner that just started has had the machine to itself,
+			// unless its documents come in a burst.
+			plan(bursting(entry) ? 0 : replaceMs);
+		},
+		refused(repository) {
+			if (stopped) return;
+			refusedAt.set(repository.toLowerCase(), Date.now());
+			let entry = entries.get(repository.toLowerCase());
+			if (entry) refuse(entry);
+			else void remember(repository, undefined);
+		},
 		stop: () => stopping ??= stop(),
+		managed(value) {
+			if (value === managed) return;
+			managed = value;
+			if (!stopped) remake();
+		},
 	};
 }
 
@@ -429,34 +931,38 @@ function spawnSpare(
 		url: string;
 		command: string[];
 		env?: Record<string, string>;
-		sandbox?: Sandbox;
+		sandbox: Sandbox;
+		agentStore?: AgentStore;
 		values: string[];
+		managed: boolean;
 	},
 	entry: { repository: string; checkout: string },
 	slot: string,
 	tokens: string,
 	head: string,
 	identity: string,
+	/** Lets go of its disk once it has stopped (see `holdDisk`). */
+	releaseDisk: () => Promise<void>,
 ): Spare & { ready: Promise<boolean>; printed(): boolean } {
-	let inherited = withoutGitHub({ ...process.env, ...options.env });
+	// A spare a managed document will take starts as its cold launch would: nothing of the owner's
+	// agent setup in its environment or in its sight.
+	let inherited = plannerEnvironment(options.managed, slot, options.env, options.agentStore);
 	for (let name of HANDED) delete inherited[name];
 	let child = spawnIn(options.sandbox, {
 		command: options.command,
-		cwd: entry.checkout,
 		env: {
 			...inherited,
 			// Where its credentials will be: the files appear with its hand-over, never before.
 			...githubPaths(join(tokens, "github"), join(tokens, "gh"), entry.repository),
 			CHOPIN_URL: options.url,
 			CHOPIN_CHECKOUT: entry.checkout,
-			CHOPIN_WORKTREE: slot,
+			CHOPIN_WORKTREE: guestRepositoryPath(entry.repository, options.sandbox.work),
 			CHOPIN_PLANNER_TOKEN_FILE: join(tokens, "planner"),
 			CHOPIN_MCP_TOKEN_FILE: join(tokens, "mcp"),
 			CHOPIN_PLANNER_SPARE: String(SPARE_PROTOCOL),
 		},
 		stdin: "pipe",
-		writable: [slot],
-		own: [slot, tokens],
+		...plannerGuest(slot, entry.checkout, entry.repository, options.managed, options.sandbox.work),
 	});
 	let hooks: { secrets: () => string[]; stderr?: (text: string) => void } = {
 		secrets: () => options.values,
@@ -482,6 +988,8 @@ function spawnSpare(
 	void exited.then(() => {
 		living = false;
 		isReady(false);
+		// `nvx` exits once its microVM has.
+		void releaseDisk();
 	});
 	let writable = true;
 	child.stdin?.on("error", () => {
@@ -500,6 +1008,7 @@ function spawnSpare(
 		}
 		// Its children go with it, as a backend's do.
 		if (living || process.platform !== "win32") await stopBackend(child);
+		await releaseDisk();
 	};
 	return {
 		repository: entry.repository,
@@ -509,6 +1018,7 @@ function spawnSpare(
 		child,
 		started: Date.now(),
 		identity,
+		managed: options.managed,
 		exited,
 		ready,
 		printed: () => printed,
@@ -527,15 +1037,14 @@ function spawnSpare(
 		async refresh() {
 			let now = String((await gitAsync(["rev-parse", "HEAD"], { cwd: entry.checkout })).stdout)
 				.trim();
-			if (now === head) return;
-			// Its worktree is untouched: detached at the checkout's HEAD now, files and all.
-			await gitAsync(["checkout", "--quiet", "--detach", now], { cwd: slot, noFilters: true });
-			head = now;
+			// Its repository is in its microVM, which the host never runs git in: a spare whose checkout
+			// moved since it started is let go, and the document starts cold at the checkout's HEAD.
+			if (now !== head) throw new Error("its checkout moved since it started");
 		},
 		stop,
 		async discard() {
 			await stop();
-			await removeSlot(entry.checkout, slot);
+			await removeSlot(slot);
 		},
 	};
 }

@@ -11,6 +11,8 @@ import { GitHubReferences } from "../github/references";
 import { Router } from "../http/router";
 import { MemoryStorage } from "../storage/memory/adapter";
 import { registerChannelRoutes } from "./routes";
+import { DocumentDeletion } from "./deletion";
+import { testLease } from "../storage/contract-support";
 
 import type { HostedAuth } from "../auth/routes";
 import type {
@@ -214,6 +216,31 @@ async function setup(random?: () => number) {
 	let archived: Array<{ id: string; changed: boolean }> = [];
 	let restored: Array<{ id: string; changed: boolean }> = [];
 	let deleted: string[] = [];
+	/** Documents a build holds, which deleting refuses. */
+	let building = new Set<string>();
+	/** Who heard of each delete, after its commit, in order. */
+	let announced: Array<{ ids: string[]; by: string }> = [];
+	let transitions = new Map<string, Promise<unknown>>();
+	let deletion = new DocumentDeletion({
+		storage,
+		lease: () => lease,
+		deleting: new Set(),
+		transition: (id, action) => {
+			let next = (transitions.get(id) ?? Promise.resolve()).then(action, action);
+			transitions.set(id, next.catch(() => {}));
+			return next;
+		},
+		children: async document =>
+			(await storage.channels.children(document.id, 100)).map(child => child.id),
+		running: async ids =>
+			ids.some(id => building.has(id)) ? "This document is being built." : undefined,
+		stop: async () => {},
+		resume: async () => {},
+		deleted: (channels, by) => {
+			announced.push({ ids: channels.map(channel => channel.id), by: by.login });
+		},
+		clock: () => now.getTime(),
+	});
 	let versionRestores: Array<{ id: string; source: string; author: string }> = [];
 	let summaryRequests: Array<{ id: string; versions: { id: string; sourceHash: string }[] }> = [];
 	registerChannelRoutes(router, auth, {
@@ -234,15 +261,16 @@ async function setup(random?: () => number) {
 			reset.push(id);
 		},
 		onChannelArchived: async (id, at) => {
-			let result = await storage.channels.archive({ id, now: at });
+			let result = await storage.channels.archive({ id, now: at, lease: await testLease(storage) });
 			archived.push({ id, changed: result.changed });
 			return result;
 		},
 		setFullWidth: (id, fullWidth) => storage.channels.setFullWidth({ id, fullWidth, now }),
-		onChannelDeleted: async id => {
+		onChannelDeleted: async (id, by) => {
 			deleted.push(id);
-			return storage.channels.delete(id);
+			return deletion.delete(id, by);
 		},
+		deletedChannel: id => deletion.recent(id)?.channel,
 		onChannelRenamed: channel => {
 			renamed.push(channel.title);
 		},
@@ -275,6 +303,8 @@ async function setup(random?: () => number) {
 		archived,
 		restored,
 		deleted,
+		building,
+		announced,
 		versionRestores,
 		summaryRequests,
 		now,
@@ -725,7 +755,11 @@ describe("channel routes", () => {
 		let second = await createChannel(storage, now, "Second active");
 		let archived = await createChannel(storage, now, "Archived plan");
 		let archivedAt = new Date(now.getTime() + 1_000);
-		await storage.channels.archive({ id: archived.id, now: archivedAt });
+		await storage.channels.archive({
+			id: archived.id,
+			now: archivedAt,
+			lease: await testLease(storage),
+		});
 
 		let defaultResponse = await router.handle(request(
 			"/api/repositories/octo-org/score/channels",
@@ -869,7 +903,11 @@ describe("channel routes", () => {
 		let { router, storage, cookie, now } = await setup();
 		let channel = await createChannel(storage, now, "Archived direct read");
 		let archivedAt = new Date(now.getTime() + 1_000);
-		await storage.channels.archive({ id: channel.id, now: archivedAt });
+		await storage.channels.archive({
+			id: channel.id,
+			now: archivedAt,
+			lease: await testLease(storage),
+		});
 
 		for (
 			let path of [
@@ -894,6 +932,7 @@ describe("channel routes", () => {
 		await storage.channels.archive({
 			id: inactive.id,
 			now: new Date(now.getTime() + 1_000),
+			lease: await testLease(storage),
 		});
 		github.repo = { ...github.repo, permissions: { pull: true, push: false, admin: false } };
 
@@ -965,6 +1004,7 @@ describe("channel routes", () => {
 		await storage.channels.archive({
 			id: inactive.id,
 			now: new Date(now.getTime() + 1_000),
+			lease: await testLease(storage),
 		});
 
 		for (
@@ -987,29 +1027,118 @@ describe("channel routes", () => {
 		expect(deleted).toEqual([]);
 	});
 
-	it("requires archival before deletion and delegates archived deletion", async () => {
-		let { router, storage, cookie, deleted, now } = await setup();
-		let channel = await createChannel(storage, now, "Delete lifecycle");
-		let remove = () =>
-			router.handle(request(`/api/channels/${channel.id}`, cookie, {
+	it("lets the creator delete a document as it is, active or archived", async () => {
+		let { router, storage, cookie, deleted, announced, now } = await setup();
+		let active = await createChannel(storage, now, "Delete active");
+		let inactive = await createChannel(storage, now, "Delete archived");
+		await storage.channels.archive({ id: inactive.id, now, lease: await testLease(storage) });
+		for (let channel of [active, inactive]) {
+			let response = await router.handle(request(`/api/channels/${channel.id}`, cookie, {
+				method: "DELETE",
+				headers: { origin: "https://chopin.test" },
+			}));
+			expect(response!.status).toBe(204);
+			expect(response!.headers.get("cache-control")).toBe("no-store");
+			expect(await response!.text()).toBe("");
+			expect(await storage.channels.get(channel.id)).toBeUndefined();
+		}
+		expect(deleted).toEqual([active.id, inactive.id]);
+		expect(announced).toEqual([
+			{ ids: [active.id], by: "octocat" },
+			{ ids: [inactive.id], by: "octocat" },
+		]);
+	});
+
+	it("lets only the creator or a repository admin delete, checked on the server", async () => {
+		let { router, storage, github, cookie, otherCookie, deleted, now } = await setup();
+		let channel = await createChannel(storage, now, "Someone else's");
+		let remove = (as: string) =>
+			router.handle(request(`/api/channels/${channel.id}`, as, {
 				method: "DELETE",
 				headers: { origin: "https://chopin.test" },
 			}));
 
-		let active = await remove();
-		expect(active!.status).toBe(409);
+		// hubot can write to the repository but did not create the document: Archive only.
+		let writer = await remove(otherCookie);
+		expect(writer!.status).toBe(403);
+		expect((await writer!.json()).error).toBe(
+			"Only the person who created this document or a repository admin can delete it.",
+		);
 		expect(deleted).toEqual([]);
 		expect(await storage.channels.get(channel.id)).toBeDefined();
 
-		await storage.channels.archive({
-			id: channel.id,
-			now: new Date(now.getTime() + 1_000),
-		});
-		let archived = await remove();
-		expect(archived!.status).toBe(204);
-		expect(archived!.headers.get("cache-control")).toBe("no-store");
-		expect(await archived!.text()).toBe("");
+		// The creator who can no longer write to the repository can't either.
+		github.repo = { ...github.repo, permissions: { pull: true, push: false, admin: false } };
+		expect((await remove(cookie))!.status).toBe(403);
+		expect(deleted).toEqual([]);
+
+		// A repository admin may delete anyone's document.
+		github.repo = { ...github.repo, permissions: { pull: true, push: false, admin: true } };
+		expect((await remove(otherCookie))!.status).toBe(204);
 		expect(deleted).toEqual([channel.id]);
+		expect(await storage.channels.get(channel.id)).toBeUndefined();
+	});
+
+	it("deletes a document's children with it and never a child on its own", async () => {
+		let { router, storage, cookie, deleted, announced, now } = await setup();
+		let parent = await createChannel(storage, now, "Parent");
+		let child = await storage.channels.create({
+			id: crypto.randomUUID(),
+			repositoryId: "R_score",
+			repositoryOwner: "octo-org",
+			repositoryName: "score",
+			title: "Research child",
+			createdBy: "U_octocat",
+			parentChannelId: parent.id,
+			now,
+		});
+		let remove = (id: string) =>
+			router.handle(request(`/api/channels/${id}`, cookie, {
+				method: "DELETE",
+				headers: { origin: "https://chopin.test" },
+			}));
+
+		let alone = await remove(child.id);
+		expect(alone!.status).toBe(409);
+		expect(deleted).toEqual([]);
+		expect(await storage.channels.get(child.id)).toBeDefined();
+
+		expect((await remove(parent.id))!.status).toBe(204);
+		expect(await storage.channels.get(parent.id)).toBeUndefined();
+		expect(await storage.channels.get(child.id)).toBeUndefined();
+		expect(announced).toEqual([{ ids: [parent.id, child.id], by: "octocat" }]);
+	});
+
+	it("refuses to delete a document a build holds and deletes nothing", async () => {
+		let { router, storage, cookie, building, announced, now } = await setup();
+		let channel = await createChannel(storage, now, "Building");
+		building.add(channel.id);
+		let response = await router.handle(request(`/api/channels/${channel.id}`, cookie, {
+			method: "DELETE",
+			headers: { origin: "https://chopin.test" },
+		}));
+		expect(response!.status).toBe(409);
+		expect((await response!.json()).error).toBe("This document is being built.");
+		expect(await storage.channels.get(channel.id)).toBeDefined();
+		expect(announced).toEqual([]);
+	});
+
+	it("answers a repeated or concurrent delete as the first", async () => {
+		let { router, storage, cookie, otherCookie, announced, now } = await setup();
+		let channel = await createChannel(storage, now, "Twice");
+		let remove = (as = cookie) =>
+			router.handle(request(`/api/channels/${channel.id}`, as, {
+				method: "DELETE",
+				headers: { origin: "https://chopin.test" },
+			}));
+
+		let [first, second] = await Promise.all([remove(), remove()]);
+		expect([first!.status, second!.status]).toEqual([204, 204]);
+		expect((await remove())!.status).toBe(204);
+		// Deleted once, and told once.
+		expect(announced).toEqual([{ ids: [channel.id], by: "octocat" }]);
+		// Someone who couldn't have deleted it learns nothing from a repeat.
+		expect((await remove(otherCookie))!.status).toBe(403);
 		expect(await storage.channels.get(channel.id)).toBeUndefined();
 	});
 
@@ -1187,39 +1316,6 @@ describe("channel routes", () => {
 		expect(denied!.status).toBe(404);
 	});
 
-	it("pages through every stored stage of a workflow run for a reader", async () => {
-		let { router, storage, github, cookie, now } = await setup();
-		let channel = await createChannel(storage, now, "Runs");
-		let stages = Array.from({ length: 500 }, (_, index) => ({
-			id: `s${index}`,
-			name: `stage ${index}`,
-			status: "completed" as const,
-		}));
-		await storage.runStages.put({ channelId: channel.id, runId: "run-1", stages });
-		let page = (query: string, from: string | undefined = cookie) =>
-			router.handle(request(`/api/channels/${channel.id}/runs/run-1/stages${query}`, from));
-
-		let first = await page("");
-		expect(first!.status).toBe(200);
-		expect(await first!.json()).toEqual({ stages: stages.slice(0, 200), total: 500 });
-		expect(await (await page("?offset=400&limit=500"))!.json()).toEqual({
-			stages: stages.slice(400),
-			total: 500,
-		});
-		expect((await (await page("?limit=9999"))!.json()).stages).toHaveLength(500);
-		for (let query of ["?offset=-1", "?limit=0", "?offset=x"]) {
-			expect((await page(query))!.status).toBe(400);
-		}
-		let missing = await router.handle(
-			request(`/api/channels/${channel.id}/runs/unknown/stages`, cookie),
-		);
-		expect(await missing!.json()).toEqual({ stages: [], total: 0 });
-
-		expect((await page("", ""))!.status).toBe(401);
-		github.repo = { ...github.repo, permissions: { pull: false, push: false, admin: false } };
-		expect((await page(""))!.status).toBe(404);
-	});
-
 	it("asks for summaries of the newest sessions that have none", async () => {
 		let { router, storage, cookie, now, summaryRequests } = await setup();
 		let channel = await createChannel(storage, now, "Summaries");
@@ -1325,6 +1421,8 @@ describe("channel routes", () => {
 		expect(reset).toEqual([channel.id]);
 		expect((await storage.collaboration.load(channel.id, now))!.agent!.ownerSessionId)
 			.toBeUndefined();
+		// Kept, so a machine's Planner of it starts afresh on a new disk.
+		expect(await storage.channels.plannerReset(channel.id)).toBeInstanceOf(Date);
 	});
 
 	describe("GitHub references", () => {

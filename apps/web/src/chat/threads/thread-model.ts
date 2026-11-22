@@ -10,7 +10,6 @@ export type ThreadViewState = {
 	loaded: boolean;
 	transcript: TranscriptState;
 	busy: boolean;
-	runs?: Chat.Runs;
 	compactions: Chat.CompactionRecord[];
 	compacting: boolean;
 	alsoToChat: boolean;
@@ -84,6 +83,7 @@ function applyInThreadFrame(
 					kind: "delta",
 					id: inner.id,
 					text: inner.text,
+					...(inner.at === undefined ? {} : { at: inner.at }),
 				}),
 			};
 		case "chat:tool":
@@ -99,7 +99,6 @@ function applyInThreadFrame(
 			return {
 				...view,
 				busy: inner.busy,
-				runs: inner.runs,
 				transcript: transcriptReducer(view.transcript, {
 					kind: "turn",
 					turn: inner.turn,
@@ -117,6 +116,7 @@ function applyInThreadFrame(
 					kind: "reactions",
 					id: inner.id,
 					reactions: inner.reactions,
+					...(inner.reactionsSeq === undefined ? {} : { reactionsSeq: inner.reactionsSeq }),
 				}),
 			};
 		case "chat:context":
@@ -197,9 +197,9 @@ export function threadsReducer(state: ThreadsState, action: ThreadsAction): Thre
 					kind: "history",
 					entries: action.frame.entries,
 					turn: action.frame.turn,
+					...(action.frame.seq === undefined ? {} : { seq: action.frame.seq }),
 				}),
 				busy: action.frame.busy,
-				runs: action.frame.runs,
 				compactions: action.frame.compactions ?? [],
 				compacting: !!action.frame.compacting,
 				alsoToChat: previous?.alsoToChat ?? false,

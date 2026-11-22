@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { performance } from "@chopin/experiment/fixtures";
 import { Experiments } from "../experiments/service";
-import { contractId, openedStorage, userAndChannel } from "./contract-support";
+import { contractId, openedStorage, testLease, userAndChannel } from "./contract-support";
 import type { StorageFactory } from "./contract-support";
 
 export function experimentContract(name: string, factory: StorageFactory) {
@@ -68,12 +68,23 @@ export function experimentContract(name: string, factory: StorageFactory) {
 						lease,
 					),
 				).toEqual(stored!);
-				await storage.channels.archive({ id: first.childId!, now: new Date() });
-				await expect(storage.channels.delete(first.childId!)).rejects.toMatchObject({
-					failure: "conflict",
-					message: expect.stringContaining("published by an investigation"),
+				await storage.channels.archive({
+					id: first.childId!,
+					now: new Date(),
+					lease: await testLease(storage),
 				});
+				await expect(storage.channels.delete({ id: first.childId!, lease }))
+					.rejects.toMatchObject({
+						failure: "conflict",
+						message: expect.stringContaining("deleted only with its parent"),
+					});
 				expect(await storage.channels.get(first.childId!)).toBeDefined();
+				// Its parent takes it, with the investigation that published it.
+				expect((await storage.channels.delete({ id: channelId, lease })).map(item => item.id))
+					.toEqual([channelId, first.childId!]);
+				expect(await storage.channels.get(first.childId!)).toBeUndefined();
+				expect(await storage.experiments.get(created.id)).toBeUndefined();
+				expect(await storage.experiments.published(first.childId!)).toBeUndefined();
 			} finally {
 				await storage.close();
 			}

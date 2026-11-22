@@ -7,6 +7,7 @@ import {
 	AGENT_PATH,
 	AGENT_SUBPROTOCOL,
 	AGENT_VERSION,
+	AI_LAUNCH_HEADER,
 	encodeMessage,
 	LINK_CLOSE,
 	MAX_LINK_ATTACHMENT_BYTES,
@@ -19,7 +20,7 @@ import {
 	usableCatalog,
 } from "./protocol";
 
-import type { ServerMessage, ServerMessageOf } from "./protocol";
+import type { ClientMessage, ServerMessage, ServerMessageOf } from "./protocol";
 
 describe("Agent connection messages", () => {
 	it("accepts each client message the protocol declares", () => {
@@ -63,7 +64,6 @@ describe("Agent connection messages", () => {
 				type: "input-request",
 				request: "r",
 				session: "s",
-				workflowRunId: "run",
 				input: {
 					method: "questionnaire",
 					params: {
@@ -76,7 +76,6 @@ describe("Agent connection messages", () => {
 				},
 			},
 			{ type: "input-cancel", request: "r" },
-			{ type: "runs", session: "s", active: [], paused: ["run"], cards: [] },
 			{ type: "control-result", request: "r", ok: false, message: "no" },
 			{ type: "detach" },
 		];
@@ -108,70 +107,29 @@ describe("Agent connection messages", () => {
 		}
 	});
 
-	it("accepts optional stage parents and stopped stages without changing the connection version", () => {
-		let message = {
-			type: "runs" as const,
-			session: "s",
-			active: [],
-			paused: [],
-			cards: [{
-				id: "run",
-				name: "review",
-				status: "stopped" as const,
-				started: 1,
-				updated: 2,
-				waiting: 0,
-				stages: [
-					{ id: "parent", name: "parent", status: "stopped" as const },
-					{ id: "child", name: "child", status: "running" as const, parentIds: ["parent"] },
-				],
-			}],
-		};
-		expect(parseClientMessage(JSON.stringify(message))).toEqual({ ok: true, message });
-		message.cards[0]!.stages[1]!.parentIds = Array(65).fill("parent");
-		expect(parseClientMessage(JSON.stringify(message))).toMatchObject({ ok: false });
-	});
-
-	it("accepts a delta card with any number of stages, bounded only by the frame", () => {
-		let stages = Array.from({ length: 500 }, (_, index) => ({
-			id: `s${index}`,
-			name: `stage ${index}`,
-			status: "completed" as const,
-			...(index ? { parentIds: [`s${index - 1}`] } : {}),
-		}));
-		let card = {
-			id: "run",
-			name: "review",
-			status: "running" as const,
-			started: 1,
-			updated: 2,
-			waiting: 0,
-			stagesDelta: true as const,
-			stages,
-		};
-		let message = {
-			type: "runs" as const,
-			session: "s",
-			active: ["run"],
-			paused: [],
-			cards: [card],
-		};
-		expect(parseClientMessage(JSON.stringify(message))).toEqual({ ok: true, message });
-		let { stagesDelta: _, ...full } = card;
-		expect(parseClientMessage(JSON.stringify({ ...message, cards: [full] }))).toMatchObject({
-			ok: false,
-			code: "malformed-message",
-		});
-		let short = { ...full, stages: stages.slice(0, 64) };
-		expect(parseClientMessage(JSON.stringify({ ...message, cards: [short] }))).toMatchObject({
-			ok: true,
-		});
-		for (let wrong of [{ ...card, earlierStages: 3 }, { ...card, stagesDelta: false }]) {
-			expect(parseClientMessage(JSON.stringify({ ...message, cards: [wrong] }))).toMatchObject({
+	it("knows no run reports or run control: a client's runs and a server's stop or resume are malformed", () => {
+		for (
+			let message of [
+				{ type: "runs", session: "s", active: [], paused: [], cards: [] },
+				{
+					type: "input-request",
+					request: "r",
+					session: "s",
+					workflowRunId: "run",
+					input: { method: "confirm", title: "Ship?", message: "Now." },
+				},
+			]
+		) {
+			expect(parseClientMessage(JSON.stringify(message))).toMatchObject({
 				ok: false,
 				code: "malformed-message",
 			});
 		}
+		for (let type of ["stop", "resume"]) {
+			expect(parseServerMessage(JSON.stringify({ type, request: "r", session: "s" })))
+				.toMatchObject({ ok: false });
+		}
+		expect(Object.values(AGENT_FEATURES)).not.toContain("run-stage-deltas");
 	});
 
 	it("lets attached name the features a client asked for, without changing the version", () => {
@@ -179,9 +137,8 @@ describe("Agent connection messages", () => {
 			type: "attached" as const,
 			version: AGENT_VERSION,
 			document: { id: "d", title: "T", repository: "o/r" },
-			features: [AGENT_FEATURES.runStageDeltas],
+			features: [AGENT_FEATURES.decisionOptionPreviews],
 		};
-		expect(AGENT_FEATURES.runStageDeltas).toBe("run-stage-deltas");
 		expect(AGENT_FEATURES.decisionOptionPreviews).toBe("decision-option-previews");
 		expect(AGENT_FEATURES_HEADER).toBe("chopin-agent-features");
 		expect(parseServerMessage(encodeMessage(attached))).toEqual({ ok: true, message: attached });
@@ -322,7 +279,6 @@ describe("Agent connection messages", () => {
 			maxNoteLength: MAX_LINK_NOTE_LENGTH,
 			malformedClose: 4400,
 			featuresHeader: AGENT_FEATURES_HEADER,
-			runStageDeltas: AGENT_FEATURES.runStageDeltas,
 			decisionOptionPreviews: AGENT_FEATURES.decisionOptionPreviews,
 			resumableSessions: AGENT_FEATURES.resumableSessions,
 			restartNotice: AGENT_FEATURES.restartNotice,
@@ -331,6 +287,11 @@ describe("Agent connection messages", () => {
 			sessionForks: AGENT_FEATURES.sessionForks,
 			steerTurn: AGENT_FEATURES.steerTurn,
 			retryTurn: AGENT_FEATURES.retryTurn,
+			sessionChoice: AGENT_FEATURES.sessionChoice,
+			aiCredentials: AGENT_FEATURES.aiCredentials,
+			aiCatalog: AGENT_FEATURES.aiCatalog,
+			catalogLaunches: AGENT_FEATURES.catalogLaunches,
+			aiLaunchHeader: AI_LAUNCH_HEADER,
 			restartResumeRetryMs: RESTART_RESUME_RETRY_MS,
 		});
 		expect(AGENT_FEATURES.restartNotice).toBe("restart-notice");
@@ -357,6 +318,125 @@ describe("Agent connection messages", () => {
 		expect(parseServerMessage(JSON.stringify({ ...steer, extra: 1 }))).toMatchObject({ ok: false });
 		// Only the server steers: a client that sends one is malformed.
 		expect(parseClientMessage(JSON.stringify(steer))).toMatchObject({ ok: false });
+	});
+
+	it("may name the document's chosen model and level on a session's start or fork, as strings", () => {
+		expect(AGENT_FEATURES.sessionChoice).toBe("session-choice");
+		for (
+			let message of [
+				{
+					type: "start",
+					session: "s",
+					mode: "planner",
+					model: "acme/large",
+					thinkingLevel: "xhigh",
+				},
+				{
+					type: "fork",
+					session: "s",
+					mode: "planner",
+					from: { session: "p" },
+					model: "acme/large",
+				},
+				{ type: "start", session: "s", mode: "isolated", thinkingLevel: "low" },
+			] as const
+		) {
+			expect(parseServerMessage(encodeMessage(message))).toEqual({ ok: true, message });
+			expect(parseServerMessage(JSON.stringify({ ...message, model: 1 }))).toMatchObject({
+				ok: false,
+			});
+		}
+	});
+
+	it("hands a session its AI launch on start and fork, and replaces it with `ai`", () => {
+		expect(AGENT_FEATURES.aiCredentials).toBe("ai-credentials");
+		let ai = {
+			launch: "chopin_launch_x",
+			expiresAt: 1_700_000_000_000,
+			providers: [{
+				provider: "openai",
+				baseUrl: "https://chopin.example/api/v1/ai/openai/v1",
+				placeholder: "chopin_ai_x",
+				keyVariable: "OPENAI_API_KEY",
+			}],
+			withheld: [{ provider: "github-copilot", reason: "no-copilot-access" }],
+		};
+		let ended = { providers: [], withheld: [] };
+		for (
+			let message of [
+				{ type: "start", session: "s", mode: "planner", ai },
+				{ type: "fork", session: "s", mode: "planner", from: { session: "p" }, ai },
+				{ type: "ai", session: "s", ai },
+				{ type: "ai", session: "s", ai: ended },
+			] as const
+		) {
+			expect(parseServerMessage(encodeMessage(message))).toEqual({ ok: true, message });
+		}
+		let shellWord = {
+			...ai,
+			providers: [{ ...ai.providers[0]!, keyVariable: "OPENAI_API_KEY=1" }],
+		};
+		for (let wrong of [shellWord, { ...ai, extra: 1 }, { providers: [] }]) {
+			expect(parseServerMessage(JSON.stringify({ type: "ai", session: "s", ai: wrong })))
+				.toMatchObject({ ok: false });
+		}
+		// Only the server hands out grants.
+		expect(parseClientMessage(JSON.stringify({ type: "ai", session: "s", ai }))).toMatchObject({
+			ok: false,
+		});
+	});
+
+	it("lets a client ask once for the link's catalog grants, which the server hands in `ai-catalog`", () => {
+		expect(AGENT_FEATURES.aiCatalog).toBe("ai-catalog");
+		let ai = {
+			launch: "chopin_launch_c",
+			expiresAt: 1_700_000_000_000,
+			providers: [{
+				provider: "github-copilot",
+				baseUrl: "https://chopin.example/api/v1/ai/github-copilot",
+				placeholder: "chopin_ai_c",
+				keyVariable: "COPILOT_GITHUB_TOKEN",
+			}],
+			withheld: [],
+		};
+		let ask = { type: "ai-catalog" } as const;
+		expect(parseClientMessage(encodeMessage(ask))).toEqual({ ok: true, message: ask });
+		expect(parseClientMessage(JSON.stringify({ ...ask, session: "s" }))).toMatchObject({
+			ok: false,
+		});
+		for (let grants of [ai, { providers: [], withheld: [] }]) {
+			let message = { type: "ai-catalog", ai: grants } as const;
+			expect(parseServerMessage(encodeMessage(message))).toEqual({ ok: true, message });
+		}
+		expect(parseServerMessage(JSON.stringify({ type: "ai-catalog" }))).toMatchObject({ ok: false });
+		expect(parseServerMessage(JSON.stringify({ type: "ai-catalog", session: "s", ai })))
+			.toMatchObject({ ok: false });
+		// A client never hands out grants.
+		expect(parseClientMessage(JSON.stringify({ type: "ai-catalog", ai }))).toMatchObject({
+			ok: false,
+		});
+	});
+
+	it("names a catalog launch in `ai-catalog`, and the one a `capabilities` report was listed through", () => {
+		expect(AGENT_FEATURES.catalogLaunches).toBe("catalog-launches");
+		let handed: ServerMessage = {
+			type: "ai-catalog",
+			ai: { providers: [], withheld: [] },
+			catalogLaunch: "c-1",
+		};
+		expect(parseServerMessage(encodeMessage(handed))).toEqual({ ok: true, message: handed });
+		let report: ClientMessage = {
+			type: "capabilities",
+			catalog: { models: { available: [{ id: "acme/large", name: "Large" }] } },
+			catalogLaunch: "c-1",
+		};
+		expect(parseClientMessage(encodeMessage(report))).toEqual({ ok: true, message: report });
+		for (let wrong of ["", "c".repeat(129), 1]) {
+			expect(parseServerMessage(JSON.stringify({ ...handed, catalogLaunch: wrong })))
+				.toMatchObject({ ok: false });
+			expect(parseClientMessage(JSON.stringify({ ...report, catalogLaunch: wrong })))
+				.toMatchObject({ ok: false });
+		}
 	});
 
 	it("names the Chat message a turn answers, and a retry of it as `true` or nothing", () => {

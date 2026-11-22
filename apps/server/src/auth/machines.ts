@@ -4,7 +4,7 @@ import { GitHubError, GitHubTokenError } from "../github/client";
 import { decrypted, encrypted, imported } from "./session";
 
 import type { GitHubTokenGrant } from "../github/client";
-import type { MachineCredentials, MachineRepository, StoredMachine } from "../storage/model";
+import type { Lease, MachineCredentials, MachineRepository, StoredMachine } from "../storage/model";
 import type { StorageAdapter } from "../storage/port";
 
 const MACHINE_CONTEXT = "chopin:machine-credential:v1";
@@ -21,6 +21,13 @@ export class MachineError extends Error {
 	constructor(readonly code: "machine-revoked" | "machine-reauthorize") {
 		super(code);
 		this.name = "MachineError";
+	}
+}
+
+export class MachineCutoffError extends Error {
+	constructor(readonly reason: string) {
+		super(reason);
+		this.name = "MachineCutoffError";
 	}
 }
 
@@ -43,7 +50,18 @@ type Options = {
 	/** Whether the owner is still admitted, as a browser session is rechecked. */
 	authorize?: (userId: string, accessToken: string) => Promise<boolean>;
 	invalidate?: (accessToken: string) => void;
+	/**
+	 * The writer lease this process holds, which a revocation is written under: revoking ends the
+	 * machine's launches' AI authority, which only the lease's holder counts. Without it, or once the
+	 * process no longer holds it, a revocation is refused.
+	 */
+	lease?: () => Lease;
+	revoked?: (machineId: string) => Promise<void>;
 };
+
+function noLease(): Lease {
+	throw new Error("storage writer lease is unavailable");
+}
 
 export type PairMachine = {
 	userId: string;
@@ -159,12 +177,23 @@ export class Machines {
 	}
 
 	async revoke(id: string, userId: string): Promise<boolean> {
-		let revoked = await this.#storage.machines.revoke(id, userId, this.#clock());
+		let lease = (this.#options.lease ?? noLease)();
+		let revoked = await this.#storage.machines.revoke(lease, id, userId, this.#clock());
 		if (revoked) {
 			this.#forget(id);
 			this.#end(id);
+		} else {
+			let found = await this.#storage.machines.get(id);
+			if (!found || found.userId !== userId || !found.revokedAt) return false;
 		}
-		return revoked;
+		try {
+			await this.#options.revoked?.(id);
+		} catch (error) {
+			throw new MachineCutoffError(
+				error instanceof Error && error.message ? error.message : "the cutoff failed",
+			);
+		}
+		return true;
 	}
 
 	/** Calls `listener` with a machine's id once it is revoked or must be authorized again. */
@@ -228,7 +257,9 @@ export class Machines {
 	async #admitted(machine: StoredMachine, grant: Grant): Promise<void> {
 		if (!this.#options.authorize) return;
 		if (await this.#options.authorize(machine.userId, grant.accessToken)) return;
-		await this.revoke(machine.id, machine.userId);
+		await this.revoke(machine.id, machine.userId).catch((error: unknown) => {
+			if (!(error instanceof MachineCutoffError)) throw error;
+		});
 		throw new MachineError("machine-revoked");
 	}
 

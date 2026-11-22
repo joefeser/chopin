@@ -18,7 +18,7 @@
 				1
 			]
 		],
-		"sourceHash": "467fa6e55cbf1adc48fb7000c2faa94b04054bb2a2943750e8a8b0513ce1ccbe"
+		"sourceHash": "ddaba0d373ce9429e76b353b322aff4e662beb2b8565ae9c1031194fb8f68e3a"
 	},
 	{
 		"file": "apps/web/src/document-rename.tsx",
@@ -46,7 +46,7 @@
 				1
 			]
 		],
-		"sourceHash": "a3be7162fe9c4bfd722e9bdcf860eb374fe8b6b866e356507ffea97f35e690fc"
+		"sourceHash": "87146e029c28d5c80d4b43c3b033c98cace8f3d89d2428d172d2232ddc14a60d"
 	},
 	{
 		"file": "apps/web/src/account-menu.tsx",
@@ -60,7 +60,7 @@
 				1
 			]
 		],
-		"sourceHash": "6ec411bac9f554b6eb13f280217a66ad83f4f1e8f8e0e2d50666d1fb603ea9e0"
+		"sourceHash": "7c1bc6736a6364f08a0f40bd9c3405f9e0ae9b8981577163e0e58fcbeb9b9459"
 	},
 	{
 		"file": "apps/web/src/design-audit/icons.tsx",
@@ -74,7 +74,7 @@
 				1
 			]
 		],
-		"sourceHash": "b3500f6c31710b46b8b954ee42ac6bdb746cfc0a327f4ca54c6d420b2fbefdb2"
+		"sourceHash": "4fff769e5940d29424165c7c5dcfcfdbae6edbc395f08be13ac2c3889bda2adc"
 	},
 	{
 		"file": "apps/web/src/design-audit/controls.tsx",
@@ -102,7 +102,7 @@
 				1
 			]
 		],
-		"sourceHash": "f1286cf4e03a076a7378453eb71d5c504ce64147356bd5128141b69a2953bf4f"
+		"sourceHash": "5abb9463e07f2645ec6605588ba6181527aa293cb26cee787570656abc701c5c"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -116,7 +116,7 @@
 				1
 			]
 		],
-		"sourceHash": "f1286cf4e03a076a7378453eb71d5c504ce64147356bd5128141b69a2953bf4f"
+		"sourceHash": "5abb9463e07f2645ec6605588ba6181527aa293cb26cee787570656abc701c5c"
 	},
 	{
 		"file": "apps/web/src/document-actions-menu.tsx",
@@ -137,7 +137,7 @@
 				1
 			]
 		],
-		"sourceHash": "f1286cf4e03a076a7378453eb71d5c504ce64147356bd5128141b69a2953bf4f"
+		"sourceHash": "5abb9463e07f2645ec6605588ba6181527aa293cb26cee787570656abc701c5c"
 	},
 	{
 		"file": "apps/web/src/chat/actions/message-toolbar.tsx",
@@ -151,7 +151,7 @@
 				1
 			]
 		],
-		"sourceHash": "ca4c5ded6cd7aabfd0a700c2fef9a8317fce3f991948829954ac99af8d72fed8"
+		"sourceHash": "94290720b4b6fde5b5359153b92117e3bdd6acf62c88b64feed79c27638d3606"
 	},
 	{
 		"file": "apps/web/src/terminal-alert.tsx",
@@ -186,7 +186,7 @@
 				1
 			]
 		],
-		"sourceHash": "24d937f5509a78785b590828be4c562cf420d7467ef34e653fc45c85d23043b4"
+		"sourceHash": "3b1dc6a04de40290c2f638643814dd6c13b16cbecf263378522adca0c018b147"
 	},
 	{
 		"file": "apps/web/src/navigation-drawer.tsx",
@@ -235,7 +235,7 @@
 				1
 			]
 		],
-		"sourceHash": "8a16975e6d5525e89d41377d39b99729a56e2519a6b0ce6bab8f55777bc5a94f"
+		"sourceHash": "3705d1e0af7c7928400d0ecbc254d1e279a18b88b0ce6109623487eb8b3f3e92"
 	},
 	{
 		"file": "apps/web/src/navigation-dialog.tsx",
@@ -270,7 +270,7 @@
 				1
 			]
 		],
-		"sourceHash": "ef95f80b0d05b634dfbc54c1cf26cf950bbae85a1052b2980054499a8065e351"
+		"sourceHash": "a0ff8dd7ec5fc4326f6ffa4567278f88c774a960862d3692b09514c34b262a96"
 	},
 	{
 		"file": "apps/web/src/connecting-indicator.tsx",
@@ -312,7 +312,7 @@
 				1
 			]
 		],
-		"sourceHash": "4b42c7403a9993457a148b25dbac8d2adeb48ef935b545e373442fce964e751f"
+		"sourceHash": "e665bec8c761059e1e5a64c0d09c88f48a4b3624acfa6119f98d4c6f32bc683a"
 	},
 	{
 		"file": "apps/web/src/experiments/machines.tsx",
@@ -326,7 +326,21 @@
 				1
 			]
 		],
-		"sourceHash": "28471a91af2b9315664313e20fdca8f5c675ed4c03cce97166509c9f3313928b"
+		"sourceHash": "2fdfc9e79346e700d4465f129d7661e8802ec76a9edb7b350f1e2010dfb1e07c"
+	},
+	{
+		"file": "apps/web/src/ai-accounts/rows.tsx",
+		"reason": "Motion/presence contract returns finite semantic state classes; imported function evaluation is outside this static scanner. Review the producer when changing this boundary.",
+		"cases": [
+			[
+				"dynamic",
+				"class",
+				"presence.className",
+				"class > AccountMenu > <div>",
+				1
+			]
+		],
+		"sourceHash": "1591c7def50520fd7c40a9f810a3da7f73f4af369d2bbe506c31c5c7fe8ac5ba"
 	},
 	{
 		"file": "apps/web/src/chat/composer.tsx",
@@ -354,7 +368,7 @@
 				1
 			]
 		],
-		"sourceHash": "b13c284069d6cc8a7fa47bdf84b654176dbbac63b381b7e679a11ffca28da1e5"
+		"sourceHash": "a75201df6e7f30217aca6311d345bc8c64158cafcd9fd22d0870a164cd7428aa"
 	},
 	{
 		"file": "apps/web/src/question-markdown.tsx",

@@ -1,11 +1,12 @@
 import { afterAll, expect, mock, test } from "bun:test";
-import { mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { HOST_SANDBOX, hostSandbox } from "./testing/host-sandbox";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { answerTokens, BOT, STARTER } from "./testing/github-grant";
 import { githubRefusal } from "./github-token";
 import { existsSync } from "node:fs";
-import { machineFile } from "./machine";
+import { forgettablePlanners, machineFile } from "./machine";
 import { createOutput } from "./output";
 import {
 	commandWords,
@@ -15,9 +16,16 @@ import {
 	stopBackend,
 } from "./planner";
 import type { ServiceHost } from "./service";
-import { plainSpawn, type Sandbox } from "./sandbox";
 import { collectStatus, formatStatus } from "./status";
-import { git, lockWorkspace, startFailures } from "./workspace";
+import {
+	git,
+	lockWorkspace,
+	plannerDisk,
+	plannerServer,
+	plannerSlot,
+	startFailures,
+} from "./workspace";
+import { sweepPlannerDisks } from "./planner-disks";
 import { checkouts } from "./checkouts";
 import { CONNECTOR_PROTOCOL } from "./version";
 
@@ -61,6 +69,15 @@ async function checkout() {
 	git(root, "add", ".");
 	git(root, "commit", "-m", "fixture");
 	return root;
+}
+
+/** Makes `path` a git checkout of octo-org/score with one commit, as a registered checkout is. */
+function repository(path: string) {
+	git(path, "init", "-q");
+	git(path, "config", "user.name", "Fixture");
+	git(path, "config", "user.email", "fixture@example.test");
+	git(path, "remote", "add", "origin", "https://github.com/octo-org/score.git");
+	git(path, "commit", "-q", "--allow-empty", "-m", "fixture");
 }
 
 /**
@@ -144,14 +161,16 @@ test(
 		let root = await checkout();
 		let document = `${origin}/octo-org/score/plan`;
 		let state = await mkdtemp(join(scratch, "state-"));
-		// The Planner's own worktree: stable per document, under the base dir, made by the Planner.
+		// The Planner's folder: stable per document, under the base dir. Beside it are its tokens and
+		// the disk its microVM keeps its own clone on.
 		let worktree = join(state, "planners", "octo-org", "score", "D_1");
+		// Its repository, as its microVM has it (the stand-in's guests keep theirs in `work`).
+		let clone = join(state, "work", "score");
 		let connector = Bun.spawn([
 			process.execPath,
 			"--no-env-file",
-			join(import.meta.dir, "main.ts"),
+			join(import.meta.dir, "testing", "chopin-on-host.ts"),
 			"connect",
-			"--no-sandbox",
 			root,
 			"--planner",
 			document,
@@ -186,7 +205,7 @@ test(
 					CHOPIN_PLANNER_TOKEN: issued[0],
 					CHOPIN_PLANNER_TOKEN_FILE: join(`${worktree}.tokens`, "planner"),
 					CHOPIN_CHECKOUT: checkoutRoot,
-					CHOPIN_WORKTREE: worktree,
+					CHOPIN_WORKTREE: clone,
 					SOME_FLAG: "1",
 				},
 				{
@@ -195,15 +214,21 @@ test(
 					CHOPIN_PLANNER_TOKEN: issued[1],
 					CHOPIN_PLANNER_TOKEN_FILE: join(`${worktree}.tokens`, "planner"),
 					CHOPIN_CHECKOUT: checkoutRoot,
-					CHOPIN_WORKTREE: worktree,
+					CHOPIN_WORKTREE: clone,
 					SOME_FLAG: "1",
 				},
 			]);
-			// The connector makes the folders above it, private, and leaves the worktree to the Planner.
+			// The connector makes the folders above it private, and the Planner's disk beside them; no
+			// worktree of the checkout is made on the host.
 			for (let folder of [join(state, "planners"), dirname(dirname(worktree)), dirname(worktree)]) {
 				expect(((await stat(folder)).mode & 0o777).toString(8)).toBe("700");
 			}
 			expect(await stat(worktree).catch(() => "missing")).toBe("missing");
+			expect(existsSync(`${worktree}.disk`)).toBe(true);
+			expect(
+				git(root, "worktree", "list", "--porcelain").split("\n")
+					.filter(line => line.startsWith("worktree ")),
+			).toHaveLength(1);
 			expect(launches.map(launch => launch.argv.slice(1))).toEqual([[script, log], [script, log]]);
 			expect(asked).toEqual([
 				{ authorization: `Bearer ${MACHINE}`, body: { document } },
@@ -301,9 +326,8 @@ test(
 		let connector = Bun.spawn([
 			process.execPath,
 			"--no-env-file",
-			join(import.meta.dir, "main.ts"),
+			join(import.meta.dir, "testing", "chopin-on-host.ts"),
 			"connect",
-			"--no-sandbox",
 			root,
 			"--planner",
 			document,
@@ -379,7 +403,7 @@ function alive(pid: number) {
 }
 
 test.skipIf(process.platform === "win32")(
-	"a backend that starts in the sandbox finds its own worktree of the checkout made, as a linked worktree, and one that starts without a sandbox finds none made",
+	"a backend works in a clone of its own, made before it starts with the checkout's objects copied, kept between its starts, and adds nothing to the person's repository",
 	async () => {
 		let chopin = serve({
 			hostname: "127.0.0.1",
@@ -391,15 +415,18 @@ test.skipIf(process.platform === "win32")(
 					document: { id: "D_1", repository: "octo-org/score", url: "http://x" },
 				}),
 		});
-		let ran = async (sandbox: Sandbox | undefined) => {
-			let state = await mkdtemp(join(scratch, "worktree-state-"));
-			let root = await checkout();
+		let state = await mkdtemp(join(scratch, "worktree-state-"));
+		let root = await checkout();
+		let sandbox = hostSandbox();
+		let clone = join(sandbox.work, "score");
+		let started = async () => {
+			let log = join(state, `launches-${crypto.randomUUID()}.jsonl`);
 			let script = join(state, "backend.ts");
-			let log = join(state, "launches.jsonl");
 			await writeFile(script, BACKEND);
 			let abort = new AbortController();
 			let quiet = { write: () => true };
 			let serving = servePlanners({
+				sandbox,
 				url: `http://127.0.0.1:${chopin.port}`,
 				machine: MACHINE,
 				documents: ["D_1"],
@@ -408,42 +435,32 @@ test.skipIf(process.platform === "win32")(
 				directory: state,
 				output: createOutput(quiet, quiet, {}),
 				signal: abort.signal,
-				...(sandbox ? { sandbox } : {}),
 			});
 			try {
 				await until(async () => (await entries(log)).length >= 1, 20_000);
-				let [launched] = await entries(log);
-				let worktree = join(state, "planners", "octo-org", "score", "D_1");
-				expect(launched.env.CHOPIN_WORKTREE).toBe(worktree);
-				return {
-					exists: await stat(worktree).then(() => true, () => false),
-					listed: git(root, "worktree", "list", "--porcelain").split("\n")
-						.filter(line => line.startsWith("worktree ")).map(line =>
-							line.slice("worktree ".length)
-						),
-					worktree,
-					file: await readFile(join(worktree, "sample.txt"), "utf8").catch(() => undefined),
-				};
+				return (await entries(log))[0];
 			} finally {
 				abort.abort();
 				await serving;
 			}
 		};
-		let inSandbox = (engine: "bubblewrap" | "none"): Sandbox => ({
-			report: engine === "none" ? { engine, reason: "off" } : { engine },
-			spawn: plainSpawn,
-			close: async () => {},
-		});
 		try {
-			let made = await ran(inSandbox("bubblewrap"));
-			expect(made.exists).toBe(true);
-			expect(made.listed).toContain(made.worktree);
-			expect(made.file).toBe("sample");
-			for (let sandbox of [undefined, inSandbox("none")]) {
-				let kept = await ran(sandbox);
-				expect(kept.exists).toBe(false);
-				expect(kept.listed).toHaveLength(1);
-			}
+			let first = await started();
+			expect(first.env.CHOPIN_WORKTREE).toBe(clone);
+			expect(await realpath(first.cwd)).toBe(await realpath(clone));
+			expect(await readFile(join(clone, "sample.txt"), "utf8")).toBe("sample");
+			expect(git(clone, "rev-parse", "HEAD")).toBe(git(root, "rev-parse", "HEAD"));
+			// Its objects are its own: it reads nothing of the person's once it is made.
+			expect(existsSync(join(clone, ".git", "objects", "info", "alternates"))).toBe(false);
+			expect(
+				git(root, "worktree", "list", "--porcelain").split("\n")
+					.filter(line => line.startsWith("worktree ")),
+			).toHaveLength(1);
+			// What it keeps on its disk is there at its next start, however the checkout moved since.
+			await writeFile(join(clone, "notes.md"), "kept");
+			git(root, "commit", "-q", "--allow-empty", "-m", "moved on");
+			await started();
+			expect(await readFile(join(clone, "notes.md"), "utf8")).toBe("kept");
 		} finally {
 			await chopin.stop(true);
 		}
@@ -452,13 +469,14 @@ test.skipIf(process.platform === "win32")(
 );
 
 test.skipIf(process.platform === "win32")(
-	"a sandboxed backend's credential files and its worktree of a registered checkout are made while Chopin mints its GitHub token",
+	"a backend's credential files and its disk are made while Chopin mints its GitHub token",
 	async () => {
 		let state = await mkdtemp(join(scratch, "overlap-state-"));
-		let worktree = join(state, "planners", "octo-org", "score", "D_1");
+		let disk = join(state, "planners", "octo-org", "score", "D_1.disk");
+		let sandbox = hostSandbox();
 		let mcpAsked = Promise.withResolvers<void>();
 		/** What the launch had made by the time Chopin answered for its GitHub token. */
-		let made: { mcp: boolean; worktree: boolean } | undefined;
+		let made: { mcp: boolean; disk: boolean } | undefined;
 		let chopin = Bun.serve({
 			hostname: "127.0.0.1",
 			port: 0,
@@ -469,14 +487,14 @@ test.skipIf(process.platform === "win32")(
 					// GitHub is slow to mint it: the launch goes on meanwhile, or waits out the five seconds.
 					let ready = async () => {
 						await mcpAsked.promise;
-						await until(async () => existsSync(join(worktree, "sample.txt")), 5_000);
+						await until(async () => existsSync(disk), 5_000);
 					};
 					await Promise.race([ready(), Bun.sleep(5_000)]).catch(() => {});
 					let mcp = await Promise.race([
 						mcpAsked.promise.then(() => true),
 						Bun.sleep(0).then(() => false),
 					]);
-					made ??= { mcp, worktree: existsSync(join(worktree, "sample.txt")) };
+					made ??= { mcp, disk: existsSync(disk) };
 				}
 				return await answerTokens(request) ?? Response.json({
 					token: `chopin_p_${"P".repeat(43)}`,
@@ -500,15 +518,71 @@ test.skipIf(process.platform === "win32")(
 			directory: state,
 			output: createOutput(quiet, quiet, {}),
 			signal: abort.signal,
-			sandbox: { report: { engine: "bubblewrap" }, spawn: plainSpawn, close: async () => {} },
+			sandbox,
 		});
 		try {
 			await until(async () => (await entries(log)).length >= 1, 20_000);
-			expect(made).toEqual({ mcp: true, worktree: true });
-			// It still starts only once all of it is there.
+			expect(made).toEqual({ mcp: true, disk: true });
+			// It still starts only once all of it is there, in its repository.
 			let [launched] = await entries(log);
-			expect(launched.worktree).toBe(worktree);
-			expect(await readFile(join(worktree, "sample.txt"), "utf8")).toBe("sample");
+			expect(launched.worktree).toBe(join(sandbox.work, "score"));
+			expect(await readFile(join(sandbox.work, "score", "sample.txt"), "utf8")).toBe("sample");
+		} finally {
+			abort.abort();
+			await serving;
+			await chopin.stop(true);
+		}
+	},
+	30_000,
+);
+
+test.skipIf(process.platform === "win32")(
+	"a Planner a writer reset in Chopin since its disk was made starts on a new disk, which records that reset",
+	async () => {
+		let state = await mkdtemp(join(scratch, "reset-state-"));
+		let folder = join(state, "planners", "octo-org", "score");
+		await mkdir(join(folder, "D_1.agent"), { recursive: true });
+		await writeFile(join(folder, "D_1.disk"), "made before the reset");
+		await writeFile(join(folder, "D_1.agent", "session.json"), "{}");
+		await writeFile(join(folder, "D_1.reset"), "1000\n");
+		let chopin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: async request =>
+				await answerTokens(request) ?? Response.json({
+					token: `chopin_p_${"P".repeat(43)}`,
+					expiresAt: Date.now() + 15 * 60_000,
+					document: { id: "D_1", repository: "octo-org/score", url: "http://x" },
+					reset: 2000,
+				}),
+		});
+		let root = await checkout();
+		let script = join(state, "backend.ts");
+		let log = join(state, "launches.jsonl");
+		await writeFile(script, STAYING_BACKEND);
+		let abort = new AbortController();
+		let said = "";
+		let quiet = { write: () => true };
+		let serving = servePlanners({
+			url: `http://127.0.0.1:${chopin.port}`,
+			machine: MACHINE,
+			documents: ["D_1"],
+			command: [process.execPath, script, log],
+			checkouts: checkouts({ directory: state, registered: { "octo-org/score": root } }),
+			directory: state,
+			output: createOutput({ write: (text: string) => (said += text, true) }, quiet, {}),
+			signal: abort.signal,
+			sandbox: hostSandbox(),
+		});
+		try {
+			await until(async () => (await entries(log)).length >= 1, 20_000);
+			expect(await readFile(join(folder, "D_1.disk"), "utf8")).toBe("");
+			expect(existsSync(join(folder, "D_1.agent", "session.json"))).toBe(false);
+			expect((await readFile(join(folder, "D_1.reset"), "utf8")).trim()).toBe("2000");
+			expect(said).toContain(
+				"Removed the disk of D_1's Planner (octo-org/score): its Planner was "
+					+ "reset in Chopin. Any commits on it that were never pushed went with it.",
+			);
 		} finally {
 			abort.abort();
 			await serving;
@@ -532,12 +606,15 @@ test.skipIf(process.platform === "win32")(
 				}),
 		});
 		let directory = await mkdtemp(join(scratch, "forking-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		let log = join(directory, "launches.jsonl");
 		await writeFile(script, FORKING_BACKEND);
 		let abort = new AbortController();
 		let quiet = { write: () => true };
 		let serving = servePlanners({
+			sandbox: HOST_SANDBOX,
 			url: `http://127.0.0.1:${chopin.port}`,
 			machine: MACHINE,
 			documents: ["D_1"],
@@ -600,6 +677,8 @@ test.skipIf(process.platform === "win32")(
 				}),
 		});
 		let directory = await mkdtemp(join(scratch, "failing-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		let log = join(directory, "launches.log");
 		await writeFile(script, FAILING_BACKEND);
@@ -617,6 +696,7 @@ test.skipIf(process.platform === "win32")(
 		let abort = new AbortController();
 		let quiet = { write: () => true };
 		let serving = servePlanners({
+			sandbox: HOST_SANDBOX,
 			url: `http://127.0.0.1:${chopin.port}`,
 			machine: MACHINE,
 			documents: ["D_1"],
@@ -673,6 +753,8 @@ test.skipIf(process.platform === "win32")(
 				}),
 		});
 		let directory = await mkdtemp(join(scratch, "leaking-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		await writeFile(
 			script,
@@ -702,6 +784,7 @@ test.skipIf(process.platform === "win32")(
 		process.stderr.write = capture.write as typeof process.stderr.write;
 		let abort = new AbortController();
 		let serving = servePlanners({
+			sandbox: HOST_SANDBOX,
 			url: `http://127.0.0.1:${chopin.port}`,
 			machine: MACHINE,
 			documents: ["D_1"],
@@ -766,6 +849,8 @@ test.skipIf(process.platform === "win32")(
 				}),
 		});
 		let directory = await mkdtemp(join(scratch, "long-line-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		// The first 8 characters of the credential end a 65,545-character piece without a newline;
 		// the rest comes after a pause, then a normal line. Only the first start prints it: the
@@ -810,6 +895,7 @@ test.skipIf(process.platform === "win32")(
 		process.stderr.write = capture.write as typeof process.stderr.write;
 		let abort = new AbortController();
 		let serving = servePlanners({
+			sandbox: HOST_SANDBOX,
 			url: `http://127.0.0.1:${chopin.port}`,
 			machine: MACHINE,
 			documents: ["D_1"],
@@ -897,12 +983,15 @@ test.skipIf(process.platform === "win32")(
 			},
 		});
 		let directory = await mkdtemp(join(scratch, "reported-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		await writeFile(script, REFUSING_BACKEND);
 		let release = await lockWorkspace(directory, directory, { planners: ["D_1"] });
 		let abort = new AbortController();
 		let quiet = { write: () => true };
 		let serving = servePlanners({
+			sandbox: HOST_SANDBOX,
 			url: `http://127.0.0.1:${chopin.port}`,
 			machine: MACHINE,
 			// Started by its address, as Chopin tells a connector; its reports name it by id.
@@ -975,12 +1064,15 @@ test.skipIf(process.platform === "win32")(
 			},
 		});
 		let directory = await mkdtemp(join(scratch, "unknown-report-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		await writeFile(script, "process.exit(1);\n");
 		let release = await lockWorkspace(directory, directory, { planners: ["D_1"] });
 		let abort = new AbortController();
 		let quiet = { write: () => true };
 		let serving = servePlanners({
+			sandbox: HOST_SANDBOX,
 			url: `http://127.0.0.1:${chopin.port}`,
 			machine: MACHINE,
 			documents: ["D_1"],
@@ -1018,6 +1110,8 @@ test.skipIf(process.platform === "win32")(
 					: Response.json({ token: `chopin_p_${"P".repeat(43)}`, expiresAt: Date.now() + 60_000 }),
 		});
 		let directory = await mkdtemp(join(scratch, "refused-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		await writeFile(script, "process.stderr.write('node: not found\\n');\nprocess.exit(127);\n");
 		let release = await lockWorkspace(directory, directory, { planners: ["D_1"] });
@@ -1033,6 +1127,7 @@ test.skipIf(process.platform === "win32")(
 		try {
 			// The backend exits 127, then Chopin refuses the next credential, which ends the Planner.
 			await servePlanners({
+				sandbox: HOST_SANDBOX,
 				url: `http://127.0.0.1:${chopin.port}`,
 				machine: MACHINE,
 				documents: ["D_1"],
@@ -1193,9 +1288,8 @@ test.skipIf(process.platform === "win32")(
 		let connector = Bun.spawn([
 			process.execPath,
 			"--no-env-file",
-			join(import.meta.dir, "main.ts"),
+			join(import.meta.dir, "testing", "chopin-on-host.ts"),
 			"connect",
-			"--no-sandbox",
 			root,
 			"--planner-command",
 			`${process.execPath} ${script} ${log}`,
@@ -1226,11 +1320,13 @@ test.skipIf(process.platform === "win32")(
 			// Its credential is asked for by the id Chopin named, which Chopin finds without GitHub.
 			expect(asked).toEqual([{ document: "D_1" }]);
 			let [launched] = await entries(log);
-			// A dispatched Planner gets its checkout and its own stable worktree path as well.
+			// A dispatched Planner gets its checkout and its repository as well, its disk beside its
+			// private folders.
 			expect(launched.checkout).toBe(await realpath(root));
-			expect(launched.worktree).toBe(join(state, "planners", "octo-org", "score", "D_1"));
-			expect(((await stat(dirname(launched.worktree))).mode & 0o777).toString(8)).toBe("700");
-			expect(await stat(launched.worktree).catch(() => "missing")).toBe("missing");
+			expect(launched.worktree).toBe(join(state, "work", "score"));
+			let folder = join(state, "planners", "octo-org", "score");
+			expect(((await stat(folder)).mode & 0o777).toString(8)).toBe("700");
+			expect(existsSync(join(folder, "D_1.disk"))).toBe(true);
 			await until(async () => polls.length >= 2, 5_000);
 			expect(polls.slice(0, 2)).toEqual([[], ["D_1"]]);
 			// chopin status lists it beside any --planner one, and says the machine can run Planners.
@@ -1369,9 +1465,8 @@ test.skipIf(process.platform === "win32")(
 		let connector = Bun.spawn([
 			process.execPath,
 			"--no-env-file",
-			join(import.meta.dir, "main.ts"),
+			join(import.meta.dir, "testing", "chopin-on-host.ts"),
 			"connect",
-			"--no-sandbox",
 			root,
 			"--planner-command",
 			`${process.execPath} ${script} ${log}`,
@@ -1489,9 +1584,8 @@ test.skipIf(process.platform === "win32")(
 		let connector = Bun.spawn([
 			process.execPath,
 			"--no-env-file",
-			join(import.meta.dir, "main.ts"),
+			join(import.meta.dir, "testing", "chopin-on-host.ts"),
 			"connect",
-			"--no-sandbox",
 			root,
 			"--planner-command",
 			`${process.execPath} ${script} ${log}`,
@@ -1537,6 +1631,8 @@ test.skipIf(process.platform === "win32")(
 					: new Response(null, { status: 404 }),
 		});
 		let directory = await mkdtemp(join(scratch, "confirm-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		let log = join(directory, "launches.jsonl");
 		await writeFile(script, LEAVING_BACKEND);
@@ -1549,6 +1645,7 @@ test.skipIf(process.platform === "win32")(
 			},
 		};
 		let planners = dispatchedPlanners({
+			sandbox: HOST_SANDBOX,
 			url: `http://127.0.0.1:${chopin.port}`,
 			machine: MACHINE,
 			documents: [],
@@ -1608,6 +1705,8 @@ test.skipIf(process.platform === "win32")(
 					: new Response(null, { status: 404 }),
 		});
 		let directory = await mkdtemp(join(scratch, "retry-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let leaving = join(directory, "leaving.ts");
 		let staying = join(directory, "staying.ts");
 		let log = join(directory, "launches.jsonl");
@@ -1630,7 +1729,11 @@ test.skipIf(process.platform === "win32")(
 			output: createOutput(sink, sink, {}),
 			signal: abort.signal,
 		};
-		let planners = dispatchedPlanners({ ...options, command: [process.execPath, leaving, log] });
+		let planners = dispatchedPlanners({
+			sandbox: HOST_SANDBOX,
+			...options,
+			command: [process.execPath, leaving, log],
+		});
 		let launches = async () => (await entries(log)).filter(entry => entry.pid).length;
 		let random = Math.random;
 		// Every restart waits the longest its backoff allows: 1 s, then 2 s, then 4 s.
@@ -1679,6 +1782,7 @@ test.skipIf(process.platform === "win32")(
 		let alive = new AbortController();
 		let runs = join(directory, "staying.jsonl");
 		let kept = dispatchedPlanners({
+			sandbox: HOST_SANDBOX,
 			...options,
 			signal: alive.signal,
 			command: [process.execPath, staying, runs],
@@ -1704,6 +1808,100 @@ test.skipIf(process.platform === "win32")(
 );
 
 test.skipIf(process.platform === "win32")(
+	"a Planner Chopin stopped because its document was deleted says who deleted it, and its disk goes once it has exited, never before",
+	async () => {
+		const DOCUMENT = "00000000-0000-4000-8000-0000000000d1";
+		let kept: string[][] = [];
+		let chopin = serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: async request => {
+				let path = new URL(request.url).pathname;
+				if (path === "/api/connector/planner") {
+					return Response.json({
+						token: `chopin_p_${"P".repeat(43)}`,
+						expiresAt: Date.now() + 15 * 60_000,
+						document: { id: DOCUMENT, repository: "octo-org/score", url: "http://x/plan" },
+					});
+				}
+				// The document is gone: Chopin says to forget its disk.
+				if (path === "/api/connector/planner/kept") {
+					let { documents } = await request.json() as { documents: Array<{ id: string }> };
+					kept.push(documents.map(item => item.id));
+					return Response.json({ forget: documents.map(item => item.id), reset: [] });
+				}
+				return new Response(null, { status: 404 });
+			},
+		});
+		let url = `http://127.0.0.1:${chopin.port}`;
+		let directory = await mkdtemp(join(scratch, "deleted-"));
+		repository(directory);
+		let script = join(directory, "backend.ts");
+		let log = join(directory, "launches.jsonl");
+		await writeFile(script, STAYING_BACKEND);
+		let abort = new AbortController();
+		let said = "";
+		let sink = {
+			write: (text: string) => {
+				said += text;
+				return true;
+			},
+		};
+		let output = createOutput(sink, sink, {});
+		let sweeps: Array<Promise<string[]>> = [];
+		let sweep = () =>
+			sweepPlannerDisks({
+				directory,
+				server: url,
+				output,
+				ask: documents => forgettablePlanners(url, MACHINE, documents),
+			});
+		let planners = dispatchedPlanners({
+			sandbox: HOST_SANDBOX,
+			url,
+			machine: MACHINE,
+			documents: [],
+			command: [process.execPath, script, log],
+			checkouts: checkouts({ directory, registered: { "octo-org/score": directory } }),
+			directory,
+			output,
+			signal: abort.signal,
+			withdrawn: () => void sweeps.push(sweep()),
+		});
+		let slot = await plannerSlot(directory, "octo-org/score", DOCUMENT);
+		try {
+			planners.assign([{ id: DOCUMENT, url: "http://x/plan" }]);
+			await until(async () => (await entries(log)).some(entry => entry.pid), 10_000);
+			// The disk its microVM would run on, which its launch holds.
+			await writeFile(plannerDisk(slot), "");
+			await writeFile(plannerServer(slot), `${url}\n`);
+			expect(await sweep()).toEqual([]);
+			expect(existsSync(plannerDisk(slot))).toBe(true);
+
+			planners.assign([], {
+				[DOCUMENT]: "ana deleted this document, so Build box stopped running its Planner.",
+			});
+			expect(said).toContain(
+				"Stopped the Planner for http://x/plan: ana deleted this document, so Build box stopped "
+					+ "running its Planner.",
+			);
+			await until(async () => sweeps.length === 1, 10_000);
+			// Asked only once its backend had exited and let go of the disk.
+			expect((await entries(log)).some(entry => entry.stopped)).toBe(true);
+			expect(await sweeps[0]).toEqual([DOCUMENT]);
+			expect(existsSync(plannerDisk(slot))).toBe(false);
+			expect(kept.at(-1)).toEqual([DOCUMENT]);
+			expect(said).toContain("Chopin no longer has its document");
+		} finally {
+			abort.abort();
+			await planners.stop();
+			await chopin.stop(true);
+		}
+	},
+	40_000,
+);
+
+test.skipIf(process.platform === "win32")(
 	"a dispatched Planner whose document was renamed goes by its new address, in status, output and its next start",
 	async () => {
 		let chopin = serve({
@@ -1723,6 +1921,8 @@ test.skipIf(process.platform === "win32")(
 					: new Response(null, { status: 404 }),
 		});
 		let directory = await mkdtemp(join(scratch, "renamed-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		let log = join(directory, "launches.jsonl");
 		await writeFile(
@@ -1743,6 +1943,7 @@ setTimeout(() => process.exit(0), 1_000);
 		};
 		let recorded: string[][] = [];
 		let planners = dispatchedPlanners({
+			sandbox: HOST_SANDBOX,
 			url: `http://127.0.0.1:${chopin.port}`,
 			machine: MACHINE,
 			documents: [],
@@ -1812,6 +2013,8 @@ test.skipIf(process.platform === "win32")(
 		let directory = await realpath(await mkdtemp(join(scratch, "repositories-")));
 		let score = await realpath(await mkdtemp(join(scratch, "score-")));
 		let notes = await realpath(await mkdtemp(join(scratch, "notes-")));
+		repository(score);
+		repository(notes);
 		let script = join(directory, "backend.ts");
 		let log = join(directory, "launches.jsonl");
 		await writeFile(script, BACKEND);
@@ -1825,6 +2028,7 @@ test.skipIf(process.platform === "win32")(
 		};
 		let origin = `http://127.0.0.1:${chopin.port}`;
 		let planners = dispatchedPlanners({
+			sandbox: HOST_SANDBOX,
 			url: origin,
 			machine: MACHINE,
 			documents: [],
@@ -1848,19 +2052,17 @@ test.skipIf(process.platform === "win32")(
 					entry,
 				]),
 			);
-			// Each in its own repository's checkout, its worktree beside the others of that repository.
+			// Each with its own repository's checkout, in a clone of that repository.
 			expect(launched.get("D_score")).toMatchObject({
-				cwd: score,
 				env: {
 					CHOPIN_CHECKOUT: score,
-					CHOPIN_WORKTREE: join(directory, "planners", "octo-org", "score", "D_score"),
+					CHOPIN_WORKTREE: join(HOST_SANDBOX.work, "score"),
 				},
 			});
 			expect(launched.get("D_notes")).toMatchObject({
-				cwd: notes,
 				env: {
 					CHOPIN_CHECKOUT: notes,
-					CHOPIN_WORKTREE: join(directory, "planners", "octo-org", "notes", "D_notes"),
+					CHOPIN_WORKTREE: join(HOST_SANDBOX.work, "notes"),
 				},
 			});
 			// A repository Chopin gives no GitHub token for never starts; it says why.
@@ -1964,6 +2166,8 @@ test.skipIf(process.platform === "win32")(
 		own = `${origin}/octo-org/score/plan`;
 		assigned = `${origin}/octo-org/score/other`;
 		let directory = await mkdtemp(join(scratch, "stdout-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		let log = join(directory, "launches.jsonl");
 		await writeFile(script, STDOUT_LEAKING_BACKEND);
@@ -1972,9 +2176,8 @@ test.skipIf(process.platform === "win32")(
 		let connector = Bun.spawn([
 			process.execPath,
 			"--no-env-file",
-			join(import.meta.dir, "main.ts"),
+			join(import.meta.dir, "testing", "chopin-on-host.ts"),
 			"connect",
-			"--no-sandbox",
 			root,
 			"--planner",
 			own,
@@ -2127,6 +2330,8 @@ test.skipIf(process.platform === "win32")(
 			});
 		});
 		let directory = await mkdtemp(join(scratch, "github-"));
+		// Its checkout too, as a registered one is: a git checkout.
+		repository(directory);
 		let script = join(directory, "backend.ts");
 		let log = join(directory, "launches.jsonl");
 		await writeFile(script, GITHUB_BACKEND);
@@ -2144,6 +2349,7 @@ test.skipIf(process.platform === "win32")(
 		};
 		let abort = new AbortController();
 		let serving = servePlanners({
+			sandbox: HOST_SANDBOX,
 			url: chopin.url,
 			machine: MACHINE,
 			documents: ["D_1"],
@@ -2211,6 +2417,8 @@ test.skipIf(process.platform === "win32")(
 				Response.json({ error: answer }, { status: answer === "unavailable" ? 503 : 403 })
 			);
 			let directory = await mkdtemp(join(scratch, "github-refused-"));
+			// Its checkout too, as a registered one is: a git checkout.
+			repository(directory);
 			let script = join(directory, "backend.ts");
 			let log = join(directory, "launches.jsonl");
 			await writeFile(script, GITHUB_BACKEND);
@@ -2223,6 +2431,7 @@ test.skipIf(process.platform === "win32")(
 			};
 			let abort = new AbortController();
 			let serving = servePlanners({
+				sandbox: HOST_SANDBOX,
 				url: chopin.url,
 				machine: MACHINE,
 				documents: ["D_1"],

@@ -41,15 +41,58 @@ export type ModelChoiceDeps = {
 	 */
 	incoming?: (channelId: string) => boolean;
 	/**
-	 * A turn fell back on a saved choice with no catalog to check it against while `known` was
-	 * false: the harness is to treat what it offers as known (nothing), and the room is to be told
-	 * the choice, since what the turn did is now a fact. Called once per such turn.
+	 * Whether, while the offer is not `known`, the document's Planner can't list the models of the
+	 * AI accounts it runs on as they are now without an update (a remote client that lists them
+	 * without naming the launch it listed through, after its person's accounts changed), so the room
+	 * is told that rather than that the models are on their way. Absent means it can.
+	 */
+	outdated?: (channelId: string) => boolean;
+	/**
+	 * A session or turn fell back on a saved choice with no catalog to check it against while `known`
+	 * was false: the harness is to treat what it offers as known (nothing), and the room is to be
+	 * told the choice, since what it did is now a fact. Called once each time that happens.
 	 */
 	fellBack?: (channelId: string) => void;
+	/**
+	 * Resolves when what the harness offers is no longer on its way, or has been waited for long
+	 * enough: opening a session and starting a turn wait on it while `known` is false and a choice
+	 * is stored, so a remote client that has just attached opens its session on the stored choice
+	 * and runs it from its first turn, instead of its own default. Absent means no wait.
+	 */
+	offered?: (channelId: string) => Promise<void>;
+	/**
+	 * The models the document's Planner last reported for `userId`'s account, if any: told to that
+	 * person alone, as the last known list, while what the harness offers is not known. Absent means
+	 * none is kept.
+	 */
+	lastKnown?: (
+		channelId: string,
+		userId: string,
+	) => Promise<{ catalog: Wire.ModelCatalog; reportedAt: Date } | undefined>;
+	/**
+	 * The models `userId`'s own AI accounts offer, as Chopin lists them with no agent: told to that
+	 * person alone while what the harness offers is not known, ahead of `lastKnown`. Absent, or
+	 * undefined, means none.
+	 */
+	accounts?: (userId: string) => Promise<Wire.ModelCatalog | undefined>;
 	storage: Pick<StorageAdapter, "plannerModelChoices">;
 	lease: () => Lease;
 	now?: () => Date;
 };
+
+/**
+ * Why a choice wasn't saved while the document's Planner has yet to say which models it runs: a
+ * list shown from before can't be checked against what it runs now.
+ */
+export const MODELS_LOADING =
+	"The machine's models are still loading, so this choice wasn't saved. Choose again once they're in.";
+
+/**
+ * Why a choice wasn't saved while the document's Planner can't list the models of the AI accounts it
+ * runs on as they are now (`ModelChoiceDeps.outdated`).
+ */
+export const PLANNER_OUTDATED =
+	"The machine needs an update to switch AI accounts, so this choice wasn't saved.";
 
 /** What a turn runs, and the words for a choice it could not honour. */
 export type TurnModel = { model?: string; thinkingLevel?: string; notice?: string };
@@ -75,10 +118,10 @@ async function stored(
  * to the default, but not while what the harness offers is unknown (`known`): it is then told as
  * `waiting`, which a composer shows while the models are on their way (`incoming`).
  */
-export async function modelState(
+async function roomState(
 	deps: ModelChoiceDeps,
 	channelId: string,
-): Promise<Wire.ModelState> {
+): Promise<{ state: Wire.ModelState; known: boolean }> {
 	let [catalog, saved, commands] = await Promise.all([
 		deps.catalog(channelId),
 		stored(deps, channelId),
@@ -90,7 +133,7 @@ export async function modelState(
 	]);
 	let known = !!catalog || (deps.known?.(channelId) ?? true);
 	let told = saved.choice && known;
-	return {
+	let state: Wire.ModelState = {
 		kind: "chat:model",
 		ts: 0,
 		...(catalog ? { catalog } : {}),
@@ -103,30 +146,123 @@ export async function modelState(
 				waiting: {
 					...(saved.choice ? { choice: saved.choice } : {}),
 					...(saved.modelName ? { modelName: saved.modelName } : {}),
+					...(deps.outdated?.(channelId) ? { outdated: true as const } : {}),
 				},
 			}),
 		...(commands?.length ? { commands } : {}),
 	};
+	return { state, known };
+}
+
+/** Whether the room's state may differ by person: while what the harness offers is not known. */
+function personal(deps: ModelChoiceDeps, room: { known: boolean }): boolean {
+	return !room.known && (!!deps.lastKnown || !!deps.accounts);
+}
+
+/**
+ * The state one person is told: the room's, and, while what the harness offers is not known, the
+ * models that person's own AI accounts offer (`accounts`), else the list the document's Planner last
+ * reported for their own account (`lastKnown`), neither of which anyone else is told. The accounts'
+ * list takes the default of the list from last time where it offers that model, since only the
+ * Planner knows its own. A list that can't be read is left out; the room's state still goes.
+ */
+async function viewerState(
+	deps: ModelChoiceDeps,
+	channelId: string,
+	room: { state: Wire.ModelState; known: boolean },
+	viewer: string,
+): Promise<Wire.ModelState> {
+	if (!personal(deps, room)) return room.state;
+	let [accounts, saved] = await Promise.all([
+		deps.accounts?.(viewer).catch((error): undefined => {
+			console.error("[chat] could not list a person's models from their AI accounts:", error);
+			return undefined;
+		}),
+		deps.lastKnown?.(channelId, viewer).catch((error): undefined => {
+			console.error("[chat] could not read the document's last model list:", error);
+			return undefined;
+		}),
+	]);
+	if (accounts?.models.length) {
+		let fallback = accounts.default ?? saved?.catalog.default;
+		let offered = fallback && accounts.models.some(model => model.id === fallback.model);
+		return {
+			...room.state,
+			accounts: {
+				catalog: offered && !accounts.default ? { ...accounts, default: fallback } : accounts,
+			},
+		};
+	}
+	if (!saved?.catalog.models.length) return room.state;
+	return {
+		...room.state,
+		lastKnown: { catalog: saved.catalog, reportedAt: saved.reportedAt.getTime() },
+	};
+}
+
+/**
+ * The model state `viewer` is told, or the room's where no viewer is named: see `roomState` and
+ * `viewerState`.
+ */
+export async function modelState(
+	deps: ModelChoiceDeps,
+	channelId: string,
+	viewer?: string,
+): Promise<Wire.ModelState> {
+	let room = await roomState(deps, channelId);
+	return viewer === undefined ? room.state : viewerState(deps, channelId, room, viewer);
+}
+
+/**
+ * The stored choice checked against the catalog as it is now. Where the harness has yet to say what
+ * it offers, it waits for that first (`offered`), unless nothing is stored to check. A choice nothing
+ * could check, because the harness never said, is run as the default, and `fellBack` is told so.
+ */
+async function resolveStored(deps: ModelChoiceDeps, channelId: string) {
+	let saved = await stored(deps, channelId);
+	if (saved.choice && deps.known?.(channelId) === false) await deps.offered?.(channelId);
+	let catalog = await deps.catalog(channelId);
+	let resolved = resolveChoice(catalog, saved.choice);
+	if (resolved.unavailable && !catalog && deps.known?.(channelId) === false) {
+		deps.fellBack?.(channelId);
+	}
+	return { catalog, saved, resolved };
 }
 
 /**
  * What the next turn runs: the stored choice checked against the catalog as it is now. A model or
  * level the catalog no longer offers is left out, the harness's default runs, and `notice` says so.
+ * Every turn reads it, typed or not, a background job's included, so a session made again (after a
+ * restart, a reset, a link that could not resume) runs the stored choice from its first turn. Where
+ * the harness has yet to say what it offers, the turn waits for it first (`offered`).
  */
 export async function turnModel(deps: ModelChoiceDeps, channelId: string): Promise<TurnModel> {
-	let [catalog, saved] = await Promise.all([deps.catalog(channelId), stored(deps, channelId)]);
-	let resolved = resolveChoice(catalog, saved.choice);
-	// The turn runs the default for a choice nothing could check, where the harness had not yet said
-	// what it offers: from now on that is known, and the composer is told what the turn did.
-	if (resolved.unavailable && !catalog && deps.known?.(channelId) === false) {
-		deps.fellBack?.(channelId);
-	}
+	let { catalog, saved, resolved } = await resolveStored(deps, channelId);
 	return {
 		...(resolved.model !== undefined ? { model: resolved.model } : {}),
 		...(resolved.thinkingLevel !== undefined ? { thinkingLevel: resolved.thinkingLevel } : {}),
 		...(resolved.unavailable
 			? { notice: unavailableNotice(catalog, resolved.unavailable, saved.modelName) }
 			: {}),
+	};
+}
+
+/**
+ * What a Planner session is opened with: the stored choice, where the catalog the harness reports
+ * offers it, and nothing otherwise. Like a turn, it first waits for a harness that has yet to say
+ * what it offers (`offered`), so a remote client that has just attached is asked for a session on
+ * the stored choice, not its own default. It says nothing; the turn that follows reads the choice
+ * again (`turnModel`) and tells the room of a fallback. A remote client that offered
+ * `session-choice` is told it when the server asks it for a session.
+ */
+export async function sessionModel(
+	deps: ModelChoiceDeps,
+	channelId: string,
+): Promise<{ model?: string; thinkingLevel?: string }> {
+	let { resolved } = await resolveStored(deps, channelId);
+	return {
+		...(resolved.model !== undefined ? { model: resolved.model } : {}),
+		...(resolved.thinkingLevel !== undefined ? { thinkingLevel: resolved.thinkingLevel } : {}),
 	};
 }
 
@@ -177,14 +313,28 @@ function inOrder<T>(channelId: string, run: () => Promise<T>): Promise<T> {
 
 /**
  * Reads the document's model state when it is this call's turn and gives it to `deliver`, which
- * tells the room, or the one person who joined. Rejects if the state cannot be read.
+ * tells the room, or the one person who joined. While what the harness offers is not known, each
+ * person may be told a state of their own (see `viewerState`): `personal` then gives it, and the
+ * room's state is not to be broadcast as it is. Rejects if the state cannot be read.
  */
 export function publishModelState(
 	deps: ModelChoiceDeps,
 	channelId: string,
-	deliver: (state: Wire.ModelState) => void,
+	deliver: (
+		state: Wire.ModelState,
+		personal?: (viewer: string) => Promise<Wire.ModelState>,
+	) => void | Promise<void>,
 ): Promise<void> {
-	return inOrder(channelId, async () => deliver(await modelState(deps, channelId)));
+	return inOrder(channelId, async () => {
+		let room = await roomState(deps, channelId);
+		if (!personal(deps, room)) return deliver(room.state);
+		let told = new Map<string, Promise<Wire.ModelState>>();
+		return deliver(room.state, viewer => {
+			let state = told.get(viewer) ?? viewerState(deps, channelId, room, viewer);
+			told.set(viewer, state);
+			return state;
+		});
+	});
 }
 
 /**
@@ -209,7 +359,13 @@ export function chooseModel(
 			let choice = requested(frame);
 			if (!choice) return fail(ws, frame.rid, "That is not a model choice.");
 			if (context.child) return fail(ws, frame.rid, "A child document uses its parent's model.");
+			// A choice is checked against what the Planner offers now, never a list it reported
+			// before: a client that has yet to report is waited for, as a turn waits for it.
+			if (deps.known?.(channelId) === false) await deps.offered?.(channelId);
 			let catalog = await deps.catalog(channelId);
+			if (!catalog && deps.known?.(channelId) === false) {
+				return fail(ws, frame.rid, deps.outdated?.(channelId) ? PLANNER_OUTDATED : MODELS_LOADING);
+			}
 			let refusal = refusedChoice(catalog, choice);
 			if (refusal) return fail(ws, frame.rid, refusal);
 			let modelName = catalogModel(catalog, choice.model)?.name;

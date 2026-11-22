@@ -1,4 +1,4 @@
-FROM oven/bun:1.4.4 AS bun
+FROM oven/bun:1.4.5 AS bun
 FROM mcr.microsoft.com/playwright:v1.62.1-noble@sha256:dcc5531e97840b9b5e794f2814476b21571c5124a3fca2267d73041f56e7580e
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 WORKDIR /work
@@ -14,7 +14,11 @@ COPY e2e ./e2e
 COPY scripts ./scripts
 COPY patches ./patches
 RUN --mount=type=cache,target=/root/.bun/install/cache bun install --frozen-lockfile --registry=https://registry.npmjs.org
-RUN bun run build
+# The server reads the connector release it recommends from this manifest as it starts. The
+# connector itself stays out, so the build below is only the web client's.
+COPY apps/connector/package.json ./apps/connector/package.json
+# The browser suites' client, as scripts/e2e.ts and CI build it: with message analysis.
+RUN VITE_CHILD_MOTION_TOGGLE=on VITE_MESSAGE_ANALYSIS=on bun run --filter '@chopin/web' build
 RUN <<'SH'
 bun -e '
 import { createHash } from "node:crypto";

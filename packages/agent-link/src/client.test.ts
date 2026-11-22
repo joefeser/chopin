@@ -5,7 +5,7 @@ import { MAX_LINK_MESSAGE_BYTES, MAX_LINK_NOTE_LENGTH, parseClientMessage } from
 
 import type { ServerWebSocket } from "bun";
 import type { AgentHandlers, HostToolResult, TurnContext } from "./client";
-import type { ClientMessage, ClientMessageOf, ServerMessage } from "./protocol";
+import type { ClientMessage, ClientMessageOf, ServerMessage, ServerMessageOf } from "./protocol";
 
 let stops: Array<() => unknown> = [];
 afterEach(async () => {
@@ -122,78 +122,12 @@ describe("Agent connection client", () => {
 		]);
 	});
 
-	it("asks for stage deltas and splits a report too large for one frame across several", async () => {
-		let server = fakeServer({ features: ["run-stage-deltas"] });
+	it("asks for the features it knows and reports no runs", async () => {
+		let server = fakeServer({ features: ["decision-option-previews"] });
 		let client = await connect(server, { turn() {} });
-		expect(server.asked).toEqual([
-			"run-stage-deltas, decision-option-previews, resumable-sessions, restart-notice",
-		]);
-		expect(client.features).toEqual(["run-stage-deltas"]);
-		let stages = Array.from({ length: 2_000 }, (_, index) => ({
-			id: `s${index}`,
-			name: `${index} ${"é".repeat(MAX_LINK_NOTE_LENGTH - 8)}`,
-			status: "completed" as const,
-			...(index ? { parentIds: [`s${index - 1}`] } : {}),
-		}));
-		let big = {
-			id: "big",
-			name: "review",
-			status: "running" as const,
-			started: 1,
-			updated: 2,
-			waiting: 0,
-			stagesDelta: true as const,
-			stages,
-		};
-		let { stagesDelta: _, ...fields } = big;
-		let small = { ...fields, id: "small", stages: stages.slice(0, 2) };
-		let quiet = { ...big, id: "quiet", stages: [] };
-		client.reportRuns("s", { active: ["big"], paused: ["small"], cards: [small, big, quiet] });
-
-		let parts: Array<Extract<ClientMessage, { type: "runs" }>> = [];
-		let seen = 0;
-		while (seen < stages.length) {
-			let part = await server.next("runs");
-			parts.push(part);
-			seen += part.cards.find(card => card.id === "big")!.stages.length;
-		}
-		expect(parts.length).toBeGreaterThan(5);
-		for (let [index, part] of parts.entries()) {
-			expect(new TextEncoder().encode(JSON.stringify(part)).byteLength).toBeLessThanOrEqual(
-				MAX_LINK_MESSAGE_BYTES,
-			);
-			expect(part).toMatchObject({ session: "s", active: ["big"], paused: ["small"] });
-			expect(part.cards.map(card => card.id)).toEqual(["small", "big", "quiet"]);
-			let [first, , last] = part.cards;
-			if (index === 0) expect(first).toEqual(small);
-			else expect(first).toEqual({ ...big, id: "small", stages: [] });
-			expect(last).toEqual(quiet);
-		}
-		expect(parts.flatMap(part => part.cards[1]!.stages)).toEqual(stages);
-	});
-
-	it("refuses a stage delta to a server that did not offer them, which gets full cards", async () => {
-		let server = fakeServer();
-		let client = await connect(server, { turn() {} });
-		expect(client.features).toEqual([]);
-		let card = {
-			id: "run",
-			name: "review",
-			status: "running" as const,
-			started: 1,
-			updated: 2,
-			waiting: 0,
-			stages: [{ id: "a", name: "a", status: "running" as const }],
-		};
-		expect(() =>
-			client.reportRuns("s", {
-				active: ["run"],
-				paused: [],
-				cards: [{ ...card, stagesDelta: true }],
-			})
-		).toThrow("stage deltas");
-		client.reportRuns("s", { active: ["run"], paused: [], cards: [card] });
-		expect((await server.next("runs")).cards).toEqual([card]);
+		expect(server.asked).toEqual(["decision-option-previews, resumable-sessions, restart-notice"]);
+		expect(client.features).toEqual(["decision-option-previews"]);
+		expect("reportRuns" in client).toBe(false);
 	});
 
 	it("settles a host call the server aborts or destroys instead of answering", async () => {
@@ -288,7 +222,7 @@ describe("Agent connection client", () => {
 			resumable: false,
 		});
 		stops.push(() => opted.detach());
-		expect(plain.asked).toEqual(["run-stage-deltas, decision-option-previews"]);
+		expect(plain.asked).toEqual(["decision-option-previews"]);
 		plain.close();
 		expect(await opted.closed).not.toHaveProperty("reconnectWithinMs");
 	});
@@ -457,8 +391,8 @@ describe("Agent connection client", () => {
 			signal: controller.signal,
 		});
 		expect(asked).toMatchObject({ type: "input-result", status: "cancelled" });
-		client.reportRuns("s", { active: [], paused: [], cards: [] });
-		await server.next("runs");
+		client.send({ type: "detach" });
+		await server.next("detach");
 		expect(server.received.some(message => message.type === "input-request")).toBe(false);
 	});
 
@@ -473,9 +407,6 @@ describe("Agent connection client", () => {
 				context.emit({ type: "error", error: long });
 				throw new Error(long);
 			},
-			control() {
-				throw new Error(long);
-			},
 		});
 		server.send({ type: "start", session: "s", mode: "planner" });
 		expect((await server.next("start-failed")).message).toHaveLength(MAX_LINK_NOTE_LENGTH);
@@ -485,10 +416,7 @@ describe("Agent connection client", () => {
 		let ended = await server.next("turn-end");
 		expect(ended).toMatchObject({ status: "failed" });
 		expect(ended.message).toHaveLength(MAX_LINK_NOTE_LENGTH);
-		server.send({ type: "stop", request: "r", session: "s" });
-		expect((await server.next("control-result")).message).toHaveLength(MAX_LINK_NOTE_LENGTH);
-		expect(client.send({ type: "runs", session: "s", active: [], paused: [], cards: [] }))
-			.toBe(true);
+		expect(client.send({ type: "detach" })).toBe(true);
 	});
 
 	it("offers steer-turn only to a client that can steer, and gives a steer to the running turn", async () => {
@@ -525,6 +453,179 @@ describe("Agent connection client", () => {
 			ok: true,
 		});
 		expect(steered).toEqual(["@bo: Also X"]);
+	});
+
+	it("asks for session-choice only when told to, and hands a session's start its chosen model", async () => {
+		let capabilities = {
+			models: { available: [{ id: "acme/large", name: "Large", thinkingLevels: ["high"] }] },
+		};
+		let plain = fakeServer();
+		let unasked = await connectAgent({
+			url: plain.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {} },
+			capabilities,
+		});
+		stops.push(() => unasked.detach());
+		expect(plain.asked[0]).toContain("capability-catalog");
+		expect(plain.asked[0]).not.toContain("session-choice");
+
+		let server = fakeServer({ features: ["capability-catalog", "session-choice"] });
+		let started = Promise.withResolvers<ServerMessageOf<"start">>();
+		let client = await connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {}, start: message => started.resolve(message) },
+			capabilities,
+			sessionChoice: true,
+		});
+		stops.push(() => client.detach());
+		expect(server.asked[0]?.split(", ")).toEqual(
+			expect.arrayContaining(["capability-catalog", "session-choice"]),
+		);
+		expect(client.features).toEqual(["capability-catalog", "session-choice"]);
+		server.send({
+			type: "start",
+			session: "s",
+			mode: "planner",
+			model: "acme/large",
+			thinkingLevel: "high",
+		});
+		expect(await started.promise).toMatchObject({ model: "acme/large", thinkingLevel: "high" });
+		await server.next("started");
+	});
+
+	it("asks for ai-credentials only with an ai handler, and hands it a session's new grants", async () => {
+		let plain = fakeServer();
+		let unasked = await connectAgent({
+			url: plain.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {} },
+		});
+		stops.push(() => unasked.detach());
+		expect(plain.asked[0]).not.toContain("ai-credentials");
+
+		let ai = {
+			launch: "chopin_launch_x",
+			expiresAt: 1_700_000_000_000,
+			providers: [{
+				provider: "anthropic",
+				baseUrl: "https://chopin.example/api/v1/ai/anthropic",
+				placeholder: "chopin_ai_x",
+				keyVariable: "ANTHROPIC_API_KEY",
+			}],
+			withheld: [],
+		};
+		let server = fakeServer({ features: ["ai-credentials"] });
+		let started = Promise.withResolvers<ServerMessageOf<"start">>();
+		let changed: Array<ServerMessageOf<"ai">> = [];
+		let client = await connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			handlers: {
+				turn() {},
+				start: message => started.resolve(message),
+				ai: message => void changed.push(message),
+			},
+		});
+		stops.push(() => client.detach());
+		expect(server.asked[0]?.split(", ")).toContain("ai-credentials");
+		// Grants for a session the client does not hold are not its own.
+		server.send({ type: "ai", session: "other", ai });
+		server.send({ type: "start", session: "s", mode: "planner", ai });
+		expect((await started.promise).ai).toEqual(ai);
+		await server.next("started");
+		let ended = { providers: [], withheld: [] };
+		server.send({ type: "ai", session: "s", ai: ended });
+		for (let deadline = Date.now() + 2000; !changed.length; await Bun.sleep(5)) {
+			if (Date.now() > deadline) throw new Error("The grants never arrived.");
+		}
+		expect(changed).toEqual([{ type: "ai", session: "s", ai: ended }]);
+	});
+
+	it("asks for ai-catalog only with ai and aiCatalog handlers, asks for the link's catalog grants once attached, and hands them over", async () => {
+		let credentialsOnly = fakeServer({ features: ["ai-credentials"] });
+		let plain = await connectAgent({
+			url: credentialsOnly.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {}, ai() {} },
+		});
+		stops.push(() => plain.detach());
+		expect(credentialsOnly.asked[0]?.split(", ")).not.toContain("ai-catalog");
+
+		let ai = {
+			launch: "chopin_launch_c",
+			expiresAt: 1_700_000_000_000,
+			providers: [{
+				provider: "github-copilot",
+				baseUrl: "https://chopin.example/api/v1/ai/github-copilot",
+				placeholder: "chopin_ai_c",
+				keyVariable: "COPILOT_GITHUB_TOKEN",
+			}],
+			withheld: [],
+		};
+		let server = fakeServer({ features: ["ai-credentials", "ai-catalog"] });
+		let handed: Array<ServerMessageOf<"ai-catalog">> = [];
+		let client = await connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			handlers: { turn() {}, ai() {}, aiCatalog: message => void handed.push(message) },
+		});
+		stops.push(() => client.detach());
+		expect(server.asked[0]?.split(", ")).toContain("ai-catalog");
+		expect(await server.next("ai-catalog")).toEqual({ type: "ai-catalog" });
+		server.send({ type: "ai-catalog", ai });
+		for (let deadline = Date.now() + 2000; !handed.length; await Bun.sleep(5)) {
+			if (Date.now() > deadline) throw new Error("The catalog grants never arrived.");
+		}
+		expect(handed).toEqual([{ type: "ai-catalog", ai }]);
+	});
+
+	it("asks for catalog-launches only when told to, with ai-catalog, and names a report's launch only to a server that accepted it", async () => {
+		let catalog = { models: { available: [{ id: "acme/large", name: "Large" }] } };
+		let handlers = { turn() {}, ai() {}, aiCatalog() {} };
+		let unasked = fakeServer({ features: ["capability-catalog", "ai-credentials", "ai-catalog"] });
+		let plain = await connectAgent({
+			url: unasked.url,
+			token: "t",
+			document: "d",
+			capabilities: catalog,
+			handlers,
+		});
+		stops.push(() => plain.detach());
+		expect(unasked.asked[0]?.split(", ")).not.toContain("catalog-launches");
+		await unasked.next("capabilities");
+		// A server that did not accept the feature is never sent the field.
+		expect(plain.report(catalog, "c-1")).toBe(true);
+		expect(await unasked.next("capabilities")).toEqual({ type: "capabilities", catalog });
+
+		let server = fakeServer({
+			features: ["capability-catalog", "ai-credentials", "ai-catalog", "catalog-launches"],
+		});
+		let client = await connectAgent({
+			url: server.url,
+			token: "t",
+			document: "d",
+			capabilities: catalog,
+			catalogLaunches: true,
+			handlers,
+		});
+		stops.push(() => client.detach());
+		expect(server.asked[0]?.split(", ")).toContain("catalog-launches");
+		// The report sent on attach names no launch: nothing was listed through one yet.
+		expect(await server.next("capabilities")).toEqual({ type: "capabilities", catalog });
+		expect(client.report(catalog, "c-1")).toBe(true);
+		expect(await server.next("capabilities")).toEqual({
+			type: "capabilities",
+			catalog,
+			catalogLaunch: "c-1",
+		});
 	});
 
 	it("answers a steer for a turn that has ended, or that its handler refuses, with ok false", async () => {

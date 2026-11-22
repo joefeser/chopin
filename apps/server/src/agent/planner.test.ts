@@ -81,28 +81,55 @@ test("a remote Planner learns where it runs and that its questions become Decisi
 	let prompt = plannerInstructions("octo-org/score", "Earlier context.", { remote: true })
 		.replace(/\s+/g, " ");
 	expect(prompt).toContain("You run in a member's own session on their machine");
-	expect(prompt).toContain("questions appear to the document's members as Decisions");
-	expect(prompt).toContain("**Stop Planner** pauses it");
+	expect(prompt).toContain(
+		"Every question asked in your session appears to the document's members as a Decision",
+	);
 	expect(prompt).not.toContain("You have no shell");
 	expect(prompt).not.toContain("Your working directory");
-	// The member's own Atomic decides how its `intercom` asks wait.
+	// The client decides how long its own asks of other sessions wait.
 	expect(prompt).not.toContain("budgetMs");
 	expect(prompt.endsWith("Earlier context.")).toBe(true);
 });
 
-test("a Planner with workflows says a Build's tasks show under Build, not as cards in Chat", () => {
-	for (
-		let workspace of [{ remote: true } as const, { cwd: "/tmp/chopin-test", checkout: false }]
-	) {
-		let prompt = plannerInstructions("octo-org/score", undefined, workspace).replace(/\s+/g, " ");
-		// Chat's cards are for the workflow runs the Planner starts; a Build has none.
-		expect(prompt).toContain("Chat shows a card for each workflow run you start");
-		expect(prompt).not.toContain("Chat shows a card for each run");
-		expect(prompt).toContain(
-			"A Build is not a workflow run, and Chat shows no card for a Build or its tasks",
-		);
-		expect(prompt).toContain("under **Build**, beside Decisions");
+test("a remote Planner is told of no runs, and that a Build's tasks show under Build", () => {
+	let prompt = plannerInstructions("octo-org/score", undefined, { remote: true })
+		.replace(/\s+/g, " ");
+	// Chat shows no run cards, and a client may have neither tool.
+	expect(prompt).not.toMatch(/\brun cards?\b|a card for each run|Resume Planner|Stop Planner/);
+	expect(prompt).not.toContain("`workflow`");
+	expect(prompt).not.toContain("`intercom`");
+	expect(prompt).not.toContain("/workflow");
+	expect(prompt).toContain("Chat shows no card for a Build or its tasks");
+	expect(prompt).toContain("under **Build**, beside Decisions");
+});
+
+test("an Atomic Planner is told of no workflow, and that a Build's tasks show under Build", () => {
+	let prompt = plannerInstructions("octo-org/score", undefined, {
+		cwd: "/tmp/chopin-test",
+		checkout: false,
+	}).replace(/\s+/g, " ");
+	expect(prompt).not.toContain("`workflow`");
+	expect(prompt).not.toContain("workflow run");
+	expect(prompt).not.toContain("/workflow");
+	expect(prompt).toContain(
+		"`ask_user_question` questions appear to the document's members as Decisions",
+	);
+	expect(prompt).toContain("Chat shows no card for a Build or its tasks");
+	expect(prompt).toContain("under **Build**, beside Decisions");
+});
+
+test("an Atomic Planner is told of no Intercom, and only a thread's of tell_chat_planner", () => {
+	let workspace = { cwd: "/tmp/chopin-test", checkout: false };
+	let chat = plannerInstructions("octo-org/score", undefined, workspace).replace(/\s+/g, " ");
+	let thread = plannerInstructions("octo-org/score", undefined, workspace, false, true)
+		.replace(/\s+/g, " ");
+	for (let prompt of [chat, thread]) {
+		expect(prompt).not.toContain("intercom");
+		expect(prompt).toContain("cannot edit files, run commands or reach other sessions");
 	}
+	expect(chat).not.toContain("tell_chat_planner");
+	expect(thread).toContain("You answer in a thread of this document's Chat");
+	expect(thread).toContain("Use `tell_chat_planner` as its description says");
 });
 
 test("ordinary guidance supplies an executable numerical chart example", () => {

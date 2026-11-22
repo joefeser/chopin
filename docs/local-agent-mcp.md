@@ -141,6 +141,73 @@ and optionally an absolute checkout path:
 The instruction must contain non-whitespace text and fit within 64 KiB in UTF-8;
 its text is preserved verbatim.
 
+### Retrying safely
+
+A caller that must deliver an instruction once, such as an automated hand-off,
+can pass an `idempotencyKey`, a nonblank string of at most 128 characters:
+
+```json
+{
+	"id": "/documents/octo-org/score/release-readiness",
+	"instruction": "Run the planning workflow and ask blocking questions in Decisions.",
+	"idempotencyKey": "release-readiness-handoff-1"
+}
+```
+
+A retry with the same key and the same request returns the first call's result
+unchanged, even if the document was renamed since, and posts nothing. The request
+is the instruction text, `as`, and the document the call names, by UUID or URL. A
+different request under a used key is refused with `idempotency-conflict` and
+posts nothing. A key belongs to its caller and its document: another account, or
+the same account on another document, can use the same key without meeting yours.
+`invoke_planner`'s input schema in `tools/list` declares `idempotencyKey`; a
+client that finds it there can rely on this behaviour.
+
+Chopin records the key before it posts the instruction, and records that the
+instruction was delivered only once it reached a turn: its own Planner turn
+started, or the person's turn running took it. A keyed call waits for that, so it
+can take longer than a call without a key: behind a background job, until the job
+has given way. It answers with the document only after the record is saved, and a
+retry that finds the record answers the same: it never reports an instruction that
+reached no turn. Whatever fails, retrying the same request under the same key posts
+the instruction at most once:
+
+- If the instruction was never posted, the retry posts it and starts its turn.
+- If it was posted and reached no turn, the call is refused with
+  `planner-unavailable`. That happens when the turn it was given to ended or was
+  stopped before taking it and another turn holds the Chat, when the server began
+  stopping before the turn waiting behind a background job could start, or when
+  the document's Chat closed first (the document was archived or closed, or a save
+  failed). The retry starts its turn without posting it again, gives it to the turn
+  running, or returns the refusal that stops it now.
+- If it was given to the turn running and that turn's machine did not confirm
+  taking it (the confirmation timed out, or the connection or the Chat closed
+  first), the instruction may already have been read. The call is refused with
+  `planner-unavailable` and a `message` saying so, the key records that, and every
+  retry under the key gets the same answer: the instruction is never given again,
+  to that turn or to a new one. To send it again, use a new key.
+- If it was posted and its turn did not start for another reason (the server
+  stopped first, or refused the turn), the retry does the same.
+- If its turn started and the start was recorded, the retry returns the first
+  result. A turn that a restart interrupted is not run again, as for any other
+  instruction.
+- If its turn started but recording the start failed, the call fails. A retry to
+  the same server process records the start and starts no second turn.
+
+One case can deliver it twice: the server process stops after the instruction
+reached a turn, or was given to one without a confirmation, and before that was
+recorded (one storage write), or after recording it failed and before a retry
+recorded it. The next process cannot tell that from an instruction that reached
+no turn, so a retry delivers it again. The turn the stopped process started was
+interrupted with it.
+
+A refusal that posted nothing, such as `planner-not-attached`, `planner-busy` or
+`system-turn-forbidden`, leaves the key free, so a corrected request can use it.
+A different request under a key whose instruction was posted, even if its turn
+never started, is refused with `idempotency-conflict`. Chopin keeps a key for 7
+days, and deletes a document's keys with the document. Calls without a key post
+their instruction every time.
+
 `checkout` applies only when the server runs `HARNESS=atomic`, where the Planner
 is a [full Atomic session](hosted-agent.md#full-atomic-planner) with **shell and
 filesystem access as the server process's user**. The path is on the Chopin
@@ -154,33 +221,36 @@ neither verified, used, nor remembered.
 
 The result contains `id`, `title`, and the canonical `url` (plus any generated
 `description`). It returns after the instruction is durably posted, not after the
-Planner finishes. The message joins the existing Planner queue if busy. Progress
-and results appear in the document and Chat; questions appear in Decisions. Under
+Planner finishes; with an `idempotencyKey`, once the instruction has reached a turn
+(see [Retrying safely](#retrying-safely)). While a turn runs, the instruction is given to it or refused
+with `planner-busy` (see below); nothing waits in a queue. Progress and results
+appear in the document and Chat; questions appear in Decisions. Under
 `atomic`, Atomic input waits in Decisions until a member answers it or it is
 withdrawn, however long that takes. The
 browser need not already have the document open: Chopin keeps its room alive
-while the invoked turn and queue run. An interrupted turn is not replayed
+while the invoked turn runs. An interrupted turn is not replayed
 automatically on restart.
 
 ### Automatic follow-ups
 
-Some instructions are not something anyone said. A client that watched a
-workflow run finish, for example, wants the Planner to update the document from
-its results. Add `"as": "system"` for those:
+Some instructions are not something anyone said. A client whose own long task
+finished, for example, wants the Planner to update the document from its
+results. Add `"as": "system"` for those:
 
 ```json
 {
 	"id": "/documents/octo-org/score/release-readiness",
-	"instruction": "The workflow run finished. Read its results and update the document.",
+	"instruction": "The benchmark finished. Read its results and update the document.",
 	"as": "system"
 }
 ```
 
 Chat then shows a short system notice, `Automatic follow-up requested by
 @octocat.`, instead of a message from you. The instruction goes to the Planner
-alone and stays out of the visible queue while it waits. Ownership,
-`planner-not-attached`, the queue, `checkout`, and the result work as for any
-other instruction.
+alone. It needs a turn of its own, so it is refused with `planner-busy` while a
+turn runs. Ownership, `planner-not-attached`, `checkout`, `idempotencyKey`, and
+the result work as for any other instruction. A retry that finds its notice
+already posted is not counted against the hourly limit again.
 
 Only the document's creator, or the account whose client holds its Planner
 under `HARNESS=remote`, may send one; for a child document that means its root.
@@ -199,7 +269,11 @@ Refusals return an object with `code`, and `planner-not-attached` also a
   as the MCP account, or ask the owner to sign in again.
 - `checkout-unverified`: under `atomic`, correct the supplied path or its
   repository origin.
-- `planner-unavailable`: the Planner is disabled or the room is closing.
+- `planner-unavailable`: the Planner is disabled or the room is closing, or, for a
+  call with an `idempotencyKey`, its posted instruction reached no turn; call again
+  with the same key. With a `message`, the running turn's machine did not confirm
+  taking it, so it may have been read and is not sent again under that key (see
+  [Retrying safely](#retrying-safely)).
 - `planner-busy`: a turn is running and cannot be given the instruction. A message-like call is
   given to the running turn when its harness takes input mid-run, and refused with this code
   when it does not (the Copilot SDK); a background job's turn gives way to it instead, and its
@@ -210,6 +284,8 @@ Refusals return an object with `code`, and `planner-not-attached` also a
   document's creator or the account holding its Planner.
 - `system-turn-limited`: the document has taken 10 automatic follow-ups in the
   past hour; try again later.
+- `idempotency-conflict`: the `idempotencyKey` was used with a different
+  request on this document; see [Retrying safely](#retrying-safely).
 - `document-unavailable`, `document-archived`, and `repository-forbidden` retain
   their ordinary document/access meanings.
 
@@ -353,7 +429,8 @@ own upload of the image, so a card never shows an image from another document.
 `list_documents` excludes archived documents by default. Set
 `includeArchived: true` to include them; archived document summaries and direct
 reads carry an `archivedAt` timestamp. Archiving and restoring are idempotent.
-MCP does not expose document deletion.
+MCP does not expose document deletion: deleting is permanent, and only a person
+who sees what goes with a document confirms it, in the browser.
 
 ## Generated descriptions
 

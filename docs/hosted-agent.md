@@ -42,27 +42,36 @@ The server owns what can be chosen, never the browser. It builds a catalog from 
 sends it to the room in `chat:model` (with the stored choice) when somebody joins and when either
 changes:
 
-| Harness                     | Catalog                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Applied by                                                                                                                                                                                                                                                     |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `atomic`                    | The models of the Atomic model runtime the adapter builds: every chat model it has credentials for that `HARNESS_AUTH` would run, as `provider/model`, in the order the runtime reports them (the picker groups them by provider, in the order each first appears, and a model it reports twice is listed twice, a choice of that id being the first entry's), with each model's thinking levels as Atomic reads them (`xhigh` and `max` only where the model maps them) and its context size as the description. `MODEL` is the default. | The turn's `model` and `thinkingLevel`, set on the session; with no level chosen the model runs its own (the level saved for it in the operator's Atomic settings, else their default level, else `medium`), whichever model or level the session held before. |
-| `remote`                    | What the attached client reported in its [capability catalog](agent-connection.md#capability-catalog), with `MODEL` as the default when set. An older client, or one that reports no models, offers none.                                                                                                                                                                                                                                                                                                                                 | `model` and `thinkingLevel` in the `turn` message; the level only to a client that offered `capability-catalog`.                                                                                                                                               |
-| `copilot-sdk` and any other | None: the composer offers no control, because a choice nobody honors is not offered.                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Not applicable.                                                                                                                                                                                                                                                |
+| Harness                     | Catalog                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Applied by                                                                                                                                                                                                                                                                                                                     |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `atomic`                    | The models of the Atomic model runtime the adapter builds: every chat model it has credentials for that `HARNESS_AUTH` would run, as `provider/model`, in the order the runtime reports them (the picker groups them by provider, in the order each first appears, and a model it reports twice is listed twice, a choice of that id being the first entry's), with each model's thinking levels as Atomic reads them (`xhigh` and `max` only where the model maps them) and its context size as the description. `MODEL` is the default. | The turn's `model` and `thinkingLevel`, set on the session; with no level chosen the model runs its own (the level saved for it in the operator's Atomic settings, else their default level, else `medium`), never one an earlier turn set.                                                                                    |
+| `remote`                    | What the attached client reported in its [capability catalog](agent-connection.md#capability-catalog), with `MODEL` as the default when set. An older client, or one that reports no models, offers none. A client on people's AI accounts that offered `ai-catalog` reports the models of the account it runs on as soon as it attaches, before any turn ([Listing models before a session](agent-connection.md#listing-models-before-a-session)).                                                                                       | `model` and `thinkingLevel` in the `turn` message; the level only to a client that offered `capability-catalog`. With `session-choice` too, also in `start` and `fork`, so a session the client makes starts on them. Where nobody chose a model, `model` is `MODEL` when set; a field left out runs the client's own default. |
+| `copilot-sdk` and any other | None: the composer offers no control, because a choice nobody honors is not offered.                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Not applicable.                                                                                                                                                                                                                                                                                                                |
 
 The thinking level is a field of the turn the harness is given, beside `model` (`PlannerTurn` in
 `apps/server/src/harness/turn-level.ts`). `HarnessAgent` builds a turn from a fixed set of fields
 that has none for it, so the call that starts a Planner turn carries the level and the harness
-wrapper puts it on that turn; no turn can see another's, and a background job's turn has none.
+wrapper puts it on that turn; no turn can see another's.
 
 `chat:model` checks a choice against the catalog reported now, stores it under the writer lease
 and only then answers the sender and tells the room. It refuses a model or a level the catalog
 does not list (whatever its spelling or length: only the catalog decides, and what it lists is
 stored as written), a field that is not a string, a choice for a child document
 (which uses its root's), and every choice where no catalog is offered; choosing nothing goes back
-to the default. Every Planner turn a person started resolves the stored choice again. A model that
-has gone, or a level its model no longer lists, is not sent: the default runs, Chat says so once
+to the default. Every Planner turn resolves the stored choice again: one a person typed, one nobody
+did (initiative, readiness, decision follow-ups, a finished run) and a background job's alike. A
+Planner session that has to be made again (after a crash, a restart, a reset, or a link that could
+not resume) is opened with it too, so its first turn runs the chosen model and level, never the
+harness's default, and making it again never changes what is stored. A remote client that offered
+`session-choice` is told it in [`start` and `fork`](agent-connection.md#server-to-client), so a
+session it makes opens on it; each turn still carries its own, and one that names none, after a
+person chose Default or cleared the level, runs the default (`MODEL` for the model where it is set,
+else the client's own). A session opened, or a turn started, while an attached client has yet to
+report its catalog, such as the first after a restart, waits up to 10 seconds for the report rather
+than falling back for want of it. A model that has gone, or a level its model no longer lists, is not sent: the default runs, Chat says so once
 while the reason stands (and again if it changes, or comes back after the choice was honored), and
 the composer shows what will run. The stored choice is
-kept, so it returns to force if the model does. Background jobs never carry a choice.
+kept, so it returns to force if the model does.
 
 The composer says so even where nothing can be chosen any longer. When a client withdraws all its
 models, or an older client takes its place, there is no catalog and the picker is gone, but the
@@ -78,6 +87,54 @@ choice: that has happened, Chat says it, and the room is told the choice without
 same fallback above the composer. A report that comes later, or
 another client, starts again from what it reports. A person who can only read the document sees
 none of it.
+
+While what a remote Planner offers is unknown, each person is sent, in their own `chat:model`
+only, the models of their own AI accounts, `accounts`, or where Chopin can list none of them,
+`lastKnown`. `accounts` is what an Atomic agent on a launch for them would list, computed by Chopin
+itself with no agent and no machine (`ai/account-models.ts`): Atomic's own model runtime, run in the
+server with no network, given the public model catalog Chopin serves agents (held for ten minutes,
+one copy for the proxy and these lists), Copilot's model list for their account and a stand-in in
+place of every key, exactly as a Planner's runtime is given them through the proxy, so it keeps
+Copilot's models to those the account's list enables and adds the ones only its list has.
+Copilot's list is the body of the `GET /models` the access check already reads for a GitHub token
+Copilot takes itself (read with the headers Atomic reads it with), kept with GitHub's answer and
+never sent to the browser; for a Copilot token GitHub gave, it is read from the account's own
+Copilot host with that token, under the same rules as the proxy's sends, and a body that carries
+the token is dropped. Copilot is left out of the list until its list has been read, as a Planner
+leaves it out. The list is computed when someone opens a document, held per person for two
+minutes, computed again behind the one held for half an hour after that, and dropped when their
+credentials change; a composer that would wait more than 400 ms for it is told it once it is
+ready. Its default is the model of their list from last time, where it offers that model. The
+composer shows it at once with a light note that the models are from their AI accounts.
+`lastKnown` is the models a Planner of the document last reported for that person's own account,
+else the last any Planner reported for that account on any document, and when (`planner_catalogs`,
+one row per document and account, saved under the writer lease whenever an attached client
+reports models that differ from the last saved). No one else is sent another account's list, and
+nothing is sent once the offer is known, whatever it is. The composer shows that list at once,
+marked as the list from last time, so its model pill does not wait on a machine that starts the
+Planner, often after its 30 idle minutes, or on one that can't. The live catalog replaces either,
+unmarked, as soon as it arrives. The server checks a choice against the catalog alone, never
+against `accounts` or `lastKnown`: a choice made while
+the offer is unknown waits for an attached client to report (as a turn does, at most ten
+seconds), is saved only if what it reports offers it, and with nothing attached to
+wait for is refused (_The machine's models are still loading, so this choice wasn't saved. Choose
+again once they're in._). A turn checks the stored choice against the catalog it runs with, as it
+always has.
+
+A client on people's AI accounts lists its models through the link's catalog launch, so what it
+reports is of the accounts that launch was prepared for. The moment its person's AI accounts change
+(they connect, replace or remove a provider, a key is refused, GitHub confirms their Copilot seat lost
+or back), the link stops counting it (`AgentLink.catalog`): what the client offers is unknown again,
+each person is told their own accounts' list as above, the account's list is computed afresh for
+the new credentials (never the one held for the old) and told to their open composers, a list kept
+from before the change is not their `lastKnown` (in this process), and a choice waits for the
+client's report as on attach. Its commands stay. Only a report made through a catalog launch
+prepared since the change counts again: a client that offers `catalog-launches` names the launch
+each report was listed through, and a late one through the old launch, or one naming none, changes
+nothing; for a client that doesn't, a report counts once the new launch has been handed, and the
+room is told it needs an update (`waiting.outdated`: _The machine needs an update to switch AI
+accounts._), with picks refused in those words and nothing waiting for it. See
+[When the person's accounts change](agent-connection.md#when-the-persons-accounts-change).
 
 A turn that cannot read the choice at all (the catalog or the stored choice fails to load) never
 runs the default silently. It runs the default, Chat says once, while that holds, that the
@@ -95,11 +152,11 @@ The same `chat:model` carries `commands`: what `/` offers in Chat besides Chopin
 (`/research`), each with a `name`, a `kind` and a one-line `description`. Only the document's own
 Planner supplies them, read each time somebody joins or the state changes:
 
-| Harness                     | Commands                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `atomic`                    | What an Atomic session in the Planner's working directory finds: its prompt templates (`prompt`), its skills (`skill`, named `skill:name`, as Atomic invokes them) and the workflows registered for it (`workflow`). The session is built as a Planner's is, in the operator's agent directory and the checkout, and ended at once; nothing goes to a model. It is read once for 30 seconds per directory, however many people join. Atomic's own extension commands are not offered. |
-| `remote`                    | What the attached client reported in its [capability catalog](agent-connection.md#capability-catalog), as written, and nothing once that client has left. An older client, or one that reports none, offers none, and so does a machine that is away.                                                                                                                                                                                                                                 |
-| `copilot-sdk` and any other | None.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Harness                     | Commands                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `atomic`                    | What an Atomic session in the Planner's working directory finds: its prompt templates (`prompt`) and its skills (`skill`, named `skill:name`, as Atomic invokes them). The session is built as a Planner's is, in the operator's agent directory and the checkout, and ended at once; nothing goes to a model. It is read once for 30 seconds per directory, however many people join. Atomic's own extension commands are not offered. |
+| `remote`                    | What the attached client reported in its [capability catalog](agent-connection.md#capability-catalog), as written, and nothing once that client has left. An older client, or one that reports none, offers none, and so does a machine that is away.                                                                                                                                                                                   |
+| `copilot-sdk` and any other | None.                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 
 The list is the document's Planner's alone. A remote Planner's commands are held with its attached
 link, so another person's machine, or an earlier client of the same document, never shows its own.
@@ -116,10 +173,9 @@ command.` A command goes to the Planner; sent to the room it is refused. The ref
 with the message (the same persisted shape as a document reference, so a saved request keeps
 it across a restart) and the Planner's turn is built from it:
 
-| Kind                            | The turn's prompt                                                                                                                                                                                                         |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `skill`, `prompt` and any other | Atomic's own invocation, `/name args`, alone: the room's earlier words and the focused child's line wait for the next turn (a fresh session has them in its instructions), so the prompt opens with the `/`.              |
-| `workflow`                      | A request, in the person's turn as any message is, to start the registered workflow by name with the workflow tool's run action; the words after the chip are given as its input, said to be data and not an instruction. |
+| Kind                            | The turn's prompt                                                                                                                                                                                            |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `skill`, `prompt` and any other | Atomic's own invocation, `/name args`, alone: the room's earlier words and the focused child's line wait for the next turn (a fresh session has them in its instructions), so the prompt opens with the `/`. |
 
 Chopin's own commands (`/research`) keep their behaviour: they are never sent to the Planner, and
 the Planner's list never replaces them. A command in a queued message is not checked again when its
@@ -175,8 +231,8 @@ Saving an anchored Planner decision durably queues a scoped prose update, indepe
 conversation-analysis flags. It uses the complete saved answers affecting that passage and
 updates only its explicit target. Applied answer generations commit with the source, so an
 interrupted retry cannot write them twice. Lost or ambiguous targets refuse safely. Edits
-elsewhere in the document between the job's read of its passage and its write, such as a
-workflow run publishing its plan or another decision's update, do not refuse the write: it
+elsewhere in the document between the job's read of its passage and its write, such as an
+attached client publishing its plan or another decision's update, do not refuse the write: it
 lands when its passage, headings and saved answers are still the ones it read. A write-up that
 still fails says why on its card in plain words, beside Retry. Work waits
 for an existing authorized Planner owner; it never claims ownership from a viewer or saver.
@@ -244,6 +300,14 @@ With `as: "system"` the call is an
 system notice naming the caller instead of their message, and the instruction
 goes to the Planner alone. Only the document's creator or the account holding
 its Planner may send one, at most 10 an hour per document.
+A call with an `idempotencyKey` claims the key before its instruction is posted,
+naming the Chat entry the instruction becomes, and records the delivery once the
+instruction reached a turn (its own turn started, or the person's turn running took
+it), before it answers; one that reached none is refused with `planner-unavailable`,
+and one given to a running turn whose machine did not confirm it is recorded as
+uncertain and never delivered again under the key. A retry returns the first result, starts the
+turn of an instruction that was posted without one, and never posts it twice
+([Retrying safely](local-agent-mcp.md#retrying-safely)).
 Under `HARNESS=remote` only attaching claims ownership. An `@chopin` message or
 `invoke_planner` call for a document without an attached Planner is refused with
 `planner-not-attached`, and with one it runs as a turn on that Planner under its
@@ -306,6 +370,9 @@ Chopin's tools available to the Planner under every harness are:
   [pages like `read_plan`](#reading-a-large-document). They are
   never offered to background jobs, and unexpected storage errors reach the
   model only as a generic message;
+- `create_document`, which makes new top-level documents for the person whose
+  message drives the turn (see [Creating documents](#creating-documents)); it is
+  never offered to background jobs;
 - bounded file and tree reads plus commit history using the session's default
   branch, or an explicitly supplied full commit ID when inspecting investigation evidence;
 - repository-scoped code search, post-filtered by repository node ID; and
@@ -376,7 +443,7 @@ against GitHub or independently inspect the coding agent's checkout.
 Under `HARNESS=atomic` the Planner is a [full Atomic session](#full-atomic-planner),
 but the summary and research workers each still own one isolated in-process
 Atomic `AgentSession`. It is built with every shipped Atomic package disabled
-(workflows, subagents, MCP, web access, and Intercom). It has no Atomic coding
+(subagents, MCP, web access, and Intercom). It has no Atomic coding
 tools, and its resource loader discovers no extensions, skills, prompt
 templates, themes, or context files. Its working and configuration directory is
 an empty private temporary directory, and its session, settings, and
@@ -390,15 +457,17 @@ model again before every model request.
 ## Full Atomic Planner
 
 Under `HARNESS=atomic` every Planner session is a full Atomic session, in local
-and hosted deployments alike, with no separate flag. The workflows it starts
-get shell and filesystem access **as the server process's user**, not a sandbox
+and hosted deployments alike, with no separate flag. The Atomic extensions, MCP
+servers and tools it loads run **as the server process's user**, not in a sandbox
 confined to a repository. Operators who do not want that should use
 `copilot-sdk`. Both `HARNESS_AUTH=auto` and `ai-gateway` work, under
 their usual [bind rules](self-hosting.md#choose-and-trust-a-harness).
 
 The Planner's own turns offer only read-only tools beside Chopin's document and
 repository tools: `read`, `find` and `search` for the working directory,
-Atomic's web research tools, `ask_user_question`, `workflow`, and `intercom`,
+Atomic's web research tools, `ask_user_question` and `codemode` (in a Chat
+thread, also `tell_chat_planner`; see
+[What a thread decided reaches the Chat](#what-a-thread-decided-reaches-the-chat)),
 plus the read-only tools the operator names in `chopin.plannerTools` of the
 agent directory's `settings.json`, such as a code search tool a package
 registers:
@@ -410,10 +479,14 @@ registers:
 Only the operator's file counts: a checkout's `.atomic/settings.json` can't add
 tools to a Planner, and a name that edits files, runs commands or starts agents
 (`bash`, `edit`, `write`, `kill`, `subagent`, `todo`) stops the Planner from
-starting. It cannot edit files, run commands, or start subagents itself, so it
-never implements the plan; a workflow it starts keeps the tools its stages
-declare. Atomic's workflows, MCP, web access, and Intercom run alongside
-Chopin's tools. The normal Atomic
+starting. It cannot edit files, run commands, or start subagents: its turns refuse
+those tools however they are reached, a codemode script's call included, so it
+never implements the plan. Atomic has no workflows since 0.10, so a Planner starts
+none. Atomic's MCP and web access run alongside Chopin's tools.
+Atomic's `intercom` is never offered to a Planner's turns, and they refuse it
+even from a codemode script, even when the operator names it in
+`chopin.plannerTools`: its model would choose the sessions and groups it
+reaches, so one document's Planner could list or message another's. The normal Atomic
 agent directory (including `ATOMIC_CODING_AGENT_DIR` or the legacy
 `PI_CODING_AGENT_DIR` override) supplies extensions, skills, prompt templates,
 context files, and a read-only copy of its settings. A verified checkout's
@@ -421,14 +494,13 @@ context files, and a read-only copy of its settings. A verified checkout's
 packages installed for that project load too; the document's own directory
 has none. Paths in `HARNESS_EXTENSIONS` load in every Planner session as if
 passed to Atomic's `--extension` flag, so a package listed there adds its
-extensions, skills, and workflows without being installed in the agent
-directory. Tools those extensions register load but are not offered to the
-Planner's own turns unless they are named above; workflow stages still load
-them. Chopin's compaction, summary, and cache overrides still apply on top.
+extensions and skills without being installed in the agent directory. Tools
+those extensions register load but are not offered to the Planner's own turns
+unless they are named above. Chopin's compaction, summary, and cache overrides still apply on top.
 Chopin appends its Planner
 instructions to Atomic's assembled prompt. Session, settings, and model
-credentials remain in memory; Atomic's own enabled tools, extensions, MCP
-servers, and workflow journal can perform writes as the server process's user.
+credentials remain in memory; Atomic's own enabled tools, extensions and MCP
+servers can perform writes as the server process's user.
 Background summary and research workers still use the isolated sessions described
 above.
 
@@ -448,29 +520,66 @@ same tools in a directory Chopin keeps for that document alone under its per-use
 directory (`$XDG_STATE_HOME/chopin/planner/<document id>`, defaulting to
 `~/.local/state`; `~/Library/Application Support/Chopin/planner` on macOS;
 `%LOCALAPPDATA%\Chopin\planner` on Windows), with mode `0700`. It is never shared
-with another document, keeps what the Planner and its workflows write there
-across later sessions and server restarts, and is not placed in the shared
+with another document, keeps what is written there across later sessions and
+server restarts, and is not placed in the shared
 temporary directory. A symlink or file at that path is refused. The Planner's
 instructions state which case applies: a verified checkout, or an empty
 directory with no repository files, in which case it reads the repository through
 Chopin's repository tools.
 
-The Planner still does not implement the plan. When a member asks to implement it
-now, its instructions note that its `intercom` tool can reach other sessions on
-the same machine, such as one working in a checkout of the document's
-repository, and that it can pass the request to one of them and tell the member
-where the work continues. Chopin does not track or verify that handoff.
+The Planner still does not implement the plan, and it cannot hand the request
+to another session. When a member asks to implement it now, its instructions
+tell it to say so and offer to prepare the task graph instead.
 
-An Intercom `ask` returns once it is delivered and waits only Atomic's automatic
-yield, a few seconds, for the reply. Chopin starts no turn it did not ask for, so
-a reply that arrives after the turn ends stays in the session unread until the
-next turn. The instructions therefore tell the Planner to ask with a foreground
-`wait` of up to ten minutes when it needs the answer for a member, such as when
-it checks on a workflow run.
+### What a thread decided reaches the Chat
+
+A Chat thread's Planner session is a fork of the Chat's session at the thread's
+root, and nothing said in the thread reaches the Chat's Planner by itself. Under
+`HARNESS=atomic` a thread's Planner turns are offered one more host tool,
+`tell_chat_planner`, its route to the Planner of the same document's Chat. It
+sends a short note: what was decided, by whom, and the thread it was decided in.
+The tool takes no target. The server fixes it from the thread's own document, so
+a Planner can reach only its own document's Chat Planner and never another
+document's. The route is Chopin's, not Atomic's Intercom broker: Atomic's
+Intercom delivers to a live session and starts a turn in an idle one, while a
+Chat Planner session lives only for its turn. Like every Planner, a thread's is
+not offered Atomic's `intercom` (see [Full Atomic Planner](#full-atomic-planner)),
+so `tell_chat_planner` is its only route to another session.
+
+The thread's Planner sends one note for each Decision card it asked in the
+thread that a person answered, naming the card, and the server refuses a second
+note for the same card. The server keeps the ids of the cards each thread's
+Planner asks with the thread (`ask_user_question`, `ask`, `open_decision` and
+`open_decisions` all count) and refuses a note naming a card asked anywhere
+else. The Planner may also note a choice a person settled in words that it acts
+on, and sends nothing when nothing was decided. The server checks that each
+person named took part in the thread or answered the card, and keeps at most 20
+unread notes per document. A note is saved with the Chat's session state before
+any Chat turn can be given it and before the tool says it was sent; one that
+could not be saved is reported as not sent and is never given to a turn. Every
+Chat turn reads the saved session state before it takes notes or saves the
+state, however it started (a browser message, a Retry, `invoke_planner`), so a
+turn in a room opened after a restart or eviction neither misses a waiting note
+nor forgets which cards were noted. The
+note starts no turn and is not posted in Chat. The Chat Planner's next turn is
+given every unread note, with the thread's words quoted as data rather than
+instructions: ahead of its prompt, or, when the turn opens with a skill or a
+prompt template that has to stand first, as a session message recorded before
+the command so later turns keep it. The notes a turn for a message was given are saved with the session
+state, so a Retry of that turn is given them again, after a restart too: ahead of the notes
+unread since, without counting them against the 20, and the Retry is then saved as given both,
+so a further Retry of the message is given the same notes.
+`copilot-sdk` and `remote` Planners are not offered the tool. The `[agent] N
+tools:` line logged as an Atomic Planner session opens lists what Atomic
+registered, `intercom` included; the line after it, `[agent] Planner withholds
+intercom; route out: …`, says its turns refuse `intercom` and names
+`tell_chat_planner` for a thread's Planner, or `none`.
 
 Chopin implements Atomic's `HostInput`, bound through
-`extensionBindings.humanInput`; it does not intercept tools. `ask_user_question`,
-extension dialogs, and workflow-stage input become ordinary shared Decisions:
+`extensionBindings.humanInput`; it does not intercept tools. Atomic names each
+request by its session and request id alone, and the binding belongs to the one
+Planner session that asks. `ask_user_question` and extension dialogs, and a
+remote client's workflow-stage input, become ordinary shared Decisions:
 
 - Questionnaires retain question and option order, multi-selection, and the
   exact text Atomic supplied; answers return their Atomic question indices and
@@ -483,14 +592,13 @@ extension dialogs, and workflow-stage input become ordinary shared Decisions:
   Atomic's own dialog accepts typed text (single-select without previews), and
   otherwise as typed `chat`, which Atomic delivers to the model as the member's
   inline message (blank `chat` text is Atomic's plain request to talk first).
-  Chopin never reports written text as a chosen option, and Atomic workflows
-  treat `chat` as a request to keep discussing, not approval.
+  Chopin never reports written text as a chosen option, and Atomic treats
+  `chat` as a request to keep discussing, not approval.
 - Confirm uses Yes/No; only choosing Yes approves. Select returns only a supplied
   choice. Input and editor use free-text cards; hints and initial editor text
   appear verbatim in the prompt. Explicitly submitted empty text is an answer,
   not cancellation.
-- Workflow cards show their question exactly as asked, with no run or stage
-  ids; Chat's run card shows which run is waiting on Decisions. A request that
+- A remote client's cards show their question exactly as asked. A request that
   names the block it concerns goes, as one adjacent batch, directly after that
   block and is linked to it (see
   [Agent connection questions](agent-connection.md#questions)). One that names
@@ -500,22 +608,19 @@ extension dialogs, and workflow-stage input become ordinary shared Decisions:
   cancellation by `@chopin`. Member cancellations retain any answers already
   given in that batch. Late submissions cannot approve withdrawn input.
 - A request has no time limit. It waits until members answer it or it is
-  withdrawn: the Planner stops, its run is cancelled, the document is archived
+  withdrawn: the Planner stops, the document is archived
   or deleted, or the asker's link closes for good, which includes its owner's
   sign-in ending. A lost connection is never such an end. A link that dropped
-  unexpectedly and offered `resumable-sessions` keeps its open questions and live
-  runs for its account to [resume](agent-connection.md#resuming-after-a-dropped-link)
+  unexpectedly and offered `resumable-sessions` keeps its open questions for its
+  account to [resume](agent-connection.md#resuming-after-a-dropped-link)
   however long it stays away: no timer, including `PLANNER_ATTACH_GRACE_MS`, ends
-  them. While it is away Chat shows the runs with their last status, marked
-  disconnected rather than stopped, and adds no line about the connection (the machine
-  button and the cards carry it); the Decisions stay open and answerable, their answers kept
-  for the client. A Stop pressed meanwhile, or sent and still unanswered when the link
-  dropped, is held for the client's return (the line that records the Stop says so) rather
-  than lost; Stop on
+  them. While it is away Chat adds no line about the connection (the machine
+  button carries it); the Decisions stay open and answerable, their answers kept
+  for the client. Stop on
   a Planner that only waits on a question withdraws it, and Chat says that. A
   document on **Default machine**
-  keeps its Planner running while that Planner is replying or waits on a question
-  or a live or paused workflow run, a disconnected Planner's kept work included, so
+  keeps its Planner running while that Planner is replying or waits on a question,
+  a disconnected Planner's kept work included, so
   nobody viewing the document does not withdraw it or cut its work short.
 - Cards an earlier Chopin closed unanswered after a fixed time stay in the
   document and in Decisions, among the resolved cards, marked
@@ -527,10 +632,8 @@ and option counts or header, question, label, description, and answer lengths.
 Only Chopin's aggregate bounds apply. A request whose cards would take the
 document past its 256 KiB source limit fails with that message before any card
 appears. A written answer is limited by one shared-draft edit (64 KiB) and the
-whole draft (256 KiB). Text is never silently truncated. Atomic keeps durable
-workflow approvals pending on withdrawal; Chopin does not automatically resume
-workflows or replay interrupted turns after a restart. A new Atomic session must
-explicitly resume a saved run.
+whole draft (256 KiB). Text is never silently truncated. Chopin does not replay
+interrupted turns after a restart.
 
 A coding agent can hand an instruction to the Planner with
 [`invoke_planner`](local-agent-mcp.md#hand-an-instruction-to-the-planner) under
@@ -564,7 +667,7 @@ message naming the problem.
 | `abort`                                               | `part` (text, reasoning, tool input, own tool call/result, finish-step, finish, error) |
 | `host-tool-result`                                    | `host-tool-call`                                                                       |
 | `input-result` (answered, expired, cancelled, failed) | `input-request`, `input-cancel`                                                        |
-| `stop`, `resume` (Stop and Resume Planner)            | `control-result`, `runs` (run cards for Chat)                                          |
+| `steer` (a message for the running turn)              | `control-result`                                                                       |
 | `destroy`                                             | `turn-end`, `detach`                                                                   |
 
 **Attaching.** The upgrade request offers the `chopin.agent.v1` subprotocol, or
@@ -579,7 +682,7 @@ repository it cannot write, or a missing or archived document is refused with a
 `refused` message and close code 4426, 4403, or 4404. Neither attaching nor a
 refusal posts anything to the document. The account and repository access are
 checked again before every session and every turn the connection starts, including
-turns of a session kept for its runs, and every 5 minutes while the connection stays
+turns of a session kept for its open questions, and every 5 minutes while the connection stays
 attached; losing either fails that session or turn and closes the connection with
 `access-revoked`.
 
@@ -614,14 +717,14 @@ produce, is cleared under its generation and the document is claimed again.
 One client holds a document's Planner. While it is attached, every other
 `attach` for that document is refused with `planner-attached` (4409) and a
 message naming its GitHub login. A connection that detaches, or drops with no
-workflow run or open question to keep, keeps the ownership for
+open question to keep, keeps the ownership for
 `PLANNER_ATTACH_GRACE_MS` (2 minutes by default). A connection that
 answers none of the server's [protocol pings](agent-connection.md#pings) for
 `AGENT_CONNECTION_TIMEOUT_MS` (2 minutes by default) is closed as dropped, so a
 client whose network silently went away does not keep the document attached.
 Within the grace period the same account can attach again and keeps the same
 ownership generation; anyone else is refused. A link that offered
-`resumable-sessions` and dropped unexpectedly while it had runs or open questions
+`resumable-sessions` and dropped unexpectedly while it had open questions
 instead keeps the ownership with no deadline, as the document's **disconnected**
 Planner: the same account takes back the sessions, runs and questions whenever its
 client returns, however long that takes, and nobody else can attach meanwhile.
@@ -642,11 +745,10 @@ be closed. Attachments live in the server process, so a restart does not keep a 
 but it does keep what its client holds: at the cut, and when a link drops with work
 kept, the server writes each hold to `planner_link_holds` (see
 [Storage](storage.md#postgresql-schema)): the sessions the client holds, the questions
-it waits on, the answers it has not acknowledged and the Stops it has not heard. The next
+it waits on and the answers it has not acknowledged. The next
 process rebuilds each as a suspended hold, so a client that returns and sends `resume`
 takes its sessions back. No turn of the new process opened those sessions, so they reach the
-document through its room: their run reports are Chat's run cards, shown live, not stopped, when
-the document opens after the client is back, and a question asked on one after the restart is a
+document through its room: a question asked on one after the restart is a
 Decision, for which the document is opened if nobody has it open. Startup's reset keeps the owner of a document whose hold names a
 browser sign-in that has stored credentials; a paired machine's hold names the machine
 and no login, which a restart cannot keep: the machine's backend attaches again with its
@@ -666,14 +768,13 @@ it rewrites the row without it before it shows the hold (a write that fails is l
 window is still given), so a process that starts after that one crashed, inside the window or
 after it, finds the hold of a link that had already dropped, disconnected. Until the window ends, `session:planner`, the owner's own views and
 Planner comments treat it as attached, with its login, so no member sees it disconnected or
-reconnecting; a request to it is saved as a row and starts when it resumes, and workflow
-runs Chat stored come back live, not stopped. A `resume` inside the window before the owner's
+reconnecting; a request to it is saved as a row and starts when it resumes. A `resume` inside the window before the owner's
 browser sign-in is back (it comes back with the browser's cookie) is not refused: it waits, with
 the link kept and the machine shown attached, and the sessions are handed back the moment the
 sign-in is. One still without it when the window is over is refused with `unavailable` and
 `retry`, which a client retries; it is never `sign-in-required`, which would end the link. A
 `resume` inside the window ends it. When it ends with no resume the hold is disconnected,
-as a dropped link is today, announced, with run cards marked disconnected, and the miss is
+as a dropped link is today, announced, and the miss is
 logged with its cause: the owner's sign-in or the client was not back. A hold that was already
 disconnected keeps its state and gets no window, and one in its grace period is not kept.
 A question a client waited on is not waited on again: nothing in the new process can
@@ -721,16 +822,7 @@ _Connecting_ and _No machine is connected_ are said only once they have lasted t
 list names a machine the document does not run on, a teammate's or another of the person's own,
 for a Planner their own account is starting or has lost, while it describes another account's Planner than the page's connection does, or while it was read before the connection's last word, which describes the Planner as it was (the page reads it again on every word, and a read that began after the word is the one that may name a machine), nothing is named
 until it agrees. Meanwhile the status says nothing of the machine, however long that takes (a read that fails or a hidden tab leaves it empty, never stale), and what it said of an older word does not stay. The state it last showed and said is remembered through that gap, with the live region silent meanwhile, but only so that the same state naming the same machine, such as a word that repeats it with one more attempt, is neither made to wait out its grace again nor announced twice. Any other state that arrives after the gap is drawn by its own rules, never in place of what was shown before the gap: a state that waits (_Connecting_, _No machine is connected_) draws nothing until it has lasted its grace, so a document moved from one machine to another does not read the first machine's _offline_ before it says it is connecting to the second, and a state with no grace is drawn at once. With no gap, in an ordinary transition, the last state still stays through the grace of the next, so a reconnect does not flicker. A `disconnected` Planner's work is
-kept with no deadline. Its live
-run cards carry `disconnected` beside the status they last reported: each reads
-**disconnected**, not running or stopped, with a still ring instead of the pulse and
-its clock held at the last report; an open card says what it last reported and what
-happens when the Planner returns. A card offers Pause, named as waiting for the Planner
-to reconnect, because Chopin holds it, and no Resume, which it cannot hold. While the
-page's offline bar shows, the cards say nothing of the machine: no **disconnected**, no
-note, and a plain Pause, with the status as last reported, a still neutral ring and the
-clock held; the words come back with the connection, as the state then is. Decisions
-stay where they were and stay answerable. **Build plan** says to reconnect the machine
+kept with no deadline. Decisions stay where they were and stay answerable. **Build plan** says to reconnect the machine
 (_Reconnect the machine to build_), and a new comment is not sent to Chopin by default, until
 it does. With no machine connected at all it says _Connect a machine to this document to
 build_ and offers how to connect one.
@@ -799,30 +891,27 @@ a document with no attached client; its job stays pending until one attaches. A 
 client's `turn-end`, then ends the turn anyway. A turn that ends while one of
 its host tools still runs, such as an `ask` waiting on Decisions, stops that tool
 and withdraws the cards it opened. A connection that closes mid-turn ends the turn
-with an error rather than as a stop, its open questions are withdrawn, and runs
-it reported are shown stopped; nothing waits on a client that has gone. A
+with an error rather than as a stop and its open questions are withdrawn; nothing
+waits on a client that has gone. A
 session the client refuses or does not start in time is destroyed, and any
 question it asked while starting is withdrawn.
 
 **Questions.** An `input-request` carries one Atomic `HostInput` call
 (`questionnaire`, `confirm`, `select`, `input`, or `editor`) and becomes Decisions
 through the same path as the [full Atomic Planner](#full-atomic-planner): the same
-verbatim text, the same 30-minute expiry, cancellation that withdraws open
-cards, and answers to a workflow question held while the client reports that
-run's root as paused. `input-result` returns what Atomic would have received in
-process, with a status that tells an expiry from a cancellation.
+verbatim text, the same 30-minute expiry, and cancellation that withdraws open
+cards. `input-result` returns what Atomic would have received in
+process, with a status that tells an expiry from a cancellation. Stopping a turn
+withdraws the questions it asked while it ran, as Stop
+does an Atomic Planner's, and cancels at once any it asks before it ends, so a
+Decision the turn waited on never keeps its session for the next message.
 
-**Runs.** The client reports its workflow runs with `runs`; Chat shows those
-cards and keeps the session after its turn while any run is live or paused, as
-for an Atomic Planner. **Stop Planner** and **Resume Planner** send `stop` and
-`resume`, optionally for one run, and wait for `control-result`. Unlike an
-Atomic Planner's, a reported run that ends blocked or failed between turns gets
-only its Chat notice: the reports are the client's word, so they never start a
-Planner turn that no writer asked for. A client that asks for the `run-stage-deltas`
-feature sends only new and changed stages, so a run's stages have no count
-limit; Chopin merges them into the run's stored stages as it does an Atomic
-Planner's (see
-[Agent connection](agent-connection.md#run-stage-deltas)).
+**Work the client keeps.** Chopin keeps no workflow runs of a client's and shows no run cards: a
+client's own work that outlives its turn is the client's to report in its replies. A session is
+kept past its turn only while it waits on a question it asked or on an answer its client has not
+received (see [Session lifecycle](#session-lifecycle)). **Stop Planner** stops the running turn,
+or withdraws the question a kept session waits on. The Planner's instructions name none of the
+client's tools.
 
 **Trust boundary.** The server never holds the client's model credentials and
 gains no shell or filesystem access from this harness. The client, in turn,
@@ -835,6 +924,577 @@ or administration access every Planner owner needs. Summary and research workers
 have no model in the server either; they run as isolated sessions on the same
 client, so attaching also lends that client's model to the document's
 background work.
+
+## AI credentials
+
+People connect their AI credentials in Chopin once: GitHub Copilot (through the
+GitHub sign-in Chopin already holds for them, or a personal access token), a
+ChatGPT or Claude subscription through that provider's own sign-in, an OpenAI API
+key, and an Anthropic API key. The server keeps them and serves them
+through its credential proxy; runners receive only placeholders, with no model
+sign-in or key of their own (see [Handing launches to runners](#handing-launches-to-runners)).
+
+```text
+GET    /api/ai/credentials
+PUT    /api/ai/credentials/:provider     {"kind":"api-key","secret":"…"} or {"kind":"github-sign-in"}
+POST   /api/ai/credentials/github-copilot/check
+POST   /api/ai/sign-ins/:subscription                 → {"url":"…"}
+POST   /api/ai/sign-ins/:subscription/finish          {"input":"…"}
+DELETE /api/ai/credentials/:provider
+```
+
+`:provider` is `github-copilot`, `openai`, `anthropic`, `chatgpt` or `claude`;
+`github-sign-in` is for `github-copilot` alone, and `chatgpt` and `claude` take no
+key, only a sign-in (`:subscription`). The list says which providers a person connected,
+how, and when (`updatedAt`); no route returns a secret. A key is listed with its
+last four characters (`suffix`, kept beside the ciphertext) and the time a
+launch last sent a request with it (`lastUsedAt`, the time the transport took the
+request, saved unless a use in the same minute, or a later one, is saved already, so it
+shows the minute of the latest use and never moves back, and absent until one is;
+replacing the key starts it afresh). A key whose provider answered a request with it
+that the key itself is invalid (a 401 with OpenAI's `invalid_api_key` or Anthropic's
+`authentication_error`) is listed with `rejectedAt` and needs connecting again: no
+launch is given it until it is, one whose last check is under way included: a mark
+that completes while a launch reads is counted for its person as a replacement is, and
+the launch is prepared again without the key, and the person's lasting launches are
+told. Only the key that was sent is marked, so a refusal
+that arrives after the key was replaced leaves the replacement as it is, and a rate
+limit or a refusal of one model marks nothing. GitHub Copilot is always listed and usable through the person's
+current GitHub sign-in, with nothing saved, until they connect a token instead,
+which the AI accounts page offers whatever GitHub said of the sign-in, a seat
+included (a token of another GitHub account, whose Copilot plan may offer other
+models); removing that token returns them to the sign-in, and `check` asks GitHub
+about whichever is theirs. Connecting and disconnecting need a
+signed-in browser login and Chopin's own `Origin`. A key is 8 to 4096 printable
+characters with no spaces. An OpenAI or Anthropic key is first checked with one
+request to that provider (`GET /v1/models`) and saved only when the provider
+accepts it: a refusal (401 or 403) is answered 422 with the provider's name, and
+a provider that can't be asked 502, and either leaves any key already connected
+as it was. A GitHub Copilot token is first asked of GitHub as a launch asks (see
+GitHub Copilot below) and saved when GitHub exchanges it, Copilot's model API
+takes it, or GitHub says its account has no Copilot subscription (listed with
+`copilotAccess: "none"`). One GitHub refused to exchange (a 4xx, for neither the
+account's subscription nor its rate limit) and Copilot's model API refused too
+(401 or 403) is answered 422, and one that couldn't be asked 502; either leaves
+the sign-in, or the token connected before, as it was. A saved key is stored encrypted with AES-GCM under a key
+derived from `SESSION_ENCRYPTION_KEY`, bound to its person and provider
+(`ai_credentials` in [Storage](storage.md)). One the server can no longer open, such as
+one saved under an encryption key since replaced, is listed `unusable: true`
+until it is connected again. People manage all of this on the AI accounts page
+(`/ai-accounts`, under Machines in the sidebar).
+
+**Subscriptions.** ChatGPT and Claude are connected the way Atomic signs in to
+them (`packages/ai/src/auth/oauth/openai-chatgpt.ts` and `anthropic.ts` in
+bastani-inc/atomic), adapted to a server the browser is not on
+(`apps/server/src/ai/subscriptions.ts`). Starting a sign-in makes a PKCE verifier
+and state and answers the provider's authorize address, which the dialog opens in
+a new tab; the sign-in waits 15 minutes, in the process's memory, and a new start
+replaces it. Sign in with ChatGPT uses OpenAI's dynamic agent client
+(`dynamic_agent_client`, agent name _Chopin_, this deployment's own UUID as the
+agent host, derived from `SESSION_ENCRYPTION_KEY`), OpenAI's API as the resource
+and the `chatgpt.tokens.use.direct` scope; its callback goes to
+`http://127.0.0.1:1455/auth/callback`, which a hosted server can't receive, so the
+person pastes the address their browser ends on, and it is taken only with that
+origin and path, the sign-in's state and an issued `client_id`, as Atomic's manual
+path takes it. Claude uses Anthropic's copy-the-code redirect: the verifier is the
+state, and the person pastes the code Claude shows (`code#state`, a bare code or an
+address carrying them), whose state must be the sign-in's. Only then is the code
+exchanged, once, at the provider's token endpoint (`auth.openai.com` or
+`platform.claude.com`); a paste that isn't the sign-in's answer keeps the sign-in
+to paste again, and a refused or failed exchange spends it (`restart: true`).
+Nothing is stored until the provider returns tokens, so a sign-in that fails or is
+abandoned leaves what the person connected before as it was. Each sign-in begun is
+the person's latest attempt for that provider until a newer one begins or they
+disconnect it, through its code's exchange too: only the latest saves what its
+exchange returns, in turn with disconnects, and storage takes it only over the
+connection stored when its exchange began (`signedIn`), so a sign-in that finishes
+after a newer one, or after a disconnect, saves nothing and is told to start again
+(409, `restart: true`). The tokens are
+stored encrypted like a key, in `ciphertext`, which names the connection; a
+refresh writes the renewed pair to `tokens`, only while the stored pair is still
+the one it began from, so a refresh that lost a race never replaces a newer pair.
+An access token is renewed when it reaches the expiry the provider gave less a
+margin (three minutes for ChatGPT, five for Claude, as Atomic's), and after the
+provider refused that very token (any 401 to a proxied request): the refusal is
+written with the stored pair it belongs to, as that pair due for renewal, so no
+process sends the token again, one started after a restart included, and a refusal
+of a token renewed past since, however late it arrives, marks nothing. Only the
+writer lease's holder refreshes. A connection's refreshes run one after another, and each
+reads the stored pair again first, so a caller that read the pair before another
+refresh saved a new one is given the new one and never sends the spent refresh
+token. A renewed pair storage couldn't save stays in the process for that
+connection, is sent meanwhile, and is saved again on its next use, before any
+further refresh. A refresh the provider refuses for good (a 401, or `invalid_grant`,
+`refresh_token_expired`, `refresh_token_reused` or `refresh_token_invalidated`)
+marks the sign-in `rejectedAt`, only while the stored pair is still the one the
+refresh presented, which tells the person's lasting launches, and the
+page says it needs signing in again; one that couldn't be made now refuses the
+request (`renew-unavailable`, 502), withholds the provider from a launch with the
+same reason, which counts as a check that couldn't finish, and lists the sign-in
+`unchecked`. An expired access token is never sent, nor one the provider refused: the
+proxy's final handoff reads the sign-in's pair with the launch and the credential,
+sends the request only with the very pair it was prepared with, checks that pair's
+expiry on the same clock reading as the launch's deadline, and reads it again when a
+refusal or a renewal changed it while it was read. So a token refused, or renewed
+past, while a request's body arrived is renewed (or the renewed pair taken) before
+the request is sent, and a sign-in whose renewal the provider refused for good in
+that time refuses it (`sign-in-ended`). ChatGPT's requests go to
+`https://api.openai.com` with the access token as a bearer, as Atomic sends a
+ChatGPT sign-in's; Claude's go to `https://api.anthropic.com` with the access token
+as a bearer and the headers Atomic sends for a Claude subscription token, set
+whatever the agent sent: `anthropic-beta` leading with `claude-code-20250219` and
+`oauth-2025-04-20` before the agent's own betas, `user-agent: claude-cli/2.1.322`,
+`x-app: cli` and `anthropic-dangerous-direct-browser-access: true`. A Claude
+Messages request's body is given the system block Atomic puts first for a
+subscription token, `You are Claude Code, Anthropic's official CLI for Claude.`,
+ahead of the agent's own system prompt, which is kept whole (a prompt that is
+already led by it is left as it is), so an agent that is not Atomic is sent as
+Atomic is. A Claude
+stand-in reads `chopin_ai_sk-ant-oat01-` and 30 base64url characters, so an agent
+that tells a Claude subscription token from a key by that mark (Atomic does) sends
+it as one. Disconnecting deletes the row, and every launch's stand-ins for it stop
+working at once, as removing a key does.
+
+**Placeholders.** A launch (a Planner session or a build or run) is given, per
+provider its person can use, a random placeholder (`chopin_ai_` and 43
+base64url characters), the provider's base URL on Chopin, and the environment
+variable agents read that provider's key from
+(`AiProviderGrant` in `packages/protocol/ai-credentials.ts`). Chopin keeps only
+each placeholder's SHA-256 digest (`ai_placeholders`), written before the
+placeholder is handed out, and for a launch on a document only while the
+document is still open in the archive generation it was in when the launch began
+(`channels.archive_generation`, which archiving moves on and a restore never
+takes back). Once they are written it reads the person's credentials a final
+time and publishes the grants, an empty list included, in the same step as its
+last check, only while all of this holds: that read found the very credentials
+the launch was prepared with, each refused as invalid or not as it was then; none of
+the person's credentials was connected, replaced, removed or refused as invalid since
+(storage counts each such write in memory as it commits, which one process under the
+writer lease makes exact); GitHub has given
+no answer of the other kind about the same Copilot account since the launch
+asked (see GitHub Copilot below); the launch's machine is not revoked, its
+document is open in the same generation, and every placeholder it stored is still
+there; and neither the launch's deadline nor that of the Copilot token it is given
+Copilot for has come, both read on one clock reading. A launch past its deadline, whose
+machine was revoked or document archived while it was prepared, restored since or not,
+or whose placeholders went with the machine's (a machine that must be paired again,
+which ends its launches without revoking it), takes its placeholders back and is given
+nothing (`ended`), never a provider without its stored grant. Any other change, a Copilot
+token that expired while the placeholders were written among them, takes them back and prepares the
+launch afresh, asking GitHub again, at most three times, keeping every key that is still usable: a
+seat refused meanwhile withholds Copilot alone, and a key added meanwhile is
+given. The launch's machine and document are read again when a cutoff completed
+while the final reads were made, so a machine revoked or a document archived after
+their read and before the credentials' gives the launch nothing. A key is given only
+when it decrypts with this deployment's key and its provider hasn't refused it as
+invalid; otherwise it is withheld as `key-unusable`. Changes that keep coming for all three fail the launch with a retryable
+error (503), never a launch given nothing while a verified key is there. So no
+placeholder is handed out for a credential that changed before it was, nor is
+one missing for a key added before it was. A placeholder works until its launch ends or
+expires, and is refused once the launch's machine is revoked or its document is
+deleted. Archiving a document deletes its launches' placeholders in the same
+transaction, so restoring it brings none back. A launch also says which
+connected providers it was not given and why (`withheld`); a launch with no
+grants stores nothing and starts no runner: `handOut` refuses it (see
+[Handing launches to runners](#handing-launches-to-runners)).
+
+**No AI account.** Under `HARNESS=remote`, before a person's message to the
+Planner (or their Retry) starts a turn, Chopin reads what a launch for them
+would be given (`AiCredentials.available`: the same reading as a launch, with
+GitHub's answer about Copilot access kept a few minutes and nothing stored). A
+person with no Copilot access and no API key is refused with `no-ai-account`
+before anything is saved, told privately that chopin needs an AI account, with
+a link to AI accounts, and their words return to the composer. Where GitHub
+couldn't be asked about their Copilot access or said nothing about it (`unknown`,
+see GitHub Copilot below), or their sign-in couldn't be read,
+and they have no key, the same refusal says the check couldn't finish and to
+send it again, never that they have no subscription. Accounts that keep
+changing while they are read, or storage that fails, are a passing refusal
+(`temporarily-unavailable`) that the browser sends again
+(`apps/server/src/ai/account-check.ts`).
+
+A placeholder alone is not enough. Each launch also gets a launch credential of
+its own (`launchToken`, `chopin_launch_` and 43 base64url characters), kept only
+as a digest beside each of its placeholders. The launch's runner keeps it out of
+the agent's sandbox and adds it, in `x-chopin-launch` (`AI_LAUNCH_HEADER`), to
+every request it carries to the proxy; the agent only ever sees placeholders and
+base URLs. The proxy refuses a placeholder presented without its own launch's
+credential (`no-launch`) or with another launch's (`other-launch`), whether that
+launch is someone else's or the same person's, before it reads any credential.
+So a placeholder copied out of one launch, onto the same runner or elsewhere,
+reaches nothing.
+
+| Provider         | Base URL                            | Key variable           | Sent to                                                                                                                                      | Credential header |
+| ---------------- | ----------------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ----------------- |
+| `github-copilot` | `<origin>/api/v1/ai/github-copilot` | `COPILOT_GITHUB_TOKEN` | a Copilot token to the account's Copilot host, else `https://api.githubcopilot.com`; a GitHub token to `https://api.githubcopilot.com` alone | `Authorization`   |
+| `openai`         | `<origin>/api/v1/ai/openai/v1`      | `OPENAI_API_KEY`       | `https://api.openai.com`                                                                                                                     | `Authorization`   |
+| `anthropic`      | `<origin>/api/v1/ai/anthropic`      | `ANTHROPIC_API_KEY`    | `https://api.anthropic.com`                                                                                                                  | `x-api-key`       |
+
+**The credential proxy.** `/api/v1/ai/<provider>/…` serves each provider's model
+API and nothing else on its host (`ROUTES` in `apps/server/src/ai/proxy.ts`):
+
+| Provider         | Routes                                                                                                                                                         |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `github-copilot` | `GET /models`, `POST /models/<id>/policy`, `POST /chat/completions`, `/responses`, `/embeddings`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1/systemone` |
+| `openai`         | `GET /v1/models[/<id>]`, `GET` or `POST /v1/responses[/…]`, `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings`                                   |
+| `anthropic`      | `GET /v1/models[/<id>]`, `POST /v1/messages`, `/v1/messages/count_tokens`, `/v1/complete`                                                                      |
+
+Any other method or path, and a path with an empty, dot or percent-encoded
+segment, is refused with `route` (404) before a credential is read, so a Copilot
+placeholder can't reach Copilot's other services (its MCP server among them). A
+request must carry a live launch's placeholder for that provider in
+`Authorization: Bearer` or `x-api-key`, only one value across the two, and that
+same launch's credential in `x-chopin-launch`. The proxy drops these headers,
+the caller's cookies and forwarding headers, and reads the body. A request that
+also carries any launch's placeholder in a header the proxy drops (`Referer`,
+`Cookie`, `Forwarded` and the like), in its value or in its name, is refused with
+`dropped-header` (400) rather than sent without it. Then, at the final handoff, it takes the next Copilot token for one
+that expired meanwhile, reads the launch, its machine, its document and the
+person's credential again together, and builds the whole request. Last, with
+nothing awaited between that check and the send: when a cutoff (a launch ended, a
+machine revoked, a document archived, a credential connected, replaced or removed)
+completed while those reads were pending, it reads them again; the launch must
+not have reached its deadline by then; and a Copilot token whose deadline came
+while the request was built is renewed and the request built again. The transport
+that submits the request is handed the launch's and the token's deadlines and
+checks them on the clock reading it takes the request at: a launch past its
+deadline then is refused, and a token past its own is renewed and the whole check
+made again. Storage counts each cutoff in memory as it commits, before its caller
+hears so, which one process under the writer lease makes exact while it holds the
+lease. Each cutoff is written under the writer lease, checked in its own
+transaction as other fenced writes are, so a process that no longer holds the lease
+commits none: its revocation, archive or credential change is refused and never
+acknowledged, and the successor that holds the lease counts every one it could
+miss. A successor's cutoffs are not counted by the process it took over from, so a
+process sends nothing once its lease is released, lost or past its deadline
+(`restarting`, 503), and nothing for a request its hand-over abandoned
+(`cancelled`, 499); a request already sent is not recalled. So a launch ended, a machine revoked or a document archived before
+the send, during a Copilot renewal or a pending read included, sends nothing
+(`launch-ended`), nor does a provider disconnected (`not-connected`), a
+credential replaced, or removed and connected again, since the request was
+admitted, or a renewed Copilot token that came from a credential other than both
+the one admitted and the one connected at the send (`credential-changed`), and
+the provider never sees a key its person no longer has, nor another account's. A request already handed to the provider when a
+cutoff completes was sent once and is answered. It puts the real credential of
+the person the launch runs for in the one header the provider takes, and sends
+the method, path, query and body unchanged to the provider's own origin. The path
+cannot name another host. A placeholder in the query, another header the proxy
+forwards or the body is sent on as the placeholder it is.
+A redirect is returned to the agent, never followed with the credential. The
+response streams back with the provider's status code but not its reason phrase,
+with only the headers model clients read (`RETURNED_RESPONSE` in `proxy.ts`: the
+content type, caching, validators, `location`, retry and rate-limit headers and
+request IDs; `Cache-Control: no-store` when the provider sends none), and with
+the credential replaced by `[redacted]` wherever one of those headers or the
+body holds it, even split across chunks. What is emitted is checked, not only
+what came: a rate-limit header whose name holds the credential, in any case, is
+left out, as is a header whose value forms the credential again once replaced
+with the text around it; and a body that would emit it, the replacement and its
+neighbours forming it within a chunk or across two, ends there with an error and
+none of it emitted. The finished headers are checked last, those Chopin adds
+included: an answer one of whose headers Chopin adds (`Cache-Control: no-store`)
+would hold the credential is refused with `upstream-headers` (502) rather than
+passed back without that protection, and an error Chopin answers once it holds
+the credential leaves out any header of its own that would hold it. A body in a
+content coding the proxy can't decode, which it could not take the credential out of, is refused with
+`upstream-encoding` (502) and none of it is passed back. Refusals are JSON with
+a `code`: `no-placeholder`, `no-launch`, `unknown-placeholder`,
+`other-provider`, `other-launch` or `launch-ended` (401), `not-connected`,
+`sign-in-unavailable` or `no-copilot-access` (403), `credential-changed` (409,
+which clients send again), `cancelled` (499), `copilot-unavailable` (502),
+`restarting` (503, sent again to the next process), `busy` (503, sent again
+too) when cutoffs kept completing while the final check read, three times
+running, and `unrecorded` (503, sent again too) when the request could not be
+recorded before it was sent (see Usage below).
+
+**GitHub Copilot.** Copilot's model API takes a Copilot token, which GitHub
+exchanges a GitHub token for (`GET /copilot_internal/v2/token` on
+`api.github.com`), or, as Copilot's own CLI sends one, a GitHub token itself.
+Chopin asks with the person's current GitHub user token for a GitHub sign-in or
+the token they connected as an `api-key`. It makes the exchange first, and when
+GitHub gives a Copilot token it sends Copilot only that, never the GitHub token.
+GitHub exchanges only the tokens of Copilot's own clients, so it refuses a
+GitHub App's user token (a Chopin sign-in's), another app's OAuth token and a
+personal access token, a seat-holder's included: a plain-text 403 page for the
+first two, a 404 for a fine-grained token. Then Chopin asks Copilot's model API
+whether it takes the GitHub token itself (`GET https://api.githubcopilot.com/models`
+with `Authorization: Bearer` and `Copilot-Integration-Id: copilot-developer-cli`,
+the integration Copilot's CLI is), and when it does, the proxy sends that GitHub
+token, in `Authorization: Bearer` with that integration id in place of any the
+agent sent, to `https://api.githubcopilot.com` and no other host, never to one a
+Copilot token names (`COPILOT_MODEL_API` and `COPILOT_RAW_TOKEN_HEADERS` in
+`apps/server/src/ai/copilot.ts`). Whichever token is sent is taken out of what is
+passed back, as any credential is, and is never logged. It
+holds a Copilot token until a minute before it expires, and five minutes at
+most, then asks for the next; Copilot taking a GitHub token itself is relied on
+for 30 minutes, as a Copilot token's life, and held as long as one. It never
+sends one past its expiry: a token GitHub
+gives already expired, or that expires while GitHub answers, is taken as GitHub
+not answering (`copilot-unavailable`), and one that expires while a request's
+body arrives, or while the request is built, is replaced by the next before the request is sent; when GitHub names the account's own Copilot host
+(`endpoints.api`, a `githubcopilot.com` host) the proxy sends its Copilot token there. A GitHub
+sign-in's token comes from the paired machine's own GitHub authorization when
+the launch runs on the person's own machine, else from their live browser
+login, each refreshed by Chopin before it expires. No runner sees either token.
+A launch whose person has no live login Chopin can read gets no Copilot
+placeholder, and a placeholder handed out before is refused with
+`sign-in-unavailable`.
+
+A GitHub sign-in is not Copilot access. A Copilot token given, or the GitHub
+token taken by Copilot's model API, is `access`. `none`, which is not an error,
+is only GitHub saying the account has no Copilot subscription: an exchange
+refused with a JSON body whose `error_details.notification_id` is
+`no_copilot_access`, `not_signed_up` or `subscription_ended`, as GitHub tells
+Copilot's own clients. Anything else is `unknown`, which says nothing about the
+account and records no seat lost: GitHub or Copilot not answering, a refusal for
+GitHub's rate limit (a 429, or a 403 with `Retry-After` or
+`X-RateLimit-Remaining: 0`, after which Copilot's model API is not asked), and a
+token neither takes (any other refusal of the exchange, then any refusal by
+Copilot's model API). The AI accounts page shows `unknown` as a check that
+couldn't be done, made again when the page is next opened, with _Use a token
+instead_ for a sign-in, and never as no subscription. The list and the
+connect answer carry it as `copilotAccess`, from an answer at most five minutes
+old (`unknown` is never held); `POST /api/ai/credentials/github-copilot/check` asks GitHub again at once.
+Every answer GitHub gives, to the list, a check as the AI accounts page opens, a launch or a proxied
+request, is recorded against the account it is about: the person's GitHub
+sign-in, whichever of its tokens asked (a browser login's or a paired
+machine's), or a token they connected instead, which is another account. Answers
+are ordered by when they completed, not when they were asked, and a failure to
+ask is no answer. GitHub decides an answer before Chopin has it, so one that
+completes after an answer of the other kind about the same account that was asked
+later (the two crossed) may have been decided first: neither is settled, an answer held
+that the late one contradicts is dropped, and GitHub is asked again, at most three times. Until
+it answers a question put after both, the check is unfinished (`unknown`), never either answer,
+so a retry GitHub can't answer never leaves a disputed refusal on the page. An answer is used
+again only for the account and the token it was asked for together, so a sign-in never takes
+what GitHub said of the same token connected instead. An answer held for one token of an account is dropped once a
+newer one of the other kind completes for the same account, so a seat lost in one
+session is not shown as there in another, and a seat back is shown in all once
+GitHub says so; a separately connected account keeps its own. A launch whose
+Copilot answer GitHub has contradicted since it asked, about the same account,
+asks again before it publishes. An answer of the other kind than the last one GitHub
+gave about the account (a seat confirmed lost, or back), or either kind once a crossing
+disputed the last one, tells the person's lasting
+launches, which are prepared again; the same answer again, and no answer, tell no one.
+Each launch that runs models asks GitHub afresh (a catalog launch takes an answer held for the
+same account and token, as the proxy does) and gets a Copilot placeholder only for
+`access`: `none` withholds it as `no-copilot-access`, and `unknown` as
+`copilot-unavailable`, which a later launch may not meet. A person who loses
+access stops getting Copilot in later launches, and a placeholder handed out
+before is refused with `no-copilot-access` once Chopin asks for its next Copilot
+token. A refusal withholds only Copilot: API keys alone are enough, so a person
+with only an OpenAI or Anthropic key, or whose sign-in has no Copilot access,
+gets those, and a person with nothing usable gets no placeholder at all, never
+one that would only fail.
+
+**Model lists.** A provider's model list is an ordinary request through the
+proxy (Copilot's account `GET /models`, OpenAI's and Anthropic's `/v1/models`).
+`GET /api/v1/ai/models.dev/api.json` serves the public models.dev catalog to a
+live launch alone: the request needs one of that launch's placeholders, of any
+provider, in `Authorization: Bearer` or `x-api-key`, with that launch's credential
+in `x-chopin-launch`, checked before anything is fetched or served, a cached copy
+or a `304` included (`no-placeholder`, `no-launch`, `unknown-placeholder`,
+`other-launch` or `launch-ended`, 401). The catalog is fetched with nothing of
+the request, so one carrying any launch's placeholder in its query
+(`dropped-query`) or in another header, by value or name (`dropped-header`), is
+refused (400) rather than served without it. Each name and value in the query is
+decoded on its own, and a query with one that can't be decoded is refused
+(`unreadable-query`, 400), so a field that doesn't decode can't hide a placeholder in
+another. The last check is made in the same step
+as the answer, and read again when a cutoff completed meanwhile, so a launch that
+ended while it was checked is refused even a warm copy, and a process that no longer
+holds the writer lease serves nothing (`restarting`, 503).
+Chopin fetches the catalog with no credential, at most every ten minutes, and
+answers with its `ETag`, for an agent's catalog base URL (Atomic's
+`ATOMIC_MODEL_CATALOG_URL` is `<origin>/api/v1/ai/models.dev`).
+
+**Usage.** Every request the proxy is about to send to a provider is recorded
+first (`ai_usage` in [Storage](storage.md)), once its placeholder and launch
+credential are accepted and its body is read: a fresh id, the launch, its person,
+the provider and the model the request's JSON body names (`model`), as
+`pending`, written under the writer lease. A request that can't be recorded is
+not sent (`unrecorded`, 503); when the write may have been saved with only its
+acknowledgement lost, the record is completed `unsent` with `unrecorded`, so a
+request sent again after it is the only one counted. The record is completed
+once, by the first way the request ends: `unsent` with the refusal's code when
+the final check refuses it, or with `unchecked` when that check fails (a
+storage trouble) before the transport took the request, so nothing reached the
+provider; `error` with `unreachable` or `cancelled` when
+no answer came, or the proxy's code when it refused the answer; else, when the
+answer's body has passed back whole, `ok` for a status under 400, and `error`
+for any other status with the provider's error code (`error.code`, else
+`error.type`, or `http-<status>`), for a stream that reported an error event, a
+body that broke off (`interrupted`) or one the agent stopped reading
+(`cancelled`). It holds the provider's status and the token counts the provider
+reported, read from the answer as it passes, never holding it back: a JSON
+body's `usage` (only its usage and error fields are kept, so an answer of any size,
+such as a large batch of embeddings, is counted), or each server-sent event's, a
+later count replacing an earlier one (Anthropic's growing output count, OpenAI's
+usage in its last chunk). Input
+is what was read without the cache, so OpenAI's cached input is taken out of its
+input and counted as a cache read; Anthropic's cache reads and writes are its
+own. A completion sent again changes nothing, so one whose write fails for a
+passing storage trouble is written again, waiting longer each time up to 30
+seconds, for as long as the process holds the writer lease it began under. A process that stops between the
+send and the record (a crash, or a hand-over whose answers were still streaming)
+leaves the request `pending`, and the next holder of the writer lease marks
+every request an earlier holder left pending `unknown` once it is ready, so none
+is lost or counted twice. Records are kept for 90 days.
+
+```text
+GET /api/ai/usage
+```
+
+answers the signed-in person's own totals for the last seven days
+(`AiUsageSummary` in `packages/protocol/ai-usage.ts`), and nobody else's: per
+provider and model, most requested first, the requests sent, which counts only
+those the transport took and that have ended (`ok` or `error`), how many of them
+ended in an error, and apart from them how many are `pending` (recorded, and
+being sent or answered now) and how many are `unknown` (Chopin can't say
+whether they were sent), and the input, output, cache read and cache write
+tokens. Requests that were never sent (`unsent`) are not counted. Requests
+that named no model (a model list) are counted under no model.
+
+### Handing launches to runners
+
+Every launch is prepared by `handOut` (`apps/server/src/ai/launches.ts`), which
+calls `AiCredentials.launch()` for the person the launch runs for and turns its
+result into what the runner is handed: the launch credential, its deadline and
+one placeholder per granted provider with its base URL on the proxy and key
+variable, and what was withheld. A launch that would be given no provider is never
+handed out, so no agent starts on anything but the person's own accounts in Chopin,
+and the machine owner's own sign-ins and keys are never used in their place, on a
+shared machine or the person's own: `handOut` throws `AiLaunchRefused` with
+`no-ai-account` (and, where GitHub couldn't be asked about the person's Copilot
+access and they have no key, that the check couldn't finish, never that they have no
+subscription), or with `launch-ended` when the launch's document was archived, its
+machine revoked or its grants ended with the machine's before it was handed out. A
+launch Chopin could not prepare because the person's accounts kept changing (503) fails
+the start too, as something that can be tried again. Each launch records what it is
+for (`owner`: `run:<id>`, `session:<id>` or `link:<id>`), which ends it (see below).
+
+- **A Planner session** on a client attached at `/api/v1/agent` that offers the
+  `ai-credentials` feature is launched for the account that attached (for a paired
+  machine's Planner credential, the machine's owner, on that machine, as its other
+  work there runs), for the document, for 12 hours. `start` and `fork` carry it in
+  `ai`; one that would be given no provider is not sent at all, and the turn that
+  needed the session fails with `no-ai-account` in its words ("chopin needs an AI
+  account to answer, so it didn't start. Add one, then try again."), as a message from
+  someone with no AI account is refused, with a link to AI accounts for whoever asked.
+  An `ai` message hands the session a new launch when what a launch for the person may
+  be given changes (they connect, replace or remove a provider, their provider refuses
+  a key of theirs as invalid, or GitHub confirms their Copilot seat lost or regained),
+  half an hour before the deadline, and when a resumed session comes back; the earlier
+  launch ends once the new one is sent. A change while the session is starting reaches
+  it once the client acknowledges `start` or `fork`, prepared again from what the person
+  has then, once however often it changed. A renewal that finds nothing left to give
+  hands the session an empty `providers` and ends its launch. The session's end
+  (`destroy`, or its link closing for good) ends its launch. A session a restart's hold
+  keeps keeps its launch, named in the hold (`aiLaunchId`, an id and no credential):
+  from the moment the cut takes the hold no launch of its changes, and one a renewal
+  prepared meanwhile is ended unsent, so the hold names the launch its client holds. The
+  next process ends it when the session ends or the hold does, and replaces it when the
+  client resumes. A client that does not offer the feature is launched nothing. See
+  [Models through Chopin](agent-connection.md#models-through-chopin).
+- **A link's catalog launch**, for a client that offers `ai-credentials` and `ai-catalog` and
+  asks for it once attached, is launched for the same account its sessions are, for the
+  document, for 12 hours, owned by the link (`link:<id>`). It is how the client lists the
+  models of the account it will run on as soon as it attaches, before any session has a launch,
+  so the composer offers them when someone opens the document: its runner reads each provider's
+  model list and the model catalog with it, and nothing else. It is catalog-only: the proxy
+  refuses every other request on it, a model call included, with `catalog-only` (403) before it
+  reads a credential. Unlike a session's, it takes GitHub's answer about the account's Copilot
+  access held for the same account and token, as the proxy's own requests do, instead of asking
+  GitHub again, under the same checks before its grants are published; it asks again when it is
+  prepared again for a change. Chopin asks that question itself as a machine starts the document's
+  Planner (with the machine's own token, its owner admitted again), so the answer is held by the
+  time the Planner attaches and asks. The log says how long each catalog launch took and which step took
+  it (the document, the accounts, the GitHub token, Copilot's answer, held or asked, storing and the
+  final checks). It is handed in an `ai-catalog` message, and again, replacing it, whenever
+  a session's launch would be (the person's credentials change, half an hour before its
+  deadline); the earlier one ends once the new one is sent. An account with nothing to list is
+  handed an empty `providers`. It is held only while its link is attached to this process, and
+  ends with the link however it closes (detach, a drop the link's sessions survive, a restart, a
+  refusal), with every cutoff a session's launch ends with, and at its deadline. See
+  [Listing models before a session](agent-connection.md#listing-models-before-a-session).
+- **A build, investigation or prototype** on a paired machine asks with its run
+  credential:
+
+  ```text
+  POST /api/connector/ai-launch       { "run": "<run credential>" }
+  POST /api/connector/ai-launch/end   { "launch": "<launch credential>" }
+  ```
+
+  with the machine token as its bearer. The launch is for whoever started the run,
+  on their own machine or a teammate's shared one (as the run's MCP token acts for
+  them), on that machine and the run's document, for 5 hours, owned by the run. One
+  that would be given no provider is refused with 409 `no-ai-account` and the words
+  the run's end says ("chopin needs an AI account to run this, so it didn't start. Add
+  one, then start it again.", or that the check couldn't finish), and the connector
+  starts no agent: the build, investigation or prototype fails with those words, and
+  its card offers its starter, and only them, Open AI accounts. One whose document or
+  machine ended first is refused with 409 `launch-ended`, and accounts that kept
+  changing with 503 `unavailable`, which says the run can be started again. Only that
+  machine can end the launch, with the launch credential, which the connector does
+  when the run ends. Storage keeps the credential's digest and the machine with the
+  launch, so a process started since the launch ends it too; a Chopin without people's
+  AI credentials answers 404, and the run's agent has no models but what the machine's
+  `--env` passes, since none of the machine's own setup is in its microVM. The
+  connector keeps the launch credential and relays the agent's requests (see
+  [Sandbox](chopin-cli.md#sandbox)).
+
+**When a launch ends.** A launch stops working when its run, session or link ends, when it
+is replaced, ended or past its deadline, when its machine is revoked or its document
+archived. The proxy's checks read whether what the launch is for is still live with
+every request: the run still running, the session still held by this process (a
+restart's hold once it is rebuilt), the link still attached to it. An end asked in the process that holds the writer
+lease is in force from that moment, before storage has deleted the placeholders, so a
+request waiting at the proxy when a Planner closes, a run's machine ends its launch or a
+session's launch is replaced is never sent on it. An end storage refuses keeps the
+launch ended in that process and is tried again, on a backoff and with each sweep. The
+writer lease's holder also ends, as it starts serving and every five minutes, each
+launch nothing owns any longer (its run ended, no session or link holds it), whichever process
+handed it out and whether or not its end ever reached storage, as a run whose
+connector never sent its end or a process that lost the lease before writing its ends
+leave them; a launch handed out in the last two minutes is left to its owner to take
+up.
+
+**Telling a runner its launch ended.** A runner asks, with the launch's own credential,
+whether its launch is live:
+
+```text
+GET /api/v1/ai/launch     x-chopin-launch: <launch credential>
+200 { "state": "live" | "ended" }
+```
+
+It reads `ended` once the launch ended, however that was, after its placeholders are
+gone too; a credential no launch has reads as ended, which tells nothing to anyone who
+does not hold one. A process that no longer holds the writer lease answers 503. The
+connector's relay asks it when the proxy refuses its agent a request as
+`launch-ended` or `unknown-placeholder` (the proxy's own refusal, `{ "error": { "type":
+"chopin_proxy", "code": … } }`), tells the run once, which stops it, and refuses the
+launch's later requests itself. A provider's own refusal, a 401 among them, and a
+stand-in the agent got wrong on a live launch end nothing. A Chopin from before this
+route answers it 404, and the relay then takes only `launch-ended` at its word.
+
+A Copilot agent sends `Copilot-Integration-Id: vscode-chat`, the header of an editor's
+sign-in, for the exchanged Copilot token Chopin sends Copilot; when Chopin sends a GitHub
+token Copilot takes itself instead, the proxy replaces it with `copilot-developer-cli`,
+Copilot's CLI's (see GitHub Copilot above). Each request a launch's
+placeholder sends is recorded against that launch (see Usage above).
+
+**What the proxy guarantees, and what it does not.** The cutoffs (an end, a
+replacement, a run or session ending, a revocation, an archive, a credential replaced,
+removed or refused) protect admission at the proxy: no request is admitted after one
+completed. A request already admitted, past its last check, is not recalled, and its
+provider answers it. Every check is made under the writer lease, so a process paused
+whole (a machine asleep, a debugger) across the lease's expiry sends nothing once it
+resumes without the lease, and its successor's cutoffs bind from its start: how late a
+paused process can send is bounded by the lease. Copilot access is GitHub's last
+confirmed answer about the account, applied until the next definitive refusal (a rate
+limit is no answer); while answers about one account from two sign-ins conflict and
+Chopin asks again, the list, and what a launch may be given, show the last confirmed
+answer.
 
 ## Permission checks
 
@@ -1193,12 +1853,21 @@ Nothing a person sends to the Planner is held for later. A message is never "wai
   machine's own work is, and the status beside the composer says so (_Your work is kept._), but
   the message is not.
 
-A message sent while a turn is only beginning or finishing has no session to be given to just
-now. It is answered as a passing trouble (`temporarily-unavailable`), and its browser sends it
-again, with the same request ID, in a moment. If a turn ends between a message being posted and
-the turn reading it, an idle Chat starts a turn for the message; otherwise Chat says that Chopin
-did not read it, and it is not sent again on its own. A process that is stopping starts no turn and
-says nothing, so the browser sends the message again to the next process. Sends are admitted one
+A message sent while a turn is being stopped or finishing, or while one of Chopin's own turns is
+being handed the Chat, has no session to be given to just now. It is saved and acknowledged at
+once, and starts the next turn as that one winds down, ahead of anything waiting, as a message
+that preempts a job does. A message sent while such a person's turn waits to start is saved and
+acknowledged at once too, and given to that turn once it can take one; a harness that takes no
+input mid-run refuses it with `planner-starting` and words that ask for no Stop, since nothing is
+running for Stop to end: "chopin is about to answer another message and can't take more while it
+works on this machine. Send yours again once it has answered." None of these is answered as a passing
+trouble, so no message waits in its browser's outbox behind another. If a turn ends between a
+message being posted and the turn reading it, an idle Chat starts a turn for the message; otherwise
+Chat says that Chopin did not read it, and it is not sent again on its own. A process that is
+stopping starts no turn and says nothing, so the browser sends the message again to the next
+process. A message it had already kept for a turn that has not started yet is not lost silently:
+the stopping process says in Chat that Chopin did not read it ("chopin did not read @bo's message.
+Send it again to ask."), before it hands over. Sends are admitted one
 at a time, and at most 20 are processed at once (past that a send is answered
 `temporarily-unavailable`).
 
@@ -1214,18 +1883,20 @@ and which is neither saved nor shown (its turn is sent as `quiet`, which Chat dr
 all, as it does a reply whose words are all out while its after-answer check runs): background jobs
 (such as keeping a title), which also wait behind a person's turn they gave way to, and the turns the
 server writes for itself (answers to open decisions, relinking after a build, settling a prototyped
-passage, an ended workflow run, a readiness check, an initiative proposal). They start in the
+passage, a readiness check, an initiative proposal). They start in the
 order they were asked once the running turn ends, a job that is no longer worth running is dropped
 at that point, and none counts against what a person may send.
 
 **What a person sees.** The message is in Chat at once, as theirs, with no mark. While only the
 browser has it, in an outbox that sends it by itself, in order and once, when the page's connection
 is back, it says **Sending**; never waiting, queued or a clock. When the server refuses it because
-no machine took it or the running turn cannot take input mid-run, and the composer holds no newer
+no machine took it or the harness cannot take input mid-run (`planner-not-attached`,
+`planner-busy`, `planner-starting`), and the composer holds no newer
 draft, the message's words (with its mention, references and staged files) return to the composer
-draft, chopin says why in a row at the end of the transcript only that person sees (with _How
-to fix_ where the machine has something to fix), so nothing typed is lost, and while Chopin works the composer's
-one button offers Stop so the person can stop Chopin and send it. When a newer draft was already
+draft, chopin says why in a row only that person sees, at the time it was said (with _How
+to fix_ where the machine has something to fix), so nothing typed is lost, and for `planner-busy`
+while Chopin works the composer's one button offers Stop so the person can stop Chopin and send it
+(`planner-starting` keeps Send, so it never stops the waiting person's turn). When a newer draft was already
 typed, or another refusal turned the message down, it says **Couldn't send** on itself, with the
 reason, **Try again** and **Delete**, which act on the outbox alone since the server kept nothing.
 While the page's offline bar shows, both give way to it and return with the connection. The
@@ -1249,82 +1920,25 @@ A harness session is disposable. A process restart, credential rotation,
 logout, or ownership reset discards it. A later turn bootstraps from the
 bounded transcript and reads the current document.
 
-The one exception is an atomic Planner session that still owns Atomic workflow
-runs when its turn ends. A workflow the Planner starts outlives the turn that
-launched it, and its runs belong to that session, so Chopin keeps the session
-and its owner binding, and keeps the document loaded, until every run has
-finished. The next turn reuses that session, so the Planner can still see and
-steer its runs over Intercom; people steer through Chat and Decisions, never a
-stage directly. Since Atomic 0.9.44 such a message reaches a busy stage after
-its current tool calls finish rather than cancelling them, unless the Planner
-sends it as an `interrupt`. **Stop Planner** also pauses the session's live runs, resumably,
-through Atomic's session run control, and **Resume Planner** resumes the runs it
-paused. A run waiting on a question pauses too: Atomic withdraws the question
-from Decisions while the run is paused and presents it again on Resume, and an
-answer that arrives during the pause reaches the run only after Resume, so a
-paused run never advances. A run that ends blocked or failed while the Planner
-is between turns starts a Planner turn about it, on the kept session, so the
-Planner reports what happened and what the team needs to do; Chat records the
-run's end as that turn's reason, and the session is let go after the turn. The
-adapter stops any turn Atomic starts on its own, such as for its lifecycle
-notices or, since Atomic 0.9.41, for a message queued while the session is
-idle, because Chopin would neither show nor record it. The Planner's next turn
-still starts normally.
-Chat shows the session's runs as one stack, one row
-per run: its name, status (running, waiting on Decisions, paused, or ended), and
-elapsed time. Several runs can be live at once. Runs waiting on Decisions come
-first, then running, paused, and ended runs, newest first within each, and more
-than three rows fold behind "more" without ever hiding a waiting run. Only the
-first waiting run, or else the newest live one, shows its stages; any row opens
-on click to show its six most recent stages with their status and duration, and
-a waiting row links to its Decisions. Chopin stores every stage of a run, with
-no limit on how many, in `workflow_run_stages` (see
-[Storage](storage.md#postgresql-schema)); the card itself carries only the latest
-12, with an unfinished stage under an ended ancestor already shown as stopped.
-Its "+N earlier" button unfolds every stage in a list that scrolls inside the
-card, loading the stored ones 200 at a time from
-`GET /api/channels/<id>/runs/<run id>/stages?offset=&limit=` (for anyone who can
-read the document; at most 500 a page) only when someone unfolds it, and says
-how many earlier stages nobody reported; "Show fewer" folds it back and forgets
-them. Each live row can be paused, and each paused row resumed, on its own; Chat
-records who did. The stack and every stage are stored with the document, so a
-reload or restart keeps them, including for finished runs; a run that was live
-when the server stopped comes back stopped. A stored run's stages go when its
-card does. Ended rows stay until the next workflow starts in the
-document. When a run ends, Chat also records a line saying how it ended and how
-long it took. The session is let go when its runs finish, when its owner
-binding ends, or when the document closes. A session that waits on a question
-it asked, such as an `ask_user_question` with no reported run, is kept the same way
-until a member answers it or it is withdrawn. A turn whose Chat reply could not
-be verified, or moved into inline decisions, fails without letting go a session
-that still owns runs or waits on a question, so that failure ends no run and
-withdraws no question. An explicit Stop still lets go a session that only waits on
-a question, but changes nothing for one whose workflows are paused: they and the
-question they hold open wait for Resume. The
-"was stopped after N min" line records how long the run had lasted when its
-session was let go, not a limit; run state is durable in Atomic's
-workflow journal, so runs interrupted that way can be resumed from a later
-session. Before disposing the session, the adapter waits, for at most 10
-seconds, on Atomic's `session.workflows.waitForSettled()` for each run that
-finished, failed or was stopped, so a session let go right after a run ends
-never leaves that run `running` in the journal; a run whose ending could not be
-recorded is logged by its ID. Chopin keeps that journal at
-`$XDG_STATE_HOME/chopin/atomic/workflows.sqlite` under the same per-user state
-directory as the documents' own directories, because a run resumes only with
-the journal and working directory it started in. Each Planner session is
-given that file through Atomic's `createAgentSession({ journal })`, so the
-server's process environment is left unchanged. An operator's non-empty
-`ATOMIC_WORKFLOW_JOURNAL_PATH` names another file instead; Atomic's
-`workflows.journal` setting and its `ATOMIC_WORKFLOWS_JOURNAL` and
-`ATOMIC_STORAGE` selections do not move a Planner session's journal, and
-neither does the shared top-level `storage` setting, including an adapter named
-by package such as the libSQL selection `atomic storage join` writes. That
-setting does reach the Planner's Intercom: its sessions use the machine's
-Intercom broker, which keeps its routing in the selected database and so can
-reach sessions on every machine that selects the same one. Atomic
-still checks every set `ATOMIC_STORAGE`, `ATOMIC_SESSIONS_STORAGE`, and
-`ATOMIC_WORKFLOWS_JOURNAL` when it creates a session, so an invalid value fails
-every Atomic turn with a `StorageConfigError` naming the variable. A Build is not a workflow run and has no card in Chat: its tasks, their
+The one exception is a Planner session that waits on a question it asked, such as an
+`ask_user_question`, or on an answer its client has not received, when its turn ends. Chopin
+keeps the session and its owner binding, and keeps the document loaded, until a member answers
+the question or it is withdrawn, and the next turn reuses it. The session is let go once no
+question is open and every answer has reached its client, when its owner binding ends, or when
+the document closes. A turn whose Chat reply could not be verified, or moved into inline
+decisions, fails without letting go a session that waits on a question, so that failure
+withdraws no question. **Stop Planner** stops the running turn; with no turn running, it lets go
+a session that only waits on a question, which withdraws the question, and Chat says so. Chopin
+keeps no workflow runs and shows no run cards: a remote client's own work that outlives its turn
+is the client's to report in its replies. The Atomic adapter stops any turn Atomic starts on its
+own, such as for its lifecycle notices or, since Atomic 0.9.41, for a message queued while the
+session is idle, because Chopin would neither show nor record it. The Planner's next turn still
+starts normally. An Atomic Planner session keeps its history in
+memory, and Chopin saves its every entry with the document for forks and threads,
+so Atomic's shared top-level `storage` setting and its `ATOMIC_STORAGE` and
+`ATOMIC_SESSIONS_STORAGE` selections do not move it. Atomic still checks every set
+`ATOMIC_STORAGE` and `ATOMIC_SESSIONS_STORAGE` when it creates a session, so an
+invalid value fails every Atomic turn with a `StorageConfigError` naming the variable. A Build's tasks, their
 state and pull requests show under **Build**, whichever machine runs it. The
 Planner's instructions say so, so it does not point people to Chat for a Build.
 
@@ -1338,6 +1952,62 @@ attempt. `AGENT=off` prevents those turns and disables the background-job
 runner. For the `copilot-sdk` adapter this also avoids starting Copilot CLI.
 `AGENT=off` does not disable `/mcp`, and the prototype UI may still contain
 Planner-oriented explanatory copy.
+
+## Creating documents
+
+When a request splits into separate pieces of work (several features, or one
+change across the whole app), the Planner can open one new document per piece
+with `create_document` instead of writing one document too large to review. Its
+instructions prefer separate documents unless the person asks for one.
+
+The tool takes an `idempotencyKey`, a `title`, a `brief` (MCP's
+`create_document` brief), the whole first `document` in the dialect, and an
+optional `instruction`. It is a host tool, so it is offered under every harness
+(`copilot-sdk`, `atomic` and `remote`), and it is among the Planner's tools the
+Copilot SDK adapter checks a session against. `apps/server/src/agent/new-documents.ts`
+holds its rules:
+
+- **Who creates it.** Only a turn a person's Chat message, thread reply or
+  `invoke_planner` message drives may create documents; a turn nobody typed, a comment turn and a
+  background job are refused. That person is the creator. Their own live browser
+  login is asked again for push or administration access to the repository, as
+  `chat:send` is, both before and after the visual assessment; the Planner owner's
+  credential never authorizes a new document. A person with no live login is
+  refused.
+- **What it makes.** A top-level document in the creating document's repository,
+  with its own Chat, Decisions and Planner session, sharing no transcript with the
+  creating one. Its recorded base is the creating document's own (from its MCP
+  creation), or else the repository's default branch at its current commit. The
+  draft goes through MCP's `prepare` and the same visual assessment
+  (`createDocument` in `apps/server/src/mcp/hosted.ts` serves both). It is given
+  the creating document's model and thinking level, stored with the creator as
+  its chooser in the same transaction that creates the document, fenced by the
+  writer lease (`CreateChannel.modelChoice`). A choice that can't be stored
+  creates nothing, so a retry creates the document with it; a retry of a
+  document already made never writes a choice, and so keeps any chosen since.
+- **Bounds.** At most 10 documents a turn and 30 an hour for one person, counted
+  in the process. A turn's count is kept with the turn itself (its active member
+  request) for as long as it runs, a turn waiting on a Decision included, and
+  goes with it. The idempotency key is scoped to the creating document, so a
+  retried call returns the document the first made and creates and starts
+  nothing again; the same key with a different draft is a conflict. A retry is
+  looked up in storage first: it is compared against the base the first call
+  recorded, so a default branch that moved since is no conflict, and it is
+  answered even after the limits are spent, since it counts toward neither.
+- **Order.** The document is stored first. Then the sidebar hears of it through
+  `/ws/sidebar`, the Chat or thread whose turn asked gets one system line naming
+  it with a link (`Chat.Entry.document`), saved before it is shown, and, if an
+  `instruction` was given, it is posted in the new document's Chat as the
+  creator's message, exactly as `invoke_planner` posts one, starting that
+  document's Planner under the same machine rules as any other document. A
+  refused instruction (no machine attached, for one) leaves the document in place
+  and is reported to the model. A line that could not be saved is reported too
+  (`announced: false`), and the same call again posts it; one the Chat already
+  holds is never posted twice, so a retry after a crash between the two posts
+  the missing line and nothing else.
+
+The result gives each new document's `id` and absolute `url`, so the model, or a
+workflow it started, can follow up on it.
 
 ## Background jobs
 

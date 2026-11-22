@@ -6,8 +6,10 @@ import type {
 	SessionNotification,
 } from "@agentclientprotocol/sdk";
 import { PROCESSES, stopBackend } from "./planner";
+import type { GuestRepository } from "./nvx";
 import { type Sandbox, spawnIn } from "./sandbox";
 import { withoutGitHub } from "./github-token";
+import { managedEnvironment } from "./ai-agent";
 import { VERSION } from "./version";
 
 /** How long a stopped agent's process group has to exit before it is killed. */
@@ -32,11 +34,19 @@ export type AgentOptions = {
 	onStart?: (failure?: AgentFailure) => void;
 	/** Called with the agent's name and version once it has answered initialize with them. */
 	onInfo?: (info: AgentInfo) => void;
-	/** Where the agent starts: the machine's process sandbox, else plainly. */
-	sandbox?: Sandbox;
+	/** Where the agent starts: a microVM of its own. */
+	sandbox: Sandbox;
 	/** What it may write beside its worktree, and its own files in the connector's state directory. */
 	writable?: string[];
 	own?: string[];
+	/**
+	 * The agent's own state directory, for a run handed AI grants: nothing of the owner's agent setup
+	 * reaches it, in its environment or on disk (see `Launch.agentHome`). Its environment is then
+	 * only what `managedEnvironment` permits of the connector's own, and `env`.
+	 */
+	agentHome?: string;
+	/** The repository its guest clones and works in (see `Launch.repository`). */
+	repository?: GuestRepository;
 	/** How long the agent's turn may run before it is stopped; one hour unless said. */
 	limitMs?: number;
 };
@@ -85,8 +95,8 @@ function startAgent(
 	command: string[],
 	cwd: string,
 	env: NodeJS.ProcessEnv | undefined,
-	stderr?: (chunk: string) => void,
-	where: Pick<AgentOptions, "sandbox" | "writable" | "own"> = {},
+	stderr: ((chunk: string) => void) | undefined,
+	where: Pick<AgentOptions, "sandbox" | "writable" | "own" | "agentHome" | "repository">,
 ) {
 	let child = spawnIn(where.sandbox, {
 		command,
@@ -95,11 +105,16 @@ function startAgent(
 		stdin: "pipe",
 		...(where.writable ? { writable: where.writable } : {}),
 		...(where.own ? { own: where.own } : {}),
+		...(where.agentHome ? { agentHome: where.agentHome } : {}),
+		...(where.repository ? { repository: where.repository } : {}),
 	});
 	let kill = (signal: NodeJS.Signals = "SIGTERM") => {
 		try {
 			if (process.platform !== "win32" && child.pid) process.kill(-child.pid, signal);
-			else child.kill(signal);
+			// Killing nvx.exe alone would leave its OpenVMM running.
+			else if (child.stopMicrovm) {
+				void child.stopMicrovm(signal === "SIGKILL" ? 0 : AGENT_STOP.graceMs);
+			} else child.kill(signal);
 		} catch { /* Process may have already exited. */ }
 	};
 	let head = "";
@@ -181,7 +196,7 @@ export async function checkAgent(
 		onInfo?: (info: AgentInfo) => void;
 		/** Stops the agent at once, as a failure. */
 		signal?: AbortSignal;
-		sandbox?: Sandbox;
+		sandbox: Sandbox;
 	},
 ): Promise<AgentFailure | undefined> {
 	let timeoutMs = options.timeoutMs ?? 10_000;
@@ -193,7 +208,7 @@ export async function checkAgent(
 			options.cwd,
 			options.env,
 			undefined,
-			options.sandbox ? { sandbox: options.sandbox } : {},
+			{ sandbox: options.sandbox },
 		);
 	} catch (error) {
 		return { how: error instanceof Error ? error.message : String(error) };
@@ -241,13 +256,20 @@ export async function runAgent(options: AgentOptions): Promise<string> {
 		app,
 		options.command,
 		options.cwd,
-		// Nothing of the machine's GitHub setup reaches a run's agent; its own comes in `env`.
-		{ ...withoutGitHub(process.env), ...options.env },
+		// Nothing of the machine's GitHub setup reaches a run's agent; its own comes in `env`. One
+		// with a state directory of its own, which runs on Chopin's AI accounts, gets only what is
+		// permitted of the connector's environment, and so nothing of the owner's agent setup either.
+		{
+			...(options.agentHome ? managedEnvironment(process.env) : withoutGitHub(process.env)),
+			...options.env,
+		},
 		options.stderr,
 		{
-			...(options.sandbox ? { sandbox: options.sandbox } : {}),
+			sandbox: options.sandbox,
 			...(options.writable ? { writable: options.writable } : {}),
 			...(options.own ? { own: options.own } : {}),
+			...(options.agentHome ? { agentHome: options.agentHome } : {}),
+			...(options.repository ? { repository: options.repository } : {}),
 		},
 	);
 	let { connection } = agent;

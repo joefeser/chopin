@@ -1,5 +1,6 @@
 import { displayTitle } from "@chopin/dialect";
 import * as Plan from "../plan/service";
+import { mayDeleteDocument } from "@chopin/protocol/document-delete";
 import { documentPath } from "@chopin/protocol/document-url";
 import { MAX_GITHUB_REFERENCES, parseGitHubReferenceKey } from "@chopin/protocol/github-reference";
 
@@ -13,6 +14,7 @@ import { documentSlug } from "./slug";
 import { normalizedTitle } from "./title";
 
 import type { HostedAuth } from "../auth/routes";
+import type { DeleteOutcome, Deleter } from "./deletion";
 import type { AuthenticatedSession } from "../auth/session";
 import type { GitHubReference, GitHubReferencesResponse } from "@chopin/protocol/github-reference";
 import type { Repository } from "../github/client";
@@ -210,9 +212,6 @@ async function authorizedRepository(
 
 /** Enough editing sessions to cover a document's recent life without paging. */
 const VERSION_LIMIT = 200;
-/** Stages of a workflow run per page, by default and at most. */
-const RUN_STAGE_PAGE = 200;
-const MAX_RUN_STAGE_PAGE = 500;
 
 /** The newest sessions History asks summaries for; the version-summary job accepts no more. */
 const MAX_SUMMARIZED_VERSIONS = 20;
@@ -262,8 +261,14 @@ export function registerChannelRoutes(
 	auth: HostedAuth,
 	options: {
 		onAgentReset?: (channelId: string) => Promise<void>;
-		onChannelArchived?: (channelId: string, now: Date) => Promise<ChannelArchiveResult>;
-		onChannelDeleted?: (channelId: string) => Promise<boolean>;
+		/** Archives a document, under the writer lease, as every write that ends AI authority is. */
+		onChannelArchived: (channelId: string, now: Date) => Promise<ChannelArchiveResult>;
+		/**
+		 * Deletes a document for good, with its children, for `by`, who may (see `mayDeleteDocument`).
+		 */
+		onChannelDeleted: (channelId: string, by: Deleter) => Promise<DeleteOutcome>;
+		/** A document this process deleted moments ago, so a repeated delete is answered alike. */
+		deletedChannel?: (channelId: string) => ChannelRecord | undefined;
 		onChannelRenamed?: (channel: ChannelRecord) => void;
 		/** A person created a document. */
 		onChannelCreated?: (channel: ChannelRecord) => void;
@@ -291,7 +296,7 @@ export function registerChannelRoutes(
 		) => Promise<"pending" | "unavailable">;
 		random?: () => number;
 		references?: GitHubReferences;
-	} = {},
+	},
 ): void {
 	router.on(
 		"GET",
@@ -496,31 +501,6 @@ export function registerChannelRoutes(
 			return failure(err, request, auth);
 		}
 	});
-
-	/** Every stored stage of one of the document's workflow runs, a page at a time, in run order. */
-	router.on(
-		"GET",
-		"/api/channels/:channelId/runs/:runId/stages",
-		async (request, url, params) => {
-			try {
-				let readable = await readableChannel(auth, request, params.channelId!);
-				if (readable instanceof Response) return readable;
-				let number = (name: string, fallback: number) => {
-					let text = url.searchParams.get(name);
-					return text === null ? fallback : /^\d+$/.test(text) ? Number(text) : -1;
-				};
-				let offset = number("offset", 0);
-				let limit = Math.min(number("limit", RUN_STAGE_PAGE), MAX_RUN_STAGE_PAGE);
-				let runId = params.runId!;
-				if (offset < 0 || limit < 1 || !runId || runId.length > 128) {
-					return json({ error: "invalid page" }, 400);
-				}
-				return json(await auth.storage.runStages.list(readable.id, runId, { offset, limit }));
-			} catch (err) {
-				return failure(err, request, auth);
-			}
-		},
-	);
 
 	router.on(
 		"GET",
@@ -751,9 +731,7 @@ export function registerChannelRoutes(
 				}
 				let now = auth.clock();
 				let result = action === "archive"
-					? await (options.onChannelArchived
-						? options.onChannelArchived(id, now)
-						: auth.storage.channels.archive({ id, now }))
+					? await options.onChannelArchived(id, now)
 					: await (options.onChannelRestored
 						? options.onChannelRestored(id, now)
 						: auth.storage.channels.restore({ id, now }));
@@ -778,7 +756,8 @@ export function registerChannelRoutes(
 			if (!session) return json({ error: "authentication required" }, 401);
 			let id = params.channelId!;
 			if (!isChannelId(id)) return json({ error: "channel not found" }, 404);
-			let channel = await auth.storage.channels.get(id);
+			// One deleted moments ago is authorized as it was, so a repeat is answered alike.
+			let channel = await auth.storage.channels.get(id) ?? options.deletedChannel?.(id);
 			if (!channel) return json({ error: "channel not found" }, 404);
 			let repo = await authorizedRepository(
 				auth,
@@ -792,15 +771,26 @@ export function registerChannelRoutes(
 			if (!repo.permissions.push && !repo.permissions.admin) {
 				return json({ error: "repository write access is required" }, 403);
 			}
-			if (!channel.archivedAt) {
-				return json({ error: "document must be archived before deletion" }, 409);
+			if (channel.parentChannelId) {
+				return json({ error: "A research document is deleted with the document it's in." }, 409);
 			}
-			let deleted = options.onChannelDeleted
-				? await options.onChannelDeleted(id)
-				: await auth.storage.channels.delete(id);
-			return deleted
-				? new Response(null, { status: 204, headers: { "cache-control": "no-store" } })
-				: json({ error: "channel not found" }, 404);
+			if (!mayDeleteDocument(channel, repo.permissions, session.user.id)) {
+				return json({
+					error: "Only the person who created this document or a repository admin can delete it.",
+				}, 403);
+			}
+			let outcome = await options.onChannelDeleted(id, {
+				id: session.user.id,
+				login: session.user.login,
+			});
+			if (outcome.kind === "deleted") {
+				return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+			}
+			if (outcome.kind === "running") return json({ error: outcome.message }, 409);
+			if (outcome.kind === "child") {
+				return json({ error: "A research document is deleted with the document it's in." }, 409);
+			}
+			return json({ error: "channel not found" }, 404);
 		} catch (err) {
 			return failure(err, request, auth);
 		}
@@ -825,6 +815,8 @@ export function registerChannelRoutes(
 				repo.id !== channel.repositoryId
 				|| (!repo.permissions.push && !repo.permissions.admin)
 			) return json({ error: "repository write access is required" }, 403);
+			// Kept first, so a machine whose Planner of it starts again starts afresh (its disk goes).
+			await auth.storage.channels.markPlannerReset(channel.id, auth.clock());
 			let stored = await auth.storage.collaboration.load(channel.id, auth.clock());
 			let owner = stored?.agent;
 			if (owner?.ownerSessionId) {

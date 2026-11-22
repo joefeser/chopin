@@ -1,7 +1,10 @@
 import { instruction } from "@chopin/protocol/address";
 import { PLANNER_NAME } from "@chopin/editor/people";
 
+import { interleave, isNote } from "./chronology";
+
 import type { Chat } from "@chopin/protocol";
+import type { Local } from "./chronology";
 
 type Speaker = Exclude<Chat.Author, { kind: "system" }>;
 
@@ -39,7 +42,17 @@ export type Group =
 		ts?: number;
 		decision?: Chat.Entry["decision"];
 		comment?: Chat.Entry["comment"];
-	};
+		document?: Chat.Entry["document"];
+	}
+	/** chopin's note to this person alone (`Local`), where it falls in time. */
+	| { kind: "note"; id: string; ts: number };
+
+/**
+ * The turn in progress. `anchorId` is the entry its work is drawn on once it has one
+ * (`TranscriptState.activeAnchorId`), which the work keeps when the turn ends, so an entry placed
+ * before it by its time does not take the work from it.
+ */
+export type WorkingTurn = Pick<Chat.Turn, "id" | "started" | "entryOffset"> & { anchorId?: string };
 
 export type CompletedWork = {
 	turnId: string;
@@ -107,9 +120,10 @@ export function displayText(value: string): string {
 
 export function group(
 	entries: Chat.Entry[],
-	working?: Pick<Chat.Turn, "id" | "started" | "entryOffset">,
+	working?: WorkingTurn,
 	completed: CompletedWork[] = [],
 	suspended?: CompletedWork,
+	local: readonly Local[] = [],
 ): Group[] {
 	let replacements = new Map<number, Message>();
 	let hiddenTools = new Set<number>();
@@ -135,7 +149,7 @@ export function group(
 			? [{
 				entryOffset: working.entryOffset,
 				endOffset: entries.length,
-				anchorId: "",
+				anchorId: working.anchorId ?? "",
 				active: true,
 				disconnected: false,
 			}]
@@ -145,11 +159,14 @@ export function group(
 		let current = entries.slice(span.entryOffset, span.endOffset)
 			.map((entry, index) => ({ entry, index: index + span.entryOffset }))
 			.filter(({ entry }) => entry.author.kind === "agent");
-		let anchor = span.anchorId
+		let anchor = (span.anchorId
 			? current.find(({ entry }) => entry.id === span.anchorId)
-			: current.find(({ entry }) =>
-				!!entry.tools?.length || !!entry.text.trim() || !!entry.streaming
-			);
+			: undefined)
+			?? (span.active
+				? current.find(({ entry }) =>
+					!!entry.tools?.length || !!entry.text.trim() || !!entry.streaming
+				)
+				: undefined);
 		if (!anchor) continue;
 		let tools = current.flatMap(({ entry }) => entry.tools ?? []);
 		if (!span.active && !span.disconnected && !tools.length) continue;
@@ -171,7 +188,7 @@ export function group(
 			if (item.index !== anchor.index && item.entry.tools?.length) hiddenTools.add(item.index);
 		}
 	}
-	let rows: Array<Chat.Entry | Message> = [
+	let server: Array<(Chat.Entry | Message) & { ts: number }> = [
 		...entries.map((entry, index) =>
 			replacements.get(index)
 				?? (hiddenTools.has(index) && entry.author.kind === "agent" && entry.tools?.length
@@ -187,10 +204,16 @@ export function group(
 				working: true,
 			}]
 			: []),
-	];
+	] as Array<(Chat.Entry | Message) & { ts: number }>;
+	// Offsets of turns count the server's entries, so what only this browser has joins them after.
+	let rows = interleave(server, local, entry => entry);
 	let result: Group[] = [];
 
 	for (let row of rows) {
+		if (isNote(row)) {
+			result.push({ kind: "note", id: row.id, ts: row.ts });
+			continue;
+		}
 		if (row.author.kind === "system") {
 			let notice = row as Chat.Entry;
 			// Filter at presentation time so saved turn offsets and comment references stay intact.
@@ -210,6 +233,7 @@ export function group(
 				ts: notice.ts,
 				decision: notice.decision,
 				...(notice.comment ? { comment: notice.comment } : {}),
+				...(notice.document ? { document: notice.document } : {}),
 			});
 			continue;
 		}

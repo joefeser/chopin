@@ -1,13 +1,17 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import { MICROVMS } from "../../testing/microvms";
+import { testLease } from "../../storage/contract-support";
 import { AGENT_VERSION, LINK_CLOSE } from "@chopin/agent-link";
 import {
 	CONNECTOR_PLANNER_COMMAND_HEADER,
 	CONNECTOR_PROTOCOL_HEADER,
+	CONNECTOR_UPDATE_REQUIRED,
 	CONNECTOR_VERSION_HEADER,
 } from "@chopin/protocol/connector";
 
 import { Machines } from "../../auth/machines";
 import {
+	CONNECTOR_PROTOCOLS,
 	offlineMessage,
 	PLANNER_IDLE_MS,
 	PLANNER_PATIENCE_MS,
@@ -31,9 +35,24 @@ import {
 	startingMessage,
 } from "./attachments";
 import { MachinePlanners } from "./machine-planners";
+import { createDocument } from "../../mcp/hosted";
+import {
+	createNewDocument,
+	MAX_DOCUMENTS_PER_TURN,
+	NewDocumentLimits,
+} from "../../agent/new-documents";
 
 import type { RepositoryPage } from "../../github/client";
 import type { RemotePlanner } from "./registry";
+import type { AuthenticatedSession } from "../../auth/session";
+import type { NewDocumentDeps } from "../../agent/new-documents";
+
+/** What a current connector, whose agents run in microVMs, sends with each request. */
+const CONNECTOR = {
+	[CONNECTOR_VERSION_HEADER]: "dev",
+	[CONNECTOR_PROTOCOL_HEADER]: String(CONNECTOR_PROTOCOLS.max),
+	...MICROVMS,
+};
 
 let cleanups: Array<() => unknown> = [];
 afterEach(async () => {
@@ -45,8 +64,11 @@ afterEach(async () => {
  * choose them for the linked document, and run its Planner on them over the agent connection.
  */
 async function dispatchServer(
-	/** `planners: false` is a server that runs no Planner on machines, as with AGENT=off. */
-	{ planners: runsPlanners = true }: { planners?: boolean } = {},
+	/**
+	 * `planners: false` is a server that runs no Planner on machines, as with AGENT=off; `ai` one that
+	 * hands Planner sessions launches on people's AI accounts.
+	 */
+	{ planners: runsPlanners = true, ai = false }: { planners?: boolean; ai?: boolean } = {},
 ) {
 	let linked = await linkAuth();
 	let { auth, storage, sessions, cookies, channel } = linked;
@@ -72,6 +94,7 @@ async function dispatchServer(
 			origin: auth.config.origin,
 			clientId: "client",
 			authorize: async (userId, token) => (await auth.admission.user(token)).id === userId,
+			lease: () => lease,
 		});
 		planners = new MachinePlanners({
 			machines,
@@ -91,6 +114,7 @@ async function dispatchServer(
 				changed: () => {},
 				context: async () => ({ source: "# Context", revision: 0 }),
 				...runsPlanners ? { planners } : {},
+				...ai ? { ai: () => ({}) as never } : {},
 				attachments: () => server.attachments,
 				documentOpen: id => open.has(id),
 				plannerStatus: id => announced.push(id),
@@ -144,10 +168,9 @@ async function dispatchServer(
 		userId: string,
 		label: string,
 		connector: {
-			protocol?: number;
 			plannerCommand?: boolean;
 			shared?: boolean;
-			/** Connect with no checkout, as a protocol 5 connector does where it clones what it needs. */
+			/** Connect with no checkout, as a connector does where it clones what it needs. */
 			bare?: boolean;
 			/** The chopin release it says it runs. */
 			version?: string;
@@ -166,7 +189,6 @@ async function dispatchServer(
 				refreshExpiresIn: 15_897_600,
 			},
 		});
-		let protocol = connector.protocol ?? (connector.bare ? 5 : 4);
 		/** `chopin connect` on the machine: a connection of its own, as after a restart. */
 		async function connect() {
 			let opened = await send("/api/connector/connections", {
@@ -175,8 +197,8 @@ async function dispatchServer(
 					? { label: "score", checkouts: [] }
 					: { repository: "octo-org/score", commit: "a".repeat(40), label: "score" },
 				headers: {
+					...CONNECTOR,
 					[CONNECTOR_VERSION_HEADER]: connector.version ?? "dev",
-					[CONNECTOR_PROTOCOL_HEADER]: String(protocol),
 					...(connector.plannerCommand ?? true ? { [CONNECTOR_PLANNER_COMMAND_HEADER]: "1" } : {}),
 				},
 			});
@@ -192,10 +214,7 @@ async function dispatchServer(
 		async function poll(planners?: string[], waitMs = 300) {
 			let response = await send("/connector/mcp", {
 				bearer: connection,
-				headers: {
-					[CONNECTOR_VERSION_HEADER]: "dev",
-					[CONNECTOR_PROTOCOL_HEADER]: String(protocol),
-				},
+				headers: CONNECTOR,
 				body: {
 					jsonrpc: "2.0",
 					id: 1,
@@ -211,42 +230,33 @@ async function dispatchServer(
 			return result.isError ? { error: text } : JSON.parse(text);
 		}
 		/** The Planner credential the connector asks for before it starts a backend. */
-		async function credential() {
+		async function credential(document = channel.id) {
 			let issued = await send("/api/connector/planner", {
 				bearer: token,
-				headers: {
-					[CONNECTOR_VERSION_HEADER]: "dev",
-					[CONNECTOR_PROTOCOL_HEADER]: String(protocol),
-				},
-				body: { document: channel.id },
+				headers: CONNECTOR,
+				body: { document },
 			});
 			expect(issued.status).toBe(200);
 			return (await issued.json()).token as string;
 		}
 		/** The backend the connector starts: a credential for the document, then a link that attaches. */
-		async function backend(feature?: string) {
-			let raw = await rawLink(server.url, await credential(), feature);
-			raw.send({ type: "attach", version: AGENT_VERSION, document: channel.id });
+		async function backend(feature?: string, document = channel.id) {
+			let raw = await rawLink(server.url, await credential(document), feature);
+			raw.send({ type: "attach", version: AGENT_VERSION, document });
 			return raw;
 		}
 		/** What the connector tells Chopin about its Planner backend's failing to start. */
 		async function report(body: unknown) {
 			return send("/api/connector/planner/failure", {
 				bearer: token,
-				headers: {
-					[CONNECTOR_VERSION_HEADER]: "dev",
-					[CONNECTOR_PROTOCOL_HEADER]: String(protocol),
-				},
+				headers: CONNECTOR,
 				body,
 			});
 		}
 		let disconnect = () =>
 			send("/connector/mcp", {
 				bearer: connection,
-				headers: {
-					[CONNECTOR_VERSION_HEADER]: "dev",
-					[CONNECTOR_PROTOCOL_HEADER]: String(protocol),
-				},
+				headers: CONNECTOR,
 				body: {
 					jsonrpc: "2.0",
 					id: 2,
@@ -445,6 +455,24 @@ function failing(document: string, attempts: number, reason = "unsafe-checkout: 
 	return { document, failure: { attempts, how: "exit 1", reason, at: Date.now() } };
 }
 
+describe("a Planner whose sessions run on people's AI accounts in Chopin", () => {
+	it("is said so to its machine, in each Planner credential and in the versions a connector reads first, only where Chopin hands them launches", async () => {
+		for (let ai of [true, false]) {
+			let { machine, send, channel } = await dispatchServer({ ai });
+			let laptop = await machine("member", "U_member", "laptop");
+			let issued = await send("/api/connector/planner", {
+				bearer: laptop.token,
+				headers: CONNECTOR,
+				body: { document: channel.id },
+			});
+			expect(issued.status).toBe(200);
+			expect((await issued.json()).ai, String(ai)).toBe(ai ? "chopin" : undefined);
+			let versions = await (await send("/api/connector/version", {})).json();
+			expect(versions.ai, String(ai)).toBe(ai ? "chopin" : undefined);
+		}
+	});
+});
+
 describe("a Planner backend that keeps failing to start", () => {
 	it("is told to the document's people from the second launch in a row, and goes once the Planner attaches", async () => {
 		let { machine, choose, runtime, channel, server } = await dispatchServer();
@@ -542,7 +570,7 @@ describe("a Planner backend that keeps failing to start", () => {
 		// Nor anyone who is not a paired machine.
 		let stranger = await send("/api/connector/planner/failure", {
 			bearer: `chopin_m_${"x".repeat(43)}`,
-			headers: { [CONNECTOR_VERSION_HEADER]: "dev", [CONNECTOR_PROTOCOL_HEADER]: "4" },
+			headers: CONNECTOR,
 			body: failing(channel.id, 2),
 		});
 		expect(stranger.status).toBe(401);
@@ -837,6 +865,44 @@ describe("choosing a machine for a document", () => {
 		expect(server.attachments.attached(channel.id)).toBe(false);
 	});
 
+	it("tells a machine running a deleted document's Planner who deleted it, and then to forget its disk", async () => {
+		let { machine, choose, channel, server, storage, runtime, send, url } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		await choose("member", laptop.id);
+		expect(await laptop.poll([])).toEqual({
+			kind: "planners",
+			planners: [{ id: channel.id, url }],
+		});
+		let link = await laptop.backend();
+		await link.next("attached");
+		let kept = async () =>
+			(await send("/api/connector/planner/kept", {
+				bearer: laptop.token,
+				headers: CONNECTOR,
+				body: { documents: [{ id: channel.id }] },
+			})).json();
+		expect(await kept()).toEqual({ forget: [], reset: [] });
+
+		// As main.ts deletes it: its Planner's link ends, every row goes, then machines hear.
+		await server.attachments.documentEnded(channel.id);
+		expect(await link.next("refused")).toMatchObject({ code: "document-archived" });
+		let deleted = await storage.channels.delete({
+			id: channel.id,
+			lease: await testLease(storage),
+		});
+		runtime.documentsDeleted(deleted, "ana");
+		expect(await laptop.poll([channel.id])).toEqual({
+			kind: "planners",
+			planners: [],
+			stopped: {
+				[channel.id]: "ana deleted this document, so laptop stopped running its Planner.",
+			},
+		});
+		// Once its Planner has exited, the connector asks, and is told its disk may go.
+		expect(await kept()).toEqual({ forget: [channel.id], reset: [] });
+		expect(await laptop.poll([])).toEqual({ waiting: true });
+	});
+
 	it("tells the machine a renamed document's current address, once", async () => {
 		let { machine, choose, channel, storage } = await dispatchServer();
 		let laptop = await machine("member", "U_member", "laptop");
@@ -1055,9 +1121,8 @@ describe("choosing a machine for a document", () => {
 			createdBy: "U_member",
 			now: new Date(),
 		});
-		// Both connected with a checkout of octo-org/score only.
-		let laptop = await machine("member", "U_member", "laptop", { protocol: 5 });
-		let older = await machine("member", "U_member", "older", { protocol: 4 });
+		// Connected with a checkout of octo-org/score only.
+		let laptop = await machine("member", "U_member", "laptop");
 		let chooseNotes = async (machineId: string) => {
 			let response = await send(`/api/documents/${notes.id}/machine`, {
 				login: "member",
@@ -1077,10 +1142,7 @@ describe("choosing a machine for a document", () => {
 		// Its credential says which repository's checkout the Planner runs in.
 		let issued = await send("/api/connector/planner", {
 			bearer: laptop.token,
-			headers: {
-				[CONNECTOR_VERSION_HEADER]: "dev",
-				[CONNECTOR_PROTOCOL_HEADER]: "5",
-			},
+			headers: CONNECTOR,
 			body: { document: notes.id },
 		});
 		expect(issued.status).toBe(200);
@@ -1088,31 +1150,71 @@ describe("choosing a machine for a document", () => {
 			id: notes.id,
 			repository: "octo-org/notes",
 		});
-		// An older connector connected for octo-org/score is never asked for octo-org/notes.
-		expect((await chooseNotes(older.id)).planner)
-			.toEqual({ state: "none", login: null, machine: null });
-		expect(await older.poll([])).toEqual({ waiting: true });
 	});
 
-	it("never asks a machine without a Planner command or an older connector", async () => {
+	it("never asks a machine without a Planner command", async () => {
 		let { machine, choose } = await dispatchServer();
 		let plain = await machine("member", "U_member", "plain", { plannerCommand: false });
-		let older = await machine("member", "U_member", "older", { protocol: 3 });
 		let chosen = await choose("member", plain.id);
 		expect(chosen.planner).toEqual({ state: "none", login: null, machine: null });
 		expect(
 			chosen.machines.map((item: { label: string; runsPlanners: boolean }) => [
 				item.label,
 				item.runsPlanners,
-			]).sort(),
-		).toEqual([["older", false], ["plain", false]]);
+			]),
+		).toEqual([["plain", false]]);
 		expect(await plain.poll([])).toEqual({ waiting: true });
-		await choose("member", older.id);
-		// An older connector's poll for work never carries the message.
-		expect(await older.poll()).toEqual({ waiting: true });
 	});
 
-	it("stops the Planner when the chosen machine disconnects, is revoked, or loses push access", async () => {
+	it("says in each Planner credential when a writer last reset the Planner, so its disk from before goes", async () => {
+		let { machine, send, channel, storage } = await dispatchServer();
+		let laptop = await machine("member", "U_member", "laptop");
+		let asked = async () =>
+			(await send("/api/connector/planner", {
+				bearer: laptop.token,
+				headers: CONNECTOR,
+				body: { document: channel.id },
+			})).json();
+		expect((await asked()).reset).toBeUndefined();
+		let at = new Date("2026-03-04T05:06:07.008Z");
+		await storage.channels.markPlannerReset(channel.id, at);
+		expect((await asked()).reset).toBe(at.getTime());
+	});
+
+	it("issues no Planner credential to a connector that would run its backend outside a microVM", async () => {
+		let dispatch = await dispatchServer();
+		let { send, channel } = dispatch;
+		let laptop = await dispatch.machine("member", "U_member", "laptop");
+		let issue = spyOn(dispatch.planners, "issue");
+		let ask = (headers: Record<string, string>) =>
+			send("/api/connector/planner", {
+				bearer: laptop.token,
+				headers,
+				body: { document: channel.id },
+			});
+		// chopin 0.0.30, from before microVMs, is told to update, whatever it says of its agents.
+		let older = await ask({
+			...CONNECTOR,
+			[CONNECTOR_VERSION_HEADER]: "0.0.30",
+			[CONNECTOR_PROTOCOL_HEADER]: "7",
+		});
+		expect(older.status).toBe(409);
+		let told = await older.json();
+		expect(told.error).toBe(CONNECTOR_UPDATE_REQUIRED);
+		expect(told.message).toStartWith("chopin 0.0.30 runs agents outside a microVM");
+		// A current one that doesn't say its agents run in microVMs is refused.
+		let unsaid = await ask({
+			[CONNECTOR_VERSION_HEADER]: "dev",
+			[CONNECTOR_PROTOCOL_HEADER]: String(CONNECTOR_PROTOCOLS.max),
+		});
+		expect(unsaid.status).toBe(409);
+		expect((await unsaid.json()).error).toBe("microvm-required");
+		expect(issue).not.toHaveBeenCalled();
+		expect((await ask(CONNECTOR)).status).toBe(200);
+		expect(issue).toHaveBeenCalledTimes(1);
+	});
+
+	it("stops the Planner when the chosen machine disconnects or is revoked, and gives it no credential once its owner can't push", async () => {
 		let { machine, choose, choice, channel, server, send, auth } = await dispatchServer();
 		let laptop = await machine("member", "U_member", "laptop");
 		await choose("member", laptop.id);
@@ -1139,8 +1241,6 @@ describe("choosing a machine for a document", () => {
 		let tower = await machine("member", "U_member", "tower");
 		await choose("member", tower.id);
 		expect((await tower.poll([])).planners).toHaveLength(1);
-		link = await tower.backend();
-		await link.next("attached");
 		let access = auth.github.repositoryAccess;
 		auth.github.repositoryAccess = async (token, owner, name) => {
 			let repository = await access(token, owner, name);
@@ -1148,9 +1248,14 @@ describe("choosing a machine for a document", () => {
 				? { ...repository, permissions: { ...repository.permissions, push: false } }
 				: repository;
 		};
-		expect((await tower.poll([channel.id])).error).toStartWith("repository-forbidden");
-		expect(await link.next("refused")).toMatchObject({ code: "access-revoked" });
-		expect(server.attachments.attached(channel.id)).toBe(false);
+		// Its backend's next credential, which it asks for before it attaches or as one runs out.
+		let renewed = await send("/api/connector/planner", {
+			bearer: tower.token,
+			headers: CONNECTOR,
+			body: { document: channel.id },
+		});
+		expect(renewed.status).toBe(403);
+		expect(await renewed.json()).toEqual({ error: "repository-forbidden" });
 	});
 });
 
@@ -1362,7 +1467,7 @@ describe("a document on Default machine", () => {
 		let planner: RemotePlanner = {
 			channelId: channel.id,
 			isolated: false,
-			humanInput: report => createHumanInput(room.room, undefined, report),
+			humanInput: report => createHumanInput(room.room, report),
 		};
 		let started = link.next("start").then(start => {
 			link.send({ type: "started", session: start.session });
@@ -1423,17 +1528,15 @@ describe("a document on Default machine", () => {
 	});
 
 	it("keeps a Planner whose machine went quiet, with its work, however long it stays away, and offers its document to no other machine", async () => {
-		let { link, laptop, idle, machine, channel, runtime, server, url, choice } = await unwatched(
-			true,
-		);
+		let { link, room, laptop, idle, machine, channel, runtime, server, url, choice } =
+			await unwatched(true);
 		link.send({
-			type: "runs",
+			type: "input-request",
+			request: "ship",
 			session: "planner-session",
-			active: ["root"],
-			paused: [],
-			cards: [],
+			input: { method: "confirm", title: "Ship?", message: "Now." },
 		});
-		await Bun.sleep(50);
+		await room.cards(1);
 		let desk = await machine("member", "U_member", "desk");
 		// The machine sleeps: its backend's link and its connector's connection both end.
 		link.socket.close();
@@ -1466,26 +1569,11 @@ describe("a document on Default machine", () => {
 		});
 		let back = await laptop.backend("resumable-sessions");
 		await back.next("attached");
-		back.send({ type: "resume", sessions: [{ session: "planner-session", requests: [] }] });
+		back.send({ type: "resume", sessions: [{ session: "planner-session", requests: ["ship"] }] });
 		expect(await back.next("resumed")).toEqual({
 			type: "resumed",
-			sessions: [{ session: "planner-session", requests: [] }],
+			sessions: [{ session: "planner-session", requests: ["ship"] }],
 		});
-	});
-
-	it("keeps the Planner while one of its workflow runs is live or paused", async () => {
-		let { link, idle } = await unwatched();
-		let runs = async (active: string[], paused: string[]) => {
-			link.send({ type: "runs", session: "planner-session", active, paused, cards: [] });
-			await Bun.sleep(50);
-		};
-		await runs(["root"], []);
-		expect(await idle(PLANNER_IDLE_MS + 60_000)).toBe(true);
-		await runs([], ["root"]);
-		expect(await idle(PLANNER_IDLE_MS + 60_000)).toBe(true);
-		await runs([], []);
-		expect(await idle(PLANNER_IDLE_MS - 1_000)).toBe(true);
-		expect(await idle(2_000)).toBe(false);
 	});
 });
 
@@ -1594,8 +1682,8 @@ describe("a teammate's machine shared with teammates", () => {
 
 	it("passes over a shared machine whose owner can't push to the repository", async () => {
 		let { machine, share, visit, choice } = await dispatchServer();
-		// A protocol 5 machine connects for any repository, whatever its owner can push to.
-		let box = await machine("viewer", "U_viewer", "viewer-box", { protocol: 5 });
+		// A machine connects for any repository, whatever its owner can push to.
+		let box = await machine("viewer", "U_viewer", "viewer-box");
 		expect(await share("viewer", box.id)).toBe(200);
 		await visit();
 		expect(await box.poll([])).toEqual({ waiting: true });
@@ -1617,7 +1705,7 @@ describe("a teammate's machine shared with teammates", () => {
 		let planner: RemotePlanner = {
 			channelId: channel.id,
 			isolated: false,
-			humanInput: report => createHumanInput(room.room, undefined, report),
+			humanInput: report => createHumanInput(room.room, report),
 		};
 		let started = link.next("start").then(start => {
 			link.send({ type: "started", session: start.session });
@@ -1682,25 +1770,23 @@ describe("a teammate's machine shared with teammates", () => {
 		expect(await link.next("refused")).toMatchObject({ code: "access-revoked" });
 	});
 
-	it("keeps it through a live run, not a paused one, and keeps it when shared again meanwhile", async () => {
-		let { share, box, link, stillRuns, finishing } = await sharedAndAttached();
-		let runs = async (active: string[], paused: string[]) => {
-			link.send({ type: "runs", session: "planner-session", active, paused, cards: [] });
-			await Bun.sleep(50);
-		};
-		await runs(["root"], []);
+	it("keeps it through an open question when shared again meanwhile, and stops nothing later", async () => {
+		let { share, box, link, room, stillRuns, finishing } = await sharedAndAttached();
+		link.send({
+			type: "input-request",
+			request: "ship",
+			session: "planner-session",
+			input: { method: "confirm", title: "Ship?", message: "Now." },
+		});
+		let [card] = await room.cards(1);
 		expect(await share("rival", box.id, false)).toBe(200);
 		expect(await stillRuns()).toBe(true);
 		// Shared again before it finished: nothing is stopped later.
 		expect(await share("rival", box.id)).toBe(200);
 		expect(await finishing()).toBe(0);
-		await runs([], ["root"]);
+		await room.answer(card!.id, [0]);
+		expect(await link.next("input-result")).toMatchObject({ status: "answered", value: true });
 		expect(await stillRuns()).toBe(true);
-
-		// A paused run waits on people, not on the machine: sharing off stops the Planner at once.
-		expect(await share("rival", box.id, false)).toBe(200);
-		expect(await link.next("refused")).toMatchObject({ code: "access-revoked" });
-		expect(await stillRuns()).toBe(false);
 	});
 
 	it("lets only the owner share a machine", async () => {
@@ -2616,7 +2702,7 @@ describe("choosing a teammate's shared machine for a document", () => {
 		let planner: RemotePlanner = {
 			channelId: channel.id,
 			isolated: false,
-			humanInput: report => createHumanInput(room.room, undefined, report),
+			humanInput: report => createHumanInput(room.room, report),
 		};
 		let started = link.next("start").then(start => {
 			link.send({ type: "started", session: start.session });
@@ -2882,7 +2968,7 @@ describe("an editor's choice of a teammate's shared machine, on a document on De
 		let planner: RemotePlanner = {
 			channelId: channel.id,
 			isolated: false,
-			humanInput: report => createHumanInput(room.room, undefined, report),
+			humanInput: report => createHumanInput(room.room, report),
 		};
 		let started = link.next("start").then(start => {
 			link.send({ type: "started", session: start.session });
@@ -3090,7 +3176,7 @@ describe("a machine's GitHub token", () => {
 		let ask = (bearer: string, repository: string) =>
 			send("/api/connector/github-token", {
 				bearer,
-				headers: { [CONNECTOR_VERSION_HEADER]: "dev", [CONNECTOR_PROTOCOL_HEADER]: "4" },
+				headers: CONNECTOR,
 				body: { repository },
 			});
 		let member = await machine("member", "U_member", "box");
@@ -3175,5 +3261,95 @@ describe("a person asking for a Planner that is not there", () => {
 		// A machine that was not the one asked is told nothing.
 		await runtime.plannerUsed(channel.id, true);
 		expect(await desk.poll([], 400)).not.toHaveProperty("retry");
+	});
+});
+
+describe("a burst of documents a Planner turn makes", () => {
+	it("every document create_document makes with an instruction in one turn is asked of its creator's machine at once, and each one's backend attaches", async () => {
+		let dispatch = await dispatchServer();
+		let { machine, favor, storage, runtime, channel: source } = dispatch;
+		let desk = await machine("member", "U_member", "desk", { bare: true });
+		await favor("member", desk.id);
+		let session = {
+			session: { id: "session-U_member", userId: "U_member" },
+			user: { id: "U_member", login: "member", avatarUrl: "" },
+		} as unknown as AuthenticatedSession;
+		let deps: NewDocumentDeps = {
+			channel: id => storage.channels.get(id),
+			deleting: () => false,
+			login: async () => session,
+			repository: async () => ({
+				id: "R_score",
+				owner: "octo-org",
+				name: "score",
+				fullName: "octo-org/score",
+				private: true,
+				url: "https://github.test/octo-org/score",
+				defaultBranch: "main",
+				permissions: { pull: true, push: true, admin: false },
+			}),
+			branchHead: async () => "0123456789abcdef0123456789abcdef01234567",
+			origin: async () => undefined,
+			created: async () => undefined,
+			// As the server wires it: a document made with an instruction is in use at once, so its
+			// Planner is asked for as New document's is.
+			create: (creator, input, instructed) =>
+				createDocument(
+					{ storage, clock: () => new Date() },
+					{
+						onChannelCreated: channel => {
+							if (instructed) void runtime.plannerUsed(channel.id);
+						},
+					},
+					creator,
+					input,
+				),
+			modelChoice: async () => undefined,
+			invoke: async () => undefined,
+			appOrigin: "https://chopin.test",
+			limits: new NewDocumentLimits(() => Date.now()),
+		};
+		let turn = { created: 0 };
+		// The turn's fan-out: as many documents as one turn may make, all at once.
+		let made = await Promise.all(
+			Array.from({ length: MAX_DOCUMENTS_PER_TURN }, (_, index) =>
+				createNewDocument(deps, {
+					sourceId: source.id,
+					turn,
+					creator: {
+						userId: "U_member",
+						handle: "member",
+						claimantSessionId: "session-U_member",
+					},
+					arguments: {
+						idempotencyKey: `part-${index + 1}`,
+						title: `Part ${index + 1}`,
+						brief: {
+							goal: `Part ${index + 1} of the work.`,
+							constraints: [],
+							settledDecisions: [],
+							openQuestions: [],
+							repositoryFindings: [],
+						},
+						document: `# Part ${index + 1}\n\nOne part of the work.\n`,
+						instruction: `Draft part ${index + 1}.`,
+					},
+					announce: async () => {},
+				})),
+		);
+		let ids = made.map(result => {
+			if (!result.ok) throw new Error(JSON.stringify(result));
+			return result.document.id;
+		});
+		expect(new Set(ids).size).toBe(MAX_DOCUMENTS_PER_TURN);
+		// Chopin asks the creator's machine for all of them in one answer.
+		let asked = await desk.poll([]);
+		expect(asked.kind).toBe("planners");
+		expect((asked.planners as Array<{ id: string }>).map(planner => planner.id).sort())
+			.toEqual([...ids].sort());
+		// Each one's backend attaches, all at once, and none is left starting.
+		let links = await Promise.all(ids.map(id => desk.backend(undefined, id)));
+		await Promise.all(links.map(link => link.next("attached")));
+		for (let id of ids) expect(await runtime.plannerStarting(id)).toBeUndefined();
 	});
 });

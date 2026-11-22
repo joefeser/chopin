@@ -5,8 +5,8 @@
  * session: Atomic builtins, the operator's Atomic resources, a channel working
  * directory, and Chopin as HostInput. Its own turns only offer the tools in
  * `FULL_PLANNER_TOOLS`, the read-only tools the operator's `chopin.plannerTools`
- * setting adds, and Chopin's; the workflows it starts keep their
- * stages' tools. Every other session (the summary and research workers) stays
+ * setting adds, and Chopin's, and never call a tool that writes, however it is
+ * reached. Every other session (the summary and research workers) stays
  * isolated: only Chopin host tools, no host resources, and a checked per-turn
  * tool boundary.
  */
@@ -23,11 +23,12 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@bastani/atomic";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fullPlanner, settleEndedRuns, workflowRuns } from "./full";
+import { join } from "node:path";
+import { fullPlanner } from "./full";
 import { atomicThinkingLevels } from "../catalog";
+import { THREAD_NOTE_TOOL_NAME } from "../tool-names";
 
 import type {
 	HarnessV1,
@@ -66,11 +67,11 @@ export const ATOMIC_DEFAULT_SYSTEM_PROMPT =
 
 /**
  * What a full Planner's own turns may call besides Chopin's tools: reading the
- * checkout and the web, asking Decisions, running workflows, Intercom, and
- * codemode. Codemode scripts call only the tools this turn already offers, plus
- * non-LLM models such as classifiers and image generators, so it adds no file
- * edits or commands. The Planner cannot edit files or run commands, so
- * implementing the plan goes to another session.
+ * checkout and the web, asking Decisions, and codemode. Codemode scripts call
+ * only the tools this turn already offers, plus non-LLM models such as
+ * classifiers and image generators, so it adds no file edits or commands. The
+ * Planner cannot edit files, run commands or start agents, so it never
+ * implements the plan itself.
  */
 export const FULL_PLANNER_TOOLS: ReadonlySet<string> = new Set([
 	"read",
@@ -81,13 +82,21 @@ export const FULL_PLANNER_TOOLS: ReadonlySet<string> = new Set([
 	"fetch_content",
 	"get_search_content",
 	"ask_user_question",
-	"workflow",
-	"intercom",
 	"codemode",
 ]);
 
-/** Atomic tools that change files, run commands or start agents, which no setting gives a Planner's own turns. */
-const WRITING_TOOLS: ReadonlySet<string> = new Set([
+/**
+ * What no full Planner's turn may call, however it is reached: Atomic's `intercom` lets the model
+ * pick its target and group, so one document's Planner could reach another's. A thread's one route
+ * out is Chopin's `tell_chat_planner`, to its own document's Chat Planner.
+ */
+export const PLANNER_WITHHELD_TOOLS: ReadonlySet<string> = new Set(["intercom"]);
+
+/**
+ * Atomic tools that change files, run commands or start agents, which no setting gives a Planner's
+ * own turns and none of its turns may call, a codemode script's call included.
+ */
+export const WRITING_TOOLS: ReadonlySet<string> = new Set([
 	"bash",
 	"edit",
 	"write",
@@ -123,7 +132,6 @@ export function operatorPlannerTools(operatorSettings: unknown): ReadonlySet<str
 const GATEWAY_PROVIDER = "vercel-ai-gateway";
 const OPERATION_TIMEOUT_MS = 10_000;
 const BUILTINS_OFF = {
-	workflows: false,
 	subagents: false,
 	mcp: false,
 	"web-access": false,
@@ -245,17 +253,9 @@ export type AtomicSettings = {
 	providers?: Record<string, ProviderConfig>;
 	/**
 	 * Extension or package paths every Planner session loads, as the CLI's
-	 * `--extension` would; their workflows and skills register too. Worker
-	 * sessions never load them.
+	 * `--extension` would; their skills register too. Worker sessions never load them.
 	 */
 	extensions?: readonly string[];
-	/**
-	 * The SQLite file the workflows of Planner sessions are journaled in, in place
-	 * of Atomic's default beside its agent directory. Each Planner session is given
-	 * it through `createAgentSession({ journal })`, which takes precedence over
-	 * `ATOMIC_WORKFLOW_JOURNAL_PATH`; the process environment is left unchanged.
-	 */
-	journal?: string;
 	/** The directory an isolated session's working directory is created in; the system's when absent. */
 	tempRoot?: string;
 };
@@ -274,6 +274,11 @@ export type TurnPolicy = {
 	systemPrompt: string;
 	result?: { value: unknown };
 	full?: boolean;
+	/**
+	 * Tools refused in this session however they are reached, a codemode script included. A full
+	 * Planner also refuses every tool in `WRITING_TOOLS` that way.
+	 */
+	withheld?: ReadonlySet<string>;
 };
 
 /**
@@ -299,12 +304,13 @@ export function atomicTurnExtension(policy: TurnPolicy): ExtensionFactory {
 				};
 			},
 		});
-		let stage = false;
+		// A subagent an extension starts from the session does not run the Planner's turns.
+		let child = false;
 		atomic.on("session_start", (_event, ctx) => {
-			stage = ctx.subagentPolicy !== undefined;
+			child = ctx.subagentPolicy !== undefined;
 		});
 		atomic.on("before_agent_start", event => {
-			if (stage) {
+			if (child) {
 				atomic.setActiveTools(
 					atomic.getActiveTools().filter(name => name !== ATOMIC_RESULT_TOOL_NAME),
 				);
@@ -318,9 +324,14 @@ export function atomicTurnExtension(policy: TurnPolicy): ExtensionFactory {
 			};
 		});
 		atomic.on("tool_call", event => {
-			if (stage) {
+			if (child) {
 				if (event.toolName !== ATOMIC_RESULT_TOOL_NAME) return;
-				return { block: true, reason: `${event.toolName} is not available in a workflow stage.` };
+				return { block: true, reason: `${event.toolName} is not available in a subagent.` };
+			}
+			if (
+				policy.withheld?.has(event.toolName) || policy.full && WRITING_TOOLS.has(event.toolName)
+			) {
+				return { block: true, reason: `${event.toolName} is not available to a Chopin Planner.` };
 			}
 			if (policy.full && event.toolName !== ATOMIC_RESULT_TOOL_NAME) return;
 			if (activeNames(policy).includes(event.toolName)) return;
@@ -479,6 +490,37 @@ export function hostLeak(
 	return found.length > 0 ? found.join("; ") : undefined;
 }
 
+/** What `onSessionEntries` is handed: the session's `FileEntry[]` (`[header, ...entries]`) and its leaf. */
+export type SaveEntries = (entries: unknown[], leafId: string | null) => void;
+
+/**
+ * Saves a session's every entry through `save`, each snapshot replacing the last. Once a
+ * compaction is appended Atomic keeps only the current context window in memory, so a snapshot
+ * then waits for the whole history to load, and any snapshot asked for meanwhile waits behind it:
+ * a snapshot never replaces a fuller one. The returned function settles once its snapshot is saved.
+ */
+export function entrySnapshots(save: SaveEntries): (manager: SessionManager) => Promise<void> {
+	let emit = (manager: SessionManager) => {
+		let header = manager.getHeader();
+		if (header) save([header, ...manager.getEntries()], manager.getLeafId());
+	};
+	let saved = Promise.resolve();
+	let queued = 0;
+	return manager => {
+		if (queued === 0 && manager.hasFullHistory()) {
+			emit(manager);
+			return saved;
+		}
+		queued++;
+		saved = saved.then(async () => {
+			await manager.loadFullHistory();
+			emit(manager);
+		}).catch(error => console.error("[agent] Atomic session entries were not saved:", error))
+			.finally(() => queued--);
+		return saved;
+	};
+}
+
 function serialize(output: unknown): string {
 	return typeof output === "string" ? output : JSON.stringify(output ?? null);
 }
@@ -501,9 +543,9 @@ export function resultWithImages(result: unknown, toolName: string): NonNullable
 }
 
 /**
- * The stream parts for a tool Atomic runs itself: a builtin, extension, workflow
- * or subagent tool. Host tools report through `hostTool`, and a nested call
- * belongs to its parent's row.
+ * The stream parts for a tool Atomic runs itself: a builtin or extension tool.
+ * Host tools report through `hostTool`, and a nested call belongs to its
+ * parent's row.
  */
 export function ownToolParts(
 	event: AgentSessionEvent,
@@ -593,6 +635,8 @@ type Run = {
 	stop: () => void;
 	/** Gives the model a person's message at its next step, between a step's tool calls and its next call. */
 	steer: (text: string) => Promise<void>;
+	/** Settles once Atomic has begun the turn's prompt, or the turn is over. */
+	begun: PromiseWithResolvers<void>;
 	done: Promise<void>;
 };
 
@@ -617,8 +661,8 @@ function listen(run: Run, signal: AbortSignal | undefined): void {
 }
 
 /**
- * The commands an Atomic session in `cwd` offers as `/name`: its prompt templates, its skills
- * (named `skill:name`, as Atomic invokes them) and the workflows registered for it. It reads them
+ * The commands an Atomic session in `cwd` offers as `/name`: its prompt templates and its skills
+ * (named `skill:name`, as Atomic invokes them). It reads them
  * from a session built as a Planner's is, in the operator's agent directory and the checkout, and
  * ends that session at once: nothing is sent to a model. Atomic's own extension commands are not
  * listed, since a person could not run them from a message.
@@ -658,26 +702,6 @@ export async function sessionCommands(
 				description: skill.description,
 				kind: "skill",
 			});
-		}
-		let workflow = session.getToolDefinition("workflow");
-		if (workflow) {
-			let listed = await workflow.execute(
-				"chopin-commands",
-				{ action: "list" } as never,
-				undefined,
-				undefined,
-				session.extensionRunner.createContext() as never,
-			);
-			let items = (JSON.parse(resultText(listed)) as { items?: unknown }).items;
-			for (let item of Array.isArray(items) ? items : []) {
-				let { name, description } = item as { name?: unknown; description?: unknown };
-				if (typeof name !== "string") continue;
-				commands.push({
-					name,
-					...(typeof description === "string" ? { description } : {}),
-					kind: "workflow",
-				});
-			}
 		}
 		return commands;
 	} finally {
@@ -720,6 +744,7 @@ export function createAtomicAdapter(
 			let settingsManager = SettingsManager.inMemory(SETTINGS);
 			let policy: TurnPolicy = {
 				full: !!full,
+				...(full ? { withheld: PLANNER_WITHHELD_TOOLS } : {}),
 				hostNames: [],
 				structured: false,
 				systemPrompt: ATOMIC_DEFAULT_SYSTEM_PROMPT,
@@ -775,6 +800,7 @@ export function createAtomicAdapter(
 					}
 					return;
 				}
+				if (event.type === "agent_start") run.begun.resolve();
 				if (event.type === "turn_start") {
 					let offered = session.agent.state.tools.map(tool => tool.name);
 					if (!full && !sameNames(offered, activeNames(policy))) {
@@ -798,17 +824,10 @@ export function createAtomicAdapter(
 						run.emit(part);
 					}
 					if (
-						sessionManager
-						&& (event.type === "entry_appended" || event.type === "message_end"
-							|| event.type === "compaction_end")
+						event.type === "entry_appended" || event.type === "message_end"
+						|| event.type === "compaction_end"
 					) {
-						let header = sessionManager.getHeader();
-						if (header) {
-							full.onSessionEntries?.(
-								[header, ...sessionManager.getEntries()],
-								sessionManager.getLeafId(),
-							);
-						}
+						void saveEntries();
 					}
 				}
 				if (event.type === "compaction_start") {
@@ -863,6 +882,11 @@ export function createAtomicAdapter(
 				}
 			}
 
+			let entries = full?.onSessionEntries ? entrySnapshots(full.onSessionEntries) : undefined;
+			let saveEntries = async () => {
+				if (entries && sessionManager) await entries(sessionManager);
+			};
+
 			let plannerTools: ReadonlySet<string> = new Set();
 
 			async function prepare(turn: PlannerTurn): Promise<AgentSession> {
@@ -896,25 +920,25 @@ export function createAtomicAdapter(
 						plannerTools = operatorPlannerTools(operator);
 						settingsManager = await fullSettings(operator, cwd);
 					}
-					// The journal holds workflow inputs and outputs; Atomic would create its directory world-readable.
-					if (full && settings.journal) {
-						await mkdir(dirname(settings.journal), { recursive: true, mode: 0o700 });
-					}
 					if (!sessionManager) {
 						if (full?.sessionEntries?.length) {
-							sessionManager = SessionManager.inMemory(
+							let seeded = await SessionManager.inMemory(
 								cwd,
 								undefined,
 								structuredClone(full.sessionEntries) as Parameters<
 									typeof SessionManager.inMemory
 								>[2],
 							);
+							// Atomic opens a session at its current context window; a fork point, and every
+							// snapshot saved from here, needs the whole tree.
+							await seeded.loadFullHistory();
 							if (full.branchLeafId !== undefined) {
-								if (full.branchLeafId === null) await sessionManager.resetLeaf();
-								else if (sessionManager.getEntry(full.branchLeafId)) {
-									await sessionManager.branch(full.branchLeafId);
+								if (full.branchLeafId === null) await seeded.resetLeaf();
+								else if (seeded.getEntry(full.branchLeafId)) {
+									await seeded.branch(full.branchLeafId);
 								}
 							}
+							sessionManager = seeded;
 						} else {
 							sessionManager = SessionManager.inMemory(cwd);
 						}
@@ -932,10 +956,7 @@ export function createAtomicAdapter(
 							systemPrompt: ATOMIC_DEFAULT_SYSTEM_PROMPT,
 							appendSystemPrompt: [],
 						}),
-						extensionFactories: [
-							atomicTurnExtension(policy),
-							...(full ? [workflowRuns(full)] : []),
-						],
+						extensionFactories: [atomicTurnExtension(policy)],
 					});
 					await loader.reload();
 					let created = await createAgentSession({
@@ -950,15 +971,11 @@ export function createAtomicAdapter(
 						builtins: full ? undefined : BUILTINS_OFF,
 						tools: full ? undefined : [...hostNames, ATOMIC_RESULT_TOOL_NAME],
 						extensionBindings: full ? { humanInput: full.humanInput } : undefined,
-						journal: full && settings.journal ? { path: settings.journal } : undefined,
 						customTools: turn.tools.map(hostTool),
 					});
 					// Never `startPendingRecovery()`: it replays undelivered work as turns Chopin did not
 					// start, and an interrupted turn is never replayed.
 					let session = created.session;
-					if (full) {
-						full.workflows = session.workflows;
-					}
 					let leak = full
 						? undefined
 						: hostLeak(session, created.extensionsResult.extensions.length, hostNames);
@@ -978,6 +995,11 @@ export function createAtomicAdapter(
 					}
 					let registered = session.getAllTools().map(tool => tool.name);
 					console.log(`[agent] ${registered.length} tools: ${registered.sort().join(", ")}`);
+					if (policy.withheld) {
+						let route = hostNames.includes(THREAD_NOTE_TOOL_NAME) ? THREAD_NOTE_TOOL_NAME : "none";
+						let withheld = [...policy.withheld].join(", ");
+						console.log(`[agent] Planner withholds ${withheld}; route out: ${route}`);
+					}
 					live = {
 						session,
 						signature,
@@ -1017,12 +1039,6 @@ export function createAtomicAdapter(
 				try {
 					if (live) {
 						live.release();
-						if (full) {
-							await bounded(
-								settleEndedRuns(live.session.workflows, full.runs),
-								"Atomic workflow runs did not settle.",
-							).catch(error => console.error("[agent]", error));
-						}
 						await bounded(live.session.dispose(), "Atomic session disposal timed out.");
 					}
 				} finally {
@@ -1053,8 +1069,9 @@ export function createAtomicAdapter(
 					let structured = turn.responseFormat?.type === "json";
 					let names = full
 						? agent.getAllTools().map(tool => tool.name).filter(name =>
-							FULL_PLANNER_TOOLS.has(name) || plannerTools.has(name)
-							|| policy.hostNames.includes(name)
+							!policy.withheld?.has(name)
+							&& (FULL_PLANNER_TOOLS.has(name) || plannerTools.has(name)
+								|| policy.hostNames.includes(name))
 						)
 						: policy.hostNames;
 					let expected = structured ? [...names, ATOMIC_RESULT_TOOL_NAME] : names;
@@ -1086,7 +1103,12 @@ export function createAtomicAdapter(
 							run.pending.clear();
 							void bounded(agent.abort(), "Atomic abort timed out.").catch(() => {});
 						},
+						begun: Promise.withResolvers<void>(),
 						steer: async text => {
+							// A message given as the turn opens waits for Atomic to begin its prompt.
+							if (!run.stopped && current === run && !agent.isStreaming) {
+								await bounded(run.begun.promise, "Atomic turn did not begin.");
+							}
 							// Atomic would start a turn of its own for a message it is given while idle, and
 							// Chopin never starts one it did not ask for.
 							if (run.stopped || current !== run || !agent.isStreaming) {
@@ -1105,10 +1127,18 @@ export function createAtomicAdapter(
 							if (!run.stopped) {
 								run.emit({ type: "stream-start", modelId: agent.model?.id });
 								await agent.agent.waitForIdle();
-								await agent.prompt(text, {
-									expandPromptTemplates: !!full,
-									...(images.length ? { images } : {}),
-								});
+								if (full && turn.context && !run.stopped) {
+									await agent.sendCustomMessage(
+										{ customType: "chopin.turn_context", content: turn.context, display: false },
+										{ triggerTurn: false },
+									);
+								}
+								if (!run.stopped) {
+									await agent.prompt(text, {
+										expandPromptTemplates: !!full,
+										...(images.length ? { images } : {}),
+									});
+								}
 							}
 							if (run.failure) throw run.failure;
 							if (run.stopped) return;
@@ -1153,15 +1183,7 @@ export function createAtomicAdapter(
 									},
 								});
 							}
-							if (full && sessionManager) {
-								let header = sessionManager.getHeader();
-								if (header) {
-									full.onSessionEntries?.(
-										[header, ...sessionManager.getEntries()],
-										sessionManager.getLeafId(),
-									);
-								}
-							}
+							if (full) await saveEntries();
 							run.emit({
 								type: "finish-step",
 								finishReason: { unified: "stop", raw: undefined },
@@ -1174,6 +1196,7 @@ export function createAtomicAdapter(
 							});
 						} finally {
 							if (current === run) current = undefined;
+							run.begun.resolve();
 						}
 					})();
 					listen(run, turn.abortSignal);

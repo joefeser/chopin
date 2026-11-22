@@ -1,11 +1,13 @@
-import type { SQL } from "bun";
+import type { SQL, TransactionSQL } from "bun";
 import { conflict, missing } from "../errors";
 import type {
 	CreateMachine,
+	Lease,
 	MachineChoice,
 	MachineCredentials,
 	MachineFavorite,
 	MachineRepository,
+	MachineVmProblem,
 	StoredMachine,
 } from "../model";
 import type { MachineStore } from "../port";
@@ -24,12 +26,13 @@ type MachineRow = {
 	lastSeenAt: Date | string;
 	reauthorizeAt: Date | string | null;
 	revokedAt: Date | string | null;
+	vmProblem: MachineVmProblem | string | null;
 };
 
 const COLUMNS = `id, user_id AS "userId", label, repositories, auto_run AS "autoRun", shared,
 	token_hash AS "tokenHash", credential_ciphertext AS ciphertext, credential_revision AS revision,
 	created_at AS "createdAt", last_seen_at AS "lastSeenAt", reauthorize_at AS "reauthorizeAt",
-	revoked_at AS "revokedAt"`;
+	revoked_at AS "revokedAt", vm_problem AS "vmProblem"`;
 
 function machine(row: MachineRow): StoredMachine {
 	return {
@@ -51,6 +54,9 @@ function machine(row: MachineRow): StoredMachine {
 		lastSeenAt: new Date(row.lastSeenAt),
 		...(row.reauthorizeAt ? { reauthorizeAt: new Date(row.reauthorizeAt) } : {}),
 		...(row.revokedAt ? { revokedAt: new Date(row.revokedAt) } : {}),
+		...(row.vmProblem
+			? { vmProblem: typeof row.vmProblem === "string" ? JSON.parse(row.vmProblem) : row.vmProblem }
+			: {}),
 	};
 }
 
@@ -58,6 +64,10 @@ export class PostgresMachineStore implements MachineStore {
 	constructor(
 		private sql: SQL,
 		private run: <T>(action: string, execute: () => Promise<T>) => Promise<T>,
+		/** Throws unless `lease` is held, in the transaction a revocation is written in. */
+		private fence: (transaction: TransactionSQL, lease: Lease) => Promise<void>,
+		/** Told once a revocation settles, committed or not, before its caller hears so. */
+		private revoked: () => void,
 	) {}
 	create(input: CreateMachine) {
 		return this.run("pair machine", async () => {
@@ -156,9 +166,18 @@ export class PostgresMachineStore implements MachineStore {
 			return updated.length > 0;
 		});
 	}
-	revoke(id: string, userId: string, now: Date) {
+	vmProblem(id: string, problem?: MachineVmProblem) {
+		return this.run("record machine capability", async () => {
+			await this.sql`
+				UPDATE machines SET vm_problem = ${problem ? JSON.stringify(problem) : null}::text::jsonb
+				WHERE id = ${id} AND revoked_at IS NULL
+			`;
+		});
+	}
+	revoke(lease: Lease, id: string, userId: string, now: Date) {
 		return this.run("revoke machine", () =>
 			this.sql.begin(async transaction => {
+				await this.fence(transaction, lease);
 				let updated = await transaction<{ id: string }[]>`
 					UPDATE machines
 					SET credential_ciphertext = NULL, credential_revision = NULL, revoked_at = ${now}
@@ -170,7 +189,7 @@ export class PostgresMachineStore implements MachineStore {
 					await transaction`DELETE FROM machine_favorites WHERE machine_id = ${id}`;
 				}
 				return updated.length > 0;
-			}));
+			})).finally(() => this.revoked());
 	}
 	share(id: string, userId: string, shared: boolean) {
 		return this.run("share machine", () =>

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { contractId as id, openedStorage, userAndChannel } from "./contract-support";
+import { contractId as id, openedStorage, testLease, userAndChannel } from "./contract-support";
 import { StorageError } from "./errors";
 import { machine, owner } from "./machine-contract";
 
@@ -122,8 +122,9 @@ export function plannerCredentialContract(name: string, factory: StorageFactory)
 				let { channelId, credential } = await paired(storage);
 				let stored = credential(later(900));
 				await storage.plannerCredentials.put(stored);
-				await storage.channels.archive({ id: channelId, now: AT });
-				expect(await storage.channels.delete(channelId)).toBe(true);
+				let lease = await testLease(storage);
+				await storage.channels.archive({ id: channelId, now: AT, lease });
+				expect(await storage.channels.delete({ id: channelId, lease })).toHaveLength(1);
 				expect(await storage.plannerCredentials.find(stored.digest, AT)).toBeUndefined();
 			} finally {
 				await storage.close();

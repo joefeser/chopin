@@ -8,11 +8,21 @@ import { formatForkedClock, isReplyEntry, replyCountLabel } from "@chopin/protoc
 import { WireLost, WireRefusal } from "../../wire";
 import { asksChopinKey, withChopinMention } from "../ask-chopin";
 import { ErrorState } from "../error-state";
-import { failureBanner, sendFailureView, withoutFailure } from "../failure";
+import {
+	AI_ACCOUNTS_LINK,
+	failureBanner,
+	refusedRetryView,
+	retryRefusal,
+	sendFailureView,
+	withoutFailure,
+} from "../failure";
 import { keepFormatPreference, readFormatPreference } from "../format-preference";
 import { useDocumentPeople } from "../document-people";
 import { MentionLogins } from "../message-mentions";
 import { MentionPicker } from "../mention-picker";
+import { navigateTo } from "../navigate";
+import { QuietNote } from "../quiet-note";
+import { typingFrame, TypingReporter } from "../typing";
 import { pointerGroups, useMentionSources } from "../mention-sources";
 import {
 	chatAuthors,
@@ -44,7 +54,6 @@ import {
 	reviseComposerDraft,
 	sendFailure,
 } from "../references";
-import { runCounts, RunStack } from "../run-card";
 import { ThreadRoot, Transcript } from "../transcript";
 import { offersStop, progressOf, shownWork } from "../transcript-state";
 import { ThreadComposerBoundary } from "./composer-boundary";
@@ -59,6 +68,7 @@ import type { ReferenceRow } from "../reference-picker";
 import type { PointerOption } from "../mention-sources";
 import type { MentionCandidate } from "../mentions";
 import type { ComposerDraft, ReferenceTarget, SendFailure } from "../references";
+import type { RetryRefusal } from "../failure";
 import type { TranscriptDecisions } from "../transcript";
 import type { ComposerModel } from "../use-model-choice";
 import type { ThreadViewState } from "./thread-model";
@@ -86,14 +96,10 @@ export type ThreadPanelProps = {
 	modelControl?: ComposerModel;
 	modelNotice?: ComposerNotice;
 	decisions?: TranscriptDecisions;
-	loadStages: (
-		runId: string,
-		page: { offset: number; limit: number },
-		signal: AbortSignal,
-	) => Promise<{ stages: Wire.RunStage[]; total: number }>;
-	onShowDecisions?: () => void;
 	onAlsoToChatChange: (checked: boolean) => void;
 	onClose: (options?: { restoreFocus?: boolean }) => void;
+	/** Who else is writing in this thread (`typingWords`), under its composer. */
+	typing?: string;
 	wire?: Socket;
 };
 
@@ -119,10 +125,9 @@ export function ThreadPanel(
 		modelControl,
 		modelNotice,
 		decisions,
-		loadStages,
-		onShowDecisions,
 		onAlsoToChatChange,
 		onClose,
+		typing,
 		wire,
 	}: ThreadPanelProps,
 ) {
@@ -139,7 +144,10 @@ export function ThreadPanel(
 	let [submitting, setSubmitting] = useState(false);
 	let [sendError, setSendError] = useState<SendFailure & { code?: string }>();
 	// The failure notice a Retry was pressed for, and the server's words when it refused one.
-	let [retried, setRetried] = useState<{ entry: string; refusal?: string }>();
+	let [retried, setRetried] = useState<{ entry: string; refusal?: RetryRefusal }>();
+	// chopin's ephemeral row: a reply to it refused for want of an AI account, said to this person
+	// alone, with the words kept in the draft.
+	let [note, setNote] = useState<{ text: string; ts: number }>();
 	let bannerId = useId();
 	let [formatting, setFormatting] = useState(() => readFormatPreference(handle));
 	let pendingCaret = useRef<number | { start: number; end: number } | undefined>(undefined);
@@ -167,6 +175,20 @@ export function ThreadPanel(
 
 	let draftable = !readonly && !archived;
 	let composerReady = connected && !readonly && !archived;
+	let reporter = useRef<TypingReporter | undefined>(undefined);
+	useEffect(() => {
+		if (!wire || !composerReady) return;
+		let thread = view.rootId;
+		let lease = new TypingReporter(report => {
+			let frame = typingFrame(report, wire.serverNow());
+			if (frame && wire.connected) wire.send("chat:typing", { ...frame, thread });
+		});
+		reporter.current = lease;
+		return () => {
+			lease.stop();
+			if (reporter.current === lease) reporter.current = undefined;
+		};
+	}, [wire, composerReady, view.rootId]);
 	// `#` and `@` both open at the caret; the one typed nearer to it is the one being written.
 	let hashed = referencesEnabled && composerReady && !submitting
 		? referenceTrigger(draft.text, selection.start, selection.end)
@@ -344,6 +366,7 @@ export function ThreadPanel(
 
 	let submit = () => {
 		if (submission.current || !draftable || !composerReady || !wire?.connected) return;
+		reporter.current?.stop();
 		let current = draftRef.current;
 		if (!current.text.trim()) return;
 		let submitted = prepareDraftSubmission(current, undefined, {
@@ -376,14 +399,20 @@ export function ThreadPanel(
 		void wire.ask<Wire.Sent>("chat:send", payload).then(
 			() => {
 				clearSubmittedDraft(submitted);
+				if (payload.to === "planner" || alone) setNote(undefined);
 			},
 			(error: unknown) => {
-				if (!(error instanceof WireLost && error.restarting)) {
-					setSendError({
-						...sendFailure(error),
-						...(error instanceof WireRefusal && error.code ? { code: error.code } : {}),
-					});
+				if (error instanceof WireLost && error.restarting) return;
+				let failure = sendFailure(error);
+				if (error instanceof WireRefusal && error.code === "no-ai-account") {
+					setNote({ text: failure.text, ts: Math.floor(Date.now() / 1000) });
+					return;
 				}
+				setNote(undefined);
+				setSendError({
+					...failure,
+					...(error instanceof WireRefusal && error.code ? { code: error.code } : {}),
+				});
 			},
 		).finally(() => {
 			if (submission.current !== token) return;
@@ -404,7 +433,6 @@ export function ThreadPanel(
 		reactable,
 	);
 
-	let counts = runCounts(view.runs);
 	let live = connected && view.loaded;
 	let { working: workingTurn, suspended: suspendedWork, settled: settledWork } = useMemo(
 		() => progressOf(view.transcript, live, false),
@@ -431,26 +459,44 @@ export function ThreadPanel(
 						current?.entry !== entry
 							? current
 							: error instanceof WireRefusal
-							? { entry, refusal: error.message }
+							? { entry, refusal: retryRefusal(error) }
 							: undefined
 					)
 				);
 		}
 		: undefined;
-	let failureNode = failed && !sendError
+	let failedView = failed
+		&& refusedRetryView(failed, retried?.entry === failed.entry ? retried.refusal : undefined);
+	let failureNode = failedView && !sendError
 		? (
 			<ErrorState
-				detail={(retried?.entry === failed.entry ? retried.refusal : undefined) ?? failed.detail}
+				detail={failedView.detail}
 				id={bannerId}
-				kind={failed.kind}
-				link={failed.link}
+				kind={failedView.kind}
+				link={failedView.link}
 				onRetry={retryTurn}
 				retryDisabled={!composerReady}
-				retrying={retried?.entry === failed.entry && retried.refusal === undefined}
-				title={failed.title}
+				retrying={retried?.entry === failedView.entry && retried.refusal === undefined}
+				title={failedView.title}
 			/>
 		)
 		: undefined;
+	let noteRow = useMemo(
+		() =>
+			note && {
+				id: String(note.ts),
+				ts: note.ts,
+				row: (
+					<QuietNote
+						link={AI_ACCOUNTS_LINK}
+						onNavigate={navigateTo}
+						text={note.text}
+						ts={note.ts}
+					/>
+				),
+			},
+		[note],
+	);
 	let sendErrView = sendError && !offline
 		? sendFailureView(sendError, sendError.code)
 		: undefined;
@@ -545,6 +591,7 @@ export function ThreadPanel(
 					handle={handle}
 					lead={lead}
 					live={connected && view.loaded}
+					note={noteRow}
 					onReact={reactions.react}
 					reactionIntents={reactions.intents}
 					room={room}
@@ -552,21 +599,6 @@ export function ThreadPanel(
 					working={workingTurn}
 				/>
 			</ImagePlace.Provider>
-
-			{agent && !!view.runs?.length && (
-				<div className="chat-runs flex shrink-0 flex-col px-2.5 pb-2" data-thread-runs="">
-					<RunStack
-						loadStages={loadStages}
-						offline={offline}
-						onPause={runId =>
-							wire?.send("chat:pause-run", { runId, thread: view.rootId })}
-						onResume={runId =>
-							wire?.send("chat:resume-run", { runId, thread: view.rootId })}
-						onShowDecisions={onShowDecisions}
-						runs={view.runs}
-					/>
-				</div>
-			)}
 
 			<ThreadComposerBoundary
 				agent={agent}
@@ -606,6 +638,10 @@ export function ThreadPanel(
 					],
 					onChange: event => {
 						let next = event.currentTarget.value;
+						if (next !== draftRef.current.text) {
+							if (next.trim()) reporter.current?.change();
+							else reporter.current?.stop();
+						}
 						setDraft(current =>
 							reviseComposerDraft(
 								current,
@@ -708,6 +744,7 @@ export function ThreadPanel(
 						event.preventDefault();
 						submit();
 					},
+					onBlur: () => reporter.current?.stop(),
 					onSelect: event =>
 						setSelection({
 							start: event.currentTarget.selectionStart,
@@ -754,21 +791,16 @@ export function ThreadPanel(
 					}
 					: undefined}
 				rootRef={composerRoot}
-				run={agent && (offersStop(view.busy, view.transcript.turn, false) || counts.active > 0)
+				run={agent && offersStop(view.busy, view.transcript.turn, false)
 					? {
 						action: "stop",
 						disabled: !composerReady,
 						onClick: () => wire?.send("chat:abort", { thread: view.rootId }),
 					}
-					: agent && !view.busy && !counts.active && counts.paused > 0
-					? {
-						action: "resume",
-						disabled: !composerReady,
-						onClick: () => wire?.send("chat:resume", { thread: view.rootId }),
-					}
 					: undefined}
 				sendDisabled={!draftable || submitting || !draft.text.trim() || !composerReady}
 				sending={submitting}
+				typing={typing}
 				unavailable={archived ? "archived" : readonly ? "readonly" : undefined}
 			/>
 		</section>

@@ -54,8 +54,9 @@ export type About = {
 	/** It has a Planner command, so it can run the Planner of a document it is chosen for. */
 	plannerCommand?: boolean;
 	agent?: { name: string; version?: string };
-	/** Whether the connector runs agents in the system's process sandbox, and if not, why. */
+	/** Whether the connector runs each agent in an NVX microVM, and if not, why. */
 	sandbox?: SandboxReport;
+	storeProblem?: string;
 };
 /** The browser's approval of a pairing, waiting for GitHub to authorize the machine. */
 export type Approval = {
@@ -99,6 +100,16 @@ export const RESUME_PROTOCOL = 6;
  * as the App's bot and credit the person who asked.
  */
 export const APP_TOKEN_PROTOCOL = 7;
+/**
+ * A connector from this protocol on runs every agent, coding agent and Planner backend alike, in an
+ * NVX microVM of its own. Chopin gives work, Planner credentials and AI launches to no other.
+ */
+export const NVX_PROTOCOL = 8;
+/**
+ * The first chopin release whose connector speaks `NVX_PROTOCOL`. A connector told to update is
+ * never named an older one, which this server would refuse as it refused the one it runs.
+ */
+export const NVX_RELEASE = "0.0.32";
 
 /** A build's run, as its durable credential names it. */
 export type DurableRun = { id: string; documentId: string; kind: "implementation" | "rebuild" };

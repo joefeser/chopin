@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 
-import { contractId as id, openedStorage, userAndChannel } from "./contract-support";
+import { contractId as id, openedStorage, testLease, userAndChannel } from "./contract-support";
 import { StorageError } from "./errors";
 
 import type { StorageFactory } from "./contract-support";
@@ -99,7 +99,9 @@ export function machineContract(name: string, factory: StorageFactory) {
 				await storage.machines.create(second);
 				await storage.machines.create(revoked);
 				await storage.machines.create(machine(other));
-				expect(await storage.machines.revoke(revoked.id, userId, new Date())).toBe(true);
+				expect(
+					await storage.machines.revoke(await testLease(storage), revoked.id, userId, new Date()),
+				).toBe(true);
 				expect((await storage.machines.list(userId)).map(value => value.id)).toEqual([
 					second.id,
 					first.id,
@@ -119,9 +121,40 @@ export function machineContract(name: string, factory: StorageFactory) {
 				expect(await storage.machines.rename(input.id, other, "taken")).toBe(false);
 				expect(await storage.machines.rename(input.id, userId, "build box")).toBe(true);
 				expect((await storage.machines.get(input.id))?.label).toBe("build box");
-				await storage.machines.revoke(input.id, userId, new Date());
+				await storage.machines.revoke(await testLease(storage), input.id, userId, new Date());
 				expect(await storage.machines.rename(input.id, userId, "after")).toBe(false);
 				expect((await storage.machines.get(input.id))?.label).toBe("build box");
+			} finally {
+				await storage.close();
+			}
+		});
+
+		it("keeps why a live machine can't run agents in microVMs until it is cleared, and a revoked one keeps what it had", async () => {
+			let storage = await openedStorage(factory);
+			try {
+				let userId = await owner(storage);
+				let input = machine(userId);
+				await storage.machines.create(input);
+				expect((await storage.machines.get(input.id))?.vmProblem).toBeUndefined();
+				let problem = {
+					reason: "Your user can't read and write /dev/kvm.",
+					fix: "sudo usermod -aG kvm $USER",
+				};
+				await storage.machines.vmProblem(input.id, problem);
+				expect((await storage.machines.get(input.id))?.vmProblem).toEqual(problem);
+				expect((await storage.machines.list(userId))[0]?.vmProblem).toEqual(problem);
+				await storage.machines.vmProblem(input.id, {
+					reason: "macOS has no hypervisor NVX can use.",
+				});
+				expect((await storage.machines.get(input.id))?.vmProblem).toEqual({
+					reason: "macOS has no hypervisor NVX can use.",
+				});
+				await storage.machines.vmProblem(input.id);
+				expect((await storage.machines.get(input.id))?.vmProblem).toBeUndefined();
+				await storage.machines.vmProblem(input.id, problem);
+				await storage.machines.revoke(await testLease(storage), input.id, userId, new Date());
+				await storage.machines.vmProblem(input.id);
+				expect((await storage.machines.get(input.id))?.vmProblem).toEqual(problem);
 			} finally {
 				await storage.close();
 			}
@@ -136,7 +169,7 @@ export function machineContract(name: string, factory: StorageFactory) {
 				let seen = new Date("2026-01-05T03:04:05.000Z");
 				await storage.machines.seen(input.id, seen);
 				expect((await storage.machines.get(input.id))?.lastSeenAt).toEqual(seen);
-				await storage.machines.revoke(input.id, userId, seen);
+				await storage.machines.revoke(await testLease(storage), input.id, userId, seen);
 				await storage.machines.seen(input.id, new Date("2026-01-06T03:04:05.000Z"));
 				expect((await storage.machines.get(input.id))?.lastSeenAt).toEqual(seen);
 			} finally {
@@ -155,7 +188,7 @@ export function machineContract(name: string, factory: StorageFactory) {
 				expect(await storage.machines.rotate(input.id, 1, next)).toBe(true);
 				expect(await storage.machines.rotate(input.id, 1, next)).toBe(false);
 				expect((await storage.machines.get(input.id))?.credentials).toEqual(next);
-				await storage.machines.revoke(input.id, userId, new Date());
+				await storage.machines.revoke(await testLease(storage), input.id, userId, new Date());
 				expect(
 					await storage.machines.rotate(input.id, 2, { ciphertext: bytes(48, 3), revision: 3 }),
 				).toBe(false);
@@ -191,13 +224,25 @@ export function machineContract(name: string, factory: StorageFactory) {
 				let input = machine(userId);
 				await storage.machines.create(input);
 				let now = new Date("2026-01-05T03:04:05.000Z");
-				expect(await storage.machines.revoke(input.id, id("someone-else"), now)).toBe(false);
-				expect(await storage.machines.revoke(input.id, userId, now)).toBe(true);
-				expect(await storage.machines.revoke(input.id, userId, new Date())).toBe(false);
+				expect(
+					await storage.machines.revoke(
+						await testLease(storage),
+						input.id,
+						id("someone-else"),
+						now,
+					),
+				).toBe(false);
+				expect(await storage.machines.revoke(await testLease(storage), input.id, userId, now)).toBe(
+					true,
+				);
+				expect(
+					await storage.machines.revoke(await testLease(storage), input.id, userId, new Date()),
+				).toBe(false);
 				let found = await storage.machines.byToken(input.tokenHash);
 				expect(found?.revokedAt).toEqual(now);
 				expect(found?.credentials).toBeUndefined();
-				expect(await storage.machines.revoke(id("missing"), userId, now)).toBe(false);
+				expect(await storage.machines.revoke(await testLease(storage), id("missing"), userId, now))
+					.toBe(false);
 			} finally {
 				await storage.close();
 			}
@@ -246,7 +291,7 @@ export function machineContract(name: string, factory: StorageFactory) {
 				await storage.machines.share(theirs.id, owner, true);
 				await storage.machines.choose({ channelId, userId: teammate, machineId: theirs.id }, now);
 				expect(await chosen()).toEqual([{ channelId, userId: teammate, machineId: theirs.id }]);
-				await storage.machines.revoke(theirs.id, owner, now);
+				await storage.machines.revoke(await testLease(storage), theirs.id, owner, now);
 				expect(await chosen()).toEqual([]);
 				await expect(
 					storage.machines.choose({ channelId, userId: teammate, machineId: theirs.id }, now),
@@ -264,7 +309,7 @@ export function machineContract(name: string, factory: StorageFactory) {
 				let input = machine(userId);
 				await storage.machines.create(input);
 				await storage.machines.choose({ channelId, userId, machineId: input.id }, new Date());
-				await storage.machines.revoke(input.id, userId, new Date());
+				await storage.machines.revoke(await testLease(storage), input.id, userId, new Date());
 				expect(
 					(await storage.machines.choices()).filter(value => value.channelId === channelId),
 				).toEqual([]);
@@ -295,7 +340,7 @@ export function machineContract(name: string, factory: StorageFactory) {
 				await expect(storage.machines.favor({ userId: other, machineId: first.id }, now))
 					.rejects.toBeInstanceOf(StorageError);
 				await storage.machines.favor({ userId, machineId: first.id }, now);
-				await storage.machines.revoke(first.id, userId, now);
+				await storage.machines.revoke(await testLease(storage), first.id, userId, now);
 				expect(await mine()).toEqual([]);
 				await expect(storage.machines.favor({ userId, machineId: first.id }, now))
 					.rejects.toBeInstanceOf(StorageError);
@@ -330,7 +375,8 @@ export function machineContract(name: string, factory: StorageFactory) {
 				// Owner-only actions stay with the owner.
 				expect(await storage.machines.rename(theirs.id, person, "taken")).toBe(false);
 				expect(await storage.machines.share(theirs.id, person, false)).toBe(false);
-				expect(await storage.machines.revoke(theirs.id, person, now)).toBe(false);
+				expect(await storage.machines.revoke(await testLease(storage), theirs.id, person, now))
+					.toBe(false);
 				expect((await storage.machines.get(theirs.id))?.revokedAt).toBeUndefined();
 			} finally {
 				await storage.close();
@@ -358,7 +404,9 @@ export function machineContract(name: string, factory: StorageFactory) {
 				await storage.machines.share(theirs.id, owned, true);
 				await storage.machines.favor({ userId: teammate, machineId: theirs.id }, now);
 				expect(await favorites()).toEqual([owned, teammate].sort());
-				expect(await storage.machines.revoke(theirs.id, owned, now)).toBe(true);
+				expect(await storage.machines.revoke(await testLease(storage), theirs.id, owned, now)).toBe(
+					true,
+				);
 				expect(await favorites()).toEqual([]);
 			} finally {
 				await storage.close();
@@ -384,7 +432,7 @@ export function machineContract(name: string, factory: StorageFactory) {
 				await storage.users.put({ id: other, login: "teammate", avatarUrl: "", now });
 				expect(await storage.machines.share(input.id, other, true)).toBe(false);
 				expect((await storage.machines.get(input.id))?.shared).toBeUndefined();
-				await storage.machines.revoke(paired.id, userId, now);
+				await storage.machines.revoke(await testLease(storage), paired.id, userId, now);
 				expect(await storage.machines.share(paired.id, userId, true)).toBe(false);
 			} finally {
 				await storage.close();
@@ -400,7 +448,7 @@ export function machineContract(name: string, factory: StorageFactory) {
 				let revoked = machine(userId, { shared: true });
 				for (let input of [shared, plain, revoked]) await storage.machines.create(input);
 				let now = new Date("2026-01-05T03:04:05.000Z");
-				await storage.machines.revoke(revoked.id, userId, now);
+				await storage.machines.revoke(await testLease(storage), revoked.id, userId, now);
 				// The database may hold other tests' machines; this owner's are the ones to read.
 				let ids = async () =>
 					(await storage.machines.shared()).filter(value => value.userId === userId)

@@ -11,6 +11,7 @@
  * cannot be assumed to have Caddy or a container to run it in. `CHOPIN_E2E_PROXY=caddy` runs the
  * reference proxy in a container on the host's network instead (Linux, needs the Docker image).
  */
+import { MICROVMS } from "../apps/server/src/testing/microvms";
 import { spawn } from "node:child_process";
 
 import { SQL } from "bun";
@@ -299,9 +300,9 @@ async function watch(page: Page): Promise<void> {
 						field?.hasAttribute("readonly") ? "read-only" : "writable"
 					} ${
 						[...composer.querySelectorAll("button")]
-							// Send follows what is typed, and Stop and Resume follow whether a turn is running.
+							// Send follows what is typed, and Stop follows whether a turn is running.
 							.filter(button =>
-								!/^(Send message|Stop generating|Resume chopin)$/.test(
+								!/^(Send message|Stop generating)$/.test(
 									button.getAttribute("aria-label") ?? "",
 								)
 							)
@@ -642,6 +643,7 @@ async function pair(page: Page, label: string): Promise<Machine> {
 			headers: {
 				"content-type": "application/json",
 				[CONNECTOR_PROTOCOL_HEADER]: String(CONNECTOR_PROTOCOL),
+				...MICROVMS,
 				[CONNECTOR_VERSION_HEADER]: RELEASE,
 				...extra,
 			},

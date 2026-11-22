@@ -38,15 +38,16 @@ Either way you copy one command and run it in a terminal on that machine, in
 any folder. The installer installs `chopin`, then runs `chopin connect` itself. If the install
 fails, it stops with its own message and runs nothing.
 
-The agent must be installed and signed in first. The page shows its install
-command under **Show install command**, and [Coding agents](#coding-agents)
-lists them all. Your server may list its own
+The machine needs Linux or Windows on x86_64 with hardware virtualization: the
+agent isn't installed or signed in on it, because `chopin` runs it in a microVM of
+its own and installs it there (see [Coding agents](#coding-agents) and
+[Sandbox](#sandbox)). A Mac or an Arm machine can install `chopin`, but can't run
+Chopin's work. Your server may list its own
 [setup agents](self-hosting.md#setup-agents) first, each with its own steps.
 
 ### Local
 
-Pick the system and your coding agent. On Linux or macOS the command looks like
-this:
+Pick the system and your coding agent. On Linux the command looks like this:
 
 ```sh
 curl -fsSL https://github.com/githubnext/chopin/releases/latest/download/install.sh | \
@@ -108,7 +109,11 @@ even under `nohup` or `setsid`. Use the service there.
 
 ## Install
 
-On Linux or macOS (x64 or arm64):
+`chopin` installs on Linux, macOS and Windows, x64 or arm64, but only a Linux or
+Windows machine on x86_64 with hardware virtualization runs Chopin's work (see
+[Sandbox](#sandbox)).
+
+On Linux or macOS:
 
 ```sh
 curl -fsSL https://github.com/githubnext/chopin/releases/latest/download/install.sh | sh
@@ -276,21 +281,19 @@ or disconnect it, it stops being your default.
 The Machines page offers these agents. **Connect with** is what follows
 `chopin connect`, and **Runs** is the command and variables it starts:
 
-| Agent                                                                                               | Install                                              | Sign in                                  | Node.js        | Connect with      | Runs                               | Tested with Chopin |
-| --------------------------------------------------------------------------------------------------- | ---------------------------------------------------- | ---------------------------------------- | -------------- | ----------------- | ---------------------------------- | ------------------ |
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server) | `npm install -g @github/copilot`                     | `copilot login`                          | 22 or newer    | `--agent copilot` | `copilot --acp --allow-all`        | Yes                |
-| [Atomic](https://github.com/bastani-inc/atomic-acp)                                                 | `npm install -g @bastani/atomic @bastani/atomic-acp` | `atomic`, sign in with /login, then quit | 22.19 or newer | `--agent atomic`  | `ATOMIC_ACP_HEADLESS=1 atomic-acp` | Yes                |
+| Agent                                                                                               | In its microVMs                                        | Connect with      | Runs                               | Tested with Chopin |
+| --------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | ----------------- | ---------------------------------- | ------------------ |
+| [GitHub Copilot CLI](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server) | `@github/copilot@1.0.114`                              | `--agent copilot` | `copilot --acp --allow-all`        | Yes                |
+| [Atomic](https://github.com/bastani-inc/atomic-acp)                                                 | `@bastani/atomic@0.10.4`, `@bastani/atomic-acp@0.0.18` | `--agent atomic`  | `ATOMIC_ACP_HEADLESS=1 atomic-acp` | Yes                |
 
-Install the agent globally, as the table does, not through `npx`, so the
-service finds the same program each time. The service can't answer a
-permission prompt, so Copilot CLI runs with `--allow-all` to approve its tools
-without asking. Atomic doesn't ask, and `ATOMIC_ACP_HEADLESS=1` ends its
-questions at once instead of waiting for an answer.
-
-Atomic requires `atomic-acp` 0.0.3 or newer. Earlier adapters ignore the run's
-MCP servers, so an agent can chat but cannot read an investigation or build plan.
-Upgrade with `npm install -g @bastani/atomic-acp@latest`, then restart the connector
-with `chopin service restart`.
+You don't install the agent on this machine, and it doesn't need Node.js:
+`chopin` runs every agent in a microVM of its own, from an image it builds once
+with the agent installed at the version this `chopin` pins (see [Sandbox](#sandbox)).
+The agent runs on the AI accounts of the person a job is for, which they connect in
+Chopin, so it needs no sign-in here either. The service can't answer a permission
+prompt, so Copilot CLI runs with `--allow-all` to approve its tools without asking.
+Atomic doesn't ask, and `ATOMIC_ACP_HEADLESS=1` ends its questions at once instead
+of waiting for an answer.
 
 Arguments after `--` go to the agent. For example,
 `chopin connect --agent atomic -- --model openai/gpt-5.5` runs
@@ -298,20 +301,38 @@ Arguments after `--` go to the agent. For example,
 `--env` you give wins over the agent's own variable of the same name.
 
 For any other agent that speaks ACP over stdio, give its command after `--`
-instead of `--agent`, with its approval flag if it has one:
+instead of `--agent`, with its approval flag if it has one, and how to install it
+in its microVMs with `--install` (repeat it for several commands). The commands run
+in the image's build, with Node.js and npm, whose global installs go into the image:
 
 ```sh
-chopin connect -- my-agent --acp
+chopin connect --install 'npm install -g my-agent' -- my-agent --acp
 ```
 
-In PowerShell, quote a package name that starts with `@`, for example
-`npm install -g '@github/copilot'`. PowerShell would read the bare name as a
-variable.
+A Planner command is installed the same way with `--planner-install`. An agent
+`chopin` has no recipe for is refused before anything is paired, naming the option.
+`chopin connect` builds the Planner command's image with the agent's as it starts,
+before it says Connected, so the first document's Planner starts at once; when
+`--install` and `--planner-install` give the same commands, one image holds both
+programs. A build that fails stops `chopin connect` with the build's own output.
 
-If you installed your agent with a version manager such as fnm, your shell may
-find it in a folder that only lasts as long as the shell. `chopin connect`
-then saves the stable path behind it and prints a line saying so. If there is
-no stable path, it warns that `chopin service install` will refuse it.
+The build reaches the network only through the [proxy](#sandbox), with no credentials
+of yours, and runs whatever install scripts the packages have. To install something
+that needs a sign-in, such as a package from a private registry, fetch it on this
+machine yourself and name its folder with `--install-from`. The build gets a copy
+of that folder, read-only, at `/install-from`; no agent's microVM gets it:
+
+```sh
+npm pack @my-org/my-agent@1.2.3 --pack-destination ~/agent-packages
+chopin connect --install-from ~/agent-packages \
+  --install 'npm install -g /install-from/my-org-my-agent-1.2.3.tgz' -- my-agent --acp
+```
+
+What the folder holds is part of the image, so a changed file builds the image
+again. Keep the folder: the service reads it each time it starts. It may hold only
+files and folders, not links. npm installs into `/opt/chopin/agent`, so a package
+installed with `npm install -g` is at `/opt/chopin/agent/lib/node_modules/<name>`
+in the agent's microVM, and its programs are on the agent's `PATH`.
 
 ## Keep it running
 
@@ -339,11 +360,13 @@ You can also do it in two steps:
    chopin service install
    ```
 
-Before installing, `chopin` starts your agent once the way the service will,
-with the service's `PATH` and your `--env` values, and waits up to 10 seconds
-for it to answer. If it doesn't, nothing is installed, and the message shows
-the first line your agent printed. For an agent that can't start without a
-terminal, pass `--skip-check`.
+Before installing, `chopin` builds any image your settings need that isn't built
+yet, the Planner's included, so the service starts at once. Then it starts your
+agent once the way the service will, with the service's `PATH` and your `--env`
+values, and waits up to 10 seconds for it to answer. If it doesn't, nothing is
+installed, and the message shows the first line your agent printed. For an agent
+that can't start without a terminal, pass `--skip-check`, which leaves out only that
+start.
 
 The service can't answer permission prompts. The built-in agents already
 approve their own tools; give any other agent its approval flag.
@@ -502,8 +525,8 @@ is connected and can run Planners, else the machine that last worked on the
 document, else any of theirs that can. Chopin asks for it while someone has the
 document open, and from the moment its creator makes it with **New document**, before
 their page has loaded it, and stops it once nobody has used the document for 30 minutes.
-A Planner that is replying, or waiting on a question or on a live or paused
-workflow run, counts as use, so its work and its questions are never cut short
+A Planner that is replying, or waiting on a question, counts as use, so its work and its
+questions are never cut short
 however long nobody views the document.
 A Planner stays on its machine while that machine is connected, even when
 another comes online; it moves when the machine disconnects or the creator
@@ -511,6 +534,51 @@ changes the document's machine or their default. Until it attaches, the
 machine button's dot is three petrol dots that brighten in turn and its name says **Connecting to
 studio** (the machine's name), and an `@chopin` message sent meanwhile waits for
 it. Once it has attached the button says nothing more about it.
+
+### Spare Planners
+
+A Planner's microVM takes a few seconds to boot and start its backend. So `chopin
+connect` keeps a spare Planner ready for each repository this machine recently ran a
+Planner in, the ones it cloned as well as your checkouts', and hands a new document's
+Planner to it: the Planner attaches in a fraction of a second instead (see
+[Measurements](nvx-sandbox.md#measurements)). Another spare starts a few seconds
+later.
+
+- **Which repositories.** One where a Planner started in the last 7 days, and each
+  checkout you gave with `--checkout`. The first new document of a repository this
+  machine never ran a Planner in starts cold, and its spare follows. A document whose
+  Planner ran here before starts on its own disk, as before.
+- **How many.** At most 4, and no more than take a tenth of the machine's memory at
+  about 300 MB each, so one on a 4 GB machine and two on 8 GB. The repositories used
+  most recently come first. One starts only while the machine has about 1 GB free
+  beside it.
+- **Only where this machine can push.** Before a spare starts, and every 10 minutes
+  while it waits, `chopin` asks Chopin whether it would give this machine a token for
+  the repository. Once it wouldn't, or refuses one of the repository's Planners its
+  GitHub token, the spare stops and its disk goes.
+- **Many at once.** When new documents of a repository come faster than its spare is
+  replaced, as when a Planner makes several in one turn, the repository keeps up to 4
+  spares, within the same memory bound, until none has come for 2 minutes. Documents
+  that find no spare start cold side by side, half the machine's processors' worth at
+  a time (2 at least, 8 at most), in the order they were asked for, ahead of any new
+  spare.
+- **Nothing of a document until it gets one.** A spare starts with your checkout,
+  read-only, and nothing else of the document's: no credential, an empty token folder
+  and a disk of its own. It gets the document's credentials when it is handed the
+  document, and is never handed another.
+
+The Planner command has to take spare mode (`CHOPIN_PLANNER_SPARE`, see
+`apps/connector/src/planner-spare.ts`); one that doesn't is noticed and started cold.
+`chopin status` shows each spare under the connector:
+
+```text
+Connector:  running (pid 4242, chopin 0.0.34, the service)
+              Spare Planner for octo-org/score: ready (since 3 min ago, my-planner)
+              Spare Planner for octo-org/site: waiting for memory (a spare takes about 300 MB, with 1 GB left free beside it; since 1 min ago)
+```
+
+`--no-planner-spare`, or `CHOPIN_PLANNER_SPARE=0` in `chopin`'s environment, starts
+no spares, and every Planner starts when it is asked for.
 
 ### Can't connect to a machine
 
@@ -647,13 +715,11 @@ running keeps going until it finishes, like a Planner mid-reply.
   ends. A document whose Planner the machine was not running, had not been asked
   to run and was not about to run, and that nobody is using, only loses the
   choice: nothing starts for it on the creator's machine. A teammate's Planner
-  that is idle, or waits only on a paused run, stops
-  at once; one that is replying, has a question open, or has a live run keeps
+  that is idle stops at once; one that is replying or has a question open keeps
   going until that work finishes, then stops within 15 seconds. A build or run
   already going finishes. Meanwhile the machine's row on **Machines** says
   **Finishing 1 teammate document**. Each stop prints why:
-  `<owner> stopped sharing <machine> with teammates`. A paused run stays on the
-  machine and resumes if its owner shares it again.
+  `<owner> stopped sharing <machine> with teammates`.
 
 Choosing another machine stops it and prints
 `Stopped the Planner for <document>: the document chose another machine.` So do
@@ -674,49 +740,94 @@ greyed out.
 [Where chopin keeps its files](chopin-cli-reference.md#where-chopin-keeps-its-files)
 lists them all.
 
-| Path                                    | Holds                                            | Removed                                         |
-| --------------------------------------- | ------------------------------------------------ | ----------------------------------------------- |
-| `runs/<run id>`                         | A job's worktree, for you to inspect             | Once 15 newer runs have finished                |
-| `runs/<run id>-worktrees/`              | Extra worktrees an unsandboxed build adds        | When the run ends, uncommitted changes included |
-| `planners/<owner>/<repo>/<document id>` | A Planner command's worktree for one document    | Never                                           |
-| `repos/<owner>/<repo>`                  | A clone of a repository you named no checkout of | Never                                           |
+| Path                                         | Holds                                                                                                                              | Removed                                                                                                                           |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `runs/<run id>.json`, `runs/<run id>.agent/` | A job's record, and its agent's state where it ran on Chopin's AI accounts                                                         | Once 15 newer runs have finished                                                                                                  |
+| `planners/<owner>/<repo>/<document id>.disk` | A Planner's disk, with its own clone of the repository                                                                             | When Chopin says its document is archived or gone or its Planner was reset, after 30 days unused, or when the machine is unpaired |
+| `repos/<owner>/<repo>`                       | A clone of a repository you named no checkout of                                                                                   | Never                                                                                                                             |
+| `images/`                                    | The images agents and Planners run from, built once each                                                                           | When the connector that holds the base dir starts and no recipe names one any more                                                |
+| `nvx/`                                       | The NVX release this `chopin` pins, and its microVMs' records                                                                      | An NVX release `chopin` no longer pins                                                                                            |
+| `git/<process>/`                             | A copy of the settings of your git configuration that `chopin`'s own git commands use (where to fetch from, proxies, line endings) | As that `chopin` exits, or by the next `chopin connect` once it is gone                                                           |
+| `agent-store/`                               | This machine's database login for agent sessions, and the adapter                                                                  | Its password with `chopin unpair`                                                                                                 |
+
+A run leaves no worktree: its agent worked in its microVM, and pushed what it kept.
+Nor does it leave anything in your temporary directory: NVX's own folder for each
+microVM (`nvx-sandbox-run-*`) goes when the microVM ends, even when it was stopped by
+force, and `chopin connect` removes any a `chopin` that was killed left, once no
+microVM uses it.
 
 `--keep-runs <n>` keeps `n` finished runs instead of 15, and `--keep-runs 0`
 keeps them all. `chopin` never removes a run that is going or waiting to start.
 
 ## Sandbox
 
-`chopin connect` starts every agent and Planner command that runs work inside your
-operating system's own process sandbox, as Codex and Claude Code do for theirs, so a
-mistaken or hostile instruction in a document can't reach past the run's worktree.
-Two start checks, which send the agent nothing, are the exception (see
-[Things to know](#things-to-know)). The sandbox is
-[MXC](https://github.com/microsoft/mxc) on every system: Seatbelt on macOS, bubblewrap
-on Linux and ProcessContainer on Windows. It needs no virtual machine, image or daemon,
-and your credentials and environment reach the agent as before.
+`chopin connect` runs every agent and Planner command that does work in a microVM
+of its own: an [NVX](https://github.com/microsoft/nvx) guest, a small Linux virtual
+machine under your system's own hypervisor (KVM on Linux, the Windows Hypervisor
+Platform on Windows), with its own kernel. A mistaken or hostile instruction in a
+document reaches only what that microVM was given. Nothing else of your machine is
+in it: not your home, your other checkouts, your credentials or your agents'
+logins. The design is [Agents in NVX microVMs](nvx-sandbox.md).
 
-`chopin status`, and the line `chopin connect` prints once connected, say which
-you have, and so does the machine's row on the Machines page:
+There is no other way an agent runs. A machine that can't run microVMs, a Mac, an
+Arm machine, or one whose user can't use the hypervisor, can't be paired or
+connected, and `chopin` says why and what fixes it:
 
 ```text
-Sandbox:    Sandboxed (Linux bubblewrap)
-Sandbox:    Not sandboxed: <why>. Runs go on without it.
+This machine can't run Chopin's work: Chopin runs each agent in its own microVM,
+which needs Linux or Windows on x86_64 with hardware virtualization. Your user can't
+read and write /dev/kvm.
+Fix: sudo usermod -aG kvm $USER, then log out and back in (for the chopin service,
+restart the machine). Or have an administrator add a udev rule, such as
+KERNEL=="kvm", GROUP="kvm", MODE="0660", RUN+="/usr/bin/setfacl -m u:<user>:rw /dev/kvm"
+(logind may drop that ACL)
+```
+
+`chopin status`, the line `chopin connect` prints once connected, and the
+machine's Sandbox row on the Machines page say where its agents run:
+
+```text
+Agents:     Each agent in its own microVM (NVX on KVM)
+Agents:     Can't run here: <why>
             Fix: <the one command>
 ```
 
-The words are `Sandboxed (macOS Seatbelt)`, `Sandboxed (Linux bubblewrap)` or
-`Sandboxed (Windows ProcessContainer)`. Without a sandbox, runs go on
-unsandboxed and the machine says so. Choose `--require-sandbox` to refuse them
-instead.
+A machine paired before it could run microVMs tells Chopin why it can't as it
+stops, and the Machines page shows it while the machine is away.
+
+A machine that loses what microVMs need while it is connected, as when logind
+takes back the access to `/dev/kvm` a desktop login gave your user, finds out at
+its next launch. That launch fails with the words above, `chopin` tells Chopin
+why, leaves, and starts no agent or Planner until it can run microVMs again. It
+checks every 30 seconds, and connects again by itself once it can.
+
+The first `chopin connect` downloads NVX (about 275 MB on Linux, 150 MB on
+Windows, checked against the SHA-256 this `chopin` pins) and builds the images
+agents run from, once, before it says Connected: the agent's, and with
+`--planner-command` the Planner's, or one image for both when their install
+commands are the same. Each takes a minute or two and says so on its own line:
+
+```text
+… Building one image for atomic-acp and the Planner (my-planner), whose installs are the same, for their microVMs (a minute or two, once, so the first document's Planner starts at once).
+✓ Connected.
+```
+
+So the first document you open starts its Planner at once. A build that fails stops
+`chopin connect` there, with the build's own output. The service builds any image it
+lacks as it starts, as after an update that changes what an image holds, before it
+connects, so the machine shows as away until it is done. A microVM then starts in
+under a second.
 
 ### What an agent can and can't do
 
-|             | In the sandbox                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Writes      | Only the worktree the connector made for it (a run's, or a Planner's own; never your checkout), the repository's git directory in the few places commits and refs go and that worktree's entry (see [Git in the sandbox](#git-in-the-sandbox)), the agent's own state (`~/.atomic` or `~/.copilot` for the built-in agents), a private temporary directory, and what you add with `--sandbox-write`. Nothing else.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| Reads       | The rest of the disk on Linux and macOS, except `~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `.netrc`, `.git-credentials` and browser profiles, which read as empty or unreadable, and the connector's state directory (`--base-dir`), of which it sees only its own worktree and the folder of its own tokens. The machine token and every other run's and Planner's files, tokens included, are out of its sight, those made after it started too; so is the state directory when a working directory holds it, as a home does. **On Windows a ProcessContainer reads only what it is given, so it is not the rest of the disk:** your profile folder (the same names are unreadable), the directories on `PATH` and those that `PYTHONHOME`, `GOROOT`, `GOPATH`, `CARGO_HOME`, `RUSTUP_HOME`, `JAVA_HOME`, `DOTNET_ROOT`, `NODE_PATH`, `VIRTUAL_ENV`, `CONDA_PREFIX` and the other tool variables in MXC's own baseline name, the programs installed per user in `%LOCALAPPDATA%\Programs`, its working directory and its worktree, the repository's git directory whole (its configuration, hooks, objects and every worktree's entry, since a worktree's `.git` leads into it), and what Windows lets every container read (`C:\Windows`, `C:\Program Files`). A folder on another drive, in another user's profile or anywhere else, a checkout among them, is not readable, but for the checkout a Planner runs in, and for a run's checkout's git directory, which is read without that checkout's files. |
-| Network     | Only through a proxy on your machine that allows the hosts below and refuses the rest. A direct connection fails, IPv6 is blocked, and the proxy resolves names.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| Environment | Everything it has today but GitHub credentials (see [Which GitHub account pushes](#which-github-account-pushes)), and `--env` values. `TMPDIR` points at the private directory, `PATH` names each directory by its real path, and `NODE_USE_ENV_PROXY=1` makes Node's own `fetch` use the proxy; the proxy variables come from MXC. On Linux and macOS it reaches the sandbox in a `0600` file that a shell exports and deletes before the agent starts, so no value is on any process's command line.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+|             | In its microVM                                                                                                                                                                                                                                                                                  |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Works in    | A repository of its own in the microVM, cloned as it starts: a run's in the microVM's memory, a Planner's on a disk of its own that lasts between its starts (see [Repositories in its microVM](#repositories-in-its-microvm)). It pushes what it keeps to GitHub.                              |
+| Writes      | Its own repository and the rest of the microVM's own file system, its agents' state where it runs on [Chopin's AI accounts](#ai-accounts-through-chopin), and what you add with `--sandbox-write`. Nothing of your checkouts or their git directories, nothing else of your machine.            |
+| Reads       | The git directory its repository is cloned from, read-only; for a Planner, your checkout too, uncommitted files included, read-only; its own token folder. Nothing else of your machine: not your home, `~/.ssh`, your other checkouts, the connector's state directory or another run's files. |
+| Network     | Only through a proxy on your machine that allows the hosts below and refuses the rest. A direct connection, DNS, IPv6 and your machine's other local services are closed to it.                                                                                                                 |
+| Environment | What the run or Planner is given and nothing of the connector's own: its tokens, `--env` values, the proxy's variables, and an allow-list on Chopin's AI accounts (see below). It reaches the microVM in a `0600` file, never on any process's command line.                                    |
+| Programs    | Its image's: Node.js 24, git, the agent at the version this `chopin` pins, and the guest's Ubuntu. Nothing you install on your machine changes them.                                                                                                                                            |
 
 Hosts an agent may reach (the full list is `HOST_GROUPS` in
 [`apps/connector/src/sandbox-policy.ts`](../apps/connector/src/sandbox-policy.ts)):
@@ -778,328 +889,255 @@ service has no business there. Your Chopin server's origin and the hosts you add
 are your choice, and may be on a private network, as a self-hosted server or a
 corporate registry is.
 
-| Option                  | What it does                                                                                                                            |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `--require-sandbox`     | Refuses a run when this machine has no sandbox, naming why. Off by default.                                                             |
-| `--no-sandbox`          | Never sandboxes. `chopin status` says it is off.                                                                                        |
-| `--sandbox-host <host>` | Allows an agent to reach one more host. Repeat it.                                                                                      |
-| `--sandbox-write <dir>` | Allows an agent to write one more directory, such as a package cache or a local remote, but never your checkout (see below). Repeat it. |
-| `--sandbox-hide <path>` | Hides one more file or folder from every agent, even inside a `--sandbox-write` directory, such as a tool's own sign-in. Repeat it.     |
+| Option                        | What it does                                                                                                                               |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--sandbox-host <host>`       | Allows an agent to reach one more host. Repeat it.                                                                                         |
+| `--sandbox-write <dir>`       | Shares one more directory with every agent, writable, such as a package cache or a local remote, but never a checkout. Repeat it.          |
+| `--sandbox-hide <path>`       | Hides one file or folder inside what agents are given, even inside a `--sandbox-write` directory, such as a tool's own sign-in. Repeat it. |
+| `--install <command>`         | How to install an agent `chopin` has no recipe for in its microVMs' image. Repeat it for several commands.                                 |
+| `--planner-install <command>` | The same for the Planner command.                                                                                                          |
+| `--install-from <dir>`        | A folder those commands read, copied read-only to `/install-from` in the image's build and in no agent's microVM.                          |
 
-### Git in the sandbox
+`--require-sandbox` and `--no-sandbox` are gone: there is nothing to require and
+nothing to turn off. Settings an earlier `chopin connect` saved with them work, without
+them.
 
-Git runs programs its configuration names: a hooks directory (`core.hooksPath`),
-a file-system monitor (`core.fsmonitor`), filters, an ssh command, credential
-helpers and, for a remote that is a command (`ext::`), the command. The next
-`git` command on your machine reads that configuration from the repository's git
-directory and runs them as you, outside the sandbox: Chopin's own `git worktree
-add` for the next run, or your `git status` in your checkout. And git finds that
-directory through files, a worktree's `.git`, a `commondir` and the `.git` in each
-submodule's folder, that name another directory, so your `git status` and `git
-diff` open each submodule through the `.git` file in its folder and run what the
-directory it names says. An agent that could write any of them would escape the
-sandbox, and a sandbox can hold back only a path that already exists, so it can't
-forbid the making of a `commondir`, or of a `.git` in a submodule's empty folder,
-by name. So the rule is simple: **a sandboxed agent never writes your checkout**,
-and nothing you add with `--sandbox-write` changes that (see below). Then there are
-two more layers, and each is an allow-list.
+### AI accounts through Chopin
 
-**Your checkout is read-only, whole.** A Planner runs in your checkout, the one you
-named with `--checkout` or a clone Chopin made in `repos/`, and reads it: its
-files, its submodules, its `.git`, its index and `HEAD` are never writable by a
-sandboxed agent, whether it is a regular checkout or a linked worktree of yours.
-A Planner writes in its own worktree, which the connector makes for it on the host
-(`CHOPIN_WORKTREE`, see [Environment](agent-connection.md#environment)), and its
-changes reach you as commits and a branch pushed from there, never by editing your
-files in place. A run's agent works in the worktree the connector made for that
-run. So nothing a sandboxed agent writes is in a tree your own git reads, except
-what it writes in your repository's git directory, next.
+The agent of a build, investigation or prototype runs on the AI accounts that the
+person it runs for connected in Chopin (see
+[AI credentials](hosted-agent.md#ai-credentials)), never on yours. The connector asks
+Chopin for the run's launch with the run's credential before the agent starts, and
+the agent runs on those accounts with nothing of yours:
 
-**What an agent may write in the repository's git directory.** Everything is
-read-only, and a read-only directory can't be renamed, removed or made again, with
-these written inside it, and only by a launch that has a worktree of its own:
+- **Stand-ins, not keys.** The agent's environment sets each granted provider's
+  key variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `COPILOT_GITHUB_TOKEN`, and
+  for a ChatGPT or Claude sign-in `CHATGPT_ACCESS_TOKEN` or `CLAUDE_CODE_OAUTH_TOKEN`)
+  to a random stand-in that works only through Chopin, and `OPENAI_BASE_URL` and
+  `ANTHROPIC_BASE_URL` to a relay in the connector on `127.0.0.1`, which the
+  microVM reaches through the proxy. Without an OpenAI key, a ChatGPT sign-in also takes
+  `OPENAI_API_KEY` and `OPENAI_BASE_URL`; without an Anthropic key, a Claude sign-in
+  takes `ANTHROPIC_BASE_URL`. Atomic finds a sign-in as its `openai` or `anthropic`
+  provider, ahead of a key, which keeps `openai-api` or `anthropic-api`. The relay adds the launch's own credential
+  (`x-chopin-launch`) to each request and forwards it to that provider's base URL
+  on Chopin and nowhere else; the credential stays in the connector's memory and is
+  never in the agent's environment, files or command line. A stand-in copied out of
+  the microVM reaches nothing.
+- **Each provider's base URL with its key, for any agent.** `CHOPIN_AI_PROVIDERS`
+  holds, as JSON, one entry per granted provider, Copilot included, with what an
+  agent needs to reach it and nothing else (an example follows the list): `provider`,
+  `baseUrl`, `apiKey`, `keyVariable` and, for Copilot, `headers`. Send `apiKey` as the provider takes its key (`Authorization: Bearer`, or
+  `x-api-key` for Anthropic) to `baseUrl` with the provider's own paths after it
+  (Copilot's `/models` and `/chat/completions`, OpenAI's and ChatGPT's `/v1/…`, and
+  Anthropic's and Claude's `/v1/…`; a Claude stand-in goes as `Authorization: Bearer`,
+  and Chopin adds the headers and the leading system block a Claude subscription
+  needs, as Atomic sends them), with `headers` added. Each `baseUrl` is on the relay; the launch's own credential is
+  in none of it. An agent that reads no provider's variables, any agent that is not
+  Atomic, reaches every granted provider with its pair alone.
+- **Nothing of your environment.** The agent's environment is built from an
+  allow-list, not by taking known secrets out, and its microVM has its own `PATH`,
+  `HOME` and tools, so a provider key or another service's token in the connector's
+  environment never reaches it. Your `--env` values reach it, but for GitHub
+  credentials and your agents' own model keys and directories.
+- **A state directory of its own.** The agent keeps its state in a folder of the
+  run's, `<base dir>/runs/<run>.agent`, shared with its microVM:
+  `ATOMIC_CODING_AGENT_DIR`, `ATOMIC_ACP_DIR` (atomic-acp's session map),
+  `COPILOT_HOME`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME` point there. None of your
+  agents' configuration, logins or sessions (`~/.atomic`, `~/.copilot`, `~/.claude`
+  and the rest, wherever your environment moves them) is in its microVM, so nothing
+  of them can be read.
+- **Atomic** finds a generated `models.json` there that sends each granted
+  provider (and `openai-api` and `anthropic-api`) to its base URL on the relay,
+  with `apiKey` naming the provider's key variable, and reads the model catalog
+  through Chopin (`ATOMIC_MODEL_CATALOG_URL`).
+- **When it ends.** The connector ends the launch when the run ends; Chopin also ends
+  it when the run ends there, if that end never arrives. When Chopin ends it first
+  (your machine revoked, the document archived, its deadline), the relay hears it from
+  Chopin with the launch's own credential once the proxy refuses a request, and the
+  connector stops the run, once.
 
-- `objects`, `refs`, `logs` and `lfs`, where commits, branches, tags, fetched
-  objects and LFS objects go;
-- for a run, an investigation or a prototype, which run in a linked worktree of
-  your checkout that the connector made for that run, that worktree's own entry in
-  `worktrees/`, where its `HEAD`, index, merge and fetch state and the lock files
-  beside them are, with the three files in it that name configuration, `commondir`,
-  `gitdir` and `config.worktree`, and the folders `hooks`, `info` and `modules`
-  (which the repository's git directory holds read-only too), read-only inside it;
-  and the `.git` file in the worktree, which says where its entry is, read-only too;
-- for a Planner, its own worktree's entry, written exactly as a run's is, and the
-  same four directories: the connector makes the Planner's worktree before it
-  starts, and which entry is the launch's own is the connector's record of what it
-  made for it, never what a folder is called or what is in it. Your checkout's own
-  entry, where it is a linked worktree of yours, is read-only, with the `.git`
-  file in it.
+`CHOPIN_AI_PROVIDERS`, for a run granted Copilot and Anthropic:
 
-So the repository's `config`, `hooks`, `info`, `HEAD`, `index` and `packed-refs`,
-its submodules' git directories, `worktrees` itself and every worktree's entry but
-the one the connector made for that launch, your own checkout's included, are
-read-only, and so is any file git adds to its top level later. A `commondir`, a new
-worktree entry and a `.git` made again are all refused, and so are a `rebase-merge`,
-`rebase-apply` or `sequencer` folder, a `HEAD`, an `index` or a reflog in your
-entry, which is where your own `git rebase --continue` would find an `exec` line
-to run. An agent can't name a program for git to run in any place git looks in
-your checkout or those git directories, nor send git to a directory where it has.
-`objects`, `refs`, `logs` and `lfs` are data: git runs nothing from them, but an
-agent that writes them can add commits and create or move branches of your
-repository.
+```json
+[
+	{
+		"provider": "github-copilot",
+		"baseUrl": "http://127.0.0.1:43123/…/github-copilot",
+		"apiKey": "chopin_ai_…",
+		"keyVariable": "COPILOT_GITHUB_TOKEN",
+		"headers": { "Copilot-Integration-Id": "vscode-chat" }
+	},
+	{
+		"provider": "anthropic",
+		"baseUrl": "http://127.0.0.1:43123/…/anthropic",
+		"apiKey": "chopin_ai_…",
+		"keyVariable": "ANTHROPIC_API_KEY"
+	}
+]
+```
 
-Every path above is a real path, taken by the connector once, when it first sees
-the checkout or makes the worktree. A checkout whose `.git` is a symbolic link, as
-some tools leave one, is recorded by the directory the link leads to, and so is a
-`.git` file that leads through one; nothing is named through the link, which a
-sandbox could not mount over.
+A run whose person has no AI account Chopin can use never starts its agent: no
+Copilot seat and no API key, Chopin says so (`no-ai-account`), and the run ends in its
+words, "chopin needs an AI account to run this, so it didn't start. Add one, then start
+it again.", or, where GitHub couldn't be asked about their Copilot access, that the
+check couldn't finish. Your own sign-ins and keys are never used in its place, on your
+machine or a shared one. A run against a Chopin from before AI launches (which answers
+404) starts its agent with no models of yours either: none of your setup is in its
+microVM, so it has only what `--env` gives it.
 
-**Git on your machine, run by Chopin.** Every `git` command the connector runs
-(`git worktree add` for a run, its fetches, its clean-up, a Planner's worktree)
-is told where the repository is instead of looking for it: the git directory, its
-common directory and the working tree, as the connector recorded them the first
-time it saw the checkout or made the worktree, before any agent worked in it.
-Nothing it reads then can send it somewhere else, and there is no moment between
-a check and the command at which something could change. It also:
+A Planner backend gets its sessions' grants over the
+[agent connection](agent-connection.md#models-through-chopin). When Chopin says its
+Planners' sessions run on people's AI accounts (`"ai": "chopin"` in
+`/api/connector/version`, which the connector reads as it starts, and in each Planner
+credential's answer), the connector starts the backend, cold or as a spare, the same
+way: an allow-listed environment, its agents' state in a folder of its own beside its
+disk, and `CHOPIN_AI=chopin`, so its models come only from the grants it is handed. A spare started otherwise is replaced, never handed such a document.
+Against a Chopin that says nothing of it, a backend starts as before. Give a backend
+what it needs in its own `--planner-command` or in `--env`, not in the connector's
+environment, which it then gets only an allow-list of.
 
-- reads a copy of your git configuration that the connector made once, with
-  your system and global files set aside (`GIT_CONFIG_NOSYSTEM`,
-  `GIT_CONFIG_GLOBAL`): your `url.*` rewrites, `http.*` and `ssh.*` settings,
-  `safe.directory`, line-ending and symlink settings and your filters, which a Git
-  LFS checkout needs; not your credential helpers, aliases, hooks, editor or user;
-- sets aside what a repository's configuration says for the programs git
-  runs: `core.hooksPath`, `core.fsmonitor`, `core.sshCommand` (your own ssh
-  command is kept, in `GIT_SSH_COMMAND`), `core.attributesFile` and remotes that are
-  commands (`protocol.ext.allow=never`);
-- runs no credential helper: every helper any configuration names, a repository's
-  and yours, is reset (`credential.helper=` empty) and none is named again. A fetch
-  that needs a login gets the machine's GitHub token from the connector, which
-  hands it over in the command's environment, as it does for the fetch of a run's
-  commit (a prototype's too) and for a clone. A prototype's agent never gets that
-  token: it is gone before the agent starts;
-- refuses the local transport (`protocol.file.allow=never`), whatever the checkout's
-  `origin` is. Set `GIT_ALLOW_PROTOCOL` in the connector's environment if you fetch
-  through a mirror on disk.
+### Agent sessions in Chopin's database
 
-**What this does and doesn't guarantee.** Your checkout's files, its submodules,
-its configuration, hooks and `info`, every file in it that says where git is (a
-`.git`, a `commondir`), its index and its `HEAD` are never writable by a sandboxed
-agent, and a path you add with `--sandbox-write` is no exception: one that is your
-checkout or inside it (a submodule's folder, `.git/hooks`) or inside its git directory
-is not granted, and one that holds your checkout is granted with the checkout and its
-git directory held read-only, whether the agent is a Planner in the checkout or a run in
-a worktree of it. What an agent does write in your git directory is `objects`, `refs`, `logs`
-and `lfs`, and its own worktree's entry in `worktrees/`; the rest of that
-directory, your other worktrees' entries included, it can't write. The connector's
-git does not look where an agent could have pointed it. Your own `git` in your
-checkout, while a Planner runs or after, is therefore not covered by the second
-layer and doesn't need it: no sandboxed agent wrote anything it reads there, except
-those data directories and the launch's own entry, in which no name is a pointer,
-configuration, hook or program for it (see the last paragraph of this section).
+Where the Chopin you connect to gives machines a database for their agents' Atomic
+sessions, pairing and `chopin connect` set it up with nothing more to do: the
+connector asks Chopin for this machine's own login, saves it in `agent-store/` in its
+base dir (the password apart, only you can read it), installs a 0.10 release of the
+`@bastani/atomic-storage-postgres` adapter there with `npm` (once, and again only to
+replace an earlier release; a failed install leaves the one there as it was), and says so:
 
-It does not make the worktree an agent works in safe to run git in: that tree is
-the agent's. Its files, what it makes in its own worktree's git entry (`HEAD`, the
-index, an unfinished rebase's `exec` lines: do not `git rebase --continue` in a
-worktree an agent left in the middle of one), a repository it makes in a folder of
-its own (`git init`) and a submodule it adds there with a `.git` of its own are
-what the agent wrote, so treat them as you would a clone of a stranger's
-repository when you run git inside them. The connector's git does not open them
-(`status`, `diff`, a fetch and the removal of a run's worktree run nothing the
-agent named, tested), but yours would. A repository's own configuration is still
-read by the connector's git, so a filter or a proxy it carries applies to the
-connector's commands as it does to anyone's: it is the sandbox's policy that stops
-an agent writing one. Windows and macOS have the same policy and the same tests;
-they were not run on a real PC or Mac.
+```
+Agents here keep their sessions in this machine's own database at db.example.com:5432.
+```
 
-What this changes for an agent. Each of these fails with `Read-only file system`
-or `could not write config file`:
+Each agent that runs on Chopin's AI accounts, and each such Planner, then finds in its
+own Atomic directory (in its agents' state, `<run>.agent/atomic`) a copy of the adapter, its
+`storage-password` (mode `0600`) and a `settings.json` whose `storage` selects the
+database by a URL without the password. A Planner started once the machine has no
+database login (Chopin stopped giving one, or this connect couldn't set it up) finds
+that `storage` and its password taken out again, the rest of its settings kept, and
+keeps its sessions in its agents' state. Your own `~/.atomic` is never touched. The
+proxy allows the database's host and port, which Atomic's adapter in the microVM
+reaches through `HTTPS_PROXY`.
 
-- **Writing anything in a Planner's checkout**: a file or a folder, a submodule's
-  `.git` or any file under a submodule, `git add`, `git commit`, `git checkout` and
-  `git switch`. The checkout is yours and read-only whole, whether it is a regular
-  one, a linked worktree of yours (even with its `.git` a symbolic link) or a clone
-  Chopin made. Reading it works, `git status`, `git log` and `git diff`
-  included. The Planner's own worktree takes every one of these, and so does a run's.
-  A Planner edits documents through Chopin's tools, not your files: a Planner
-  backend that edited `CHOPIN_CHECKOUT` in place must edit `CHOPIN_WORKTREE` and
-  commit and push a branch instead.
-- **`git fetch` in a Planner's checkout** writes `FETCH_HEAD` there and fails; `git
-  fetch --no-write-fetch-head` works. In a worktree it works, as it keeps
-  `FETCH_HEAD` in the worktree's own entry.
-- **`git worktree add`, `git worktree remove` and `git worktree move`**: they
-  write `worktrees/`. A build is told to make each concurrent pull request from its
-  own branch, one after another, instead of adding worktrees.
-- **`git config` without `-c`, `git remote add`, `git submodule init` and `git lfs
-  install --local`** write the configuration. Give git one setting for one command
-  with `git -c <name>=<value> <command>`, and push to a URL instead of a new remote.
-- **Upstream branches are not recorded.** `git push -u` (or `--set-upstream`),
-  `git branch -u` and `git checkout -b <branch> origin/<branch>` write which remote
-  branch a branch tracks into the configuration. The push, the branch and the checkout
-  still happen, and git still exits 0, but it prints `error: could not write config
-  file` and the branch has no upstream. `gh pr create` pushes with `--set-upstream`,
-  so it prints the same line. `git push origin HEAD:<branch>` says what it means and
-  prints nothing.
-- **Deleting a ref fails.** Git takes a lock at the top of the git directory to
-  rewrite `packed-refs`, so `git branch -D`, `git tag -d` and `git gc` fail with
-  `Unable to create '.git/packed-refs.lock'`. `git rebase`, `git stash` and `git push
-  origin :<branch>` do their work and print the same line. Commits, branches,
-  fetches (`--prune` included), checkouts, `git push` and `git merge` in a worktree
-  work.
-- **Git inside a submodule** can't write the submodule's git directory, and `git
-  submodule update --init` can't record the submodule or fill its folder, which a
-  run's worktree has empty.
-- **Git LFS** writes `.git/lfs` only where it exists already: the sandbox can't make
-  it in the git directory's top level.
+If Chopin can't make the login, or the adapter can't be installed, the connector says
+why and connects anyway; the Machines page shows it too, until a connect reports it
+set up, even while the machine is away. `chopin pair` on its own, which connects
+nothing, tells Chopin at once. Agents keep their sessions
+on the machine until a later connect sets it up. When Chopin can't be reached, the
+saved login is used. `chopin unpair` removes the saved password, and Chopin turns the
+login off. The proxy allows the database's host and port whether the URL
+names a host, an IPv4 address or an IPv6 address in brackets (`[2001:db8::1]:5432`).
 
-The same runs where there is no sandbox, or with `--no-sandbox`, are not covered by
-any of this. For them the connector's git is hardened as above, the agent writes the
-git directory, and it is as it was before the sandbox: a worktree an agent made
-organizes edits and is not a sandbox.
+### Repositories in its microVM
 
-When a run or Planner starts, the connector makes an empty `config.worktree` and empty
-`hooks`, `info` and `modules` folders in the launch's own worktree entry where there are
-none, because a sandbox can hold back only a path that exists. Git ignores
-`config.worktree` unless `extensions.worktreeConfig` is on, and reads no hook or
-configuration from the other three in an entry.
+An agent never works in a folder of your machine. As its microVM starts, it clones the
+repository into its own file system, and works and commits there:
 
-**A new name at the top of the launch's own worktree entry can't be refused.** Git
-takes the lock of its `HEAD` and its index by creating a file beside each and renaming
-it over them, and a sandbox can't grant that for those names and refuse it for every
-other: with the entry read-only and `HEAD`, the index and the logs granted as paths,
-`git add` and `git commit` fail with `Unable to create '…/index.lock': Read-only file
-system` (measured, real bubblewrap). So that directory stays writable, and an agent can
-make any file or folder in it: a `future-pointer`, a `rebase-merge/`, a `locked`, a file
-named like a hook. What that comes to:
+- **A run** (Build, Run, Retry, an investigation or a prototype) clones with
+  `git clone --shared` from the git directory of your checkout of the repository (or
+  `chopin`'s own clone of it in `repos/`), which its microVM reads and never writes,
+  checks out the run's commit, and makes its branch. `--shared` reads your objects
+  where they are and copies none, so a large repository clones in seconds. The clone
+  is in the microVM's memory and ends with it: what the agent keeps, it pushes.
+- **A Planner** keeps a disk of its own beside its tokens,
+  `planners/<owner>/<repo>/<document id>.disk`: a sparse 32 GiB image that takes only
+  what it holds. Its first start clones your checkout's repository there, at your
+  checkout's `HEAD`, copying the objects it needs so the clone outlives your own
+  `git gc`. Every later start finds it as it was left. It reads your checkout too,
+  read-only and uncommitted files included (`CHOPIN_CHECKOUT`); its own clone is
+  `CHOPIN_WORKTREE`.
 
-- Your checkout and the rest of your git directory stay read-only. What git reads in
-  the entry as a pointer or as configuration (`commondir`, `gitdir`, `config.worktree`)
-  and what your git directory holds read-only (`hooks`, `info`, `modules`) is held, so
-  no name made there is a pointer, configuration, hook or program for your own git in
-  your checkout. It reads the entry only to list, prune and remove the worktree (a
-  `locked` file there keeps `git worktree prune` and `remove` from touching it unless
-  forced twice, which the connector's clean-up does), to see which branch it has checked
-  out or is rebasing (so a planted `HEAD` or `rebase-merge/head-name` can make your git
-  refuse to check out or delete that branch, though nothing runs), and, for `git gc`,
-  its `HEAD` and index.
-- The connector's git, hardened as above and told where the repository is, runs
-  nothing because of such a name. Tested, with these names planted, an unfinished
-  rebase with an `exec` line and executables named like hooks among them: `status`,
-  `fetch`, adding the next run's worktree, a run's end, a prototype's removal and
-  retention's removal of the worktree ran nothing, while `git rebase --continue`,
-  which the connector never runs, ran the `exec` line.
-- Git run inside the worktree itself reads the rest as it reads the worktree, an
-  unfinished rebase's `exec` lines among it: that tree is the agent's, as said above.
+What this changes for you:
+
+- **No worktree folder is left after a run.** `runs/` keeps each run's record and its
+  agent's state; its work is on GitHub.
+- **A run's or Planner's branches appear only once pushed.** They are never in your
+  own repository, so `git branch` in your checkout shows them only after a `git fetch`.
+- **Nothing an agent writes reaches your checkout or its git directory**, and `chopin`
+  runs no git in a tree an agent wrote.
+- **A Planner's unpushed commits live on its disk.** The disk goes when Chopin says its
+  document is archived or gone (asked as `chopin connect` connects, every hour, and
+  once a Planner Chopin stopped asking for has exited, as when its document is deleted),
+  when someone resets the document's Planner in Chopin (as it next starts here, or at
+  the next hourly check), when no Planner has run on it for 30 days, or when this machine is unpaired or
+  revoked, never while a microVM runs on it. Its unpushed commits go with it, and the
+  connector says so.
+- **Your checkout over the share is slow to walk.** Reading a whole large checkout from
+  a microVM is much slower than on your machine, so a Planner reads it for what is
+  uncommitted and does its own work in its clone.
+
+A prototype's agent still can't push anything, and in a run the agent pushes with the
+token Chopin issued for that one repository (see
+[Which GitHub account pushes](#which-github-account-pushes)).
 
 ### What each system needs
 
-**macOS** needs macOS 15 or later on Apple silicon, and nothing installed.
-MXC's Seatbelt backend isn't built for Intel Macs, which run unsandboxed.
+**Linux** on x86_64, with read and write access to `/dev/kvm` for your user (or
+`/dev/mshv` under the Microsoft Hypervisor). Most distributions give it to the `kvm`
+group: `sudo usermod -aG kvm $USER`, then log out and back in. The chopin service keeps
+running while you're logged out, so it gets the group when the machine restarts; until
+then `chopin` says you're in the `kvm` group but it runs in a login that began before
+you joined. Don't restart `user@$(id -u).service` for this: that ends every session and
+service you have.
 
-**Windows** needs Windows 11 24H2 or later (build 26100), x64 or Arm. MXC's
-ProcessContainer can't filter by name, so the proxy is its only way out. Reaching
-a proxy that has no package identity needs MXC's `ingress` and host loopback
-allowed, which is the weakest of the three setups. A ProcessContainer reads only
-what it is given, so the read set follows MXC's own baseline for one (see the table
-above) and is smaller than Linux's and macOS's "rest of the disk": your profile, the
-tool directories its environment names, per-user programs, the launch's own
-working directory and worktree, and the repository's git directory, whole, even where
-the checkout it belongs to is on another drive and is not itself readable. Where an agent needs another folder to read, there is no
-read-only option; `--sandbox-write` grants it to write as well. MXC's baseline also
-grants the system drive's root where PowerShell 7 is on `PATH`; the connector leaves
-that out, because granted around the state directory it would grant every folder on
-the drive.
+An administrator can grant `/dev/kvm` with a udev rule instead:
 
-**Linux** needs bubblewrap and, for the proxy, `slirp4netns`, util-linux's
-`unshare` and `nsenter`, `ip` (iproute2), `iptables` with its `-restore`
-programs and the `nf_conntrack` kernel module, which Docker and most firewalls
-load, and user namespaces. `socat` and `ripgrep` aren't needed. `chopin
-status` names each one that is missing, with the package manager's command for
-it (apt, dnf, pacman or apk).
-
-On **Ubuntu 24.04 and later** AppArmor also restricts unprivileged user
-namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`), which bubblewrap
-and `unshare` need. `chopin status` then gives one command that installs what
-is missing and permits those two programs, and nothing else:
-
-```sh
-sudo sh -c 'apt-get install -y slirp4netns && printf "%s\n" "abi <abi/4.0>," "include <tunables/global>" "profile chopin-mxc-bwrap /usr/bin/bwrap flags=(unconfined) { userns, }" "profile chopin-mxc-unshare /usr/bin/unshare flags=(unconfined) { userns, }" > /etc/apparmor.d/chopin-mxc && apparmor_parser -r /etc/apparmor.d/chopin-mxc'
+```text
+KERNEL=="kvm", GROUP="kvm", MODE="0660", RUN+="/usr/bin/setfacl -m u:<user>:rw /dev/kvm"
 ```
 
-It leaves out `apt-get` where nothing is missing, and names the paths of your
-own `bwrap` and `unshare`. The file is the same kind Ubuntu ships for podman
-and lxc: a profile for one program that grants it `userns`. It is narrower than
-the alternative, `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`,
-which lifts the restriction for every program on the machine. It still lets
-anyone who can run those two programs make a user namespace, which is what
-bubblewrap is for. To undo it, `sudo apparmor_parser -R
-/etc/apparmor.d/chopin-mxc && sudo rm /etc/apparmor.d/chopin-mxc`.
+logind may drop that ACL, as it drops the one a desktop login gives you without the
+group when that login ends, so the group is what lasts. CI runners, which have one
+user, use `MODE="0666"`, as
+[GitHub documents for its hosted runners](https://github.blog/changelog/2024-04-02-github-actions-hardware-accelerated-android-virtualization-now-available/)
+and Chopin's own CI does.
 
-The sandbox was run for real on Linux (Ubuntu 24.04, x64) only. macOS and
-Windows have the same policy, tests and executors, and were not run on a real Mac
-or Windows PC. On Windows a ProcessContainer refuses a directory it wasn't given,
-the parents of the state directory included, so a tool that looks for a file in
-each parent of its working directory may meet an error where Linux and macOS show
-nothing.
+On a cloud VM choose a size with nested virtualization. Nothing else needs
+installing: `chopin` downloads the NVX release it pins from NVX's own GitHub
+release as it first connects, and builds the agent's and the Planner's images with
+Node.js and git.
+
+**Windows** on x86_64, with the Windows Hypervisor Platform turned on
+(`Enable-WindowsOptionalFeature -Online -FeatureName HypervisorPlatform`, then
+restart). Windows hosts are not yet ready for work: what is left is in
+[Agents in NVX microVMs](nvx-sandbox.md#windows).
+
+**macOS** and **Arm** machines can't run Chopin's work: NVX boots x86_64 guests
+under KVM, MSHV or WHP, none of which they have. `chopin` installs on them, and
+says so when it would pair or connect.
 
 ### Things to know
 
-- **The state directory is not denied; it is left out.** Seatbelt lets a denial win
-  over a grant inside it, so no one rule could hide the directory from an agent and
-  still give it its own worktree. The sandbox reads each directory from `/` down to
-  the state directory instead and grants everything in it but the way there,
-  then grants the agent only its own worktree and token folder inside it. So what is
-  made in the state directory after an agent starts, which is every later run and
-  Planner, is never in its sight. The same goes for the working directory: a Planner
-  whose checkout holds the state directory (your home, or a dotfiles checkout) reads it
-  around the state directory like everything else, and a directory you add with
-  `--sandbox-write` that holds it is written around it too. A working directory inside
-  the state directory is read only where it is a clone Chopin made in `repos/`. The price is that a file or folder made directly
-  in one of those directories (your home, say) after a Planner backend started isn't
-  visible to it until it starts again. On Linux those directories are built in the
-  sandbox's memory, so a write directly in one succeeds and is gone when the agent
-  exits; nothing reaches the disk.
-- **A Planner's worktree** is made by the connector, on your machine and with git
-  hardened as above and no filter run (not yours, a repository's or Git LFS's: every
-  filter is given no command, so a `.gitattributes` that selects one changes nothing),
-  at `CHOPIN_WORKTREE`: a linked worktree of the checkout, detached at its `HEAD`,
-  which the backend finds there and works in. Its files are as git stores them, so
-  an LFS file is its pointer until the backend's own git, in its sandbox, converts it.
-  A run's worktree is still made with your filters, which a Git LFS checkout needs. The sandbox
-  lets the backend write that worktree and its own git entry and nothing beside it,
-  which is why the backend can't make it with `git worktree add` itself. The checkout
-  the backend runs in is yours: it reads it and writes nothing of it.
-- **Files in `/tmp` are not visible.** Each sandbox has a private `/tmp`; keep
-  checkouts and agents elsewhere.
-- **Other agents' state.** Built-in agents' state directories are writable; for
-  another ACP agent add its directories with `--sandbox-write`.
-- **Caches.** `npm install` and similar write caches under your home, which an
-  agent may not; add `--sandbox-write ~/.npm` (or point the tool's cache at the
-  worktree) if you want them.
-- **Git over SSH** can't leave the sandbox. Chopin's own git commands use
-  https; so does the agent's, with your token.
-- **A local `file://` remote** or any path outside the worktree needs
-  `--sandbox-write`.
-- **Agents that ignore the proxy** can't reach the network at all. Node's `fetch`
-  is set to use it, and Bun and curl honor it themselves.
-- **A sandboxed agent gets the stdio bridge** for Chopin's tools, not the
-  loopback HTTP one, because it can't reach your machine's loopback.
-- **On Linux, MXC gives the environment to bubblewrap as arguments**, so other
-  accounts on a shared machine can read it with `ps`. On such a machine mount
-  `/proc` with `hidepid=2`.
-- **Two start checks are not sandboxed.** `chopin service install`, and `chopin connect
-  --install-service` before the machine is paired, start your agent once with your
-  environment to send ACP `initialize` and wait up to 10 seconds, so a service is not
-  installed, nor a pairing key spent, on an agent that can't start. They are not runs:
-  nothing from Chopin, no document, prompt or instruction, reaches the agent, and they
-  start it plainly, `--require-sandbox` included. `--skip-check` leaves them out. Every
-  start after that, the check that tells Chopin the agent's name when a connection opens
-  included, goes through the sandbox. That check runs in your registered checkout, or,
-  where there is none, in an empty folder of its own in the system's temporary
-  directory, removed when the connector exits, and not in your home.
-- **Telemetry.** MXC's is opt-in under its 1.0.0 contract. chopin never opts in.
-- **`connector.js`**, the downloaded script, carries no executor and runs
-  unsandboxed; the `chopin` binary carries MXC's and writes it to
-  `<base dir>/sandbox/` on first use.
+- **The first connect** downloads NVX and builds the agent's image, and the Planner's
+  with `--planner-command`, which can take a few minutes; later ones start at once. A
+  new `chopin` that pins another NVX or agent version builds them again, as the service
+  starts and before it connects.
+- **Caches.** A microVM starts with none of your package caches. Add
+  `--sandbox-write ~/.npm` (or another tool's cache) to share one, writable, with
+  every agent.
+- **Git over SSH** can't leave the microVM; Chopin's own git commands and the
+  agent's use https with the token Chopin issued.
+- **A local `file://` remote** or another folder of yours needs `--sandbox-write`.
+- **Agents that ignore the proxy** can't reach the network at all. Node's `fetch` is
+  set to use it, and git, npm and curl honor it.
+- **Memory.** Each microVM takes up to 2 GiB of guest memory, about 200–330 MB of your
+  machine's while idle.
+- **A busy machine.** Under heavy load OpenVMM sometimes can't start a microVM (its log
+  says `driver does not support io-uring`). `chopin` starts it again, up to three times,
+  before the agent has started, and says so in its output.
+- **The agent checks.** `chopin service install`, and `chopin connect --install-service`
+  before the machine is paired, start the agent once in a microVM of its image to send
+  ACP `initialize`, so a service is not installed, nor a pairing key spent, on an agent
+  that can't start; `--skip-check` leaves them out. The check that tells Chopin the
+  agent's name when a connection opens runs the same way.
+- **`connector.js`**, the downloaded script, runs agents in microVMs too, and carries
+  the bridge its guests run, as the binary does.
+- **What a microVM reads of yours** is what it is shared: a Planner's checkout whole, and
+  the git directory a run clones from, its `config` included. A token kept in a remote
+  URL there, or a credential store file inside `.git`, is readable to the agent; keep
+  credentials out of the repository's own files.
+- **A `--sandbox-write` folder** is written by agents as your user, setuid and setgid bits
+  included, so don't name one other users of the machine can reach.
 
 ## Which GitHub account pushes
 
@@ -1181,11 +1219,13 @@ pairs again. To remove the service as well, run `chopin service uninstall`.
 | `chopin connect … --name <label>`                           | Names the machine in Chopin as it pairs. A machine paired already keeps its name; rename it on the Machines page.            |
 | `chopin connect … --install-service`                        | Connects once, then installs the service with what it ran.                                                                   |
 | `chopin connect … --keep-runs <n>`                          | Keeps the `n` most recently finished runs (default 15, 0 for all).                                                           |
-| `chopin connect … --require-sandbox`                        | Refuses runs on a machine with no [sandbox](#sandbox), instead of running them unsandboxed.                                  |
-| `chopin connect … --no-sandbox`                             | Never sandboxes agents and Planner commands.                                                                                 |
-| `chopin connect … --sandbox-host <host>`                    | Lets agents reach one more host through the sandbox. Repeat it.                                                              |
-| `chopin connect … --sandbox-write <dir>`                    | Lets agents write one more directory inside the sandbox. Repeat it.                                                          |
-| `chopin connect … --sandbox-hide <path>`                    | Hides one more file or folder from agents in the sandbox. Repeat it.                                                         |
+| `chopin connect … --no-planner-spare`                       | Keeps no [spare Planners](#spare-planners): each Planner starts when it is asked for.                                        |
+| `chopin connect … --install <command>`                      | How to install an agent `chopin` has no recipe for in its [microVMs](#sandbox)' image. Repeat it.                            |
+| `chopin connect … --planner-install <command>`              | The same for the Planner command.                                                                                            |
+| `chopin connect … --install-from <dir>`                     | A folder those commands read in the image's build, at `/install-from`, such as packages fetched with your sign-in.           |
+| `chopin connect … --sandbox-host <host>`                    | Lets agents reach one more host through the proxy. Repeat it.                                                                |
+| `chopin connect … --sandbox-write <dir>`                    | Shares one more directory, writable, with every agent's microVM. Repeat it.                                                  |
+| `chopin connect … --sandbox-hide <path>`                    | Hides one file or folder inside what agents are given. Repeat it.                                                            |
 | `chopin pair [--label <name>] [--key <key>]`                | Pairs this machine, or pairs it again. The label defaults to the hostname.                                                   |
 | `chopin status [--json]`                                    | Shows the server, pairing, the connector, the service and what it runs, the sandbox, your checkouts and clones, and the log. |
 | `chopin service install [--allow-downgrade] [--skip-check]` | Copies what `chopin connect` last ran and runs it as a background service.                                                   |
@@ -1196,7 +1236,9 @@ pairs again. To remove the service as well, run `chopin service uninstall`.
 | `chopin unpair`                                             | Revokes this machine in Chopin and deletes its token.                                                                        |
 
 Every command takes `--base-dir <dir>`, or `CHOPIN_HOME`, to keep its files
-somewhere other than the default folder.
+somewhere other than the default folder. A link in its path, such as a `~/.local`
+that is a link to another disk, is followed: `chopin` uses the folder where it
+really is.
 
 ## Troubleshooting
 
@@ -1206,28 +1248,30 @@ see
 
 Each message says what to run next. The first line of each:
 
-| Message starts with                                 | Do this                                                                                                                                                                                                                                                                                                                          |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `curl or wget is required`                          | Install curl, for example `sudo apt install curl`, then run the command again.                                                                                                                                                                                                                                                   |
-| `could not download`                                | Check your connection and any proxy (`HTTPS_PROXY`), then run the command again.                                                                                                                                                                                                                                                 |
-| `… isn't writable by you`                           | Run `sudo chown -R "$(id -un)" "$HOME/.local"`, then run the command again.                                                                                                                                                                                                                                                      |
-| `… is not on your PATH`                             | Add the line the installer prints to your shell profile. The setup command runs `chopin` by its full path.                                                                                                                                                                                                                       |
-| `npm error code EACCES`                             | npm can't write its global folder. Don't use `sudo`: run `npm config set prefix ~/.npm-global`, add `export PATH="$HOME/.npm-global/bin:$PATH"` to your shell profile, open a new terminal and install again. Or install Node.js with a version manager such as [nvm](https://github.com/nvm-sh/nvm), whose npm needs no `sudo`. |
-| `… isn't installed`                                 | Install and sign in to the agent with the commands the message lists, then run the command again.                                                                                                                                                                                                                                |
-| `… needs Node.js … or newer`                        | Install that Node.js (`nvm install 22`, or nodejs.org), reinstall the agent, then run the command again.                                                                                                                                                                                                                         |
-| `… isn't inside a git checkout`                     | Give `--checkout` the folder of a clone from GitHub, or leave it out and `chopin` clones each repository as work needs it.                                                                                                                                                                                                       |
-| `… isn't a github.com repository`                   | Check `git remote -v`; Chopin connects clones of GitHub repositories.                                                                                                                                                                                                                                                            |
-| `Can't reach Chopin at …`                           | Check `CHOPIN_URL`, your network and any proxy, then run the command again.                                                                                                                                                                                                                                                      |
-| `Chopin refused the pairing key`                    | Generate a new script from **Machines** → **Add machine** → **Cloud**, then run it.                                                                                                                                                                                                                                              |
-| `… pairing key isn't allowed to use this Chopin`    | Ask whoever runs Chopin to let your GitHub account or organization in, then generate a new script.                                                                                                                                                                                                                               |
-| `You can't push to … on GitHub`                     | Chopin won't run that repository's work on this machine. Ask an owner for write access, or drop that `--checkout`.                                                                                                                                                                                                               |
-| `This machine has no checkout of …`                 | Your server gives machines no GitHub token to clone with. Run `chopin connect --checkout <path>` with a clone of that repository, then start the work again.                                                                                                                                                                     |
-| `… speaks connector protocol …`                     | Run the `chopin update` command the message names.                                                                                                                                                                                                                                                                               |
-| `… didn't answer ACP initialize`                    | Sign in to the agent with the command the message names, then run the command again.                                                                                                                                                                                                                                             |
-| `… asks for permission in the terminal`             | Run the command without `--install-service` and keep the terminal open.                                                                                                                                                                                                                                                          |
-| `This machine is already paired with …`             | To pair it for another account, run `chopin unpair`, then the command again.                                                                                                                                                                                                                                                     |
-| `This machine is no longer paired with Chopin`      | Run `chopin pair`, then connect again.                                                                                                                                                                                                                                                                                           |
-| `The service has to keep running after you log out` | Have an administrator run `sudo loginctl enable-linger "$(id -un)"`, then run the command again.                                                                                                                                                                                                                                 |
+| Message starts with                                 | Do this                                                                                                                                                                                                                                           |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `curl or wget is required`                          | Install curl, for example `sudo apt install curl`, then run the command again.                                                                                                                                                                    |
+| `could not download`                                | Check your connection and any proxy (`HTTPS_PROXY`), then run the command again.                                                                                                                                                                  |
+| `… isn't writable by you`                           | Run `sudo chown -R "$(id -un)" "$HOME/.local"`, then run the command again.                                                                                                                                                                       |
+| `… is not on your PATH`                             | Add the line the installer prints to your shell profile. The setup command runs `chopin` by its full path.                                                                                                                                        |
+| `This machine can't run Chopin's work`              | Do what its `Fix:` line says, such as joining the `kvm` group, then run the command again. A Mac or an Arm machine can't be one of Chopin's machines; use a Linux or Windows x86_64 machine.                                                      |
+| `chopin runs … in a microVM of its own`             | Add `--install '<the command that installs it>'` (or `--planner-install` for a Planner command), then run the command again.                                                                                                                      |
+| `… isn't inside a git checkout`                     | Give `--checkout` the folder of a clone from GitHub, or leave it out and `chopin` clones each repository as work needs it.                                                                                                                        |
+| `… isn't a github.com repository`                   | Check `git remote -v`; Chopin connects clones of GitHub repositories.                                                                                                                                                                             |
+| `Can't reach Chopin at …`                           | Check `CHOPIN_URL`, your network and any proxy, then run the command again.                                                                                                                                                                       |
+| `Chopin refused the pairing key`                    | Generate a new script from **Machines** → **Add machine** → **Cloud**, then run it.                                                                                                                                                               |
+| `… pairing key isn't allowed to use this Chopin`    | Ask whoever runs Chopin to let your GitHub account or organization in, then generate a new script.                                                                                                                                                |
+| `You can't push to … on GitHub`                     | Chopin won't run that repository's work on this machine. Ask an owner for write access, or drop that `--checkout`.                                                                                                                                |
+| `This machine has no checkout of …`                 | Your server gives machines no GitHub token to clone with. Run `chopin connect --checkout <path>` with a clone of that repository, then start the work again.                                                                                      |
+| `… speaks connector protocol …`                     | Run the `chopin update` command the message names.                                                                                                                                                                                                |
+| `… didn't answer ACP initialize`                    | The agent didn't start in its microVM. Check its `--install` commands, or what the message shows it printed, then run the command again.                                                                                                          |
+| `The microVM didn't start`                          | OpenVMM couldn't start the agent's microVM; the rest of the message is the end of OpenVMM's log. Fix what it names, such as the Windows Hypervisor Platform, then start the work again. `after 3 tries` means the machine was too busy each time. |
+| `Couldn't build …`                                  | The image's install commands failed in its build; the lines after are the end of its output. Fix the `--install` or `--planner-install` commands, or the `--install-from` folder, then run the command again.                                     |
+| `… has no …`                                        | The install commands didn't put that program on the image's `PATH`. Check that `--install` (or `--planner-install` for a Planner command) installs it, then run the command again.                                                                |
+| `… asks for permission in the terminal`             | Run the command without `--install-service` and keep the terminal open.                                                                                                                                                                           |
+| `This machine is already paired with …`             | To pair it for another account, run `chopin unpair`, then the command again.                                                                                                                                                                      |
+| `This machine is no longer paired with Chopin`      | Run `chopin pair`, then connect again.                                                                                                                                                                                                            |
+| `The service has to keep running after you log out` | Have an administrator run `sudo loginctl enable-linger "$(id -un)"`, then run the command again.                                                                                                                                                  |
 
 **"CHOPIN_URL is …, but chopin connect saved …"** Install uses the server
 `chopin connect` saved. Run `chopin connect` again with the server you want in
@@ -1243,38 +1287,20 @@ Each message says what to run next. The first line of each:
 accepts this machine's authorization."** Someone disconnected the machine, or
 GitHub retired its authorization. Run `chopin pair`, then connect again.
 
-**"The service would not find … under the PATH it runs with."** Your agent,
-your Planner, the interpreter a script names on its `#!` line, or `git` is only
-on this shell's PATH, often through a version manager. Install it somewhere
-stable, or connect again with its absolute path.
-
-**"… lies in a directory that lasts only as long as this login or shell."**
-Install that program somewhere stable, or link it into a folder on the
-service's PATH, which the message prints.
-
-**"… has Windows line endings in its first line; convert it with dos2unix."**
-The system would read the interpreter's name with a carriage return on the end.
-Run `dos2unix` on the script the message names, then install again.
-
-**"…'s #! line must name an absolute path or use /usr/bin/env."** A `#!` line
-such as `#!node` finds nothing when the service runs the script. Change it to
-`#!/usr/bin/env node` or the interpreter's absolute path.
-
-**"… runs through more than 5 #! interpreters"** or **"…'s #! interpreters
-loop"**. Point the script's `#!` line at the program that finally runs it.
-
 **"… didn't answer ACP initialize when started as the service would start
-it."** The message shows how the agent ended and the first line it printed.
-Fix that, often by signing in to the agent, then install again. If the agent
-can't start without a terminal, pass `--skip-check`.
+it."** The agent didn't start in a microVM of its image. The message shows how it
+ended and the first line it printed. Fix that, often its `--install` commands,
+then install again. If the agent can't start without a terminal, pass
+`--skip-check`.
 
 **"chopin can't reach your systemd user manager."** Run the command in a login
 session as the user who owns the service, not through `su` or `sudo -u`.
 
 **"… is already locked by a running connector"** Another `chopin connect`, or
 the service, is already connected with this base dir, and one connection serves
-every repository. Stop it, or if `chopin status` shows nothing running, delete
-the `.lock` file the message names.
+every repository. The second `chopin connect` stops before it builds or removes any
+image. Stop the other one, or if `chopin status` shows nothing running, delete the
+`.lock` file the message names.
 
 For files, versions, the server rules, service internals, starting the Windows
 task at boot and status JSON, see the [chopin CLI reference](chopin-cli-reference.md).

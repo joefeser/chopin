@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-ARG BUN_VERSION=1.4.4
+ARG BUN_VERSION=1.4.5
 # The image that runs now, so this build keeps the hashed files of the builds before it and a
 # tab left open across a deploy still finds its chunks. Without one, only this build's are served.
 ARG PREVIOUS_IMAGE=no-previous
@@ -69,8 +69,8 @@ RUN apt-get update \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& install -d -o bun -g bun -m 0700 /var/lib/chopin
 
-# The atomic Planner's per-document directories and workflow journal live under
-# $XDG_STATE_HOME/chopin; mount a volume at /var/lib/chopin to keep them.
+# The atomic Planner's per-document directories live under $XDG_STATE_HOME/chopin;
+# mount a volume at /var/lib/chopin to keep them.
 ENV NODE_ENV=production \
 	PORT=8787 \
 	SERVER_HOST=0.0.0.0 \

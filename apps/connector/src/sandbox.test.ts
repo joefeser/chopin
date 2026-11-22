@@ -1,919 +1,676 @@
-import { afterAll, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { afterAll, describe, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
-	realpathSync,
-	renameSync,
 	rmSync,
-	statSync,
-	symlinkSync,
+	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { sandboxLabel } from "@chopin/protocol/connector";
-import type { Host } from "./sandbox-probe";
-import { mxcRequest } from "./sandbox-policy";
+import { join } from "node:path";
+import type { ImageBuilder, ImageRecipe } from "./images";
+import { type NvxArtifacts, SandboxRefused, STARTED_LINE, type VmSpec } from "./nvx";
 import {
 	createSandbox,
-	inspectSandbox,
-	LAUNCHER,
-	launchPolicy,
-	locateExecutor,
-	SandboxRefused,
-	sdkRoot,
-	sealedEnvironment,
-	spawnIn,
-	systemHost,
+	endOrphans,
+	nvxTemporary,
+	runFolderOf,
+	type Spawned,
+	type StartOptions,
+	startVm,
+	sweepRunFolders,
 } from "./sandbox";
+import { processStart } from "./workspace";
 
-let scratch = realpathSync(mkdtempSync(join(tmpdir(), "chopin-sandbox-test-")));
-/** Under a root the sandbox reads on Linux and macOS, as a home or a state directory is; /tmp is not one. */
-let readableScratch = existsSync("/var/tmp")
-	? realpathSync(mkdtempSync("/var/tmp/chopin-sandbox-test-"))
-	: scratch;
-afterAll(() => {
-	rmSync(scratch, { recursive: true, force: true });
-	rmSync(readableScratch, { recursive: true, force: true });
-});
+let scratch = mkdtempSync(join(tmpdir(), "chopin-orphans-"));
+afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
-/** A machine with nothing a sandbox needs, so every probe says why not. */
-function bare(): Host {
+/** A process in a group of its own, as `nvx` runs, and whether it is still alive. */
+function detached() {
+	let child = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+	let gone = new Promise(resolve => child.once("exit", resolve));
 	return {
-		...systemHost(),
-		platform: "linux",
-		arch: "x64",
-		release: "6.8.0",
-		read: () => undefined,
-		exists: () => false,
-		find: () => undefined,
-		run: async () => ({ code: 0, output: "" }),
+		pid: child.pid!,
+		alive: () => child.exitCode === null && child.signalCode === null,
+		stop: async () => {
+			child.kill("SIGKILL");
+			await gone;
+		},
 	};
 }
 
-function output(child: ReturnType<typeof spawnIn>) {
-	return new Promise<{ text: string; code: number | null }>(done => {
-		let text = "";
-		child.stdout.on("data", chunk => text += chunk);
-		child.once("close", code => done({ text, code }));
-	});
+function record(base: string, name: string, launch: Record<string, unknown>) {
+	let folder = join(base, "nvx", "launches", name);
+	mkdirSync(folder, { recursive: true });
+	writeFileSync(join(folder, "launch.json"), JSON.stringify(launch));
+	return folder;
 }
 
-test("with no sandbox to start it in, a process starts as it always did", async () => {
-	let child = spawnIn(undefined, {
-		command: [process.execPath, "-e", "console.log(process.env.CHOPIN_X + ' ' + process.cwd())"],
-		cwd: scratch,
-		env: { ...process.env, CHOPIN_X: "plain" },
-		stdin: "ignore",
-	});
-	expect(await output(child)).toEqual({ text: `plain ${scratch}\n`, code: 0 });
-});
+test.skipIf(process.platform !== "linux")(
+	"a dead connector's microVM is ended only while it is still the process recorded, never one that took its number",
+	async () => {
+		let base = mkdtempSync(join(scratch, "state-"));
+		let stranger = detached();
+		let orphan = detached();
+		try {
+			let start = (await processStart()(orphan.pid))!.id;
+			// A number now another process's, with no start recorded or another start.
+			let reused = record(base, "reused", { pid: stranger.pid, owner: 999_999_999 });
+			let restarted = record(base, "restarted", {
+				pid: stranger.pid,
+				start: "1",
+				owner: 999_999_999,
+			});
+			let left = record(base, "left", { pid: orphan.pid, start, owner: 999_999_999 });
+			await endOrphans(base);
+			await Bun.sleep(200);
+			expect(stranger.alive()).toBe(true);
+			expect(orphan.alive()).toBe(false);
+			for (let folder of [reused, restarted, left]) expect(existsSync(folder)).toBe(false);
+		} finally {
+			await stranger.stop();
+			await orphan.stop().catch(() => {});
+		}
+	},
+);
 
-test("where no sandbox works, runs go on unsandboxed and the report says why", async () => {
-	let sandbox = await createSandbox({
-		directory: scratch,
-		server: "https://chopin.example.com",
-		host: bare(),
-		executor: "/opt/mxc/lxc-exec",
-	});
-	expect(sandbox.report.engine).toBe("none");
-	expect(sandboxLabel(sandbox.report)).toStartWith("Not sandboxed: The Linux sandbox can't run:");
-	let child = sandbox.spawn({
-		command: [process.execPath, "-e", "console.log('ran')"],
-		cwd: scratch,
-		env: process.env,
-		stdin: "ignore",
-	});
-	expect(await output(child)).toEqual({ text: "ran\n", code: 0 });
-});
+test.skipIf(process.platform !== "linux")(
+	"a launch of a chopin still running beside this one is left alone",
+	async () => {
+		let base = mkdtempSync(join(scratch, "state-"));
+		let launch = detached();
+		let owner = detached();
+		try {
+			let ownerStart = (await processStart()(owner.pid))!.id;
+			let start = (await processStart()(launch.pid))!.id;
+			let kept = record(base, "kept", { pid: launch.pid, start, owner: owner.pid, ownerStart });
+			await endOrphans(base);
+			expect(launch.alive()).toBe(true);
+			expect(existsSync(kept)).toBe(true);
+		} finally {
+			await launch.stop();
+			await owner.stop();
+		}
+	},
+);
 
-test("--require-sandbox refuses a run that has no sandbox, and says why and how to go on", async () => {
-	let sandbox = await createSandbox({
-		directory: scratch,
-		server: "https://chopin.example.com",
-		settings: { require: true },
-		host: bare(),
-		executor: "/opt/mxc/lxc-exec",
-	});
-	let launch = {
-		command: [process.execPath, "-e", "process.exit(0)"],
-		cwd: scratch,
-		env: process.env,
-		stdin: "ignore" as const,
+test("a launch that never starts leaves nothing of its environment, its tokens, behind", () => {
+	let base = mkdtempSync(join(scratch, "state-"));
+	let spec: VmSpec = {
+		shares: [],
+		proxyPort: 1,
+		environment: { CHOPIN_TOKEN: "secret" },
+		command: ["agent"],
+		cwd: "/work",
+		memoryMib: 256,
+		processors: 1,
+		hostname: "launch",
 	};
-	expect(() => sandbox.spawn(launch)).toThrow(SandboxRefused);
-	expect(() => sandbox.spawn(launch)).toThrow(
-		"Not run: the sandbox is required (--require-sandbox) and The Linux sandbox can't run:",
-	);
-	// Off by default: the same machine without the option runs it.
-	let lenient = await createSandbox({
-		directory: scratch,
-		server: "https://chopin.example.com",
-		host: bare(),
-		executor: "/opt/mxc/lxc-exec",
-	});
-	expect(await output(lenient.spawn(launch))).toMatchObject({ code: 0 });
+	let artifacts = {
+		root: base,
+		nvx: join(base, "nvx.exe"),
+		layer: {
+			path: join(base, "ubuntu-distro.erofs"),
+			uuid: "0".repeat(8) + "-0000-0000-0000-" + "0".repeat(12),
+		},
+	};
+	// As on Windows when its kill-on-close job object can't be made.
+	let refuse = () => {
+		throw new SandboxRefused("Not run: Windows couldn't make the job that ends this microVM.");
+	};
+	expect(() => startVm(spec, { artifacts, hypervisor: "whp" }, base, "pipe", { start: refuse }))
+		.toThrow(SandboxRefused);
+	expect(readdirSync(join(base, "nvx", "launches"))).toEqual([]);
 });
 
-test("--no-sandbox is a sandbox that says it is off, and --require-sandbox can't override it into a run", async () => {
-	let off = await createSandbox({
-		directory: scratch,
-		server: "https://chopin.example.com",
-		settings: { off: true },
-		host: bare(),
-	});
-	expect(off.report).toEqual({ engine: "none", reason: "It is turned off with --no-sandbox." });
-	expect((await inspectSandbox({ directory: scratch, settings: { off: true } })).report).toEqual(
-		off.report,
-	);
-});
+const SPEC: VmSpec = {
+	shares: [],
+	proxyPort: 1,
+	environment: {},
+	command: ["agent"],
+	cwd: "/work",
+	memoryMib: 256,
+	processors: 1,
+	hostname: "launch",
+};
+const ARTIFACTS: NvxArtifacts = {
+	root: "/nvx",
+	nvx: "/nvx/bin/nvx",
+	layer: {
+		path: "/nvx/guest/ubuntu-distro.erofs",
+		uuid: `${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}`,
+	},
+};
 
-test("a chopin with no executor, such as the downloaded script, reports it rather than failing", async () => {
-	let sandbox = await createSandbox({
-		directory: scratch,
-		server: "https://chopin.example.com",
-		host: bare(),
-		executor: undefined,
-	});
-	expect(sandbox.report).toMatchObject({
-		engine: "none",
-		reason: expect.stringContaining("no MXC executor"),
-	});
-});
-
-/** What a launch is not allowed to write inside a directory it may, sorted. */
-function held(policy: ReturnType<typeof launchPolicy>) {
-	return [...policy.readonlyInside ?? []].sort();
-}
+/** What OpenVMM's log ends with when it couldn't set up a disk, as it said under heavy load. */
+const IO_URING_LOG = [
+	'   0.012444448s  INFO worker_new{ name="VmWorker" action="new"}: time ABI rates declared',
+	"fatal error: failed to launch vm worker",
+	"",
+	"Caused by:",
+	"    0: failed to launch worker",
+	"    1: failed to resolve resource of type virtio:virtio-blk",
+	"    2: failed to resolve resource of type disk_handle:block",
+	"    3: failed to create new device",
+	"    4: driver does not support io-uring",
+	"",
+].join("\n");
+/** What OpenVMM's log ends with when its user may no longer open /dev/kvm, as it said. */
+const KVM_LOG = [
+	'   0.000766448s  INFO openvmm_entry:  version="0.5.0+g51e9af75d"',
+	"fatal error: KVM is not available",
+	"",
+	"Caused by:",
+	"    failed to open file `/dev/kvm`: Permission denied (os error 13)",
+	"",
+].join("\n");
+/** What OpenVMM's log ends with when it can't have the guest's memory. */
+const MEMORY_LOG = [
+	'   0.000766448s  INFO openvmm_entry:  version="0.5.0+g51e9af75d"',
+	"fatal error: failed to launch vm worker",
+	"",
+	"Caused by:",
+	"    0: failed to allocate guest memory",
+	"",
+].join("\n");
+const NVX_FAILED = "error[exited]: OpenVMM exited during startup: vmm-failure status 1";
 
 /**
- * What is held read-only in a launch's own worktree entry: the three files that say where git is
- * and the three directories the repository's git directory holds read-only too. Git writes the
- * rest of the entry's top level by taking a lock beside each file, so it is not held.
+ * A stand-in for `nvx sandbox run`, as it behaves: it keeps a folder of its own in the temporary
+ * directory with OpenVMM's log in it, prints the OpenVMM command line naming it, and then, as
+ * `mode` says, fails to start (removing its folder, as `nvx` does) or runs a workload, which says it
+ * starts as the guest does and records each start in `starts`.
  */
-function inEntry(entry: string) {
-	return ["commondir", "config.worktree", "gitdir", "hooks", "info", "modules"].map(name =>
-		join(entry, name)
-	);
+const FAKE_NVX = `
+import { appendFileSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { join } from "node:path";
+let [mode, temporary, delay, starts] = process.argv.slice(2);
+await Bun.sleep(Number(delay));
+let folder = join(temporary, "nvx-sandbox-run-" + randomBytes(16).toString("hex"));
+mkdirSync(folder, { mode: 0o700 });
+let log = join(folder, "openvmm.log");
+writeFileSync(log, "   0.000766448s  INFO openvmm_entry:  version=\\"0.5.0\\"\\n");
+process.stdout.write(">> /nvx/bin/openvmm --machine microvm --microvm-report " + folder + "/outcome.json --guest-shutdown-action exit\\n");
+// As OpenVMM gets to its disks, after the connector has had the launch line.
+await Bun.sleep(100);
+let fail = (text) => {
+	writeFileSync(log, text, { flag: "a" });
+	rmSync(folder, { recursive: true, force: true });
+	process.stderr.write(${JSON.stringify(NVX_FAILED)} + "\\n");
+	process.exit(1);
+};
+if (mode === "uring") fail(${JSON.stringify(IO_URING_LOG)});
+if (mode === "kvm") fail(${JSON.stringify(KVM_LOG)});
+if (mode === "memory") fail(${JSON.stringify(MEMORY_LOG)});
+appendFileSync(starts, "started\\n");
+process.stdout.write(${JSON.stringify(STARTED_LINE)} + "\\n");
+if (mode === "started-then-uring") {
+	process.stdout.write("working\\n");
+	fail(${JSON.stringify(IO_URING_LOG)});
 }
-
-function gitCommand(...args: string[]) {
-	let result = spawnSync("git", [
-		"-c",
-		"commit.gpgsign=false",
-		"-c",
-		"user.name=t",
-		"-c",
-		"user.email=t@t",
-		...args,
-	], { encoding: "utf8" });
-	if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
-	return result.stdout.trim();
+if (mode === "hang") {
+	process.stdout.write("up\\n");
+	await new Promise(() => {});
 }
+let input = await new Response(Bun.stdin.stream()).text();
+process.stdout.write("the workload read: " + input);
+rmSync(folder, { recursive: true, force: true });
+`;
 
-/** A checkout with one commit, and the policy of a launch in any directory of it. */
-function repository(name: string) {
-	let root = join(readableScratch, name);
-	let checkout = join(root, "checkout");
-	let base = join(root, "state");
-	mkdirSync(checkout, { recursive: true });
-	mkdirSync(base, { recursive: true });
-	gitCommand("-C", checkout, "init", "-b", "main");
-	writeFileSync(join(checkout, "a.txt"), "a");
-	gitCommand("-C", checkout, "add", ".");
-	gitCommand("-C", checkout, "commit", "-m", "init");
+/** A connector's state directory, a temporary directory for `nvx`, and `nvx` itself. */
+function machine(modes: string[]) {
+	let base = mkdtempSync(join(scratch, "state-"));
+	let temporary = mkdtempSync(join(scratch, "tmp-"));
+	let script = join(base, "fake-nvx.mjs");
+	let starts = join(base, "starts");
+	writeFileSync(script, FAKE_NVX);
+	writeFileSync(starts, "");
+	let calls: StartOptions[] = [];
+	let start = (_program: string, _words: string[], launch: StartOptions) => {
+		let mode = modes[calls.length] ?? modes.at(-1)!;
+		calls.push(launch);
+		return spawn(
+			process.execPath,
+			[script, mode, temporary, String(launch.delayMs ?? 0), starts],
+			{ stdio: [launch.stdin, "pipe", "pipe"], detached: true },
+		) as Spawned;
+	};
 	return {
-		root,
-		checkout,
 		base,
-		git: join(checkout, ".git"),
-		worktree(name: string) {
-			let path = join(base, "runs", name);
-			gitCommand("-C", checkout, "worktree", "add", "--detach", path);
-			return path;
-		},
-		policy(cwd: string, writable: string[] = [], own: string[] = [], added: string[] = []) {
-			mkdirSync(join(root, "tmp"), { recursive: true });
-			return launchPolicy(
-				"bubblewrap",
-				{ ...systemHost(), platform: "linux" },
-				{ command: ["agent", "planner"], cwd, env: {}, stdin: "ignore", writable, own },
-				{ directory: base, home: join(root, "home"), settings: { writable: added } },
-				"http://127.0.0.1:4000",
-				join(root, "tmp"),
-			);
-		},
+		temporary,
+		calls,
+		start,
+		starts: () => readFileSync(starts, "utf8").split("\n").filter(Boolean).length,
+		launches: () => readdirSync(join(base, "nvx", "launches")),
 	};
 }
 
-test("a launch may write its worktree, its repository's git directory, its agent's state and a private temporary directory", () => {
-	let root = join(readableScratch, "launch");
-	let base = join(root, "state");
-	let checkout = join(root, "checkout");
-	let git = (...args: string[]) =>
-		spawnSync("git", [
-			"-c",
-			"commit.gpgsign=false",
-			"-c",
-			"user.name=t",
-			"-c",
-			"user.email=t@t",
-			...args,
-		], {
-			encoding: "utf8",
+/** How a launch ended, and what it wrote. */
+function ended(child: Spawned) {
+	let out = "";
+	let err = "";
+	child.stdout.on("data", chunk => out += chunk);
+	child.stderr.on("data", chunk => err += chunk);
+	return new Promise<{ code: number | null; signal: string | null; out: string; err: string }>(
+		resolve => child.once("close", (code, signal) => resolve({ code, signal, out, err })),
+	);
+}
+
+const SETUP = { artifacts: ARTIFACTS, hypervisor: "kvm" as const };
+
+describe.skipIf(process.platform === "win32")("starting a launch's microVM", () => {
+	test(
+		"a start OpenVMM failed with io-uring starts again, and the workload starts and reads its input once",
+		async () => {
+			let vm = machine(["uring", "run"]);
+			let retrying: string[] = [];
+			let child = startVm(SPEC, SETUP, vm.base, "pipe", {
+				start: vm.start,
+				retrying: detail => retrying.push(detail),
+			});
+			// Written before any start: the workload that starts reads it, and the start that failed doesn't.
+			child.stdin!.write("hello\n");
+			child.stdin!.end();
+			expect(await ended(child)).toEqual({
+				code: 0,
+				signal: null,
+				out: "the workload read: hello\n",
+				err: "",
+			});
+			expect(vm.calls.map(call => call.delayMs ?? 0)).toEqual([0, 500]);
+			expect(vm.starts()).toBe(1);
+			expect(retrying).toEqual([
+				"A microVM didn't start (OpenVMM: driver does not support io-uring), so chopin starts it again (2 of 3).",
+			]);
+			expect(readdirSync(vm.temporary)).toEqual([]);
+			expect(vm.launches()).toEqual([]);
+		},
+		20_000,
+	);
+
+	test(
+		"another failure to start is not tried again, and says the end of OpenVMM's log",
+		async () => {
+			let vm = machine(["memory", "run"]);
+			let unsupported: unknown[] = [];
+			let child = startVm(SPEC, SETUP, vm.base, "ignore", {
+				start: vm.start,
+				unsupported: problem => unsupported.push(problem),
+			});
+			expect(await ended(child)).toEqual({
+				code: 1,
+				signal: null,
+				out: "",
+				err: "The microVM didn't start: fatal error: failed to launch vm worker / Caused by: / 0: "
+					+ "failed to allocate guest memory (nvx: " + NVX_FAILED + ")\n",
+			});
+			expect(vm.calls).toHaveLength(1);
+			expect(vm.starts()).toBe(0);
+			expect(unsupported).toEqual([]);
+		},
+		20_000,
+	);
+
+	test(
+		"a start OpenVMM couldn't open /dev/kvm for says this machine can't run microVMs, with the fix, and tells whoever started it",
+		async () => {
+			let vm = machine(["kvm", "run"]);
+			let unsupported: unknown[] = [];
+			let words: string[] = [];
+			let child = startVm(SPEC, SETUP, vm.base, "ignore", {
+				start: vm.start,
+				// Its user joined the kvm group after the service's user manager began.
+				host: { joinedLater: path => path === "/dev/kvm" },
+				unsupported: problem => {
+					unsupported.push(problem);
+					// Heard before the launch ends, so nothing starts again meanwhile.
+					words.push(child.exitCode === null ? "before its end" : "after its end");
+				},
+			});
+			let reason = "Your user is in the kvm group, but chopin runs in a login that began before "
+				+ "you joined it, so it can't read and write /dev/kvm yet.";
+			let fix = "Log out and back in (for the chopin service, restart the machine). Or have an "
+				+ 'administrator add a udev rule, such as KERNEL=="kvm", GROUP="kvm", MODE="0660", '
+				+ 'RUN+="/usr/bin/setfacl -m u:<user>:rw /dev/kvm" (logind may drop that ACL)';
+			expect(await ended(child)).toEqual({
+				code: 1,
+				signal: null,
+				out: "",
+				err: "This machine can't run Chopin's work: Chopin runs each agent in its own microVM, "
+					+ `which needs Linux or Windows on x86_64 with hardware virtualization. ${reason} `
+					+ `Fix: ${fix} (OpenVMM: failed to open file \`/dev/kvm\`: Permission denied (os `
+					+ "error 13))\n",
+			});
+			expect(unsupported).toEqual([{ supported: false, reason, fix }]);
+			expect(words).toEqual(["before its end"]);
+			expect(vm.calls).toHaveLength(1);
+			expect(vm.starts()).toBe(0);
+			expect(vm.launches()).toEqual([]);
+		},
+		20_000,
+	);
+
+	test("a start whose workload had started is never tried again", async () => {
+		let vm = machine(["started-then-uring", "run"]);
+		let child = startVm(SPEC, SETUP, vm.base, "pipe", { start: vm.start });
+		expect(await ended(child)).toEqual({
+			code: 1,
+			signal: null,
+			out: "working\n",
+			err: `${NVX_FAILED}\n`,
 		});
-	mkdirSync(checkout, { recursive: true });
-	git("-C", checkout, "init", "-b", "main");
-	writeFileSync(join(checkout, "a.txt"), "a");
-	git("-C", checkout, "add", ".");
-	git("-C", checkout, "commit", "-m", "init");
-	mkdirSync(join(base, "runs", "mine-worktrees"), { recursive: true });
-	mkdirSync(join(base, "runs", "other"), { recursive: true });
-	writeFileSync(join(base, "machine.json"), "{}");
-	mkdirSync(join(root, "notes"));
-	let worktree = join(base, "runs", "mine");
-	let tokens = `${worktree}.tokens`;
-	mkdirSync(tokens);
-	writeFileSync(join(tokens, "github"), "ghu_mine\n");
-	git("-C", checkout, "worktree", "add", "--detach", worktree);
-	// A Planner's worktree isn't there yet: the sandbox makes the folder it is made in.
-	let planned = join(base, "planners", "octo", "score", "D_1");
-	let temporary = join(root, "tmp");
-	mkdirSync(temporary);
-	let policy = launchPolicy(
-		"bubblewrap",
-		{ ...systemHost(), platform: "linux" },
-		{
-			command: ["atomic-acp"],
-			cwd: worktree,
-			env: { PATH: process.env.PATH, HOME: join(root, "home"), KEEP: "yes" },
-			stdin: "pipe",
-			writable: [join(base, "runs", "mine-worktrees"), planned],
-			own: [worktree, tokens],
-		},
-		{
-			directory: base,
-			home: join(root, "home"),
-			settings: { writable: [join(root, "extra-missing")] },
-		},
-		"http://127.0.0.1:4000",
-		temporary,
-	);
-	expect(policy.writable).toContain(worktree);
-	expect(policy.writable).toContain(join(base, "runs", "mine-worktrees"));
-	expect(policy.writable).toContain(planned);
-	expect(existsSync(planned)).toBe(true);
-	// A linked worktree's launch writes where commits and refs go, in the repository's git
-	// directory, and its own worktree's directory there: not the directory whole, and not `worktrees`.
-	for (let name of ["objects", "refs", "logs"]) {
-		expect(policy.writable).toContain(join(checkout, ".git", name));
-	}
-	expect(policy.writable).toContain(join(checkout, ".git", "worktrees", "mine"));
-	for (
-		let path of [
-			join(checkout, ".git"),
-			join(checkout, ".git", "config"),
-			join(checkout, ".git", "hooks"),
-			join(checkout, ".git", "info"),
-			join(checkout, ".git", "HEAD"),
-			join(checkout, ".git", "worktrees"),
-			join(checkout, ".git", "modules"),
-		]
-	) {
-		expect(policy.writable).not.toContain(path);
-	}
-	// And the rest of it is read, by name, since a system that reads only some roots has it in none.
-	expect(policy.readable).toContain(join(checkout, ".git"));
-	expect(policy.writable).toContain(temporary);
-	expect(policy.writable).toContain(join(root, "home", ".atomic"));
-	// A directory that isn't there is not granted: MXC would refuse the request.
-	expect(policy.writable).not.toContain(join(root, "extra-missing"));
-	// What git reads to find its configuration, in what it may write: the worktree's pointer to its
-	// git directory, and in that directory the files that say whose configuration it reads and where
-	// the worktree is, and its own. The repository's own git directory is held whole, so its
-	// `config`, `hooks` and `info` are not written at all.
-	let entry = join(checkout, ".git", "worktrees", "mine");
-	expect(held(policy)).toEqual(
-		[
-			join(checkout, ".git"),
-			...inEntry(entry),
-			join(worktree, ".git"),
-		].sort(),
-	);
-	expect(policy.readable).toContain("/usr");
-	// What is around the state directory is read, and what is in it only by name: the launch's
-	// tokens, as a folder, and nothing about any other run, the machine token or what comes later.
-	expect(policy.readable).toContain(join(root, "notes"));
-	expect(policy.readable.filter(path => path.startsWith(`${base}/`))).toEqual([tokens]);
-	for (let path of policy.readable) {
-		expect(base === path || base.startsWith(`${path}/`)).toBe(false);
-	}
-	expect(policy.denied.filter(path => path.startsWith(`${base}/`))).toEqual([]);
-	expect(policy.readable).not.toContain("/tmp");
-	expect(policy.readable).not.toContain("/dev");
-	// Credentials are not hidden from the agent's own environment, and it gets a private TMPDIR.
-	expect(policy.env.KEEP).toBe("yes");
-	expect(policy.env.TMPDIR).toBe(temporary);
-	expect(policy.env.NODE_USE_ENV_PROXY).toBe("1");
-	expect(policy.proxy).toBe("http://127.0.0.1:4000");
+		expect(vm.calls).toHaveLength(1);
+		expect(vm.starts()).toBe(1);
+	}, 20_000);
+
+	test("three failed starts end the launch, saying why", async () => {
+		let vm = machine(["uring"]);
+		let child = startVm(SPEC, SETUP, vm.base, "ignore", { start: vm.start });
+		expect(await ended(child)).toEqual({
+			code: 1,
+			signal: null,
+			out: "",
+			err: "The microVM didn't start after 3 tries: fatal error: failed to launch vm worker / "
+				+ "Caused by: / 0: failed to launch worker / 1: failed to resolve resource of type "
+				+ "virtio:virtio-blk / 2: failed to resolve resource of type disk_handle:block / 3: failed "
+				+ "to create new device / 4: driver does not support io-uring (nvx: " + NVX_FAILED + ")\n",
+		});
+		expect(vm.calls.map(call => call.delayMs ?? 0)).toEqual([0, 500, 1_500]);
+		expect(readdirSync(vm.temporary)).toEqual([]);
+		expect(vm.launches()).toEqual([]);
+	}, 20_000);
+
+	test("a launch stopped while it waits to start again ends without starting", async () => {
+		let vm = machine(["uring", "run"]);
+		let child = startVm(SPEC, SETUP, vm.base, "pipe", {
+			start: vm.start,
+			// As a caller ends a launch: its process group, which is the waiting start's.
+			retrying: () => setTimeout(() => process.kill(-child.pid!, "SIGTERM"), 100),
+		});
+		let result = await ended(child);
+		expect({ code: result.code, signal: result.signal }).toEqual({ code: null, signal: "SIGTERM" });
+		expect(vm.calls).toHaveLength(2);
+		expect(vm.starts()).toBe(0);
+		expect(vm.launches()).toEqual([]);
+	}, 20_000);
+
+	test("a launch ended by force leaves nothing of nvx's in the temporary directory", async () => {
+		let vm = machine(["hang"]);
+		let child = startVm(SPEC, SETUP, vm.base, "ignore", { start: vm.start });
+		let result = ended(child);
+		await new Promise(resolve => child.stdout.once("data", resolve));
+		let [run] = readdirSync(vm.temporary);
+		let record = JSON.parse(
+			readFileSync(join(vm.base, "nvx", "launches", vm.launches()[0]!, "launch.json"), "utf8"),
+		);
+		expect(record.run).toBe(join(vm.temporary, run!));
+		process.kill(-child.pid!, "SIGKILL");
+		expect((await result).signal).toBe("SIGKILL");
+		expect(readdirSync(vm.temporary)).toEqual([]);
+		expect(vm.launches()).toEqual([]);
+	}, 20_000);
 });
 
-test("a launch in a checkout the connector did not make for it, the person's own, writes none of it: the checkout and its git directory are read-only whole, and no name in the git directory is granted", () => {
-	let repo = repository("git-checkout");
-	let before = readdirSync(repo.git).sort();
-	let policy = repo.policy(repo.checkout);
-	// Nothing in the checkout is written: not its files, not its `.git`, and with no worktree of its
-	// own there is nothing to commit in, so not even where commits go.
+test("nvx's folder is read from the OpenVMM command line it prints, on Linux and Windows", () => {
 	expect(
-		policy.writable.filter(path => path === repo.checkout || path.startsWith(`${repo.checkout}/`)),
-	)
-		.toEqual([]);
-	expect(policy.readable).toContain(repo.checkout);
-	// The directory is held whole, so no file can be made at its top level, a `commondir` among them.
-	expect(held(policy)).toEqual([repo.git]);
-	// And nothing is made in it for the sandbox's sake.
-	expect(readdirSync(repo.git).sort()).toEqual(before);
-	expect(existsSync(join(repo.git, "config.worktree"))).toBe(false);
-});
-
-test("a Planner in the person's checkout writes its own worktree and where commits go in the repository's git directory, and nothing else of the repository", () => {
-	let repo = repository("git-planner-checkout");
-	let planned = join(repo.base, "planners", "octo", "score", "D_1");
-	mkdirSync(join(repo.base, "planners", "octo", "score"), { recursive: true });
-	gitCommand("-C", repo.checkout, "worktree", "add", "--detach", planned);
-	// A submodule's folder, with the `.git` file that sends the person's own git to its git directory.
-	mkdirSync(join(repo.checkout, "vendor"));
-	writeFileSync(join(repo.checkout, "vendor", ".git"), "gitdir: ../.git/modules/vendor\n");
-	let before = readdirSync(repo.git).sort();
-	let policy = repo.policy(repo.checkout, [planned], [planned]);
-	expect(policy.writable).toContain(planned);
-	expect(policy.writable).not.toContain(repo.checkout);
-	expect(policy.writable).not.toContain(repo.git);
-	// Where its worktree's commits, branches, fetched objects and LFS objects go, and its entry.
-	for (let name of ["objects", "refs", "logs"]) {
-		expect(policy.writable).toContain(join(repo.git, name));
-	}
-	expect(policy.writable).toContain(join(repo.git, "worktrees", "D_1"));
-	for (
-		let name of ["config", "hooks", "info", "HEAD", "index", "packed-refs", "worktrees", "modules"]
-	) {
-		expect(policy.writable).not.toContain(join(repo.git, name));
-	}
-	// Of the checkout itself, only the directories there are written, and none of its files.
+		runFolderOf(
+			">> /nvx/bin/openvmm --machine microvm --microvm-control-console listen=/tmp/nvx-sandbox-run-5821597868702c8d/control.sock --microvm-report /tmp/nvx-sandbox-run-5821597868702c8d/outcome.json --guest-shutdown-action exit",
+			"linux",
+		),
+	).toBe("/tmp/nvx-sandbox-run-5821597868702c8d");
 	expect(
-		policy.writable.filter(path => path.startsWith(`${repo.checkout}/`)).map(path =>
-			path.slice(repo.checkout.length + 1)
-		).sort(),
-	).toEqual([
-		".git/logs",
-		".git/objects",
-		".git/refs",
-		".git/worktrees/D_1",
-	]);
-	expect(readdirSync(repo.git).sort()).toEqual(before);
+		runFolderOf(
+			">> C:\\nvx\\bin\\openvmm.exe --microvm-control-console listen=//./pipe/openvmm-microvm-a23d --microvm-report C:\\Users\\mona\\AppData\\Local\\Temp\\nvx-sandbox-run-7158f3d7\\outcome.json --guest-shutdown-action exit",
+			"win32",
+		),
+	).toBe("C:\\Users\\mona\\AppData\\Local\\Temp\\nvx-sandbox-run-7158f3d7");
+	expect(
+		runFolderOf(
+			'>> "C:\\nvx\\bin\\openvmm.exe" --microvm-report "C:\\Users\\Mona Lisa\\AppData\\Local\\Temp\\nvx-sandbox-run-7158f3d7\\outcome.json"',
+			"win32",
+		),
+	).toBe("C:\\Users\\Mona Lisa\\AppData\\Local\\Temp\\nvx-sandbox-run-7158f3d7");
+	// Only a folder of nvx's own is ever taken for one.
+	expect(runFolderOf(">> openvmm --microvm-report /home/mona/outcome.json", "linux"))
+		.toBeUndefined();
+	expect(runFolderOf(">> openvmm --machine microvm", "linux")).toBeUndefined();
 });
 
-test("a Planner's checkout inside the connector's state directory, which a clone the connector made is, is read by name and not written", () => {
-	let repo = repository("git-planner-clone");
-	// A clone is made in `<base>/repos/<owner>/<repo>`, where nothing is read but what is named.
-	let clone = join(repo.base, "repos", "octo", "score");
-	mkdirSync(join(repo.base, "repos", "octo"), { recursive: true });
-	gitCommand("clone", "-q", repo.checkout, clone);
-	let planned = join(repo.base, "planners", "octo", "score", "D_1");
-	mkdirSync(join(repo.base, "planners", "octo", "score"), { recursive: true });
-	gitCommand("-C", clone, "worktree", "add", "--detach", planned);
-	let policy = repo.policy(clone, [planned], [planned]);
-	expect(policy.readable).toContain(clone);
-	expect(policy.writable).not.toContain(clone);
-	expect(policy.writable).toContain(planned);
-});
-
-test("the repository's lfs directory, where Git LFS keeps its objects, is written where it exists, and no name beside it, no new file at the top level and no lfs directory that isn't there is", () => {
-	let repo = repository("git-lfs");
-	mkdirSync(join(repo.git, "lfs", "objects"), { recursive: true });
-	// Names that only resemble it, and a file git or an agent might add at the top level.
-	mkdirSync(join(repo.git, "lfs-x"));
-	writeFileSync(join(repo.git, "lfs.lock"), "");
-	writeFileSync(join(repo.git, "new-file"), "");
-	let beside = (policy: ReturnType<typeof launchPolicy>) =>
-		policy.writable.filter(path => path.startsWith(`${repo.git}/`)).map(path =>
-			path.slice(repo.git.length + 1)
-		).sort();
-	let planned = join(repo.base, "planners", "octo", "score", "D_1");
-	mkdirSync(join(repo.base, "planners", "octo", "score"), { recursive: true });
-	gitCommand("-C", repo.checkout, "worktree", "add", "--detach", planned);
-	let mine = repo.worktree("mine");
-	let launches = [
-		() => repo.policy(repo.checkout, [planned], [planned]),
-		() => repo.policy(mine, [], [mine]),
-	];
-	for (let launch of launches) {
-		// Only these four, and a worktree's own entry: `lfs-x`, `lfs.lock` and `new-file` are not.
-		expect(beside(launch()).filter(name => !name.startsWith("worktrees/"))).toEqual([
-			"lfs",
-			"logs",
-			"objects",
-			"refs",
-		]);
-	}
-	// Where there is none, none is granted and none is made for the sandbox's sake.
-	rmSync(join(repo.git, "lfs"), { recursive: true });
-	expect(beside(launches[0]!())).toEqual(["logs", "objects", "refs", "worktrees/D_1"]);
-	expect(existsSync(join(repo.git, "lfs"))).toBe(false);
-});
-
-test("a launch in a linked worktree writes its own entry in the repository's git directory and no other: that is held, with the files in it that say where its configuration is, whatever the repository reads", () => {
-	let repo = repository("git-worktree-config");
-	let mine = repo.worktree("mine");
-	let other = repo.worktree("other");
-	let admin = (name: string) => join(repo.git, "worktrees", name);
-	// The worktree is the connector's, made for this launch, which is what makes its entry the
-	// launch's.
-	let policy = repo.policy(mine, [], [mine]);
-	expect(policy.writable).toContain(admin("mine"));
-	expect(policy.writable).not.toContain(admin("other"));
-	expect(policy.writable).not.toContain(join(repo.git, "worktrees"));
-	// An empty `config.worktree` where there was none, which git ignores unless the repository reads
-	// one, so an agent can't be the one to write it; and the files that say where git is held back.
-	expect(readFileSync(join(admin("mine"), "config.worktree"), "utf8")).toBe("");
-	expect(held(policy)).toEqual(
-		[
-			repo.git,
-			...inEntry(admin("mine")),
-			join(mine, ".git"),
-		].sort(),
+test("nvx's folders are looked for where nvx makes them, which on Linux only TMPDIR moves", () => {
+	expect(nvxTemporary({ TMP: "/fast/tmp", TEMP: "/fast/tmp" }, "linux")).toBe("/tmp");
+	expect(nvxTemporary({ TMPDIR: "/fast/tmp", TMP: "/elsewhere" }, "linux")).toBe("/fast/tmp");
+	expect(nvxTemporary({ TMP: "C:\\Temp", TEMP: "C:\\Users\\mona\\Temp" }, "win32")).toBe(
+		"C:\\Temp",
 	);
-	// Nothing is made in a sibling's entry, or in the repository's top level.
-	expect(existsSync(join(admin("other"), "config.worktree"))).toBe(false);
-	expect(existsSync(join(repo.git, "config.worktree"))).toBe(false);
-	expect(held(policy)).not.toContain(join(other, ".git"));
-	// One that already has such a file keeps what is in it.
-	gitCommand("-C", repo.checkout, "config", "extensions.worktreeConfig", "true");
-	writeFileSync(join(admin("mine"), "config.worktree"), "[core]\n\tsparseCheckout = true\n");
-	repo.policy(mine, [], [mine]);
-	expect(readFileSync(join(admin("mine"), "config.worktree"), "utf8")).toContain("sparseCheckout");
+	expect(nvxTemporary({ TEMP: "C:\\Users\\mona\\Temp" }, "win32")).toBe("C:\\Users\\mona\\Temp");
 });
 
-test("a Planner whose checkout is itself a linked worktree of the person's reads that checkout and its git entry and writes only its own worktree's entry", () => {
-	let repo = repository("git-planner-linked");
-	// The person's own checkout of the repository is a linked worktree, which is where the Planner
-	// runs; the connector makes the Planner's worktree from it.
-	let persons = join(repo.root, "persons-checkout");
-	gitCommand("-C", repo.checkout, "worktree", "add", "--detach", persons);
-	let planned = join(repo.base, "planners", "octo", "score", "D_1");
-	mkdirSync(join(repo.base, "planners", "octo", "score"), { recursive: true });
-	gitCommand("-C", persons, "worktree", "add", "--detach", planned);
-	let admin = (name: string) => join(repo.git, "worktrees", name);
-	// The launch, as `planner.ts` makes it: the checkout is where it runs, and the worktree is its
-	// own.
-	let policy = repo.policy(persons, [planned], [planned]);
-	expect(policy.writable).not.toContain(persons);
-	expect(policy.readable).toContain(persons);
-	expect(policy.writable).toContain(planned);
-	expect(policy.writable).toContain(admin("D_1"));
-	// The person's entry is theirs: its HEAD, index and any rebase in progress are what their own
-	// git reads and runs, so nothing in it is written, and nothing is made in it for the sandbox's sake.
-	expect(policy.writable.filter(path => path.startsWith(admin("persons-checkout")))).toEqual([]);
-	expect(existsSync(join(admin("persons-checkout"), "config.worktree"))).toBe(false);
-	expect(policy.writable).not.toContain(join(repo.git, "worktrees"));
-	expect(policy.writable).not.toContain(repo.git);
-	for (let name of ["objects", "refs", "logs"]) {
-		expect(policy.writable).toContain(join(repo.git, name));
-	}
-	// The repository's git directory is held whole, as a regular checkout's is, so the person's
-	// entry can't be renamed or made again either; the checkout, `.git` file included, is read-only
-	// whole, and the Planner's own worktree's pointers are held, as a run's are.
-	expect(held(policy)).toEqual(
-		[
-			repo.git,
-			...inEntry(admin("D_1")),
-			join(planned, ".git"),
-		].sort(),
-	);
-});
-
-test("a Planner's checkout whose .git is a symbolic link has its git directory granted by its real path, never through the link, and is read as any checkout is", () => {
-	let repo = repository("git-symlink");
-	// A checkout made by a tool that keeps the git directory elsewhere and links it in.
-	let store = join(repo.root, "store", "checkout.git");
-	mkdirSync(dirname(store));
-	renameSync(repo.git, store);
-	symlinkSync(join("..", "store", "checkout.git"), repo.git);
-	let planned = join(repo.base, "planners", "octo", "score", "D_1");
-	mkdirSync(join(repo.base, "planners", "octo", "score"), { recursive: true });
-	gitCommand("-C", repo.checkout, "worktree", "add", "--detach", planned);
-	let policy = repo.policy(repo.checkout, [planned], [planned]);
-	// Where commits go is named by the real directory, never through the link, which a sandbox
-	// can't mount over and the agent could point elsewhere.
-	for (let name of ["objects", "refs", "logs"]) {
-		expect(policy.writable).toContain(join(store, name));
-	}
-	expect(held(policy)).toContain(store);
-	for (let path of [...policy.writable, ...held(policy), ...policy.readable]) {
-		expect(path === repo.git || path.startsWith(`${repo.git}/`)).toBe(false);
-	}
-	// The link is a name in the checkout, which is the person's: read whole, so no agent replaces it.
-	// The Planner's own worktree, whose `.git` is a file that is held, is written.
-	expect(policy.writable).not.toContain(repo.checkout);
-	expect(policy.readable).toContain(repo.checkout);
-	expect(policy.writable).toContain(planned);
-	expect(policy.writable).toContain(join(store, "worktrees", "D_1"));
-	expect(held(policy)).toContain(join(planned, ".git"));
-});
-
-test("one policy shape for every system: what a launch writes of its git directory is the same on Linux, macOS and Windows", () => {
-	let repo = repository("git-shapes");
-	let mine = repo.worktree("mine");
-	let shape = (platform: NodeJS.Platform, cwd: string) => {
-		let policy = launchPolicy(
-			platform === "darwin" ? "seatbelt" : platform === "win32" ? "processcontainer" : "bubblewrap",
-			{ ...systemHost(), platform },
-			{
-				command: ["agent", "planner"],
-				cwd,
-				env: {},
-				stdin: "ignore",
-				own: cwd === mine ? [mine] : [],
-			},
-			{ directory: repo.base, home: join(repo.root, "home") },
-			"http://127.0.0.1:4000",
-			join(repo.root, "tmp"),
-		);
-		let git = (paths: readonly string[]) => paths.filter(path => path.startsWith(repo.git)).sort();
-		return {
-			writable: git(policy.writable),
-			held: held(policy),
-			inGit: git(held(policy)),
-			// Whether the working directory is written: the connector's own worktree, not the person's.
-			writesWorkingDirectory: policy.writable.includes(cwd),
-			readsWorkingDirectory: policy.readable.includes(cwd),
-		};
-	};
-	for (let cwd of [mine, repo.checkout]) {
-		let linux = shape("linux", cwd);
-		expect(shape("darwin", cwd)).toEqual(linux);
-		expect(shape("win32", cwd)).toEqual(linux);
-		expect(linux.writesWorkingDirectory).toBe(cwd === mine);
-		expect(linux.readsWorkingDirectory).toBe(cwd !== mine);
-	}
-});
-
-test("on Windows a launch reads, of a checkout outside every directory it is given, its repository's git directory whole and nothing else of it: a run its worktree, a Planner its working directory", () => {
-	let repo = repository("windows-reads");
-	let mine = repo.worktree("mine");
-	let windows = (cwd: string, own: string[]) =>
-		launchPolicy(
-			"processcontainer",
-			{ ...systemHost(), platform: "win32" },
-			{ command: ["atomic-acp"], cwd, env: {}, stdin: "ignore", own },
-			{ directory: repo.base, home: join(repo.root, "home") },
-			"http://127.0.0.1:4000",
-			join(repo.root, "tmp"),
-		);
-	// A run: its worktree is written, which reads it; the checkout is not granted, but the git
-	// directory it came from is, since the worktree's `.git` leads into it, and that is read whole:
-	// its configuration, hooks, objects, and every worktree's entry.
-	let run = windows(mine, [mine]);
-	expect(run.writable).toContain(mine);
-	expect(run.readable).toEqual([repo.git]);
-	// A Planner works in the person's checkout, which is read whole with its git directory.
-	let planner = windows(repo.checkout, []);
-	expect([...planner.readable].sort()).toEqual([repo.checkout, repo.git].sort());
-});
-
-test("a Planner's own worktree, found made in its checkout's repository, is written as a run's is: its entry and no other, and its .git file is held", () => {
-	let repo = repository("git-planner-worktree");
-	let planned = join(repo.base, "planners", "octo", "score", "D_1");
-	mkdirSync(join(repo.base, "planners", "octo", "score"), { recursive: true });
-	gitCommand("-C", repo.checkout, "worktree", "add", "--detach", planned);
-	let persons = repo.worktree("persons");
-	let policy = repo.policy(repo.checkout, [planned], [planned]);
-	let admin = (name: string) => join(repo.git, "worktrees", name);
-	expect(policy.writable).not.toContain(repo.checkout);
-	expect(policy.writable).toContain(planned);
-	expect(policy.writable).toContain(admin("D_1"));
-	expect(policy.writable).not.toContain(admin("persons"));
-	expect(policy.writable).not.toContain(join(repo.git, "worktrees"));
-	expect(held(policy)).toEqual(
-		[
-			repo.git,
-			...inEntry(admin("D_1")),
-			join(planned, ".git"),
-		].sort(),
-	);
-	expect(held(policy)).not.toContain(join(persons, ".git"));
-});
-
-test("a submodule's git directory and every worktree entry but the launch's own are read-only, as the rest of the git directory is: nothing of theirs is granted", () => {
-	let repo = repository("git-submodules");
-	let mine = repo.worktree("mine");
-	repo.worktree("theirs");
-	let gitDirectory = (...parts: string[]) => {
-		let path = join(...parts);
-		mkdirSync(join(path, "hooks"), { recursive: true });
-		writeFileSync(join(path, "HEAD"), "ref: refs/heads/main\n");
-		writeFileSync(join(path, "config"), "[core]\n");
-		return path;
-	};
-	gitDirectory(repo.git, "modules", "lib");
-	gitDirectory(repo.git, "modules", "ext", "tool");
-	for (let cwd of [repo.checkout, mine]) {
-		let policy = repo.policy(cwd, [], cwd === mine ? [mine] : []);
-		expect(policy.writable.filter(path => path.startsWith(join(repo.git, "modules")))).toEqual([]);
-		expect(policy.writable).not.toContain(join(repo.git, "worktrees", "theirs"));
-		expect(policy.writable.filter(path => path.startsWith(join(repo.git, "worktrees", "theirs"))))
-			.toEqual([]);
-	}
-});
-
-test("a git directory named by a file in a folder the agent made earlier is not believed: only the working directory says which repository this is", () => {
-	let repo = repository("git-pointer");
-	let mine = repo.worktree("mine");
-	let other = repository("git-pointer-other");
-	// A Planner's worktree, as a backend left it, now pointing at another repository's git directory.
-	let planned = join(repo.base, "planners", "octo", "score", "D_1");
-	mkdirSync(planned, { recursive: true });
-	writeFileSync(join(planned, ".git"), `gitdir: ${other.git}\n`);
-	let policy = repo.policy(mine, [planned], [mine]);
-	expect(policy.writable).toContain(planned);
-	expect(policy.writable).toContain(join(repo.git, "objects"));
-	expect(policy.writable).not.toContain(other.git);
-	expect(policy.writable.filter(path => path.startsWith(other.git))).toEqual([]);
-	expect(held(policy).filter(path => path.startsWith(other.git))).toEqual([]);
-});
-
-test("a launch whose working directory holds the connector's state directory, as a home does, is given what is around it by name and never the state directory or a parent of it", () => {
-	let root = join(readableScratch, "ancestor");
-	let home = join(root, "home");
-	let base = join(home, ".local", "state", "chopin", "connector");
-	mkdirSync(join(base, "runs", "other-run"), { recursive: true });
-	writeFileSync(join(base, "machine.json"), "{}");
-	writeFileSync(join(base, "runs", "other-run", "token"), "ghu_other");
-	mkdirSync(join(home, "notes"), { recursive: true });
-	mkdirSync(join(home, ".local", "share"), { recursive: true });
-	mkdirSync(join(home, ".local", "state", "other"), { recursive: true });
-	for (let platform of ["linux", "darwin"] as const) {
-		let policy = launchPolicy(
-			platform === "darwin" ? "seatbelt" : "bubblewrap",
-			{ ...systemHost(), platform },
-			{ command: ["agent", "planner"], cwd: home, env: {}, stdin: "ignore" },
-			{ directory: base, home },
-			"http://127.0.0.1:4000",
-			join(root, "tmp"),
-		);
-		// No grant is the state directory or holds it, whole, and nothing in it is named.
-		for (let path of policy.readable) {
-			expect(base === path || base.startsWith(`${path}/`), `${platform}: ${path}`).toBe(false);
-			expect(path.startsWith(`${base}/`), `${platform}: ${path}`).toBe(false);
+describe.skipIf(process.platform !== "linux")(
+	"nvx's folders a connector sweeps as it starts",
+	() => {
+		/** A folder of nvx's in `temporary`, made `ageMs` ago. */
+		function runFolder(temporary: string, name: string, ageMs = 120_000) {
+			let folder = join(temporary, `nvx-sandbox-run-${name}`);
+			mkdirSync(folder);
+			writeFileSync(join(folder, "openvmm.log"), "log\n");
+			let then = new Date(Date.now() - ageMs);
+			utimesSync(folder, then, then);
+			return folder;
 		}
-		// What is around the way to it is read, as the working directory is the launch's to read.
-		for (
-			let path of [
-				join(home, "notes"),
-				join(home, ".local", "share"),
-				join(home, ".local", "state", "other"),
-			]
-		) {
-			expect(policy.readable, platform).toContain(path);
-		}
-		expect(policy.writable.some(path => path === home || path.startsWith(`${base}`))).toBe(false);
-	}
-	// A directory the owner adds with --sandbox-write that holds the state directory, `~` itself,
-	// is written around it and never in it (a launch that works elsewhere than in `~`, which would
-	// be its checkout and never written).
-	mkdirSync(join(root, "work"));
-	let owner = launchPolicy(
-		"bubblewrap",
-		{ ...systemHost(), platform: "linux" },
-		{ command: ["agent", "planner"], cwd: join(root, "work"), env: {}, stdin: "ignore" },
-		{ directory: base, home, settings: { writable: [home] } },
-		"http://127.0.0.1:4000",
-		join(root, "tmp"),
-	);
-	expect(owner.writable).toContain(join(home, "notes"));
-	for (let path of owner.writable) {
-		expect(base === path || base.startsWith(`${path}/`), path).toBe(false);
-		expect(path.startsWith(`${base}/`), path).toBe(false);
-	}
-});
 
-test("what the owner hides with --sandbox-hide is in no grant, read or write, even inside a folder they let agents write, and is denied besides", () => {
-	let root = join(readableScratch, "hidden");
-	let home = join(root, "home");
-	let base = join(home, ".local", "state", "chopin", "connector");
-	let tool = join(home, ".tool");
-	mkdirSync(base, { recursive: true });
-	mkdirSync(join(tool, "cache"), { recursive: true });
-	writeFileSync(join(tool, "github-token"), "a sign-in of the tool's own");
-	writeFileSync(join(tool, "settings.json"), "{}");
-	mkdirSync(join(root, "work"), { recursive: true });
-	for (let platform of ["linux", "darwin"] as const) {
-		let policy = launchPolicy(
-			platform === "darwin" ? "seatbelt" : "bubblewrap",
-			{ ...systemHost(), platform },
-			{ command: ["agent", "planner"], cwd: join(root, "work"), env: {}, stdin: "ignore" },
-			{
-				directory: base,
-				home,
-				settings: { writable: [tool], hidden: [join(tool, "github-token")] },
-			},
-			"http://127.0.0.1:4000",
-			join(root, "tmp"),
-		);
-		let secret = join(tool, "github-token");
-		for (let path of [...policy.readable, ...policy.writable]) {
-			expect(secret === path || secret.startsWith(`${path}/`), `${platform}: ${path}`).toBe(false);
-		}
-		// What is beside it in the folder is still written, and it is denied as a secret is.
-		expect(policy.writable, platform).toContain(join(tool, "cache"));
-		expect(policy.writable, platform).toContain(join(tool, "settings.json"));
-		expect(policy.denied, platform).toContain(secret);
-	}
-});
+		test("one no launch or process has is removed", async () => {
+			let base = mkdtempSync(join(scratch, "state-"));
+			let temporary = mkdtempSync(join(scratch, "tmp-"));
+			let stale = runFolder(temporary, "0a");
+			let other = join(temporary, "chopin-other");
+			mkdirSync(other);
+			await sweepRunFolders(base, temporary);
+			expect(existsSync(stale)).toBe(false);
+			expect(existsSync(other)).toBe(true);
+		});
 
-test("a working directory inside the state directory is read by name only where it is a clone the connector made, and not at all elsewhere in it", () => {
-	let root = join(readableScratch, "inside");
-	let base = join(root, "state");
-	let clone = join(base, "repos", "octo", "score");
-	let other = join(base, "runs", "other-run");
-	mkdirSync(clone, { recursive: true });
-	mkdirSync(other, { recursive: true });
-	writeFileSync(join(other, "token"), "ghu_other");
-	let policy = (cwd: string) =>
-		launchPolicy(
-			"bubblewrap",
-			{ ...systemHost(), platform: "linux" },
-			{ command: ["agent", "planner"], cwd, env: {}, stdin: "ignore" },
-			{ directory: base, home: join(root, "home") },
-			"http://127.0.0.1:4000",
-			join(root, "tmp"),
-		);
-	expect(policy(clone).readable).toContain(clone);
-	for (let cwd of [other, base, join(base, "repos"), join(base, "runs")]) {
-		let granted = policy(cwd).readable;
-		expect(granted.filter(path => path === base || path.startsWith(`${base}/`)), cwd).toEqual([]);
-		expect(granted.filter(path => base.startsWith(`${path}/`)), cwd).toEqual([]);
-	}
-});
+		test("a live launch's survives a sweep by another connector, on this base dir or another", async () => {
+			let base = mkdtempSync(join(scratch, "state-"));
+			let elsewhere = mkdtempSync(join(scratch, "state-"));
+			let temporary = mkdtempSync(join(scratch, "tmp-"));
+			let launch = detached();
+			let owner = detached();
+			let recorded = runFolder(temporary, "1b");
+			let running = runFolder(temporary, "2c");
+			let starting = runFolder(temporary, "3d", 1_000);
+			// OpenVMM names its folder on its command line for as long as it runs.
+			let openvmm = spawn(
+				"sh",
+				["-c", "sleep 60", "openvmm", `--microvm-report=${running}/outcome.json`],
+				{ detached: true, stdio: "ignore" },
+			);
+			try {
+				let ownerStart = (await processStart()(owner.pid))!.id;
+				let start = (await processStart()(launch.pid))!.id;
+				// A chopin beside this one on its base dir, whose launch's record names its folder.
+				record(base, "live", {
+					pid: launch.pid,
+					start,
+					owner: owner.pid,
+					ownerStart,
+					run: recorded,
+				});
+				await endOrphans(base);
+				await sweepRunFolders(base, temporary);
+				for (let folder of [recorded, running, starting]) expect(existsSync(folder)).toBe(true);
+				// A chopin on another base dir has no record of either, and finds the running one's process.
+				await endOrphans(elsewhere);
+				await sweepRunFolders(elsewhere, temporary);
+				for (let folder of [running, starting]) expect(existsSync(folder)).toBe(true);
+			} finally {
+				openvmm.kill("SIGKILL");
+				await launch.stop();
+				await owner.stop();
+			}
+		});
 
-test("a path the owner adds with --sandbox-write never makes the person's checkout writable: one that is it or inside it, or inside its git directory, is not granted, and one that holds it is granted with the checkout held read-only", () => {
-	let repo = repository("git-added");
-	mkdirSync(join(repo.checkout, "vendor"));
-	let granted = join(repo.root, "granted");
-	mkdirSync(granted);
-	let mine = repo.worktree("mine");
-	let under = (policy: ReturnType<typeof launchPolicy>) =>
-		policy.writable.filter(path => path === repo.checkout || path.startsWith(`${repo.checkout}/`));
-	// A Planner in the checkout and a run in a worktree of it: the checkout is the person's in both.
-	for (
-		let launch of [
-			(added: string[]) => repo.policy(repo.checkout, [], [], added),
-			(added: string[]) => repo.policy(mine, [], [mine], added),
-		]
-	) {
-		let alone = under(launch([]));
-		for (
-			let added of [
-				[join(repo.checkout, "vendor")],
-				[repo.checkout],
-				[repo.git],
-				[join(repo.git, "hooks")],
-				[join(repo.git, "modules", "lib")],
-			]
-		) {
-			let policy = launch([...added, granted]);
-			// Nothing of the checkout is written that was not before, and the rest is given.
-			expect(under(policy), added.join()).toEqual(alone);
-			expect(policy.writable, added.join()).toContain(granted);
-		}
-		// A folder that holds the checkout is written, around the state directory, and the checkout
-		// and its git directory are held read-only inside it.
-		let holder = launch([repo.root]);
-		expect(holder.writable).toContain(granted);
-		expect(under(holder)).toEqual(alone);
-		expect(holder.writable).not.toContain(repo.root);
-	}
-	let nested = repository("git-added-nested");
-	let outer = join(nested.root, "src");
-	mkdirSync(outer);
-	renameSync(nested.checkout, join(outer, "proj"));
-	let moved = launchPolicy(
-		"bubblewrap",
-		{ ...systemHost(), platform: "linux" },
-		{
-			command: ["agent", "planner"],
-			cwd: join(outer, "proj"),
-			env: {},
-			stdin: "ignore",
-			own: [],
+		test("a dead connector's launch takes nvx's folder with its record", async () => {
+			let base = mkdtempSync(join(scratch, "state-"));
+			let temporary = mkdtempSync(join(scratch, "tmp-"));
+			let run = runFolder(temporary, "4e", 0);
+			let left = record(base, "left", { pid: 999_999_999, owner: 999_999_999, run });
+			await endOrphans(base);
+			expect(existsSync(run)).toBe(false);
+			expect(existsSync(left)).toBe(false);
+		});
+	},
+);
+
+/**
+ * A builder that stands in for the build's microVM, counting its builds: the first is made at once,
+ * as connect makes it; each after it waits for `release`, and fails with `failure` when one is set.
+ */
+function heldBuilder(failure?: string) {
+	let builds = 0;
+	let gate = Promise.withResolvers<void>();
+	let builder: ImageBuilder = {
+		async build(_recipe, job) {
+			builds++;
+			if (builds > 1) await gate.promise;
+			if (failure && builds > 1) throw new Error(failure);
+			writeFileSync(job.layer, "layer");
 		},
-		{ directory: nested.base, home: join(nested.root, "home"), settings: { writable: [outer] } },
-		"http://127.0.0.1:4000",
-		join(nested.root, "tmp"),
-	);
-	expect(moved.writable).toContain(outer);
-	expect(held(moved)).toContain(join(outer, "proj"));
-	expect(held(moved)).toContain(join(outer, "proj", ".git"));
-});
-
-test("a worktree beside the state directory is written and not also granted to read, which MXC would take as read-only", () => {
-	let root = join(readableScratch, "beside");
-	let base = join(root, "state");
-	let checkout = join(root, "score");
-	mkdirSync(checkout, { recursive: true });
-	mkdirSync(base);
-	let policy = launchPolicy(
-		"bubblewrap",
-		{ ...systemHost(), platform: "linux" },
-		{ command: ["agent", "planner"], cwd: checkout, env: {}, stdin: "ignore", own: [checkout] },
-		{ directory: base, home: join(root, "home") },
-		"http://127.0.0.1:4000",
-		join(root, "tmp"),
-	);
-	expect(policy.writable).toContain(checkout);
-	expect(policy.readable).not.toContain(checkout);
-	// The agent's state directory, a child of the home the grants walk through, is the same.
-	let home = join(root, "home");
-	let again = launchPolicy(
-		"bubblewrap",
-		{ ...systemHost(), platform: "linux" },
-		{ command: ["atomic-acp"], cwd: checkout, env: {}, stdin: "ignore" },
-		{ directory: join(home, ".local", "state", "chopin"), home },
-		"http://127.0.0.1:4000",
-		join(root, "tmp"),
-	);
-	expect(again.writable).toContain(join(home, ".atomic"));
-	expect(again.readable).not.toContain(join(home, ".atomic"));
-	expect(again.readable).not.toContain(join(home, ".local", "state", "chopin"));
-});
-
-test("the chopin binary carries MXC's executor, and a source checkout finds the one in the SDK package", async () => {
-	let executor = await locateExecutor(scratch);
-	let supported = ["linux", "darwin", "win32"].includes(process.platform)
-		&& (process.arch === "x64" || process.arch === "arm64");
-	if (!supported || (process.platform === "darwin" && process.arch !== "arm64")) {
-		expect(executor).toBeUndefined();
-		return;
-	}
-	expect(executor).toBeDefined();
-	expect(existsSync(executor!)).toBe(true);
-	expect(executor).toMatch(/(lxc-exec|mxc-exec-mac|wxc-exec\.exe)$/);
-});
-
-test("the SDK package is found by walking up node_modules, never by a resolver that would install it", () => {
-	// A script run from a folder with no node_modules above it, as the downloaded one is, has none.
-	expect(sdkRoot(scratch)).toBeUndefined();
-	// A source checkout has it beside the connector's own sources.
-	expect(sdkRoot(import.meta.dir)).toEndWith("/node_modules/@microsoft/mxc-sdk");
-	let nested = join(scratch, "app", "node_modules", "@microsoft", "mxc-sdk");
-	mkdirSync(nested, { recursive: true });
-	writeFileSync(join(nested, "package.json"), "{}");
-	mkdirSync(join(scratch, "app", "src", "deep"), { recursive: true });
-	expect(sdkRoot(join(scratch, "app", "src", "deep"))).toBe(nested);
-});
-
-test("on Linux and macOS a launch's environment goes to the sandbox in a 0600 file its shell reads, never on a command line; Windows passes it as it did", () => {
-	let folder = mkdtempSync(join(scratch, "sealed-"));
-	let policy = {
-		platform: "linux" as NodeJS.Platform,
-		engine: "bubblewrap" as const,
-		command: ["agent", "--acp"],
-		cwd: folder,
-		env: {
-			PATH: "/usr/bin",
-			CHOPIN_PLANNER_TOKEN: "chopin_p_secret",
-			QUOTED: "it's",
-			HTTPS_PROXY: "http://person:password@proxy:8080",
-			"ODD.NAME": "x",
-			GONE: undefined,
-		},
-		readable: [],
-		writable: [],
-		denied: [],
-		proxy: "http://127.0.0.1:1",
+		missing: async () => [],
 	};
-	let sealed = sealedEnvironment(policy, folder);
-	let file = join(folder, ".chopin-launch-environment");
-	expect(sealed.command).toEqual(["/bin/sh", "-c", LAUNCHER, "chopin-launch", "agent", "--acp"]);
-	// The only values left for MXC's command line: the search path, the file, and a name no shell
-	// can export.
-	expect(sealed.env).toEqual({
-		PATH: "/usr/bin",
-		CHOPIN_LAUNCH_ENVIRONMENT: file,
-		"ODD.NAME": "x",
-	});
-	expect(JSON.stringify(mxcRequest(sealed))).not.toContain("chopin_p_secret");
-	// The person's proxy neither reaches the command line nor replaces the one MXC sets.
-	expect(readFileSync(file, "utf8")).toBe(
-		"PATH='/usr/bin'\nCHOPIN_PLANNER_TOKEN='chopin_p_secret'\nQUOTED='it'\\''s'\n",
+	return { builder, builds: () => builds, release: gate.resolve };
+}
+
+const PLANNER: ImageRecipe = {
+	name: "my-planner",
+	install: ["npm install -g my-planner"],
+	programs: ["my-planner"],
+	runs: ["planner"],
+};
+
+describe.skipIf(process.platform === "win32")("a burst of launches whose image is gone", () => {
+	async function machineWith(builder: ImageBuilder) {
+		let vm = machine(["run"]);
+		let sandbox = await createSandbox({
+			directory: vm.base,
+			server: "http://127.0.0.1:9",
+			setup: SETUP,
+			recipes: new Map([["my-planner", PLANNER]]),
+			start: vm.start,
+			builder,
+		});
+		// Gone since connect made it, as when someone removed it.
+		rmSync(join(vm.base, "images"), { recursive: true, force: true });
+		let folder = join(vm.base, "documents");
+		mkdirSync(folder);
+		let launch = () =>
+			sandbox.spawn({ command: ["my-planner"], cwd: folder, env: {}, stdin: "ignore" });
+		return { vm, sandbox, launch };
+	}
+
+	test(
+		"ten Planner launches at once wait on one build, and each starts in the image it made",
+		async () => {
+			let images = heldBuilder();
+			let { vm, sandbox, launch } = await machineWith(images.builder);
+			try {
+				let launches = Array.from({ length: 10 }, launch);
+				let ends = Promise.all(launches.map(ended));
+				await Bun.sleep(200);
+				// One build since connect's, under way, and nothing started before it is done.
+				expect(images.builds()).toBe(2);
+				expect(vm.calls).toHaveLength(0);
+				images.release();
+				expect((await ends).map(end => [end.code, end.out])).toEqual(
+					Array(10).fill([0, "the workload read: "]),
+				);
+				expect(images.builds()).toBe(2);
+				expect(vm.starts()).toBe(10);
+			} finally {
+				await sandbox.close();
+			}
+		},
+		30_000,
 	);
-	expect(statSync(file).mode & 0o777).toBe(0o600);
-	expect(sealedEnvironment({ ...policy, platform: "win32" }, folder)).toEqual({
-		...policy,
-		platform: "win32",
-	});
+
+	test(
+		"a build that fails ends every launch waiting on it with its words, and starts none",
+		async () => {
+			let words = "Couldn't build my-planner's image (exit 1):\nnpm error 404 my-planner";
+			let images = heldBuilder(words);
+			let { vm, sandbox, launch } = await machineWith(images.builder);
+			try {
+				let launches = Array.from({ length: 10 }, launch);
+				let ends = Promise.all(launches.map(ended));
+				images.release();
+				expect((await ends).map(end => [end.code, end.err])).toEqual(
+					Array(10).fill([1, `${words}\n`]),
+				);
+				expect(images.builds()).toBe(2);
+				expect(vm.calls).toHaveLength(0);
+			} finally {
+				await sandbox.close();
+			}
+		},
+		30_000,
+	);
+
+	test(
+		"a spare's boot waits on the one build with the documents' launches, never builds again, and each says its workload started",
+		async () => {
+			let images = heldBuilder();
+			let { vm, sandbox, launch } = await machineWith(images.builder);
+			try {
+				let folder = join(vm.base, "spare");
+				mkdirSync(folder);
+				// A spare is a launch like any other: the same image, its stdin kept for its hand-over.
+				let spare = sandbox.spawn({
+					command: ["my-planner"],
+					cwd: folder,
+					env: { CHOPIN_PLANNER_SPARE: "1" },
+					stdin: "pipe",
+				});
+				let launches = [spare, launch(), launch(), launch()];
+				let workloads = launches.map(child =>
+					new Promise<boolean>(resolve => child.once("workload", () => resolve(true)))
+				);
+				let ends = Promise.all(launches.map(ended));
+				spare.stdin?.end();
+				await Bun.sleep(200);
+				expect(images.builds()).toBe(2);
+				expect(vm.calls).toHaveLength(0);
+				images.release();
+				// Each hears its workload start, as the launch gate does to give its slot back.
+				expect(await Promise.all(workloads)).toEqual([true, true, true, true]);
+				await ends;
+				expect(images.builds()).toBe(2);
+				expect(vm.starts()).toBe(4);
+			} finally {
+				await sandbox.close();
+			}
+		},
+		30_000,
+	);
+
+	test("a launch stopped while it waits for the image starts nothing", async () => {
+		let images = heldBuilder();
+		let { vm, sandbox, launch } = await machineWith(images.builder);
+		try {
+			let stopped = launch();
+			let other = launch();
+			let ends = Promise.all([ended(stopped), ended(other)]);
+			stopped.kill("SIGTERM");
+			images.release();
+			let [first, second] = await ends;
+			expect([first.code, first.signal]).toEqual([null, "SIGTERM"]);
+			expect([second.code, second.out]).toEqual([0, "the workload read: "]);
+			expect(vm.starts()).toBe(1);
+		} finally {
+			await sandbox.close();
+		}
+	}, 30_000);
 });

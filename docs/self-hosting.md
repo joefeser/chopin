@@ -95,16 +95,18 @@ proxy that the server learns some other way, such as a system setting, set
 these variables on the server process too: otherwise the CLI connects directly,
 and a Planner turn fails with "The Planner stream failed."
 
-`HARNESS=atomic` runs Atomic 0.9.87 in the Chopin server process through its
+`HARNESS=atomic` runs Atomic 0.10.4 in the Chopin server process through its
 headless SDK (`createAgentSession()`). It does not spawn the `atomic` CLI or use
 RPC mode.
 
 **Choosing `HARNESS=atomic` gives the Planner shell and filesystem access as the
 server process's user, on hosted instances as well as local ones.** Every Planner
-session is a full Atomic session: Atomic's workflows, subagents, MCP, web access,
-Intercom, and default coding tools run beside Chopin's document tools, with the
-operator's Atomic extensions, skills, prompt templates, and context files. There is
-no separate flag; choosing the harness is the choice. Operators who do not want that
+session is a full Atomic session: Atomic's subagents, MCP, web access,
+and default coding tools load beside Chopin's document tools, with the
+operator's Atomic extensions, skills, prompt templates, and context files. Its own
+turns are never offered Atomic's `intercom`, so one document's Planner cannot list or
+message another's, and never call a tool that edits files, runs commands or starts a
+subagent, from a codemode script either. There is no separate flag; choosing the harness is the choice. Operators who do not want that
 should use `copilot-sdk`, whose Planner keeps the isolated, Chopin-tools-only
 boundary. Only the summary and research workers still run isolated Atomic sessions.
 See [The atomic Planner](#the-atomic-planner) below and
@@ -156,7 +158,8 @@ Atomic caveats:
   temporary file. For the isolated worker sessions the adapter overrides each
   default and fails closed on the ones it can observe, but a new Atomic release
   can add a default the suite does not check. Planner sessions deliberately keep
-  those capabilities.
+  those capabilities, except that `intercom` and the tools that write are
+  unavailable to Planner turns.
 - Sessions live only in memory. `doStop` returns a state the adapter refuses to
   resume, so a session never survives a restart. Chopin does not resume
   harness sessions.
@@ -178,44 +181,12 @@ Atomic caveats:
   `maxAiCredits` does not apply. Use the provider's spend limits.
 - `@bastani/atomic` adds more than 200 MB of installed dependencies on Linux
   x64, including glibc and musl native modules. Expect a larger image.
-- Atomic workflows need no database server. Their runs are journaled in a
-  SQLite file, `$XDG_STATE_HOME/chopin/atomic/workflows.sqlite`, beside the
-  documents' Planner directories, which Chopin passes to each Planner session
-  as its `journal` rather than through the process environment (see
-  [Full Atomic Planner](hosted-agent.md#full-atomic-planner)). The Docker image
-  sets `XDG_STATE_HOME=/var/lib/chopin`; mount a volume there to keep runs
-  and those directories when the container is replaced.
-- Local workflow worker pools stay off unless the operator's Atomic settings
-  set `workflows.localWorkers`. Since Atomic 0.9.44 a pool runs as one
-  coordinator process per root run, started by the Chopin server process, with
-  the worker processes under it; it uses the same journal, and if the server
-  exits, the coordinator and its workers exit with it. Atomic keeps each
-  worker's standard error in `worker-logs/` beside the journal, so under
-  `$XDG_STATE_HOME/chopin/atomic/worker-logs/<run id>/`, inside the directory
-  Chopin creates for the journal with access for the server's user only. It
-  deletes a log when its worker shuts down normally but keeps the logs of
-  workers that failed; remove them yourself. A child whose worker dies is
-  replayed on a new worker, up to three attempts; after that the run fails and
-  its card in Chat says so. The settings `workflows.localWorkers.startupTimeoutMs`
-  and `leaseMs` set how long a worker may take to start and how long an
-  unresponsive one keeps its child; Chopin sets neither. A pool runs children
-  once one worker is ready and fails to start only when none is. Since Atomic
-  0.9.45 an unset `startupTimeoutMs` is no longer a flat 30 seconds: it is 30
-  seconds times the worker count plus the one-minute load average, divided by
-  the CPU cores, at least 30 seconds and at most 10 minutes, so a large pool on
-  a busy Chopin host waits longer. A run whose workers still miss it fails with
-  `Local worker startup timed out`, and its card in Chat says so; raise the
-  setting or use fewer workers.
-- Since Atomic 0.9.44 a workflow runs up to 1000 of its stages at once unless
-  it says otherwise (`defaultConcurrency`, 3 before), nests child workflows at
-  most three levels deep (`maxDepth`, 4 before), and a stage's `subagent` tool
-  runs up to 1000 children at once (`parallel.concurrency` and
-  `parallel.runningCapacity`, 3 and 4 before). Without a pool, all of them run
-  in the Chopin server process and share its memory and the provider rate
-  limit above. To throttle a server, lower `defaultConcurrency` in
-  `extensions/workflow/config.json` and the `parallel` limits in
-  `extensions/subagent/config.json` under the Atomic agent directory, which
-  Planner sessions read; Chopin sets none of these itself.
+- Atomic 0.10 has no workflows, so a Planner starts no workflow runs and
+  Chopin keeps no workflow journal. A journal file an earlier Chopin kept at
+  `$XDG_STATE_HOME/chopin/atomic/workflows.sqlite` is no longer read; remove
+  it once no earlier release needs it. The Docker image sets
+  `XDG_STATE_HOME=/var/lib/chopin`; mount a volume there to keep the
+  documents' Planner directories when the container is replaced.
 - Atomic depends on `typebox` 1.3.27 while Chopin pins 1.3.7. Host tool schemas
   pass to Atomic as plain JSON Schema, so the two versions never meet.
 
@@ -244,23 +215,22 @@ Without a remembered checkout that still verifies, the session runs in a directo
 directory (`$XDG_STATE_HOME/chopin/planner/<document id>`, defaulting to
 `~/.local/state`; `~/Library/Application Support/Chopin/planner` on macOS;
 `%LOCALAPPDATA%\Chopin\planner` on Windows), with mode `0700`. It is never shared
-with another document, keeps what the Planner and its workflows write there
-across later sessions and server restarts, and is not placed in the shared
+with another document, keeps what is written there across later sessions and server restarts, and is not placed in the shared
 temporary directory. A symlink or file at that path is refused. The session has the
 same tools either way; the Planner is told whether it is in a checkout or in an
 empty directory without repository files, and its repository tools remain
 available.
 
-Atomic input (`ask_user_question`, extension dialogs, and workflow-stage
-questions) appears as shared Decisions instead of terminal dialogs, including
-workflow run and stage labels. Unanchored batches append at the document's end.
+Atomic input (`ask_user_question` and extension dialogs) appears as shared
+Decisions instead of terminal dialogs. Unanchored batches append at the
+document's end.
 Dialog text and written answers stay verbatim, bounded only by the document's
 256 KiB source limit and the shared-draft limits rather than the Planner's own
 question limits. A request has no time limit: it waits until a member answers it
 or it is withdrawn. Cancellation withdraws pending cards and never approves an
 action. See
 [Full Atomic Planner](hosted-agent.md#full-atomic-planner) for the mapping,
-resource loading, persistence, and workflow restart boundaries.
+resource loading, and persistence.
 
 `invoke_planner` itself is offered on every harness and in both authentication
 modes. Other harnesses ignore its `checkout`: they neither verify nor use nor
@@ -270,9 +240,11 @@ remember it.
 
 `HARNESS=remote` keeps the model out of the server. Each Planner session and turn
 goes to a client attached to the document over the agent connection at
-`/api/v1/agent`, usually an agent on a member's own machine; code, model credentials, and that client's tools stay on the
-member's machine, while the document, Decisions, and every room write stay in
-this server. The server needs no `MODEL` (one that is set is passed to the
+`/api/v1/agent`, usually an agent on a member's own machine; code and that client's tools stay on the
+member's machine, and its models run on the AI accounts people connected in this server
+(see [AI credentials](hosted-agent.md#ai-credentials)), reached through its credential
+proxy, or, for a client that does not take them, on the client's own, while the document,
+Decisions, and every room write stay in this server. The server needs no `MODEL` (one that is set is passed to the
 client as the turn's requested model) and accepts no `HARNESS_AUTH`, so it may
 bind to a public interface. Startup refuses `HARNESS_AUTH`. Summary and
 research workers run as isolated sessions on the client attached to their
@@ -308,8 +280,8 @@ receives what a Planner turn sees, including repository reads made with that
 owner's token, and decides what the Planner writes during turns writers start;
 its run reports never start a turn. The server never runs the client's tools and
 gains no shell or filesystem access from this harness. Without an attached
-client, `@chopin` and `invoke_planner` are saved and wait for one, under
-`AUTH_MODE=local` as well. See
+client, `@chopin` and `invoke_planner` are refused with `planner-not-attached`
+and nothing is kept for one, under `AUTH_MODE=local` as well. See
 [Remote Planner](hosted-agent.md#remote-planner) for the behaviour and
 [Agent connection](agent-connection.md) for the wire format. The connection shares the
 application's origin and port with `/ws` and `/mcp`, so a TLS-terminating proxy
@@ -319,7 +291,7 @@ headers.
 
 ## Prerequisites
 
-- Docker for the application image, or Bun 1.4.4 for a source deployment.
+- Docker for the application image, or Bun 1.4.5 for a source deployment.
 - A reachable PostgreSQL database and credentials with schema migration access.
 - A stable DNS name with TLS termination and WebSocket proxying.
 - Outbound HTTPS access to GitHub and the selected harness's model provider
@@ -398,6 +370,11 @@ the image.
 | `GITHUB_ALLOWED_USERS`            | empty                   | Comma-separated admitted GitHub logins.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `GITHUB_ALLOWED_ORGANIZATIONS`    | empty                   | Comma-separated organizations whose active members are admitted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `SESSION_ENCRYPTION_KEY`          | required                | Exactly 64 hexadecimal characters. Encrypts the hosted OAuth attempt cookie and derives a separate key for session credentials in PostgreSQL. Keep stable across releases and outside the database; replacing it invalidates hosted logins. Local mode requires the configured key but uses separate unpredictable, HttpOnly attempt and browser-binding cookies.                                                                                                                                                                                                                                                                                                 |
+| `MACHINE_STORE_URL`               | empty                   | `postgres:` or `postgresql:` URL of an administrator role on a PostgreSQL 16 or later server, without a password. Turns on a database login of its own for each paired machine's agent sessions; see [Agent sessions database for machines](#agent-sessions-database-for-machines). Unset, pairing and connecting are as before.                                                                                                                                                                                                                                                                                                                                  |
+| `MACHINE_STORE_PASSWORD_FILE`     | empty                   | Path of the administrator role's password, read at startup. Not with `MACHINE_STORE_PASSWORD`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `MACHINE_STORE_PASSWORD`          | empty                   | The administrator role's password, for platforms that put secrets (a Key Vault reference, for one) in the environment.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `MACHINE_STORE_RETENTION_DAYS`    | never                   | Whole days after a machine is revoked or unpaired before its database and role are dropped. Unset keeps them, with the login turned off.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `MACHINE_STORE_OPEN_DATABASES`    | empty                   | Comma-separated databases the service owns and keeps open to every role, which its administrator can't close. Machines may connect to them; Chopin neither revokes `CONNECT` on them nor refuses a login over them. Only databases that hold no machine's data, and never one that records the statements roles run and lets every role read them unless the service's statement capture is off for the whole server; never `postgres`, `template1`, the administrator's own or a machine's database. See [Agent sessions database for machines](#agent-sessions-database-for-machines).                                                                          |
 | `AUTH_MODE`                       | `hosted`                | Set `local` for loopback device-flow sign-in with persisted credentials (see [Authentication](authentication.md#local-device-flow-sign-in)). Any other value fails startup.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `DEMO_PERSONAS`                   | `off`                   | Set `on` to enable the server-owned local demo collaborators (Lily and Felix). Requires `AUTH_MODE=local` on a loopback bind; otherwise, or for any value besides `on` and `off`, startup fails.                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `CHOPIN_LOCAL_CREDENTIALS_DIR`    | platform default        | Local mode only. Overrides the plaintext-fallback credential directory (default `~/.config/chopin` on Linux, `~/Library/Application Support/Chopin` on macOS, `%APPDATA%\Chopin` on Windows). Must resolve outside the repository and process working directory.                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -419,7 +396,7 @@ the image.
 | `HANDOVER_HOLD_MS`                | `20000`                 | How long a process in standby holds a request or WebSocket upgrade that needs the writer lease before it answers `503` with `Retry-After: 1`, in milliseconds, an integer between 0 and 120000.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `CLIENT_DIR`                      | `apps/web/dist`         | Directory of the built web client. A process is ready only when `index.html` exists there, unless `DEV_CLIENT` is set.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `HARNESS_AUTH`                    | unset                   | Auth mode forwarded to the selected adapter. For `copilot-sdk`, `direct` and `ai-gateway` are allowed on any bind and `auto` requires a loopback-only `SERVER_HOST`; the adapter does not otherwise consume it. For `atomic`, it is required and must be `auto`, which requires a loopback-only `SERVER_HOST`, or `ai-gateway`; every other value is refused. For `remote`, any value is refused.                                                                                                                                                                                                                                                                 |
-| `HARNESS_EXTENSIONS`              | unset                   | Extension or package paths every atomic Planner session loads, as Atomic's `--extension` flag would, separated by the platform path delimiter (`:`, or `;` on Windows). A package's extensions, skills, and workflows all register. Each path must be absolute and exist; any other harness refuses the variable at startup. Background workers never load them. The code runs in the server process as its user.                                                                                                                                                                                                                                                 |
+| `HARNESS_EXTENSIONS`              | unset                   | Extension or package paths every atomic Planner session loads, as Atomic's `--extension` flag would, separated by the platform path delimiter (`:`, or `;` on Windows). A package's extensions and skills register. Each path must be absolute and exist; any other harness refuses the variable at startup. Background workers never load them. The code runs in the server process as its user.                                                                                                                                                                                                                                                                 |
 | `AGENT`                           | on                      | Set exactly `off` to prevent hosted agent turns, disable the entire background-job runner, and avoid Copilot CLI startup.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `BACKGROUND_JOBS`                 | on                      | Set exactly `off` to disable background job scheduling. `AGENT=off` disables the entire runner. Under `HARNESS=remote`, workers run on the document's attached client.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `WEB_RESEARCH`                    | on                      | Set exactly `off` to disable new public-web research while retaining durable requests, artifacts, and other jobs.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -519,6 +496,14 @@ supplied image without also replacing its health check and container routing.
 `CHOPIN_SETUP_AGENTS` adds your own setups to the **Coding agent** picker on the
 Machines page, before the built-in agents. Only signed-in people see them.
 Chopin refuses to start when the value is malformed.
+
+What a setup installs on the machine doesn't reach its agent: `chopin` runs every
+agent and Planner command in a microVM of its own, from an image it builds. So a
+setup command that runs `chopin connect -- <agent>`, or `--planner-command`, for an
+agent that isn't one of the built-in ones needs `--install '<the command that
+installs it>'` (and `--planner-install`) as well, or `chopin` refuses it before it
+pairs. The Machines page shows what the machine needs (KVM or the Windows
+Hypervisor Platform, on x86_64) above a setup's own steps.
 
 ```json
 [
@@ -864,26 +849,127 @@ Remove `PREVIOUS_ORIGINS` once machines have reconnected and you stop serving
 the old name. Never list an origin you no longer control: its pages would pass
 Chopin's Origin checks.
 
-### Machines and the connector sandbox
+### Machines and their microVMs
 
-`chopin connect` runs agents and Planner commands in the operating system's
-process sandbox where the machine has one (see
-[Sandbox](chopin-cli.md#sandbox)). Nothing to configure here: the server only
-keeps what each connector says about its own sandbox, in three additive request
-headers (`chopin-connector-sandbox`, `-reason` and `-fix`), and the Machines page
-shows it as **Sandboxed** or **Not sandboxed**, with the reason and the one fix
-for a machine that has none. An older connector sends none, and an older server
-ignores them.
+Every agent and Planner command a machine runs is in an NVX microVM of its own
+(see [Sandbox](chopin-cli.md#sandbox) and [Agents in NVX microVMs](nvx-sandbox.md)).
+What this means for an operator:
 
-The sandbox lets agents reach your instance's origin, GitHub, the model
-providers and the npm, PyPI and crates registries, and nothing else. A
-self-hosted deployment whose agents also need an internal registry, a Git mirror
-or another model endpoint adds each host on the machine, with
-`chopin connect --sandbox-host <host>`, and runs `chopin service install` again
-for a service. An instance behind another origin needs nothing: the connector
-allows the origin it connected to. `--require-sandbox` refuses runs on a machine
-with no sandbox, which an operator may want to ask of the people who share
-machines.
+- **Machines need hardware virtualization.** Linux on x86_64 with KVM (or MSHV),
+  or Windows on x86_64 with the Windows Hypervisor Platform. A Mac or an Arm
+  machine can't be one of your machines.
+- **Older connectors are refused once you deploy.** Chopin takes a connection and
+  hands a credential only to connector protocol 8, which runs agents in microVMs, and
+  tells an older `chopin` to update (`connector-update-required`); people run
+  `chopin update`.
+  The Machines page says so for a machine that tried, and why a machine that can't
+  run microVMs can't, with the fix, while it is away. Migration 051 adds where that
+  is kept (`machines.vm_problem`).
+- **A machine's first connect downloads NVX** from
+  [github.com/microsoft/nvx](https://github.com/microsoft/nvx/releases) (about 275 MB
+  on Linux, 150 MB on Windows, checked against the SHA-256 `chopin` pins), and the
+  agent's npm packages and Node.js, to build its image.
+
+Agents reach only your instance's origin, GitHub, the model providers and the
+package registries, through a proxy on the machine. A deployment whose agents
+also need an internal registry, a Git mirror or another model endpoint adds each
+host on the machine, with `chopin connect --sandbox-host <host>`, and runs
+`chopin service install` again for a service. An instance behind another origin
+needs nothing: the connector allows the origin it connected to.
+
+### Agent sessions database for machines
+
+With `MACHINE_STORE_URL` set, every paired machine gets a login of its own to one
+shared PostgreSQL server, where the agents Chopin starts on it keep their Atomic
+sessions (Atomic's `@bastani/atomic-storage-postgres` adapter). Nothing changes for
+the people who pair: pairing, `chopin connect` and the service ask for the login as
+they connect, and a machine paired earlier gets it the next time it connects. If
+Chopin can't make it, the pairing output and the Machines page say why, and the
+machine is paired and connected all the same; its agents keep their sessions on the
+machine until a later connect succeeds.
+
+For each machine Chopin keeps, under the administrator role:
+
+- a role and a database both named `m_` followed by the machine's id without its
+  dashes (`m_x` and a hash for any other id), never a name a person typed;
+- the database owned by the administrator, created with connections off and given the
+  comment `chopin:machine-store`, with `CONNECT` (without the right to grant it)
+  granted to the machine's role alone before connections are allowed, and a schema
+  `atomic` owned by the role, where Atomic sets up its tables. Until that comment is
+  set, the role's comment says the database is being made, so a retry after a crash
+  finishes it;
+- a role that is no superuser, can't create roles or databases, replicate or bypass
+  row security, is a member of no other role, has no member but the administrator, has
+  no privilege on any other database, and carries the comment `chopin:machine-store`
+  Chopin gives it as it creates it. An existing role or database that isn't exactly
+  this is refused, never changed, and its login is never turned on. A password is
+  changed only while the database's privileges are still exactly these. Turning a login
+  off or dropping it touches only a role and a database with that comment, the database
+  owned by the administrator, so a name another role or database already held is left
+  alone;
+- `CONNECT` revoked from `PUBLIC` on every other database the role could connect to,
+  then checked twice: no other connectable database may give the role `CONNECT`
+  (`has_database_privilege`) before its login is turned on, and once it is, a login as
+  the role must fail on `postgres`, `template1`, the administrator's own database and
+  every other connectable database but the machines' own and those named in
+  `MACHINE_STORE_OPEN_DATABASES`. Each cleanup pass checks every login that is on the
+  same way, with one read of the catalog for all of them: a login another connectable
+  database has let in since (`CONNECT` granted to `PUBLIC`, a new database open to
+  every role, a name taken out of `MACHINE_STORE_OPEN_DATABASES`) is turned off, the
+  Machines page names that database, and the machine's next connect turns it on again
+  once no such database lets it in. Give the administrator a server of its own: other
+  applications' roles on it need `CONNECT` granted to them by name;
+- a schema `extensions` owned by the administrator, which the role may use but not
+  write, holding `pg_trgm`, which the role can't add itself and Atomic indexes session
+  search with. Where the server doesn't allow `pg_trgm`, Chopin logs a warning and
+  Atomic searches without the index.
+
+The administrator role needs `CREATEROLE` and `CREATEDB` (a managed service's
+administrator has both) and must own the server's other databases. A `REVOKE` by a
+role that doesn't own a database only warns, so where `CONNECT` stays, Chopin refuses
+to hand out the login, and the Machines page says which database is still open and that
+its owner must revoke it.
+
+A managed PostgreSQL service gives its operator such an administrator and may keep
+databases of its own open to every role, so Chopin would refuse every machine's login.
+Name those databases in `MACHINE_STORE_OPEN_DATABASES`
+(`MACHINE_STORE_OPEN_DATABASES=provider_health,provider_maintenance`): Chopin leaves them
+as they are and doesn't count them, and a machine can connect to them and read what the
+service lets every role read there. Name a database only when the service owns it and it
+holds no machine's data. Never name one that records the statements roles run and lets
+every role read them, such as a query store, unless the service's statement capture is
+turned off for the whole server, with nothing captured before it, before any machine is
+given a login: a machine could read the other machines' statements and the
+administrator's, and Chopin sets each machine's password with an `ALTER ROLE` statement
+that carries its SCRAM-SHA-256 verifier, which statement capture keeps. Leave such a
+database out, and Chopin goes on refusing logins while it stays open. Chopin refuses to
+start with `postgres`, `template1`, a name the administrator's own database could have
+(from the URL, its `dbname` or `PGDATABASE`) or a machine's name among them, and refuses
+a login while one of them is a database Chopin made for a machine or the administrator's
+own.
+
+The password is 32 random bytes, sent to PostgreSQL only as a SCRAM-SHA-256 verifier
+computed by Chopin, kept by Chopin as AES-GCM ciphertext under a key derived from
+`SESSION_ENCRYPTION_KEY` (`machine_databases`), and handed only to the machine
+itself, over HTTPS (or to loopback), in the body of
+`POST /api/connector/machine-store`. The URL it is handed with holds no password,
+and it is in no log, argument list or error. Asking again returns the same login.
+The machine's owner rotates it with
+`POST /api/connector/machines/<id>/store/rotate`: the new password is kept beside the
+working one until PostgreSQL has it, the old one stops working and its sessions are
+ended, and the machine takes the new one the next time it connects. Revoking or
+unpairing a machine turns its login off (`NOLOGIN`, connections to its database off,
+its sessions ended) before Chopin answers that the machine is disconnected. If the
+server can't be reached then, the machine is revoked all the same, Chopin answers that
+its login is still on and why, revoking again (or `chopin unpair` again) finishes it,
+and each cleanup pass tries again. A rotation waits until PostgreSQL has confirmed or
+refused the one before it. After `MACHINE_STORE_RETENTION_DAYS` the database and role
+are dropped.
+
+The URL machines get names the host and port of `MACHINE_STORE_URL` and its
+`sslmode`, so use a host name machines can reach, with a certificate that names it.
+A sandboxed agent reaches the database through the connector's proxy, which allows
+that host and port.
 
 ### Writer lease
 

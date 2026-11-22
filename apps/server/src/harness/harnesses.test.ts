@@ -2,12 +2,12 @@ import { afterEach, expect, it } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { workflowJournal } from "./atomic/workspace";
 import {
 	harnesses,
 	harnessFor,
 	plannerCatalog,
 	plannerCommands,
+	plannerOffered,
 	plannerOfferIncoming,
 	plannerOfferKnown,
 	plannerRanWithoutOffer,
@@ -91,37 +91,6 @@ it("refuses Atomic's host-login auto mode on a non-loopback bind but accepts ai-
 		.toBe("atomic");
 });
 
-it("journals Atomic workflow runs in Chopin's state directory unless the operator names a journal", async () => {
-	let previous = {
-		state: process.env.XDG_STATE_HOME,
-		journal: process.env.ATOMIC_WORKFLOW_JOURNAL_PATH,
-	};
-	let state = join(tmpdir(), `chopin-state-${crypto.randomUUID()}`);
-	let restore = (name: string, value: string | undefined) =>
-		value === undefined ? delete process.env[name] : process.env[name] = value;
-	try {
-		process.env.XDG_STATE_HOME = state;
-		delete process.env.ATOMIC_WORKFLOW_JOURNAL_PATH;
-		if (process.platform === "linux") {
-			expect(workflowJournal()).toBe(join(state, "chopin", "atomic", "workflows.sqlite"));
-		}
-		// Each Planner session is given its journal; the process environment is left alone.
-		harnessFor({ harness: "atomic", harnessAuth: "ai-gateway", host: "0.0.0.0" });
-		expect(process.env.ATOMIC_WORKFLOW_JOURNAL_PATH).toBeUndefined();
-		await shutdownHarnesses();
-
-		process.env.ATOMIC_WORKFLOW_JOURNAL_PATH = "/srv/atomic/runs.sqlite";
-		expect(workflowJournal()).toBe("/srv/atomic/runs.sqlite");
-		harnessFor({ harness: "atomic", harnessAuth: "ai-gateway", host: "0.0.0.0" });
-		await shutdownHarnesses();
-		expect(process.env.ATOMIC_WORKFLOW_JOURNAL_PATH).toBe("/srv/atomic/runs.sqlite");
-	} finally {
-		await shutdownHarnesses();
-		restore("XDG_STATE_HOME", previous.state);
-		restore("ATOMIC_WORKFLOW_JOURNAL_PATH", previous.journal);
-	}
-});
-
 it("accepts the remote harness on any bind without HARNESS_AUTH, and refuses one", () => {
 	for (let host of ["0.0.0.0", "::", "192.168.1.2", "127.0.0.1"]) {
 		expect(harnessFor({ harness: "remote", host }).harnessId).toBe("remote");
@@ -197,13 +166,17 @@ it("offers a remote Planner's commands only from the client attached to that doc
 			{ name: "review", kind: "prompt" },
 		],
 	};
+	// What each client last reported: its commands are its own, whatever accounts its models were of.
 	let machineA = {
 		get catalog() {
+			return undefined;
+		},
+		get lastReport() {
 			return reportedByA;
 		},
 	} as unknown as AgentLink;
 	let machineB = {
-		get catalog() {
+		get lastReport() {
 			return { models: { available: [] } };
 		},
 	} as unknown as AgentLink;
@@ -224,7 +197,7 @@ it("offers a remote Planner's commands only from the client attached to that doc
 	expect(await plannerCommands("remote", "doc-a", repository)).toBeUndefined();
 	detachB();
 	// An older client reports no commands at all.
-	let older = attachLink("doc-a", { catalog: undefined } as unknown as AgentLink);
+	let older = attachLink("doc-a", { lastReport: undefined } as unknown as AgentLink);
 	expect(await plannerCommands("remote", "doc-a", repository)).toBeUndefined();
 	older();
 	// A harness that reports none offers none.
@@ -313,4 +286,40 @@ it("offers an Atomic Planner the models of its own runtime, once the harness is 
 	// Gateway authentication offers only the gateway's models, and none has a default here.
 	expect(catalog!.models.every(model => model.provider?.id === "vercel-ai-gateway")).toBe(true);
 	expect(catalog!.default).toBeUndefined();
+});
+
+it("holds a turn until an attached remote client reports what it offers, and no longer than its bound", async () => {
+	let pending = true;
+	let reported = Promise.withResolvers<void>();
+	let link = {
+		get catalogPending() {
+			return pending;
+		},
+		get offered() {
+			return reported.promise;
+		},
+	} as unknown as AgentLink;
+	// Nothing attached, and every other harness: nothing to wait for.
+	await plannerOffered("remote", "doc-a", 60_000);
+	for (let harness of ["copilot-sdk", "atomic"]) await plannerOffered(harness, "doc-a", 60_000);
+	let detach = attachLink("doc-a", link);
+	try {
+		let done = false;
+		let waiting = plannerOffered("remote", "doc-a", 60_000).then(() => done = true);
+		await Bun.sleep(10);
+		expect(done).toBe(false);
+		pending = false;
+		reported.resolve();
+		await waiting;
+		// A client that has yet to report and never does holds the turn only until the bound.
+		pending = true;
+		let silent = { catalogPending: true, offered: new Promise<void>(() => {}) };
+		detach();
+		detach = attachLink("doc-a", silent as unknown as AgentLink);
+		let started = Date.now();
+		await plannerOffered("remote", "doc-a", 30);
+		expect(Date.now() - started).toBeGreaterThanOrEqual(25);
+	} finally {
+		detach();
+	}
 });

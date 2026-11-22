@@ -12,6 +12,18 @@ export function ArchiveIcon(props: IconProps) {
 	);
 }
 
+export function TrashIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<line x1="2.75" x2="15.25" y1="4.25" y2="4.25" />
+			<path d="M6.75,4.25V2.75c0-.552,.448-1,1-1h2.5c.552,0,1,.448,1,1v1.5" />
+			<path d="M13.75,6.75l-.578,7.512c-.08,1.042-.949,1.988-1.994,1.988H6.822c-1.045,0-1.914-.946-1.994-1.988l-.578-7.512" />
+			<line x1="7.75" x2="7.75" y1="8.75" y2="13.25" />
+			<line x1="10.25" x2="10.25" y1="8.75" y2="13.25" />
+		</LineIcon>
+	);
+}
+
 export function DocumentIcon(props: IconProps) {
 	return (
 		<LineIcon {...props}>
@@ -57,6 +69,17 @@ export function ServerIcon(props: IconProps) {
 			<rect height="5" rx="1.5" width="14.5" x="1.75" y="10.25" />
 			<circle cx="5" cy="5.25" fill="currentColor" r=".75" stroke="none" />
 			<circle cx="5" cy="12.75" fill="currentColor" r=".75" stroke="none" />
+		</LineIcon>
+	);
+}
+
+export function KeyIcon(props: IconProps) {
+	return (
+		<LineIcon {...props}>
+			<circle cx="5.75" cy="12.25" r="3" />
+			<path d="M7.871 10.129L15.25 2.75" />
+			<path d="M13.25 4.75L15 6.5" />
+			<path d="M11.25 6.75L12.5 8" />
 		</LineIcon>
 	);
 }

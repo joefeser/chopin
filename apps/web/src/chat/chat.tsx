@@ -31,6 +31,7 @@ import {
 	usePendingWork,
 	usePopoverDismissal,
 } from "@chopin/editor";
+import { safeSessionStorage } from "@chopin/editor/browser-storage";
 import { chatDraftKey } from "../demo-actor";
 import { WireLost, WireRefusal } from "../wire";
 import { noteEmojiUse } from "./actions/emoji-frequent";
@@ -42,8 +43,10 @@ import {
 	outboxReducer,
 	passing,
 	refusalText,
+	refusedByChopin,
 	restoreOutbox,
 } from "./delivery";
+import { refusedWhileBusy } from "./assistant-ui/send-stop";
 import type { DraftInputHandle } from "./draft-input";
 import type { CSSProperties } from "react";
 import { keepFormatPreference, readFormatPreference } from "./format-preference";
@@ -56,9 +59,21 @@ import type { MachineFix } from "../machine-fix";
 import { silencesFailedSends } from "./connection-phase";
 import { ErrorState } from "./error-state";
 import { QuietNote } from "./quiet-note";
+import { navigateTo } from "./navigate";
 import { PlannerPresenceContext } from "./presence";
-import { failureBanner, sendFailureView, withoutFailure } from "./failure";
-import { TypingReporter } from "./typing";
+import { localRows } from "./chronology";
+import {
+	AI_ACCOUNTS_LINK,
+	failureBanner,
+	refusedRetryView,
+	retryRefusal,
+	sendFailureView,
+	withoutFailure,
+} from "./failure";
+import { typingFrame, TypingReporter } from "./typing";
+import { PacingReporter } from "./pacing";
+import { receiveTypists, threadsWithTypers, typersIn, typingWords } from "./typists";
+import { TypingAnnouncer, TypingLine } from "./typing-line";
 import { useSteadyCallback, useSteadyFields } from "./steady";
 import { asksChopin, asksChopinKey, withChopinMention } from "./ask-chopin";
 import { ChatComposer } from "./composer";
@@ -86,7 +101,7 @@ import { useFiles } from "./attachments/use-files";
 import { dictationSource, useDictation } from "./dictation/use-dictation";
 import { currentShortcutPlatform, shortcutLabel } from "../shortcuts";
 import { composerModelNotice } from "./model-picker-state";
-import { pendingModel, useModelChoice } from "./use-model-choice";
+import { useModelChoice } from "./use-model-choice";
 import {
 	chatAuthors,
 	filterMentions,
@@ -122,11 +137,9 @@ import {
 	runsCommand,
 	sendFailure,
 	shownSendFailure,
-	withNoticesAfter,
 } from "./references";
-import { runCounts, RunStack } from "./run-card";
+import { BuildCard } from "./run-card";
 import type { BuildRun } from "../build-model";
-import { runStages } from "../api";
 import { ResizeHandle } from "../resizable-pane";
 import { WorkspaceThreadContext } from "../workspace";
 import { THREAD_MIN } from "./threads/split-layout";
@@ -155,8 +168,11 @@ import type { ChatCommand } from "./commands";
 import type { ReferenceRow } from "./reference-picker";
 import type { MentionCandidate } from "./mentions";
 import type { ChatSendPayload, ComposerDraft, ReferenceTarget, SendFailure } from "./references";
+import type { RetryRefusal } from "./failure";
 import type { Wire as Socket } from "../wire";
 import type { ComposerModel } from "./use-model-choice";
+import type { PlannerPlace } from "./model-picker-state";
+import type { Typists } from "./typists";
 
 export type ChatProps = {
 	/** The child document open beside this Chat, sent with a Planner message as its focus. */
@@ -207,9 +223,7 @@ export type ChatProps = {
 	decisions?: TranscriptDecisions;
 	researchOffers?: ResearchOfferControls;
 	sourceDestination?: ChatDestination;
-	/** Opens Decisions, where a waiting workflow's questions are. */
-	onShowDecisions?: () => void;
-	/** The document's running build, which the run strip shows first. */
+	/** The document's running build, which Chat shows in a card under its transcript. */
 	build?: BuildRun;
 	/** Opens Build, where the running build's tasks are. */
 	onShowBuild?: () => void;
@@ -235,20 +249,15 @@ export type ChatProps = {
 	 */
 	machine?: { presence?: PlannerPresence; fix?: MachineFix; choose?: () => void };
 	/**
-	 * Where the document's Planner is coming from its machine, as the room last said, whether or not
-	 * the machine is named yet: `starting` while the machine starts it (and has not said it can't),
-	 * `attached` once it is there. The composer's model pill waits for its models meanwhile.
+	 * Where the document's Planner is, as the room last said, whether or not the machine is named
+	 * yet: `starting` while the machine starts it (and has not said it can't), `attached` once it is
+	 * there, `failed` where it can't start it, `held` while the machine stepped away, `away` while it
+	 * is offline, `none` with no machine. The composer's model pill waits for its models, or says why it can't, meanwhile.
 	 */
-	plannerComing?: "starting" | "attached";
+	plannerPlace?: PlannerPlace;
 	/** What the transcript tells the banner: a reply running, its size, and whether it is current. */
 	onTranscript?: (facts: TranscriptFacts) => void;
 };
-
-/** Follows a link to a page of Chopin's own, as the navigation does. */
-function navigateTo(href: string) {
-	history.pushState(null, "", href);
-	window.dispatchEvent(new PopStateEvent("popstate"));
-}
 
 /** How long a message the server turned down for a passing trouble is left before it is sent again. */
 const TROUBLE_RETRY_MS = 5_000;
@@ -260,28 +269,24 @@ function draftKey(room: string, handle: string): string {
 	return chatDraftKey(room, isDemoHandle(handle) ? handle : undefined);
 }
 
-/** Holds an unsent message across a reload of this tab; storage may refuse. */
+/** Holds an unsent message across a reload of this tab, or this page where storage is refused. */
 function keepDraft(room: string, handle: string, draft: ComposerDraft): void {
-	try {
-		if (!draft.text.trim()) return sessionStorage.removeItem(draftKey(room, handle));
-		sessionStorage.setItem(
-			draftKey(room, handle),
-			JSON.stringify({
-				text: draft.text,
-				references: draft.references,
-				submission: draft.submission,
-			}),
-		);
-	} catch {
-		// Private windows and blocked storage: the draft is lost as it was before.
-	}
+	if (!draft.text.trim()) return safeSessionStorage.removeItem(draftKey(room, handle));
+	safeSessionStorage.setItem(
+		draftKey(room, handle),
+		JSON.stringify({
+			text: draft.text,
+			references: draft.references,
+			submission: draft.submission,
+		}),
+	);
 }
 
 /** The message a reload interrupted; anything malformed starts empty. */
 function restoreDraft(room: string, handle: string): ComposerDraft {
 	let empty = { text: "", references: [] };
 	try {
-		let raw = sessionStorage.getItem(draftKey(room, handle));
+		let raw = safeSessionStorage.getItem(draftKey(room, handle));
 		if (!raw) return empty;
 		let saved = JSON.parse(raw) as Partial<ComposerDraft>;
 		if (typeof saved.text !== "string") return empty;
@@ -333,9 +338,8 @@ export function Chat(
 		emptyNotice,
 		banner,
 		machine,
-		plannerComing,
+		plannerPlace,
 		onTranscript,
-		onShowDecisions,
 		build,
 		onShowBuild,
 		onResearch,
@@ -433,12 +437,6 @@ export function Chat(
 	let [flushed, setFlushed] = useState(0);
 	let [unanswered, setUnanswered] = useState<Record<string, Wire.Entry>>({});
 	let [busy, setBusy] = useState(false);
-	let [runs, setRuns] = useState<Wire.Runs>();
-	let loadStages = useCallback(
-		(runId: string, page: { offset: number; limit: number }, signal: AbortSignal) =>
-			runStages(room, runId, page, signal),
-		[room],
-	);
 	let [participation, setParticipation] = useState<{
 		room: string;
 		wire: Socket;
@@ -446,7 +444,8 @@ export function Chat(
 	}>();
 	let [participationKey, setParticipationKey] = useState(0);
 	let typing = useRef<TypingReporter | undefined>(undefined);
-	let counts = runCounts(runs);
+	let pacing = useRef<PacingReporter | undefined>(undefined);
+	let [typists, setTypists] = useState<Typists>();
 	// What the document's agent can be set to run, and what everyone in the room has set it to.
 	let {
 		control: modelControl,
@@ -454,37 +453,45 @@ export function Chat(
 		savedName: modelSavedName,
 		unreadable: modelUnreadable,
 		commands: agentCommands,
-		waiting: modelWaiting,
+		pill: modelPill,
+		refusal: modelRefusal,
 	} = useModelChoice({
 		wire,
 		room,
 		connected,
 		enabled: agent && !readonly && !archived,
+		place: plannerPlace,
 	});
-	// The pill from the moment the document opens: it waits in place while the machine starts the
-	// Planner, and becomes the real pill when the models arrive.
-	let waitingWith = modelControl ? undefined : pendingModel(modelWaiting, plannerComing);
-	let waitingName = waitingWith?.name;
-	let waitingLevel = waitingWith?.level;
+	// The pill from the moment the document opens: the machine's list, or the list from last time
+	// marked as such, or the saved choice's words waiting in place while the machine starts the
+	// Planner, or why it can't give its models. A pill with no list keeps one object while its words
+	// stand, so the composer's transition stays stable.
+	let still = modelPill && !("catalog" in modelPill) ? modelPill : undefined;
+	let stillName = still?.name;
+	let stillLevel = still?.level;
+	let stillStatus = still && "status" in still ? still.status : undefined;
 	let pillModel = useMemo<ComposerModel | undefined>(
 		() =>
-			modelControl
-				?? (waitingName === undefined ? undefined : {
-					pending: true,
-					name: waitingName,
-					...(waitingLevel ? { level: waitingLevel } : {}),
-				}),
-		[modelControl, waitingName, waitingLevel],
+			modelPill && "catalog" in modelPill
+				? modelPill
+				: stillName === undefined
+				? undefined
+				: stillStatus === undefined
+				? { pending: true, name: stillName, ...(stillLevel ? { level: stillLevel } : {}) }
+				: {
+					unavailable: true,
+					name: stillName,
+					...(stillLevel ? { level: stillLevel } : {}),
+					status: stillStatus,
+				},
+		[modelPill, stillName, stillLevel, stillStatus],
 	);
 	// A refused or unreadable choice has its own notice. A fallback is shown only until the
 	// transcript records it. One object while its words stand keeps the composer's transition stable.
-	let modelShown = composerModelNotice(
-		modelControl,
-		modelUnreadable,
-		modelSaved,
-		entries,
-		modelSavedName,
-	);
+	// A pick from the list from last time can be refused before the machine's list is in.
+	let modelShown = !modelControl && modelRefusal
+		? { tone: "warning" as const, text: modelRefusal }
+		: composerModelNotice(modelControl, modelUnreadable, modelSaved, entries, modelSavedName);
 	let modelWords = modelShown?.text;
 	let modelTone = modelShown?.tone ?? "info";
 	let modelNotice = useMemo<ComposerNotice | undefined>(
@@ -503,7 +510,7 @@ export function Chat(
 	// chopin's ephemeral row: a message to it it could not take, said to this person alone.
 	let [note, setNote] = useState<{ text: string; code: string; ts: number }>();
 	let noteRefusal = (failure: SendFailure & { code?: string }) => {
-		if (failure.code !== "planner-not-attached" && failure.code !== "planner-busy") return;
+		if (!refusedByChopin(failure.code)) return;
 		setNote({ text: failure.text, code: failure.code, ts: Math.floor(Date.now() / 1000) });
 	};
 	let [researchBlock, setResearchBlock] = useState<ResearchLaunchBlock>();
@@ -561,7 +568,7 @@ export function Chat(
 		connectionNotice !== "none",
 	);
 	// The failure notice a Retry was pressed for, and the server's words when it refused one.
-	let [retried, setRetried] = useState<{ entry: string; refusal?: string }>();
+	let [retried, setRetried] = useState<{ entry: string; refusal?: RetryRefusal }>();
 	let failed = failureBanner(entries, turn, handle);
 	let sendBanner = shownSend ? sendFailureView(shownSend, shownSend.code) : undefined;
 	// Retry runs the same message's turn again: nothing new is sent, and the failed attempt leaves
@@ -575,14 +582,15 @@ export function Chat(
 					current?.entry !== entry
 						? current
 						: error instanceof WireRefusal
-						? { entry, refusal: error.message }
+						? { entry, refusal: retryRefusal(error) }
 						: undefined
 				)
 			);
 		}
 		: undefined;
 	let retrying = !!failed && retried?.entry === failed.entry && retried.refusal === undefined;
-	let retryRefusal = failed && retried?.entry === failed.entry ? retried.refusal : undefined;
+	let failedView = failed
+		&& refusedRetryView(failed, retried?.entry === failed.entry ? retried.refusal : undefined);
 	// Only a banner that says why a send could not go gives a refused message's line its quiet;
 	// a Planner's absence is another fact, and the message still says it was not sent.
 	let quietFailures = !!banner && silencesFailedSends(banner.view);
@@ -595,7 +603,8 @@ export function Chat(
 			&& participation.wire === wire
 		? participation.state
 		: undefined;
-	let typingEnabled = composerReady && active && agent && !!participationState?.enabled;
+	let typingEnabled = composerReady && active;
+	let pacingEnabled = typingEnabled && !!agent && !!participationState?.enabled;
 	// Alone in the document, everything this person sends goes to chopin, as the server decides it.
 	let alone = !!agent && !!participationState?.enabled && !!participationState.alone;
 	// A message to the machine is kept in the outbox, so it needs neither the connection nor the
@@ -611,8 +620,11 @@ export function Chat(
 		submitted: draft.submission?.to,
 	});
 	let plannerBound = outboxed && askingChopin;
-	let busyRefused = (askingChopin || alone) && sendError?.code === "planner-busy"
-		&& (busy || counts.active > 0);
+	let busyRefused = refusedWhileBusy(
+		askingChopin || alone,
+		sendError?.code,
+		busy,
+	);
 	// An image goes where people read it, and to the Planner only if its model does.
 	let imagesAllowed = !agent || !(askingChopin || alone)
 		|| modelReadsImages(modelControl?.catalog, modelControl?.choice);
@@ -805,13 +817,17 @@ export function Chat(
 				loaded = true;
 				synchronized.current = wire;
 				seen = new Set(frame.entries.map(entry => entry.id));
-				dispatchTranscript({ kind: "history", entries: frame.entries, turn: frame.turn });
+				dispatchTranscript({
+					kind: "history",
+					entries: frame.entries,
+					turn: frame.turn,
+					...(frame.seq === undefined ? {} : { seq: frame.seq }),
+				});
 				dispatchOutbox({ kind: "history", ids: frame.entries.map(entry => entry.id) });
 				dispatchIntents({ kind: "history", entries: frame.entries, handle });
 				setBusy(frame.busy);
 				reportedBusy.current = frame.busy;
 				reportedWorking.current = frame.busy && !frame.turn?.quiet;
-				setRuns(frame.runs);
 				setParticipation({ room, wire, state: frame.participation });
 				setParticipationKey(current => current + 1);
 				// History is not unread, but a turn already in progress still needs
@@ -840,7 +856,12 @@ export function Chat(
 				dispatchTranscript({ kind: "removed", ids: frame.ids });
 			}),
 			wire.on<Wire.Reactions>("chat:reactions", frame => {
-				dispatchTranscript({ kind: "reactions", id: frame.id, reactions: frame.reactions });
+				dispatchTranscript({
+					kind: "reactions",
+					id: frame.id,
+					reactions: frame.reactions,
+					...(frame.reactionsSeq === undefined ? {} : { reactionsSeq: frame.reactionsSeq }),
+				});
 				dispatchIntents({
 					kind: "settle",
 					id: frame.id,
@@ -853,7 +874,12 @@ export function Chat(
 				});
 			}),
 			wire.on<Wire.Delta>("chat:delta", frame => {
-				dispatchTranscript({ kind: "delta", id: frame.id, text: frame.text });
+				dispatchTranscript({
+					kind: "delta",
+					id: frame.id,
+					text: frame.text,
+					...(frame.at === undefined ? {} : { at: frame.at }),
+				});
 				response(true, frame.text);
 			}),
 			wire.on<Wire.Tool>("chat:tool", frame => {
@@ -871,7 +897,6 @@ export function Chat(
 				reportedWorking.current = working;
 				setBusy(frame.busy);
 				dispatchTranscript({ kind: "turn", turn: frame.turn });
-				setRuns(frame.runs);
 			}),
 			wire.on<Wire.ParticipationState>("chat:participation", frame => {
 				if (!loaded || synchronized.current !== wire) return;
@@ -924,9 +949,23 @@ export function Chat(
 	}, [wire, room]);
 
 	useEffect(() => {
+		setTypists(undefined);
+		if (!wire) return;
+		return wire.on<Wire.Typists>("chat:typists", frame => {
+			setTypists(current => receiveTypists(current, frame));
+		});
+	}, [wire, room]);
+
+	// What a closed connection was told of who is writing ends with it; the next one says again.
+	useEffect(() => {
+		if (!connected) setTypists(undefined);
+	}, [connected]);
+
+	useEffect(() => {
 		if (!wire || !typingEnabled) return;
-		let reporter = new TypingReporter(active => {
-			if (wire.connected) wire.send("chat:typing", { active });
+		let reporter = new TypingReporter(report => {
+			let frame = typingFrame(report, wire.serverNow());
+			if (frame && wire.connected) wire.send("chat:typing", frame);
 		});
 		typing.current = reporter;
 		return () => {
@@ -934,6 +973,18 @@ export function Chat(
 			if (typing.current === reporter) typing.current = undefined;
 		};
 	}, [wire, room, typingEnabled, participationKey]);
+
+	useEffect(() => {
+		if (!wire || !pacingEnabled) return;
+		let reporter = new PacingReporter(active => {
+			if (wire.connected) wire.send("chat:pacing", { active });
+		});
+		pacing.current = reporter;
+		return () => {
+			reporter.stop();
+			if (pacing.current === reporter) pacing.current = undefined;
+		};
+	}, [wire, room, pacingEnabled, participationKey]);
 
 	useLayoutEffect(() => {
 		if (pendingCaret.current === undefined) return;
@@ -988,6 +1039,7 @@ export function Chat(
 	let submit = () => {
 		if (submission.current || !draftable || awaitingFiles.current) return;
 		typing.current?.stop();
+		pacing.current?.stop();
 		// What was being said is sent as it was shown, and listening ends.
 		let spoken = dictationRef.current?.settle(draftRef.current.text);
 		if (spoken && spoken.text !== draftRef.current.text) {
@@ -1089,7 +1141,7 @@ export function Chat(
 					id: `unanswered-${payload.requestId}`,
 					author: { kind: "system" },
 					text: PLANNER_UNAVAILABLE_NOTICE,
-					ts: Date.now(),
+					ts: Math.floor(Date.now() / 1000),
 				},
 			}));
 		}
@@ -1155,7 +1207,7 @@ export function Chat(
 					dispatchOutbox({ kind: "trouble", id });
 					setTimeout(() => dispatchOutbox({ kind: "recovered" }), TROUBLE_RETRY_MS);
 				} else if (
-					(error.code === "planner-not-attached" || error.code === "planner-busy")
+					refusedByChopin(error.code)
 					&& next.draft
 					&& !draftRef.current.text.trim()
 					&& filesRef.current.files.length === 0
@@ -1251,9 +1303,9 @@ export function Chat(
 		dispatchIntents({ kind: "ask", id, emoji, on, seq: ++reactionSeq.current });
 	}, []);
 
-	// Stop and Resume pressed during a blip are sent once it is over, or never.
-	let heldControl = useRef<"chat:abort" | "chat:resume">(undefined);
-	let control = (kind: "chat:abort" | "chat:resume") => {
+	// Stop pressed during a blip is sent once it is over, or never.
+	let heldControl = useRef<"chat:abort">(undefined);
+	let control = (kind: "chat:abort") => {
 		if (wire?.connected) wire.send(kind);
 		else heldControl.current = kind;
 	};
@@ -1402,11 +1454,9 @@ export function Chat(
 
 	let bannerId = useId();
 	// A message chopin could not take is its ephemeral row in the transcript, not a banner.
-	let refusedByChopin = shownSend?.code === "planner-not-attached"
-		|| shownSend?.code === "planner-busy";
 	let slot = bannerSlot(
 		banner?.view,
-		!!sendBanner && !refusedByChopin,
+		!!sendBanner && !refusedByChopin(shownSend?.code),
 		!!failed,
 		!readonly && !archived,
 	);
@@ -1421,17 +1471,17 @@ export function Chat(
 				title={sendBanner.title}
 			/>
 		)
-		: slot.lead === "failure" && failed
+		: slot.lead === "failure" && failedView
 		? (
 			<ErrorState
-				detail={retryRefusal ?? failed.detail}
+				detail={failedView.detail}
 				id={bannerId}
-				kind={failed.kind}
-				link={failed.link}
+				kind={failedView.kind}
+				link={failedView.link}
 				onRetry={retryTurn}
 				retryDisabled={!composerReady}
 				retrying={retrying}
-				title={failed.title}
+				title={failedView.title}
 			/>
 		)
 		: undefined;
@@ -1445,6 +1495,24 @@ export function Chat(
 		: undefined;
 	let threadSheet = !!workspaceThread
 		&& (workspaceThread.phone || workspaceThread.mode !== "split");
+	// chopin at work is its working row's to show; a line says so only where that is not drawn.
+	let threadTyping = openThreadView
+		? typingWords(typersIn(typists, {
+			thread: openThreadView.rootId,
+			viewer: handle,
+			planner: !progressOf(
+				openThreadView.transcript,
+				transcriptReady && openThreadView.loaded,
+				false,
+			)
+				.working,
+		}))
+		: "";
+	let chatTyping = typingWords(typersIn(typists, { viewer: handle, planner: !workingTurn }));
+	let chatTypers = typersIn(typists, { viewer: handle });
+	let threadTypers = openThreadView
+		? typersIn(typists, { thread: openThreadView.rootId, viewer: handle })
+		: undefined;
 	let threadPanelNode = openThreadView
 		? (
 			<Suspense fallback={null}>
@@ -1457,7 +1525,6 @@ export function Chat(
 					focus={focus}
 					handle={handle}
 					key={openThreadView.rootId}
-					loadStages={loadStages}
 					modelControl={pillModel}
 					modelNotice={modelNotice}
 					offline={offline}
@@ -1468,7 +1535,6 @@ export function Chat(
 							value,
 						})}
 					onClose={closeThread}
-					onShowDecisions={onShowDecisions}
 					people={people}
 					readonly={readonly}
 					root={entries.find(entry => entry.id === openThreadView.rootId)}
@@ -1478,6 +1544,7 @@ export function Chat(
 					sendAcknowledgements={sendAcknowledgements}
 					sheet={threadSheet}
 					summaryCount={threadsState.summaries[openThreadView.rootId]?.replyCount}
+					typing={threadTyping}
 					view={openThreadView}
 					wire={wire}
 				/>
@@ -1489,21 +1556,33 @@ export function Chat(
 	// the same object while it means the same thing, so that the transcript is not rendered with it.
 	let hiddenFailure = slot.lead === "failure" ? failed?.entry : undefined;
 	let shownEntries = useMemo(
-		() => [
-			...withNoticesAfter(withoutFailure(entries, hiddenFailure), unanswered),
-			...echoes(outbox),
-		],
-		[entries, hiddenFailure, unanswered, outbox],
+		() => withoutFailure(entries, hiddenFailure),
+		[entries, hiddenFailure],
+	);
+	let localEntries = useMemo(
+		() => localRows(echoes(outbox), unanswered),
+		[outbox, unanswered],
 	);
 	let canStartThread = !readonly && !archived && transcriptReady;
+	// Who is writing in each thread, said on its row in Chat; never as Chat's own typing line. Kept
+	// while the words are the same: every roster is a new snapshot, the viewer's own typing included,
+	// and a new map here renders every message of the transcript again.
+	let replying = useSteadyFields(useMemo(() => {
+		let words: Record<string, string> = {};
+		for (let [rootId, typers] of threadsWithTypers(typists, handle)) {
+			words[rootId] = typingWords(typers, "replying");
+		}
+		return words;
+	}, [typists, handle]));
 	let transcriptThreads = useMemo(
 		() => ({
 			summaries: threadsState.summaries,
 			openRootId: threadsState.openRootId,
 			canStart: canStartThread,
 			onOpen: openThread,
+			replying,
 		}),
-		[threadsState.summaries, threadsState.openRootId, canStartThread, openThread],
+		[threadsState.summaries, threadsState.openRootId, canStartThread, openThread, replying],
 	);
 	let hinted = !readonly && !archived;
 	let automatic = participationState?.enabled;
@@ -1523,28 +1602,34 @@ export function Chat(
 	// Where the machine has something to fix, chopin's row says so in one sentence, and How to fix
 	// unfolds the rest; any other refusal is the server's own words.
 	let noteFix = note?.code === "planner-not-attached" ? machine?.fix : undefined;
+	let noteLink = note?.code === "no-ai-account" ? AI_ACCOUNTS_LINK : undefined;
 	// The room builds the steps anew with each of its renders; the row is kept the same element while
 	// they say the same, so the memoized transcript is not rendered again for it.
 	let noteFixWords = noteFix ? JSON.stringify(noteFix) : "";
 	let steadyChoose = useSteadyCallback(machine?.choose);
 	let noteRow = useMemo(
 		() =>
-			note && (
-				<QuietNote
-					fix={noteFix}
-					key={note.ts}
-					onChoose={steadyChoose}
-					onNavigate={navigateTo}
-					text={noteFix ? refusedSentence(noteFix) : note.text}
-					ts={note.ts}
-				/>
-			),
+			note && {
+				id: String(note.ts),
+				ts: note.ts,
+				row: (
+					<QuietNote
+						fix={noteFix}
+						link={noteLink}
+						onChoose={steadyChoose}
+						onNavigate={navigateTo}
+						text={noteFix ? refusedSentence(noteFix) : note.text}
+						ts={note.ts}
+					/>
+				),
+			},
 		// oxlint-disable-next-line react-hooks/exhaustive-deps -- noteFix is compared by its words
 		[note, noteFixWords, steadyChoose],
 	);
 	let transcriptView = (
 		<Transcript
-			tail={noteRow}
+			local={localEntries}
+			note={noteRow}
 			active={active}
 			canEdit={composerShown}
 			compacting={threadsState.topCompacting}
@@ -1588,6 +1673,7 @@ export function Chat(
 	);
 	let renderSplit = (mainColumn: React.ReactNode) => (
 		<div className="chat-split-shell">
+			<TypingAnnouncer chat={chatTypers} thread={threadPanelNode ? threadTypers : undefined} />
 			<div className="chat-split-main">
 				{mainColumn}
 			</div>
@@ -1628,6 +1714,7 @@ export function Chat(
 				{transcriptView}
 				<div className="chat-composer shrink-0">
 					<p className="px-4 py-3 text-sm text-text-tertiary">{notice}</p>
+					<TypingLine words={chatTyping} />
 				</div>
 			</div>,
 		);
@@ -1638,26 +1725,16 @@ export function Chat(
 			{offlineBarNode && <div className="chat-offline-slot">{offlineBarNode}</div>}
 			{transcriptView}
 
-			{(agent && !!runs?.length || build) && (
+			{build && (
 				<div className="chat-runs flex shrink-0 flex-col px-2.5 pb-2" data-chat-runs="">
-					<RunStack
-						build={build}
-						onShowBuild={onShowBuild}
-						loadStages={loadStages}
-						offline={offline}
-						onPause={runId =>
-							wire?.send("chat:pause-run", { runId })}
-						onResume={runId =>
-							wire?.send("chat:resume-run", { runId })}
-						onShowDecisions={onShowDecisions}
-						runs={agent ? runs ?? [] : []}
-					/>
+					<BuildCard build={build} onShowBuild={onShowBuild} />
 				</div>
 			)}
 
 			<ChatComposer
 				rootRef={composerRoot}
 				inputRef={textarea}
+				typing={chatTyping}
 				agent={!!agent}
 				alone={alone}
 				model={pillModel}
@@ -1739,18 +1816,12 @@ export function Chat(
 					|| busyRefused
 					|| (connectionNotice !== "none" && !draftCommand(draft.text) && !plannerBound)}
 				onSubmit={submit}
-				run={agent && (offersStop(busy, transcript.turn, busyRefused) || counts.active > 0)
+				run={agent && offersStop(busy, transcript.turn, busyRefused)
 					? {
 						action: "stop",
 						disabled: !composerReady && connectionNotice !== "none",
 						refusedWhileBusy: busyRefused,
 						onClick: () => control("chat:abort"),
-					}
-					: agent && !busy && !counts.active && counts.paused > 0
-					? {
-						action: "resume",
-						disabled: !composerReady && connectionNotice !== "none",
-						onClick: () => control("chat:resume"),
 					}
 					: undefined}
 				pickers={
@@ -1810,7 +1881,11 @@ export function Chat(
 					mentions: mentionable,
 					onChange: event => {
 						let next = event.currentTarget.value;
-						if (next !== draftRef.current.text) typing.current?.change();
+						if (next !== draftRef.current.text) {
+							pacing.current?.change();
+							if (next.trim()) typing.current?.change();
+							else typing.current?.stop();
+						}
 						setDraft(current =>
 							reviseComposerDraft(
 								current,
@@ -1828,7 +1903,10 @@ export function Chat(
 						});
 						dictation?.follow(event.currentTarget.selectionStart);
 					},
-					onBlur: () => typing.current?.stop(),
+					onBlur: () => {
+						typing.current?.stop();
+						pacing.current?.stop();
+					},
 					interim: dictation?.interim,
 					onKeyDown: event => {
 						let composing = event.nativeEvent.isComposing || event.keyCode === 229;

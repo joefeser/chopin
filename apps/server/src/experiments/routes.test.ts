@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { MICROVMS } from "../testing/microvms";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ import {
 	CONNECTOR_SANDBOX_HEADER,
 	CONNECTOR_SANDBOX_REASON_HEADER,
 	CONNECTOR_SERVICE_HEADER,
+	CONNECTOR_STORE_PROBLEM_HEADER,
 	CONNECTOR_UPDATE_REQUIRED,
 	CONNECTOR_VERSION_HEADER,
 } from "@chopin/protocol/connector";
@@ -28,7 +30,12 @@ import type { GitHubApp } from "../github/app";
 import { hosted, locateDocument } from "../mcp/hosted";
 import { credentialDigest } from "./mcp-token";
 import { Connections } from "./connections";
+import { testLease } from "../storage/contract-support";
 import type { ImplementationConnector } from "../tasks/connector";
+import type { AiCredentials, AiLaunch, AiLaunchGrants } from "../ai/credentials";
+import { AI_ACCOUNT_UNCHECKED_RUN, NO_AI_ACCOUNT_RUN } from "@chopin/protocol/ai-credentials";
+import { MachineStores } from "../machine-store/service";
+import { FakeMachineStoreServer } from "../machine-store/fake-server.test-fixtures";
 
 function text(value: { result: { content: Array<{ text: string }> } }) {
 	return JSON.parse(value.result.content[0].text);
@@ -38,19 +45,28 @@ function error(value: { result: { isError?: boolean; content: Array<{ text: stri
 	return value.result.isError ? value.result.content[0].text : "";
 }
 
-/** What a current connector sends with every request; browser routes ignore it. */
+/**
+ * What a current connector sends with every request, and as it connects, that its agents run in
+ * microVMs; browser routes ignore it.
+ */
 const CURRENT = {
 	[CONNECTOR_VERSION_HEADER]: "dev",
 	[CONNECTOR_PROTOCOL_HEADER]: String(CONNECTOR_PROTOCOLS.max),
+	...MICROVMS,
 };
 
 async function setup(
 	shared?: { storage: MemoryStorage; lease: unknown },
-	{ durable = true, ...extra }: {
+	{ durable = true, origin = "https://chopin.test", ...extra }: {
 		implementations?: () => ImplementationConnector | undefined;
+		origin?: string;
 		/** Whether machines hold their own GitHub authorization, as everywhere but AUTH_MODE=local. */
 		durable?: boolean;
 		app?: GitHubApp;
+		ai?: () => AiCredentials | undefined;
+		machineStores?: MachineStores;
+		/** The chopin release this server recommends; `0.1.3` unless said. */
+		connectorVersion?: string | undefined;
 	} = {},
 ) {
 	let storage = shared?.storage ?? new MemoryStorage();
@@ -127,7 +143,7 @@ async function setup(
 			(/^[a-f]/.test(name) ? name[0]! : "c").repeat(40),
 	} as unknown as GitHub;
 	let config = {
-		origin: "https://chopin.test",
+		origin,
 		appSlug: "test",
 		clientId: "test",
 		clientSecret: "secret",
@@ -151,6 +167,8 @@ async function setup(
 				refreshExpiresIn: 15_897_600,
 			};
 		},
+		lease: () => lease,
+		revoked: async id => await extra.machineStores?.disable(id),
 	});
 	let router = new Router();
 	let lock = { locked: false, documents: new Set<string>() };
@@ -235,11 +253,7 @@ async function setup(
 	 * Register a checkout with a paired machine's token, as `chopin connect` does, speaking
 	 * `protocol`: 5 and up connects the machine for any repository, an older one that checkout's.
 	 */
-	async function open(
-		machineToken: string,
-		repository = "org/repo",
-		protocol = CONNECTOR_PROTOCOLS.max,
-	) {
+	async function open(machineToken: string, repository = "org/repo") {
 		return request(
 			"/api/connector/connections",
 			{
@@ -249,14 +263,12 @@ async function setup(
 			},
 			undefined,
 			machineToken,
-			{ ...CURRENT, [CONNECTOR_PROTOCOL_HEADER]: String(protocol) },
 		);
 	}
 	async function pair(
 		cookie: string,
 		repository = "org/repo",
 		user = cookie === bob.cookie ? "bob" : "alice",
-		protocol = CONNECTOR_PROTOCOLS.max,
 	) {
 		let pending = await (await request("/api/connector/pairings", {
 			repository,
@@ -268,7 +280,7 @@ async function setup(
 		let claimed = await (await request(`/api/connector/pairings/${pending.id}/claim`, {
 			secret: pending.secret,
 		})).json();
-		let opened = await (await open(claimed.token, repository, protocol)).json();
+		let opened = await (await open(claimed.token, repository)).json();
 		return { ...pending, machineToken: claimed.token as string, ...opened };
 	}
 	return {
@@ -452,47 +464,6 @@ test("a machine runs work in a repository it has no checkout of, from its defaul
 	});
 });
 
-test("an older chopin's connection serves every document in its checkout's repository only", async () => {
-	let { alice, bob, document, documentId, request, tool, pair } = await setup();
-	let second = await document();
-	let elsewhere = await document("other");
-	let connection = await pair(alice.cookie, "org/repo", "alice", 4);
-	for (let target of [documentId, second]) {
-		let id = crypto.randomUUID();
-		await request(`/api/documents/${target}/experiments`, { id, brief: "Measure" }, alice.cookie);
-		let run = await request(`/api/documents/${target}/experiments/${id}/run`, {}, alice.cookie);
-		expect((await run.json()).connectionId).toBe(connection.connection.id);
-		expect(text(await tool(connection.token, "wait_for_experiment", {}))).toEqual({ id });
-		let claim = text(await tool(connection.token, "claim_experiment", { id }));
-		expect(claim.input.documentId).toBe(target);
-		let read = text(await tool(claim.runToken, "read_experiment", {}));
-		expect(read.input.documentId).toBe(target);
-		await tool(connection.token, "fail_experiment", {
-			id,
-			generation: claim.generation,
-			error: "Stopped",
-		});
-	}
-	let id = crypto.randomUUID();
-	await request(`/api/documents/${elsewhere}/experiments`, { id, brief: "Measure" }, alice.cookie);
-	let refused = await request(
-		`/api/documents/${elsewhere}/experiments/${id}/run`,
-		{},
-		alice.cookie,
-	);
-	expect(refused.status).toBe(409);
-	expect((await refused.json()).error).toBe("no-workspace");
-	let foreign = crypto.randomUUID();
-	await request(`/api/documents/${second}/experiments`, { id: foreign, brief: "Bob" }, bob.cookie);
-	expect(
-		(await request(`/api/documents/${second}/experiments/${foreign}/run`, {}, bob.cookie))
-			.status,
-	).toBe(409);
-	let claimed = await tool(connection.token, "claim_experiment", { id: foreign });
-	expect(claimed.result.isError).toBe(true);
-	expect(claimed.result.content[0].text).toStartWith("connection-forbidden");
-});
-
 test("a failure report retried after its answer was lost lands once, and another is still refused", async () => {
 	let { alice, documentId, request, tool, pair } = await setup();
 	let connection = await pair(alice.cookie);
@@ -603,7 +574,6 @@ test("a failure report delayed past a retry leaves the next attempt running", as
 test("a machine claims work in any repository its owner can push to, and no other", async () => {
 	let { alice, document, tool, pair, runtime } = await setup();
 	let machine = await pair(alice.cookie);
-	let older = await pair(alice.cookie, "org/repo", "alice", 4);
 	let authorize = async (target: string, repository: string, connectionId: string) => {
 		let id = crypto.randomUUID();
 		await runtime.service.create(target, "alice", "Elsewhere", id);
@@ -628,16 +598,11 @@ test("a machine claims work in any repository its owner can push to, and no othe
 	expect(error(await tool(machine.token, "claim_experiment", { id: readonly })))
 		.toStartWith("repository-forbidden");
 	await runtime.service.stop(readonly, "cancelled");
-	// An older chopin's connection serves only its checkout's repository.
-	let foreign = await authorize(await document("third"), "third", older.connection.id);
-	expect(error(await tool(older.token, "claim_experiment", { id: foreign })))
-		.toStartWith("repository-forbidden");
 });
 
-test("a claim refuses a document in another repository and interrupts archived or locked ones", async () => {
+test("a claim interrupts the work of an archived or locked document", async () => {
 	let { alice, document, documentId, request, tool, pair, lock, runtime, storage } = await setup();
-	// An older chopin's connection, which serves only its checkout's repository.
-	let connection = await pair(alice.cookie, "org/repo", "alice", 4);
+	let connection = await pair(alice.cookie);
 	async function queued(target: string) {
 		let id = crypto.randomUUID();
 		await request(`/api/documents/${target}/experiments`, { id, brief: "Measure" }, alice.cookie);
@@ -648,23 +613,6 @@ test("a claim refuses a document in another repository and interrupts archived o
 		return id;
 	}
 
-	// A record bound to this connection in another repository is never claimable through it.
-	let elsewhere = await document("other");
-	let foreign = crypto.randomUUID();
-	await runtime.service.create(elsewhere, "alice", "Foreign", foreign);
-	await runtime.service.authorize(foreign, connection.connection.id, {
-		id: foreign,
-		documentId: elsewhere,
-		requester: "alice",
-		authorizer: "alice",
-		brief: "Foreign",
-		source: { repositoryId: "other", repository: "org/other", commit: "a".repeat(40) },
-		context: "Document revision 0",
-	});
-	expect(error(await tool(connection.token, "claim_experiment", { id: foreign })))
-		.toStartWith("repository-forbidden");
-	await runtime.service.stop(foreign, "cancelled");
-
 	let locked = await queued(documentId);
 	lock.locked = true;
 	expect(error(await tool(connection.token, "claim_experiment", { id: locked })))
@@ -674,7 +622,7 @@ test("a claim refuses a document in another repository and interrupts archived o
 
 	let second = await document();
 	let archived = await queued(second);
-	await storage.channels.archive({ id: second, now: new Date() });
+	await storage.channels.archive({ id: second, now: new Date(), lease: await testLease(storage) });
 	expect(error(await tool(connection.token, "claim_experiment", { id: archived })))
 		.toStartWith("invalid-state");
 	expect((await runtime.service.store.get(archived))?.state).toBe("interrupted");
@@ -782,7 +730,7 @@ test(
 		let connector = Bun.spawn([
 			process.execPath,
 			"--no-env-file",
-			join(import.meta.dir, "../../../connector/src/main.ts"),
+			join(import.meta.dir, "../../../connector/src/testing/chopin-on-host.ts"),
 			"connect",
 			root,
 			"--",
@@ -921,44 +869,187 @@ test("a connection tells the owner its machine's host, platform and agent", asyn
 	expect(config).toBeDefined();
 });
 
-test("a connection tells the owner whether its agents run in the system's sandbox, and why not", async () => {
-	let { alice, router, request, pair } = await setup();
+test("only a connector whose agents run in microVMs connects, and one that can't run them says why on the Machines page while it is away", async () => {
+	let context = await setup();
+	let { alice, bob, router, request, pair, tool } = context;
 	let paired = await pair(alice.cookie);
-	let listed = async () =>
-		(await (await request("/api/connector/machines", undefined, alice.cookie)).json()).machines;
+	// It is away: what it says as it connects again is all Chopin hears of it.
+	await tool(paired.token, "disconnect_workspace", {});
+	let listed = async (cookie = alice.cookie) =>
+		(await (await request("/api/connector/machines", undefined, cookie)).json()).machines;
 	let connect = async (extra: Record<string, string>) => {
 		let opened = new Request("https://chopin.test/api/connector/connections", {
 			method: "POST",
 			headers: {
 				"content-type": "application/json",
 				authorization: `Bearer ${paired.machineToken}`,
-				...CURRENT,
+				[CONNECTOR_VERSION_HEADER]: "dev",
 				...extra,
 			},
 			body: JSON.stringify({ repository: "org/repo", commit: "a".repeat(40), label: "Laptop" }),
 		});
-		await router.handle(opened, new URL(opened.url));
-		return (await listed())[0].sandbox;
+		return (await router.handle(opened, new URL(opened.url)))!;
 	};
-	// A connector from before the sandbox says nothing, and is shown as saying nothing.
-	expect(await connect({})).toBeNull();
-	expect(await connect({ [CONNECTOR_SANDBOX_HEADER]: "bubblewrap" })).toEqual({
-		engine: "bubblewrap",
-	});
-	expect(
-		await connect({
-			[CONNECTOR_SANDBOX_HEADER]: "none",
-			[CONNECTOR_SANDBOX_REASON_HEADER]: "slirp4netns isn't installed.",
-			[CONNECTOR_SANDBOX_FIX_HEADER]: "sudo apt-get install -y slirp4netns",
-		}),
-	).toEqual({
+	let current = { [CONNECTOR_PROTOCOL_HEADER]: String(CONNECTOR_PROTOCOLS.max) };
+	// A connector from before microVMs ran agents in a process sandbox: it is told to update,
+	// whatever it says of them.
+	for (
+		let older of [
+			{ [CONNECTOR_PROTOCOL_HEADER]: "7", [CONNECTOR_SANDBOX_HEADER]: "bubblewrap" },
+			{ [CONNECTOR_PROTOCOL_HEADER]: "7" },
+			{ [CONNECTOR_PROTOCOL_HEADER]: "7", ...MICROVMS },
+		] as Array<Record<string, string>>
+	) {
+		let refused = await connect(older);
+		expect(refused.status).toBe(409);
+		let body = await refused.json();
+		expect(body.error).toBe(CONNECTOR_UPDATE_REQUIRED);
+		expect(body.message).toContain("runs agents outside a microVM");
+		expect(body.message).toContain("chopin update");
+	}
+	// Kept on the machine, so the Machines page says why while it is away, and what to install.
+	expect((await listed())[0].sandbox).toEqual({
 		engine: "none",
-		reason: "slirp4netns isn't installed.",
-		fix: "sudo apt-get install -y slirp4netns",
+		reason: "Its chopin runs agents outside a microVM.",
+		fix: "chopin update 0.1.3",
 	});
-	// An engine this server doesn't know, or a refusal with no reason, is dropped.
-	expect(await connect({ [CONNECTOR_SANDBOX_HEADER]: "firecracker" })).toBeNull();
-	expect(await connect({ [CONNECTOR_SANDBOX_HEADER]: "none" })).toBeNull();
+	// A current one that says it can't run them is refused, and what it said is kept.
+	let unable = await connect({
+		...current,
+		[CONNECTOR_SANDBOX_HEADER]: "none",
+		[CONNECTOR_SANDBOX_REASON_HEADER]: "Your user can't read and write /dev/kvm.",
+		[CONNECTOR_SANDBOX_FIX_HEADER]: "sudo usermod -aG kvm $USER",
+	});
+	expect(unable.status).toBe(409);
+	expect((await unable.json()).error).toBe("microvm-required");
+	let [away] = await listed();
+	expect(away.sandbox).toEqual({
+		engine: "none",
+		reason: "Your user can't read and write /dev/kvm.",
+		fix: "sudo usermod -aG kvm $USER",
+	});
+	// One that runs them connects, says on which hypervisor, and clears what was kept.
+	expect((await connect({ ...current, ...MICROVMS })).status).toBe(200);
+	let [running] = await listed();
+	expect(running.sandbox).toEqual({ engine: "nvx", hypervisor: "kvm" });
+	expect((await storageOf(paired.machine))?.vmProblem).toBeUndefined();
+
+	// A paired machine whose connector finds it can't run them tells Chopin before it exits.
+	let capability = (body: unknown, token = paired.machineToken) =>
+		request("/api/connector/capability", body, undefined, token, CURRENT);
+	expect((await capability({ reason: "" })).status).toBe(409);
+	expect((await capability({ reason: "x", extra: true })).status).toBe(409);
+	expect(
+		(await capability({ reason: "macOS has no hypervisor NVX can use." }, "chopin_m_nobody"))
+			.status,
+	)
+		.toBe(401);
+	let told = await capability({
+		reason: "macOS has no hypervisor NVX can use.\u001b[31m",
+	});
+	expect(await told.json()).toEqual({ reported: true });
+	expect((await storageOf(paired.machine))?.vmProblem).toEqual({
+		reason: "macOS has no hypervisor NVX can use.",
+	});
+	// Nobody else sees any of it.
+	expect(await listed(bob.cookie)).toEqual([]);
+
+	async function storageOf(id: string) {
+		return await context.storage.machines.get(id);
+	}
+});
+
+test("an older connector is told to install a release that runs agents in microVMs, never an older one this server recommends", async () => {
+	for (
+		let [recommended, named] of [
+			// What this server recommends speaks only protocol 7: the first that speaks 8 is named.
+			["0.0.31", "0.0.32"],
+			["0.0.31-rc.1", "0.0.32"],
+			// A release that speaks 8, the first or a later one, is named as it is.
+			["0.0.32", "0.0.32"],
+			["0.1.3", "0.1.3"],
+			// None recommended: `chopin update` installs the newest release.
+			[undefined, undefined],
+		] as const
+	) {
+		let context = await setup(undefined, { connectorVersion: recommended });
+		let { alice, router, request, pair, tool } = context;
+		let paired = await pair(alice.cookie);
+		await tool(paired.token, "disconnect_workspace", {});
+		let headers = (version: string, protocol: number) => ({
+			"content-type": "application/json",
+			authorization: `Bearer ${paired.machineToken}`,
+			[CONNECTOR_VERSION_HEADER]: version,
+			[CONNECTOR_PROTOCOL_HEADER]: String(protocol),
+			...MICROVMS,
+		});
+		let ask = async (path: string, version: string, protocol: number) => {
+			let asked = new Request(`https://chopin.test${path}`, {
+				method: "POST",
+				headers: headers(version, protocol),
+				body: JSON.stringify({ repository: "org/repo", commit: "a".repeat(40), label: "Laptop" }),
+			});
+			return (await router.handle(asked, new URL(asked.url)))!;
+		};
+		let fix = named
+			? `Run \`chopin update ${named}\`, then connect again.`
+			: "Run `chopin update` to install the newest chopin, then connect again.";
+		// chopin 0.0.31 speaks protocol 7, which this server takes no work from.
+		let older = await ask("/api/connector/connections", "0.0.31", 7);
+		expect(older.status).toBe(409);
+		expect(await older.json()).toEqual({
+			error: CONNECTOR_UPDATE_REQUIRED,
+			message: "chopin 0.0.31 runs agents outside a microVM, and https://chopin.test runs each "
+				+ `agent in its own NVX microVM. ${fix}`,
+			protocol: CONNECTOR_PROTOCOLS,
+			version: named ?? null,
+		});
+		// One older than the protocols this server speaks at all.
+		let oldest = await ask("/api/connector/connections", "0.0.1", CONNECTOR_PROTOCOLS.min - 1);
+		expect((await oldest.json()).message).toEndWith(fix);
+		// The Machines page says the same while it is away.
+		let [machine] = (await (await request("/api/connector/machines", undefined, alice.cookie))
+			.json()).machines;
+		expect(machine.sandbox).toEqual({
+			engine: "none",
+			reason: "Its chopin 0.0.31 runs agents outside a microVM.",
+			fix: named ? `chopin update ${named}` : "chopin update",
+		});
+		// And `chopin update` without a version, which asks this server, installs it.
+		expect((await (await request("/api/connector/version")).json()).version).toBe(named ?? null);
+	}
+});
+
+test("a machine may forget the Planner disk of a document archived, gone or reset since, and keeps every other", async () => {
+	let { alice, storage, document, documentId, request, pair } = await setup();
+	let paired = await pair(alice.cookie);
+	let archived = await document();
+	await storage.channels.archive({
+		id: archived,
+		now: new Date(),
+		lease: await testLease(storage),
+	});
+	let gone = crypto.randomUUID();
+	let kept = (documents: unknown, token = paired.machineToken) =>
+		request("/api/connector/planner/kept", { documents }, undefined, token, CURRENT);
+	let disks = (...ids: string[]) => ids.map(id => ({ id }));
+	let answer = await kept(disks(documentId, archived, gone, "octo-org_score_plan", archived));
+	expect(answer.status).toBe(200);
+	expect(await answer.json()).toEqual({ forget: [archived, gone], reset: [] });
+	// A writer resets its Planner: a disk made before, after no reset or an earlier one, goes.
+	let reset = await document();
+	await storage.channels.markPlannerReset(reset, new Date("2026-01-01T00:00:00.000Z"));
+	let first = new Date("2026-01-01T00:00:00.000Z").getTime();
+	expect(await (await kept([{ id: reset }, { id: documentId }])).json())
+		.toEqual({ forget: [], reset: [reset] });
+	expect(await (await kept([{ id: reset, reset: first }])).json())
+		.toEqual({ forget: [], reset: [] });
+	await storage.channels.markPlannerReset(reset, new Date("2026-01-02T00:00:00.000Z"));
+	expect(await (await kept([{ id: reset, reset: first }])).json())
+		.toEqual({ forget: [], reset: [reset] });
+	expect((await kept(disks(documentId), "chopin_m_nobody")).status).toBe(401);
+	expect((await kept("all")).status).toBe(409);
+	expect((await kept([documentId])).status).toBe(409);
 });
 
 test("an owner renames a paired machine, which chopin status then reads", async () => {
@@ -1625,7 +1716,7 @@ test("a connector outside the supported protocol range is refused with the comma
 	}
 
 	// In range: pairing, claiming and connector calls all go through.
-	let current = headers("0.2.0", 6);
+	let current = { ...headers("0.2.0", max), ...MICROVMS };
 	let created = await request("/api/connector/pairings", source, undefined, undefined, current);
 	expect(created.status).toBe(200);
 	let pending = await created.json();
@@ -1758,19 +1849,16 @@ test("a person chooses which of their machines runs a document's work, and back 
 		"build-box",
 	]);
 	expect(shown.machines.every((item: { connected: boolean }) => item.connected)).toBe(true);
-	// Only the caller's own machines, every one whatever repository its checkouts are of. One an
-	// older chopin connected for another repository's checkout can't take this document's work.
+	// Only the caller's own machines, every one whatever repository its checkouts are of.
 	let bobs = await pair(bob.cookie);
 	expect((await request(path, { machine: bobs.machine }, alice.cookie)).status).toBe(404);
 	let elsewhere = await pair(alice.cookie, "org/other");
-	let older = await pair(alice.cookie, "org/other", "alice", 4);
 	let everyone = await (await request(path, undefined, alice.cookie)).json();
 	expect(
 		everyone.machines.map((item: { id: string; connected: boolean }) => [item.id, item.connected]),
-	).toEqual(expect.arrayContaining([[elsewhere.machine, true], [older.machine, false]]));
+	).toEqual(expect.arrayContaining([[elsewhere.machine, true]]));
 	expect((await request(path, { machine: elsewhere.machine }, alice.cookie)).status).toBe(200);
 	await tool(elsewhere.token, "disconnect_workspace", {});
-	await tool(older.token, "disconnect_workspace", {});
 	expect((await request(path, { machine: buildBox.machine }, alice.cookie)).status).toBe(200);
 	let chosen = await (await request(path, undefined, alice.cookie)).json();
 	expect(chosen.choice).toBe(buildBox.machine);
@@ -1935,11 +2023,7 @@ test("Automatic prefers the person's favorite machine where it serves the docume
 	expect((await (await request(path, undefined, alice.cookie)).json()).automatic)
 		.toMatchObject({ id: laptop.machine, favorite: false });
 
-	// A favorite an older chopin connected for another repository's checkout is passed over here;
-	// one that serves any repository takes the document's work, whatever its checkouts.
-	let older = await pair(alice.cookie, "org/other", "alice", 4);
-	expect((await favor(older.machine, true)).status).toBe(200);
-	expect(await ranOn(await run())).toBe(laptop.connection.id);
+	// A favorite takes the document's work, whatever repository its checkouts are of.
 	let elsewhere = await pair(alice.cookie, "org/other");
 	expect((await favor(elsewhere.machine, true)).status).toBe(200);
 	expect(await ranOn(await run())).toBe(elsewhere.connection.id);
@@ -2208,6 +2292,157 @@ test("a launch's MCP token reaches Chopin's tools only for its own documents, wh
 	expect((await caller("token"))?.user).toMatchObject({ login: "alice" });
 });
 
+test("a build's AI launch is for whoever asked for it, on the build's machine and document, and only that machine ends it", async () => {
+	let builds = new Map<string, { repository: string; starter: string; machineId?: string }>();
+	let launched: AiLaunch[] = [];
+	let ended: string[] = [];
+	/** What storage keeps of each launch: its id and machine, by its credential. */
+	let held = new Map<string, { launchId: string; machineId?: string }>();
+	let credentials = {
+		async launch(input: AiLaunch) {
+			launched.push(input);
+			held.set(`chopin_launch_${launched.length}`, {
+				launchId: `launch-${launched.length}`,
+				...(input.machineId ? { machineId: input.machineId } : {}),
+			});
+			return {
+				launchId: `launch-${launched.length}`,
+				launchToken: `chopin_launch_${launched.length}`,
+				grants: [{
+					provider: "openai",
+					baseUrl: "https://chopin.test/api/v1/ai/openai/v1",
+					placeholder: `chopin_ai_${launched.length}`,
+					keyVariable: "OPENAI_API_KEY",
+				}],
+				withheld: [{ provider: "github-copilot", reason: "no-copilot-access" }],
+			};
+		},
+		async endHeld(launchToken: string, machineId: string) {
+			let found = held.get(launchToken);
+			if (!found || found.machineId !== machineId) return false;
+			held.delete(launchToken);
+			ended.push(found.launchId);
+			return true;
+		},
+	} as unknown as AiCredentials;
+	let options = {
+		ai: () => credentials,
+		implementations: () =>
+			({
+				build: async (document: string, id: string) => builds.get(`${document} ${id}`),
+			}) as unknown as ImplementationConnector,
+	};
+	let { alice, documentId, request, pair, runtime, storage, lease } = await setup(
+		undefined,
+		options,
+	);
+	let connection = await pair(alice.cookie);
+	let other = await pair(alice.cookie);
+	let id = crypto.randomUUID();
+	builds.set(`${documentId} ${id}`, {
+		repository: "org/repo",
+		starter: "bob",
+		machineId: connection.machine,
+	});
+	let runToken = runtime.connections.runToken(connection.id, documentId, id, 1, "implementation");
+	let ask = (path: string, body: unknown, machineToken = connection.machineToken) =>
+		request(path, body, undefined, machineToken).then(response => response.json());
+	let grants = await ask("/api/connector/ai-launch", { run: runToken });
+	expect(launched).toEqual([{
+		userId: "bob",
+		machineId: connection.machine,
+		channelId: documentId,
+		expiresAt: expect.any(Date),
+		owner: `run:${id}`,
+	}]);
+	expect(launched[0]!.expiresAt.getTime()).toBeGreaterThan(Date.now() + 4 * 60 * 60_000);
+	// The runner gets its stand-ins and its own credential, never the launch's id.
+	expect(grants).toEqual({
+		launch: "chopin_launch_1",
+		expiresAt: launched[0]!.expiresAt.getTime(),
+		providers: [{
+			provider: "openai",
+			baseUrl: "https://chopin.test/api/v1/ai/openai/v1",
+			placeholder: "chopin_ai_1",
+			keyVariable: "OPENAI_API_KEY",
+		}],
+		withheld: [{ provider: "github-copilot", reason: "no-copilot-access" }],
+	});
+	// Another machine can't ask for it, nor end it.
+	expect((await ask("/api/connector/ai-launch", { run: runToken }, other.machineToken)).error)
+		.toBeOneOf(["credential-invalid", "run-unknown"]);
+	expect(await ask("/api/connector/ai-launch/end", { launch: grants.launch }, other.machineToken))
+		.toEqual({ ended: false });
+	expect(ended).toEqual([]);
+	// The process that handed it out is gone: its successor, on the same storage, ends it.
+	let successor = await setup({ storage, lease }, options);
+	let end = (machineToken: string) =>
+		successor.request(
+			"/api/connector/ai-launch/end",
+			{ launch: grants.launch },
+			undefined,
+			machineToken,
+		)
+			.then(response => response.json());
+	expect(await end(connection.machineToken)).toEqual({ ended: true });
+	expect(ended).toEqual(["launch-1"]);
+	expect(await end(connection.machineToken)).toEqual({ ended: false });
+	// A build that has ended gets nothing.
+	builds.delete(`${documentId} ${id}`);
+	expect(await ask("/api/connector/ai-launch", { run: runToken })).toMatchObject({
+		error: "run-unknown",
+	});
+	expect(launched).toHaveLength(1);
+});
+
+test("a build whose launch would be given no provider is refused before its agent starts, saying why, and one whose document ended is refused as ended", async () => {
+	let builds = new Map<string, { repository: string; starter: string; machineId?: string }>();
+	let answer: Pick<AiLaunchGrants, "withheld" | "ended"> = { withheld: [] };
+	let credentials = {
+		async launch() {
+			return { launchId: "launch-1", launchToken: "chopin_launch_1", grants: [], ...answer };
+		},
+	} as unknown as AiCredentials;
+	let { alice, documentId, request, pair, runtime } = await setup(undefined, {
+		ai: () => credentials,
+		implementations: () =>
+			({
+				build: async (document: string, id: string) => builds.get(`${document} ${id}`),
+			}) as unknown as ImplementationConnector,
+	});
+	let connection = await pair(alice.cookie);
+	let id = crypto.randomUUID();
+	builds.set(`${documentId} ${id}`, {
+		repository: "org/repo",
+		starter: "bob",
+		machineId: connection.machine,
+	});
+	let runToken = runtime.connections.runToken(connection.id, documentId, id, 1, "implementation");
+	let ask = async () => {
+		let response = await request(
+			"/api/connector/ai-launch",
+			{ run: runToken },
+			undefined,
+			connection.machineToken,
+		);
+		return { status: response.status, body: await response.json() };
+	};
+	answer = { withheld: [{ provider: "github-copilot", reason: "no-copilot-access" }] };
+	expect(await ask()).toEqual({
+		status: 409,
+		body: { error: "no-ai-account", message: NO_AI_ACCOUNT_RUN },
+	});
+	answer = { withheld: [{ provider: "github-copilot", reason: "copilot-unavailable" }] };
+	let unchecked = await ask();
+	expect(unchecked).toEqual({
+		status: 409,
+		body: { error: "no-ai-account", message: AI_ACCOUNT_UNCHECKED_RUN },
+	});
+	expect(unchecked.body.message).not.toMatch(/subscription/i);
+	answer = { withheld: [], ended: true };
+	expect(await ask()).toMatchObject({ status: 409, body: { error: "launch-ended" } });
+});
+
 test("a build's MCP token acts as whoever asked for it, on the build's machine, until it ends", async () => {
 	let builds = new Map<string, { repository: string; starter: string; machineId?: string }>();
 	let { alice, documentId, request, pair, runtime, auth } = await setup(undefined, {
@@ -2240,4 +2475,345 @@ test("a build's MCP token acts as whoever asked for it, on the build's machine, 
 	expect((await caller())?.user).toMatchObject({ id: "bob", login: "bob" });
 	builds.delete(`${documentId} ${id}`);
 	expect(await caller()).toBeUndefined();
+});
+
+async function storeSetup(origin?: string) {
+	let storage = new MemoryStorage();
+	let lease = (await storage.leases.acquire("writer", "test", 60_000))!;
+	let server = new FakeMachineStoreServer();
+	let machineStores = new MachineStores({
+		storage,
+		server,
+		key: new Uint8Array(32).fill(5),
+		clock: () => new Date(),
+	});
+	let context = await setup({ storage, lease }, { machineStores, ...(origin ? { origin } : {}) });
+	return { ...context, server, machineStores };
+}
+
+test("a paired machine asks for its own database login and gets the same one each time", async () => {
+	let { alice, bob, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let desk = await pair(bob.cookie);
+	let ask = (token: string) => request("/api/connector/machine-store", {}, undefined, token);
+	let first = await ask(laptop.machineToken);
+	expect(first.status).toBe(200);
+	expect(first.headers.get("cache-control")).toBe("no-store");
+	let login = await first.json();
+	let role = `m_${laptop.machine.replaceAll("-", "")}`;
+	expect(login.url).toBe(`postgresql://${role}@db.example.com:5432/${role}?sslmode=verify-full`);
+	expect(server.passwords.get(role)).toBe(login.password);
+	expect(await (await ask(laptop.machineToken)).json()).toEqual(login);
+	let theirs = await (await ask(desk.machineToken)).json();
+	expect(theirs.url).not.toBe(login.url);
+	expect(theirs.password).not.toBe(login.password);
+	expect((await ask("chopin_m_" + "x".repeat(43))).status).toBe(401);
+	let listed = await (await request("/api/connector/machines", undefined, alice.cookie)).json();
+	expect(listed.machines.find((value: { id: string }) => value.id === laptop.machine).store)
+		.toEqual({ state: "ready" });
+});
+
+test("a failed login is said on the Machines page and pairing still works", async () => {
+	let { alice, pair, request, server } = await storeSetup();
+	server.refuse = "a machine could still connect to the database template1";
+	let laptop = await pair(alice.cookie);
+	expect(laptop.token).toBeString();
+	let refused = await request("/api/connector/machine-store", {}, undefined, laptop.machineToken);
+	expect(refused.status).toBe(503);
+	expect(await refused.json()).toEqual({
+		error: "machine-store-unavailable",
+		message: "a machine could still connect to the database template1",
+	});
+	let listed = await (await request("/api/connector/machines", undefined, alice.cookie)).json();
+	expect(listed.machines[0].store).toEqual({
+		state: "failed",
+		reason: "a machine could still connect to the database template1",
+	});
+});
+
+test("only a machine's owner rotates its login, and the old password stops working", async () => {
+	let { alice, bob, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let ask = () => request("/api/connector/machine-store", {}, undefined, laptop.machineToken);
+	let before = await (await ask()).json();
+	let rotate = (cookie: string) =>
+		request(`/api/connector/machines/${laptop.machine}/store/rotate`, {}, cookie);
+	expect((await rotate(bob.cookie)).status).toBe(404);
+	expect((await request(`/api/connector/machines/${laptop.machine}/store/rotate`, {})).status)
+		.toBe(401);
+	expect(await (await rotate(alice.cookie)).json()).toEqual({ rotated: true });
+	let after = await (await ask()).json();
+	let role = new URL(after.url).username;
+	expect(after.password).not.toBe(before.password);
+	expect(await server.accepts(role, before.password)).toBe(false);
+	expect(await server.accepts(role, after.password)).toBe(true);
+});
+
+test("revoking or unpairing a machine turns its login off before Chopin answers", async () => {
+	let { alice, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let desk = await pair(alice.cookie);
+	let ask = (token: string) => request("/api/connector/machine-store", {}, undefined, token);
+	let first = await (await ask(laptop.machineToken)).json();
+	let second = await (await ask(desk.machineToken)).json();
+	let revoked = await request(`/api/connector/machines/${laptop.machine}/revoke`, {}, alice.cookie);
+	expect(revoked.status).toBe(200);
+	expect(server.enabled.has(new URL(first.url).username)).toBe(false);
+	expect((await ask(laptop.machineToken)).status).toBe(401);
+	let unpaired = await request("/api/connector/machine/revoke", {}, undefined, desk.machineToken);
+	expect(unpaired.status).toBe(200);
+	expect(server.enabled.has(new URL(second.url).username)).toBe(false);
+});
+
+test("a revocation whose login stays on says so, and revoking again finishes it", async () => {
+	let { alice, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let desk = await pair(alice.cookie);
+	let ask = (token: string) => request("/api/connector/machine-store", {}, undefined, token);
+	let role = new URL((await (await ask(laptop.machineToken)).json()).url).username;
+	let deskRole = new URL((await (await ask(desk.machineToken)).json()).url).username;
+	server.refuse = "Chopin couldn't reach the database server at db.example.com:5432";
+	let revoke = () => request(`/api/connector/machines/${laptop.machine}/revoke`, {}, alice.cookie);
+	let refused = await revoke();
+	expect(refused.status).toBe(503);
+	let said = await refused.json();
+	expect(said.error).toBe("machine-store-unavailable");
+	expect(said.message).toContain("couldn't turn off its database login");
+	expect(said.message).toContain("db.example.com:5432");
+	expect(server.enabled.has(role)).toBe(true);
+	expect((await ask(laptop.machineToken)).status).toBe(401);
+	let unpair = () => request("/api/connector/machine/revoke", {}, undefined, desk.machineToken);
+	expect((await unpair()).status).toBe(503);
+	delete server.refuse;
+	expect((await revoke()).status).toBe(200);
+	expect(server.enabled.has(role)).toBe(false);
+	let unpaired = await unpair();
+	expect(unpaired.status).toBe(401);
+	expect((await unpaired.json()).error).toBe("machine-revoked");
+	expect(server.enabled.has(deskRole)).toBe(false);
+});
+
+test("a machine revoked before its first login asks for one gets none", async () => {
+	let { alice, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let role = `m_${laptop.machine.replaceAll("-", "")}`;
+	let release!: () => void;
+	server.provisioning = new Promise<void>(resolve => {
+		release = resolve;
+	});
+	let asked = request("/api/connector/machine-store", {}, undefined, laptop.machineToken);
+	let revoked = request(`/api/connector/machines/${laptop.machine}/revoke`, {}, alice.cookie);
+	await Bun.sleep(5);
+	release();
+	expect((await asked).status).toBe(503);
+	expect((await revoked).status).toBe(200);
+	expect(server.calls).not.toContain(`provision ${role}`);
+	expect(server.enabled.has(role)).toBe(false);
+});
+
+test("a setup problem the connector reports is kept for the Machines page until it reports none", async () => {
+	let { alice, pair, request, storage } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	expect((await request("/api/connector/machine-store", {}, undefined, laptop.machineToken)).status)
+		.toBe(200);
+	let connect = (extra: Record<string, string>) =>
+		request(
+			"/api/connector/connections",
+			{ repository: "org/repo", commit: "a".repeat(40), label: "Laptop" },
+			undefined,
+			laptop.machineToken,
+			{ ...CURRENT, ...extra },
+		);
+	let listed = async () =>
+		(await (await request("/api/connector/machines", undefined, alice.cookie)).json()).machines[0]
+			.store;
+	expect(
+		(await connect({ [CONNECTOR_STORE_PROBLEM_HEADER]: "Couldn't install the adapter" })).status,
+	)
+		.toBe(200);
+	expect((await storage.machineDatabases.get(laptop.machine))!.connectorProblem)
+		.toBe("Couldn't install the adapter");
+	expect(await listed()).toEqual({ state: "failed", reason: "Couldn't install the adapter" });
+	expect((await connect({})).status).toBe(200);
+	expect(await listed()).toEqual({ state: "ready" });
+});
+
+test("a setup problem reported before Chopin made any login is said on the Machines page", async () => {
+	let { alice, pair, request, storage, tool } = await storeSetup("http://chopin.test");
+	let laptop = await pair(alice.cookie);
+	let asked = await request("/api/connector/machine-store", {}, undefined, laptop.machineToken);
+	expect(asked.status).toBe(503);
+	let refusal = (await asked.json()).message;
+	expect(await storage.machineDatabases.get(laptop.machine)).toBeUndefined();
+	let connect = () =>
+		request(
+			"/api/connector/connections",
+			{ repository: "org/repo", commit: "a".repeat(40), label: "Laptop" },
+			undefined,
+			laptop.machineToken,
+			{ ...CURRENT, [CONNECTOR_STORE_PROBLEM_HEADER]: refusal },
+		);
+	let listed = async () =>
+		(await (await request("/api/connector/machines", undefined, alice.cookie)).json()).machines[0]
+			.store;
+	let connected = await connect();
+	expect(connected.status).toBe(200);
+	expect(await listed()).toEqual({ state: "failed", reason: refusal });
+	await tool((await connected.json()).token, "disconnect_workspace", {});
+	expect(await listed()).toEqual({ state: "failed", reason: refusal });
+});
+
+test("a setup problem a pairing reports is said on the Machines page before the machine connects", async () => {
+	let { alice, pair, request } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let report = (token: string, body: unknown) =>
+		request("/api/connector/machine-store", body, undefined, token);
+	let listed = async () =>
+		(await (await request("/api/connector/machines", undefined, alice.cookie)).json()).machines[0]
+			.store;
+	expect((await report(laptop.machineToken, {})).status).toBe(200);
+	expect(await listed()).toEqual({ state: "ready" });
+	let problem = "its storage adapter couldn't be set up: EEXIST: file already exists";
+	let reported = await report(laptop.machineToken, { problem });
+	expect(reported.status).toBe(200);
+	expect(await reported.json()).toEqual({ reported: true });
+	expect(await listed()).toEqual({ state: "failed", reason: problem });
+	expect((await report("chopin_m_" + "x".repeat(43), { problem })).status).toBe(401);
+	expect((await report(laptop.machineToken, { problem: "" })).status).toBe(409);
+	expect(await listed()).toEqual({ state: "failed", reason: problem });
+});
+
+test("without MACHINE_STORE_URL a machine is told there is no database login", async () => {
+	let { alice, pair, request } = await setup();
+	let laptop = await pair(alice.cookie);
+	let asked = await request("/api/connector/machine-store", {}, undefined, laptop.machineToken);
+	expect(asked.status).toBe(404);
+	let listed = await (await request("/api/connector/machines", undefined, alice.cookie)).json();
+	expect(listed.machines[0].store).toBeNull();
+});
+
+/** chopin 0.0.30, from before microVMs, saying of its agents what a current one says. */
+const OLDER = {
+	[CONNECTOR_VERSION_HEADER]: "0.0.30",
+	[CONNECTOR_PROTOCOL_HEADER]: "7",
+	...MICROVMS,
+};
+/** A current connector that doesn't say where its agents run. */
+const UNSAID = {
+	[CONNECTOR_VERSION_HEADER]: "dev",
+	[CONNECTOR_PROTOCOL_HEADER]: String(CONNECTOR_PROTOCOLS.max),
+};
+
+/** `ask` from an older connector is told to update, and from one that doesn't say, refused. */
+async function refusedOutsideMicrovms(ask: (headers: Record<string, string>) => Promise<Response>) {
+	let older = await ask(OLDER);
+	expect(older.status).toBe(409);
+	let told = await older.json();
+	expect(told).toEqual({
+		error: CONNECTOR_UPDATE_REQUIRED,
+		message: "chopin 0.0.30 runs agents outside a microVM, and https://chopin.test runs each "
+			+ "agent in its own NVX microVM. Run `chopin update 0.1.3`, then connect again.",
+		protocol: CONNECTOR_PROTOCOLS,
+		version: "0.1.3",
+	});
+	let unsaid = await ask(UNSAID);
+	expect(unsaid.status).toBe(409);
+	expect(await unsaid.json()).toEqual({
+		error: "microvm-required",
+		message: "This machine can't run Chopin's work: Chopin runs each agent in its own microVM. "
+			+ "Its connector didn't say it runs them.",
+	});
+}
+
+test("a connector that would run agents outside a microVM gets no GitHub token", async () => {
+	let { app, minted } = fakeApp();
+	let { alice, documentId, request, tool, pair } = await setup(undefined, { app });
+	let connection = await pair(alice.cookie);
+	let id = crypto.randomUUID();
+	await request(`/api/documents/${documentId}/experiments`, { id, brief: "Measure" }, alice.cookie);
+	await request(`/api/documents/${documentId}/experiments/${id}/run`, {}, alice.cookie);
+	text(await tool(connection.token, "claim_experiment", { id }));
+	let ask = (body: unknown) => (headers: Record<string, string>) =>
+		request("/api/connector/github-token", body, undefined, connection.machineToken, headers);
+	await refusedOutsideMicrovms(ask({ repository: "org/repo", purpose: "run", run: id }));
+	// Nor its owner's own token, which a connector naming no purpose is given.
+	await refusedOutsideMicrovms(ask({ repository: "org/repo" }));
+	expect(minted).toEqual([]);
+	expect((await ask({ repository: "org/repo", purpose: "run", run: id })(CURRENT)).status)
+		.toBe(200);
+	expect(minted).toHaveLength(1);
+});
+
+test("a connector that would run agents outside a microVM gets no MCP token", async () => {
+	let { alice, documentId, request, pair, storage } = await setup();
+	let connection = await pair(alice.cookie);
+	let credential = "chopin_p_" + "c".repeat(43);
+	await storage.plannerCredentials.put({
+		digest: credentialDigest(credential),
+		machineId: connection.machine,
+		channelId: documentId,
+		expiresAt: new Date(Date.now() + 900_000),
+	});
+	let ask = (headers: Record<string, string>) =>
+		request(
+			"/api/connector/mcp-token",
+			{ planner: credential },
+			undefined,
+			connection.machineToken,
+			headers,
+		);
+	await refusedOutsideMicrovms(ask);
+	expect((await (await ask(CURRENT)).json()).token).toStartWith("chopin_mcp_");
+});
+
+test("a connector that would run agents outside a microVM is handed no AI launch", async () => {
+	let launched: AiLaunch[] = [];
+	let credentials = {
+		async launch(input: AiLaunch) {
+			launched.push(input);
+			return { launchId: "launch-1", launchToken: "chopin_launch_1", grants: [], withheld: [] };
+		},
+	} as unknown as AiCredentials;
+	let builds = new Map<string, { repository: string; starter: string; machineId?: string }>();
+	let { alice, documentId, request, pair, runtime } = await setup(undefined, {
+		ai: () => credentials,
+		implementations: () =>
+			({
+				build: async (document: string, id: string) => builds.get(`${document} ${id}`),
+			}) as unknown as ImplementationConnector,
+	});
+	let connection = await pair(alice.cookie);
+	let id = crypto.randomUUID();
+	builds.set(`${documentId} ${id}`, {
+		repository: "org/repo",
+		starter: "alice",
+		machineId: connection.machine,
+	});
+	let run = runtime.connections.runToken(connection.id, documentId, id, 1, "implementation");
+	let ask = (headers: Record<string, string>) =>
+		request("/api/connector/ai-launch", { run }, undefined, connection.machineToken, headers);
+	await refusedOutsideMicrovms(ask);
+	expect(launched).toEqual([]);
+	await ask(CURRENT);
+	expect(launched).toHaveLength(1);
+});
+
+test("a connector that would run agents outside a microVM is handed no database login", async () => {
+	let { alice, pair, request, server } = await storeSetup();
+	let laptop = await pair(alice.cookie);
+	let ask = (headers: Record<string, string>) =>
+		request("/api/connector/machine-store", {}, undefined, laptop.machineToken, headers);
+	await refusedOutsideMicrovms(ask);
+	expect(server.passwords.size).toBe(0);
+	// Saying why its login couldn't be set up hands it nothing, so it may.
+	let problem = await request(
+		"/api/connector/machine-store",
+		{ problem: "no room" },
+		undefined,
+		laptop.machineToken,
+		UNSAID,
+	);
+	expect(problem.status).toBe(200);
+	expect((await ask(CURRENT)).status).toBe(200);
+	expect(server.passwords.size).toBe(1);
 });

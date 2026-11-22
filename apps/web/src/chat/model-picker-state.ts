@@ -289,3 +289,136 @@ export function chooseLevel(catalog: Catalog, choice: Choice | undefined, level:
 export function sameChoice(left: Choice | undefined, right: Choice | undefined): boolean {
 	return left?.model === right?.model && left?.thinkingLevel === right?.thinkingLevel;
 }
+
+/**
+ * Where the document's Planner is, as the room last said, for the model pill: on its way
+ * (`starting`, or `attached` and yet to say which models it runs), or not coming: its machine
+ * couldn't start it (`failed`), stepped away and keeps its work for a while (`held`), is offline
+ * (`away`), or there is none (`none`).
+ */
+export type PlannerPlace = "starting" | "attached" | "failed" | "held" | "away" | "none";
+
+/**
+ * The words over a list from last time, saying why it is not the machine's list now. They never
+ * say what state the machine is in, which its own button says, and Chat never does.
+ */
+export const LAST_KNOWN_LOADING =
+	"These are the models from last time. The machine's current list is still loading.";
+export const LAST_KNOWN_WAITING =
+	"These are the models from last time, until the machine lists its own.";
+
+export const LAST_KNOWN_STATUS: Record<PlannerPlace, string> = {
+	starting: LAST_KNOWN_LOADING,
+	attached: LAST_KNOWN_LOADING,
+	failed: LAST_KNOWN_WAITING,
+	held: LAST_KNOWN_WAITING,
+	away: LAST_KNOWN_WAITING,
+	none: LAST_KNOWN_WAITING,
+};
+
+/**
+ * The light note on the models listed from the person's own AI accounts, saying they are not the
+ * machine's list yet, without what state the machine is in.
+ */
+export const ACCOUNTS_LOADING =
+	"These models are from your AI accounts. The machine's own list is still loading.";
+export const ACCOUNTS_WAITING =
+	"These models are from your AI accounts, until the machine lists its own.";
+
+export const ACCOUNTS_STATUS: Record<PlannerPlace, string> = {
+	starting: ACCOUNTS_LOADING,
+	attached: ACCOUNTS_LOADING,
+	failed: ACCOUNTS_WAITING,
+	held: ACCOUNTS_WAITING,
+	away: ACCOUNTS_WAITING,
+	none: ACCOUNTS_WAITING,
+};
+
+/**
+ * The words on a pill with no list to show, where the machine can't give one now (it couldn't
+ * start the Planner, stepped away or is offline), without saying which: its button says that.
+ */
+export const MODELS_UNAVAILABLE = "The machine's models can't load right now.";
+
+/**
+ * The words while the machine can't list the models of the AI accounts its Planner runs on as they
+ * are now without an update, since they changed: true of every state the machine may be in, and
+ * what would fix it. Its list is not on its way.
+ */
+export const MODELS_OUTDATED = "The machine needs an update to switch AI accounts.";
+export const ACCOUNTS_OUTDATED = `These models are from your AI accounts. ${MODELS_OUTDATED}`;
+export const LAST_KNOWN_OUTDATED = `These are the models from last time. ${MODELS_OUTDATED}`;
+
+export const UNAVAILABLE_STATUS: Partial<Record<PlannerPlace, string>> = {
+	failed: MODELS_UNAVAILABLE,
+	held: MODELS_UNAVAILABLE,
+	away: MODELS_UNAVAILABLE,
+};
+
+/**
+ * What the composer's model pill draws:
+ * - `live`: the list the machine reports now, which is the only list drawn unmarked;
+ * - `accounts`: the models this person's own AI accounts offer, as Chopin lists them, with a light
+ *   note (`status`), while the machine has yet to say which models it runs (`loading` while it is
+ *   on its way), ahead of a list from last time;
+ * - `last-known`: the list last reported for this person's own account, marked with `status`,
+ *   while the machine has yet to say which models it runs and nothing is listed from their
+ *   accounts;
+ * - `loading`: no list yet and the machine on its way, the saved choice's words waiting in place;
+ * - `unavailable`: no list, and a machine that can't give one (it couldn't start, stepped away or
+ *   is offline, or needs an update to list the models of accounts that changed), which says so
+ *   (`status`), with the saved choice's words where the server sent them.
+ * A machine that needs an update (`waiting.outdated`) is never waited for, and every list says so.
+ * Nothing is drawn where the harness offers no choice (no `place`, or a machine that is there and
+ * says the models are not coming), nor where no machine is chosen and no list was kept.
+ */
+export type PickerView =
+	| { kind: "live"; catalog: Catalog }
+	| { kind: "accounts"; catalog: Catalog; status: string; loading: boolean }
+	| { kind: "last-known"; catalog: Catalog; status: string; loading: boolean }
+	| { kind: "loading"; name: string; level?: string }
+	| { kind: "unavailable"; name: string; level?: string; status: string };
+
+export function pickerView(input: {
+	/** The list the machine reports now. */
+	catalog?: Catalog;
+	/** The models this person's own AI accounts offer, sent only while the offer is unknown. */
+	accounts?: { catalog: Catalog };
+	/** The list last reported for this person's account, sent only while the offer is unknown. */
+	lastKnown?: { catalog: Catalog };
+	/**
+	 * The server's word that the offer is unknown, with the stored choice to wait with, and whether
+	 * the machine needs an update to list it.
+	 */
+	waiting?: Chat.ModelState["waiting"];
+	place: PlannerPlace | undefined;
+}): PickerView | undefined {
+	if (input.catalog) return { kind: "live", catalog: input.catalog };
+	let place = input.place;
+	if (!place) return undefined;
+	let outdated = input.waiting?.outdated === true;
+	let coming = !outdated && (place === "starting" || place === "attached");
+	if (input.accounts?.catalog.models.length) {
+		return {
+			kind: "accounts",
+			catalog: input.accounts.catalog,
+			status: outdated ? ACCOUNTS_OUTDATED : ACCOUNTS_STATUS[place],
+			loading: coming,
+		};
+	}
+	if (input.lastKnown?.catalog.models.length) {
+		return {
+			kind: "last-known",
+			catalog: input.lastKnown.catalog,
+			status: outdated ? LAST_KNOWN_OUTDATED : LAST_KNOWN_STATUS[place],
+			loading: coming,
+		};
+	}
+	let words = pendingTrigger(input.waiting?.choice, input.waiting?.modelName);
+	let saved = { name: words.name, ...(words.level ? { level: words.level } : {}) };
+	if (outdated) return { kind: "unavailable", ...saved, status: MODELS_OUTDATED };
+	// A machine on its way is waited for only while the server says the models are coming.
+	if (coming) return input.waiting ? { kind: "loading", ...saved } : undefined;
+	let status = UNAVAILABLE_STATUS[place];
+	return status ? { kind: "unavailable", ...saved, status } : undefined;
+}

@@ -8,7 +8,7 @@
 export type SendStopAction = "send" | "stop";
 
 export type SendStopInput = {
-	/** The Planner has a turn or workflow runs going. */
+	/** The Planner has a turn going. */
 	running: boolean;
 	/** The draft has something in it besides white space. */
 	hasDraft: boolean;
@@ -25,6 +25,20 @@ export type SendStopInput = {
 };
 
 export type SendStop = { action: SendStopAction; disabled: boolean };
+
+/**
+ * Whether a refused draft to Chopin turns the composer's button into Stop while Chopin runs: only
+ * `planner-busy`, whose running turn the person can stop to ask now. `planner-starting` (another
+ * person's turn is about to start, so Stop would abort their turn) and `planner-not-attached`
+ * return the draft and keep Send.
+ */
+export function refusedWhileBusy(
+	askingChopin: boolean,
+	code: string | undefined,
+	running: boolean,
+): boolean {
+	return askingChopin && code === "planner-busy" && running;
+}
 
 /**
  * Stop appears only for a Planner that runs, an empty draft (or a draft to Chopin that was just

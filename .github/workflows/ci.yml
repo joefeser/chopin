@@ -1,7 +1,7 @@
 # Jobs are split by what they wait on, so the slowest one decides the wall time
 # and nothing queues behind unrelated work. Static checks, three unit shards, the
-# PostgreSQL contract, twelve browser shards, two design suites, the container and
-# the CLI all start together. Two small gates keep the required check names,
+# PostgreSQL contract, twelve browser shards, two design suites, the container,
+# the sealed conversation-plan suite and the CLI all start together. Two small gates keep the required check names,
 # `format, lint, types, tests` and `e2e`, over the jobs they summarise.
 name: ci
 
@@ -25,7 +25,7 @@ permissions:
 env:
   # Matches the version this is developed against. Bun's lockfile format and
   # its workspace catalogs are both young enough that "latest" is a variable.
-  BUN_VERSION: 1.4.4
+  BUN_VERSION: 1.4.5
   # Shard counts; keep each matrix below in step with its count.
   UNIT_SHARDS: 3
   E2E_SHARDS: 12
@@ -425,7 +425,8 @@ jobs:
           retention-days: 7
 
   # The `chopin` CLI is the connector compiled into one binary that runs without Bun. The smoke
-  # test runs a fake investigation through it, so the agent starts the binary's own stdio bridge.
+  # test checks what the binary says of this machine, and that a checkout's .env and bunfig.toml
+  # don't reach it.
   cli:
     name: chopin CLI
     runs-on: ubuntu-latest
@@ -443,7 +444,7 @@ jobs:
       - run: ./dist/chopin-linux-x64 --version
         working-directory: apps/connector
 
-      - name: Bridge smoke test from the compiled binary
+      - name: Smoke test of the compiled binary
         run: bun test apps/connector/src/binary.test.ts
         env:
           CHOPIN_BINARY: apps/connector/dist/chopin-linux-x64
@@ -454,6 +455,57 @@ jobs:
           path: apps/connector/dist/chopin-windows-x64.exe
           if-no-files-found: error
           retention-days: 1
+
+  # Agents in real NVX microVMs on the runner's KVM: what a guest can reach, write and keep, the
+  # MCP bridge in a guest, and a launch's end. The NVX package is the one the connector pins, checked
+  # against its SHA-256; the agent image is built in a microVM, as on a machine. Not part of a gate:
+  # it needs KVM and downloads NVX, Node and the agent, so it reports on its own.
+  microvms:
+    name: microVMs (KVM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - run: bun install --frozen-lockfile
+
+      # GitHub's Linux runners have /dev/kvm for root and the kvm group; this opens it to the runner's
+      # user, as joining the group would on a machine.
+      - name: Give this user KVM
+        run: |
+          ls -l /dev/kvm
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
+
+      - name: The pinned NVX release
+        run: |
+          set -eu
+          read -r url sha <<< "$(bun -e 'import { NVX_RELEASE } from "./apps/connector/src/nvx"; let p = NVX_RELEASE.packages["linux-kvm"]; console.log(`https://github.com/microsoft/nvx/releases/download/${NVX_RELEASE.tag}/${p.file} ${p.sha256}`)')"
+          curl -fsSL "$url" -o "$RUNNER_TEMP/nvx.tar.gz"
+          echo "$sha  $RUNNER_TEMP/nvx.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/nvx"
+          tar -xzf "$RUNNER_TEMP/nvx.tar.gz" -C "$RUNNER_TEMP/nvx"
+          echo "CHOPIN_NVX_ROOT=$(echo "$RUNNER_TEMP"/nvx/*)" >> "$GITHUB_ENV"
+
+      # The tests make a microVM's start fail as OpenVMM's does under heavy load, by refusing it
+      # io_uring with strace.
+      - name: strace
+        run: command -v strace || (sudo apt-get update -q && sudo apt-get install -y -q strace)
+
+      - name: Agents in microVMs
+        run: bun test --timeout 600000 apps/connector/src/nvx-vm.test.ts
+        env:
+          GIT_CONFIG_GLOBAL: /dev/null
+          CHOPIN_NVX_REQUIRED: "1"
 
   # Cross-compiled above; this checks that the .exe starts on Windows, and runs install.ps1
   # against a local fake release (the Linux job only sees it refuse to run outside Windows).
@@ -477,6 +529,56 @@ jobs:
 
       - name: install.ps1 against a fake release
         run: bun test apps/connector/install/install.test.ts
+
+  # The conversation-plan suite in its sealed image, beside a fresh PostgreSQL with no network but
+  # loopback (scripts/conversation-plan.ts). It covers CONVERSATION_PLAN, which is off by default,
+  # and takes about as long as the slowest browser shard, so neither gate waits on it. No layer
+  # cache: the Playwright base image would crowd the application image out of the repository's.
+  conversation-plan:
+    name: conversation plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      # The image's build stamp must name the commit checked out here.
+      - name: Read the commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch PostgreSQL 17
+        run: |
+          docker pull --quiet mirror.gcr.io/library/postgres:17
+          docker tag mirror.gcr.io/library/postgres:17 postgres:17
+
+      - uses: docker/setup-buildx-action@v3
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: e2e/conversation-plan.Dockerfile
+          build-args: CHOPIN_SOURCE_COMMIT=${{ steps.commit.outputs.sha }}
+          load: true
+          push: false
+          tags: chopin-conversation-plan:ci
+
+      - name: Run the conversation-plan suite
+        run: bun scripts/conversation-plan.ts --image chopin-conversation-plan:ci --postgres-image postgres:17
+
+      - if: ${{ !cancelled() && failure() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: conversation-plan-report
+          path: e2e/test-results/conversation-plan
+          retention-days: 7
 
   container:
     name: container

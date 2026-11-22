@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { contractId as id, openedStorage, userAndChannel } from "./contract-support";
+import { contractId as id, openedStorage, testLease, userAndChannel } from "./contract-support";
 import { StorageError } from "./errors";
 
 import type { StorageFactory } from "./contract-support";
@@ -76,8 +76,10 @@ export function chatThreadContract(name: string, factory: StorageFactory) {
 							author: { kind: "agent" },
 							text: "Side answer",
 							ts: 130,
+							seq: 1_767_225_600_123,
 						},
 					],
+					lastSeq: 1_767_225_600_124,
 					compactions: [
 						{
 							id: "c-1",
@@ -111,6 +113,7 @@ export function chatThreadContract(name: string, factory: StorageFactory) {
 						atomicEntries: [{ type: "session", id: "s1" }, { id: "leaf-1", type: "message" }],
 						atomicLeafId: "leaf-1",
 					},
+					askedQuestions: ["q-1", "q-2"],
 					updatedAt: AT,
 				};
 
@@ -118,6 +121,7 @@ export function chatThreadContract(name: string, factory: StorageFactory) {
 				await storage.chatThreads.putThread(lease, first);
 
 				expect(await storage.chatThreads.getThread(channelId, "root-1")).toEqual(first);
+				expect(await storage.chatThreads.getThread(channelId, "root-2")).toEqual(second);
 				expect((await storage.chatThreads.listThreads(channelId)).map(item => item.rootId)).toEqual(
 					["root-1", "root-2"],
 				);
@@ -155,6 +159,27 @@ export function chatThreadContract(name: string, factory: StorageFactory) {
 					atomicLeafId: null,
 					entryForks: {
 						"root-1": { atomicLeafId: "leaf-1", remote: { session: "rs-1", turn: "rt-1" } },
+					},
+					threadNotes: [{
+						id: "note-1",
+						rootId: "root-1",
+						root: { author: "@ana", excerpt: "Hello" },
+						decision: "Use one index per document.",
+						decidedBy: ["ana"],
+						question: "q-1",
+						ts: 160,
+					}],
+					notedQuestions: ["q-1"],
+					givenNotes: {
+						entryId: "entry-9",
+						notes: [{
+							id: "note-0",
+							rootId: "root-1",
+							root: { author: "@ana", excerpt: "Hello" },
+							decision: "Ship on Friday.",
+							decidedBy: ["bo"],
+							ts: 150,
+						}],
 					},
 					updatedAt: AT,
 				};
@@ -200,8 +225,9 @@ export function chatThreadContract(name: string, factory: StorageFactory) {
 				expect(stale).toBeInstanceOf(StorageError);
 				expect((await storage.chatThreads.getThread(channelId, "root-1"))!.forkedAt).toBe(2);
 
-				await storage.channels.archive({ id: channelId, now: AT });
-				await storage.channels.delete(channelId);
+				let current = await testLease(storage);
+				await storage.channels.archive({ id: channelId, now: AT, lease: current });
+				await storage.channels.delete({ id: channelId, lease: current });
 				expect(await storage.chatThreads.getThread(channelId, "root-1")).toBeUndefined();
 				expect(await storage.chatThreads.listThreads(channelId)).toEqual([]);
 				expect(await storage.chatThreads.getSessionState(channelId)).toBeUndefined();

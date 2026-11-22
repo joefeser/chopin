@@ -31,6 +31,14 @@ Compatibility conversion is limited to explicitly supported former fields. An
 invalid optional implementation graph is dropped instead of rejecting the
 sidecar.
 
+The sidecar's `transcriptSeq` is the last sequence Chat gave out when its entries no longer say it:
+after a Retry took out the entries that held it. It is written only then, and a thread keeps the
+same number in `chat_threads.last_seq` (migration 042), so a restart whose clock is behind gives
+out no sequence a browser has already seen. An earlier release refuses a sidecar that has
+`transcriptSeq`; rolling back past this release needs the key removed from those sidecars, and
+`ALTER TABLE chat_threads DROP COLUMN last_seq;` with
+`DELETE FROM chopin_migrations WHERE id = '043_chat_thread_seq';`.
+
 Conversation state version two lives inside that sidecar and has separate
 decision/research analysis queues. Research offers retain exact source references,
 topic and placement identities, generation metadata, bounded shared text-CRDT
@@ -50,7 +58,8 @@ Every adapter must provide:
 - atomic first-Planner ownership with a generation token;
 - active-only channel lists and scans by default, with explicit archived
   inclusion and direct archived reads;
-- idempotent archive and restore transitions and archived-only atomic deletion;
+- idempotent archive and restore transitions, and atomic deletion of a top-level
+  document, active or archived, with its children, under the writer lease;
 - repository-scoped canonical and historical slug resolution without rebinding
   aliases;
 - expiring session rows with optional opaque encrypted credentials;
@@ -120,16 +129,22 @@ applied migration. The application schema contains:
 | `machine_choices` | Each person's chosen machine for one document; no row is automatic. Revoking the machine or deleting the document removes it. |
 | `machine_favorites` | Each person's one favorite machine, their own or a teammate's shared one, which Automatic prefers; no row is none. Revoking the machine removes it; its owner no longer sharing it removes teammates' (not its owner's). |
 | `document_versions` | Activity history: one row per editing session with its author (absent for Chopin), the canonical MDX it left, revision, hash, and start and end times. |
-| `workflow_run_stages` | Every stage of each workflow run a document's Chat shows, keyed by document, run ID and stage ID, with its order, status, name, kind, parent stage IDs and start and end seconds. Bounded per stage, not per run. A run's rows go when Chat stops showing its card, or with the document. |
-| `planner_link_holds` | One row per document whose remote Planner link left work or a hand-over window for the next process: the owner's browser login session (the row goes with it) or the paired machine (and no login, which a restart cannot keep), user, generation, its held sessions (waiting request IDs, with the kind and decisions of each question so its answer can be given again, unacknowledged answers, held stops), when it was suspended, `handover_until` (the length of its hand-over window after the write, which the next process counts again from its own start and then rewrites the row without, so no process after it is given the window), and the fencing token it was written under. Written when a link drops with work kept and at the cut, removed while a live link backs the hold and by everything that ends one, and with the document. Holds no secret. |
-| `planner_model_choices` | One row per document whose people chose a model or a thinking level for its Planner: either or both (a row with neither is removed), who chose last and when, and the fencing token it was written under. Written under the writer lease before the choice is answered or shown to the room, replaced whole by the next choice, and removed with the document. The strings are not checked here: the server resolves them against the catalog the harness or attached client reports at the turn that uses them, so a model that has gone stays stored, and returns to force if it comes back. Holds no secret. |
+| `workflow_run_stages` | Kept, but no longer written or read: every stage of each workflow run an earlier release's Chat showed, keyed by document, run ID and stage ID, with its order, status, name, kind, parent stage IDs and start and end seconds. Chat shows no run cards now. Rows go with the document. |
+| `planner_link_holds` | One row per document whose remote Planner link left work or a hand-over window for the next process: the owner's browser login session (the row goes with it) or the paired machine (and no login, which a restart cannot keep), user, generation, its held sessions (waiting request IDs, with the kind and decisions of each question so its answer can be given again, unacknowledged answers, and an always empty `stops` that an earlier release reads), when it was suspended, `handover_until` (the length of its hand-over window after the write, which the next process counts again from its own start and then rewrites the row without, so no process after it is given the window), and the fencing token it was written under. Written when a link drops with work kept and at the cut, removed while a live link backs the hold and by everything that ends one, and with the document. Holds no secret. |
+| `planner_model_choices` | One row per document whose people chose a model or a thinking level for its Planner: either or both (a row with neither is removed), who chose last and when, and the fencing token it was written under. Written under the writer lease before the choice is answered or shown to the room, or, for a document the Planner creates, in the transaction that creates it (the creating document's choice, fenced the same way); replaced whole by the next choice, and removed with the document. The strings are not checked here: the server resolves them against the catalog the harness or attached client reports at the turn that uses them, so a model that has gone stays stored, and returns to force if it comes back. Holds no secret. |
+| `planner_catalogs` | One row per document and account: the models a remote Planner of the document last reported for that account (the catalog the composer lists, as JSON), when, and the fencing token it was written under. Written under the writer lease when an attached client reports models that differ from the last saved; a report with no models leaves it. Read only to show that account, and no one else, the list from last time while no Planner of the document has said what it offers: the document's own row, else the account's latest on any document (indexed by account and time); a choice is never checked against it. Removed with the document or the account. Holds no secret. |
 | `planner_credentials` | The SHA-256 digest, machine, document and expiry of each credential a paired machine handed to a Planner backend, written before the credential is handed out. Rows go when they expire, with the machine's end or withdrawal, and with the document. No token is stored. |
+| `machine_databases` | One row per paired machine given a login to the database of `MACHINE_STORE_URL`: its role (named after the machine's id), the password as AES-GCM ciphertext under a key derived from `SESSION_ENCRYPTION_KEY` and bound to the machine, role and revision, a rotation's new password apart until PostgreSQL has it, and the login's state (`pending`, `ready`, `failed` with why, `disabled` once the machine is revoked, `dropped` after `MACHINE_STORE_RETENTION_DAYS`). No password is stored in plain text. |
 | `planner_deferred_turns` | Kept, but no longer written or read: one row per Planner request an earlier release acknowledged before its turn had started (`composer`, `invoke_planner`, `invoke_system`, `comment` or `draft`), with its state (`waiting`, `started`, `ended`, `interrupted`, `cancelled`) and the fencing token of its latest transition. Nothing is held for a Planner now. At start the writer lease's holder closes the open rows (see [A live database from an earlier release](#a-live-database-from-an-earlier-release)). Rows go with the document. |
+| `ai_credentials` | One row per person and AI provider they connected (`github-copilot`, `openai`, `anthropic`, `chatgpt`, `claude`): how (`api-key`, `github-sign-in` for Copilot, or `subscription` for a ChatGPT or Claude sign-in) and when. A sign-in's tokens are AES-GCM ciphertext like a key's, with no suffix; `ciphertext` holds those the sign-in returned and names the connection, and `tokens` the pair its latest refresh returned, written only over the pair that refresh began from. A sign-in is saved only over the connection stored when its code's exchange began, or while none is stored if none was, so one that finishes after a newer sign-in was saved, or after the one it began from was removed, saves nothing. An API key is AES-GCM ciphertext under a key derived from `SESSION_ENCRYPTION_KEY`, bound to the person and provider, with its last four characters (`suffix`) to tell keys apart; a GitHub sign-in stores nothing, as Chopin reads the sign-in it holds, and a person with no Copilot row uses Copilot through that sign-in. `last_used_at` is when a launch last sent a request with the credential, saved unless a use in the same minute or a later one is saved already, never moved back, and only for the credential that was sent. `rejected_at` is when the provider answered a request with that very key that the key is invalid (OpenAI's `invalid_api_key`, Anthropic's `authentication_error`, on a 401): no launch is given it until it is connected again, and only the key that was sent is marked, never one that replaced it. Replaced whole when the provider is connected again, which clears `last_used_at` and `rejected_at`, removed when it is disconnected. |
+| `ai_placeholders` | The SHA-256 digest of each AI placeholder a launch was handed, with the launch, the digest of its launch credential, its person, provider, optional machine and document, what it is for (`owner`: `run:<id>`, `session:<id>` or a link's catalog launch, `link:<id>`, migration 046, absent on earlier rows), and expiry, written before the placeholder is handed out and found by the placeholder's digest, the launch credential's digest then compared with the request's. A launch on a document records the document's `archive_generation` it was prepared in, and its rows are written only while the document is open in that generation. Rows go when their launch ends or expires, when the writer lease's holder finds nothing owns their launch any longer (its run ended, no session or link holds it), with the machine's revocation, and when the document is archived (in the same transaction, so a restore brings none back) or deleted. Ending a launch or a machine's launches, revoking a machine, archiving a document, and connecting, replacing, removing or marking a credential refused are each counted in the process's memory as they commit (`AiCutoffs`), which the credential proxy reads around its final check. Each is written under the writer lease, checked in its own transaction as other fenced writes are, so a process that no longer holds the lease commits none and is refused rather than acknowledge one its successor would not count; one process under the writer lease makes the count exact while it holds the lease, a process whose lease was released, lost or past its deadline sends and serves nothing, and nothing of the count is stored. No placeholder, launch credential or AI credential is stored. |
+| `ai_usage` | One row per request the AI credential proxy is about to send: a random id, the launch, the person, the provider, the model the request named, and its outcome (`pending`, `ok`, `error`, `unsent` or `unknown`) with the provider's status, a short error code and the input, output, cache read and cache write token counts the provider reported. Written as `pending` under the writer lease, with its name and fencing token, before the request is sent; completed once under the lease when its answer ends, and a completion sent again changes nothing. At start the lease's holder marks every row an earlier holding of the lease left `pending` as `unknown`. Ended rows are removed 90 days after they started. Holds no secret and no request or answer text. |
 | `mcp_sessions` | MCP sessions: ID, user, client name and version, creation and last-seen times. Idle sessions are swept. |
+| `mcp_invocations` | `invoke_planner` calls made with an idempotency key: one row per caller, document and key, with a fingerprint of the request, the ID of the Chat entry the instruction is posted as, the result returned to every retry (fixed when the key is claimed), and when the call was marked invoked, or uncertain. Claimed under the writer lease before the instruction is posted and marked invoked once the instruction reached a turn (its own turn started, or the person's turn running took it), or uncertain when it was given to a running turn whose machine did not confirm it (a record never delivered again), before the call answers; until then the document's Chat says whether the instruction was posted, and a row whose instruction was not is removed when its call is refused or taken over by a different request under the key. Expired after 7 days and swept with idle MCP sessions, and removed with the document. Holds no instruction text. |
 | `decision_answers` | Saved answers to decisions the Planner left open, one row per document and decision: the saved generation, when it was saved, the Planner turn claimed to carry it and when that turn was delivered. A newer generation replaces the row and waits again; a delivered row stays marked so it never runs twice. Rows go with the document. |
 | `chat_attachments` | The images and text files sent with Chat messages, one row per file: its bytes, its sniffed type (a PNG, JPEG, WebP or GIF image, or plain text, held by a check, never HTML or SVG), its name and size, who uploaded it and when. A row has no message until one is sent with it (then the message's request ID and the file's place in it); until then only its uploader reads it, and one nobody sent within a day is forgotten. Deleting the message or the document removes it. |
-| `chat_threads` | One row per Chat thread in a document, keyed by `(channel_id, root_id)`: the root message snapshot, fork timestamp, creator, reply entries, compaction records, latest context usage, fork provenance (`bootstrapEntries`, Atomic branched session entries/leaf or remote `from`), update time and writer-lease fencing token. Stored outside the document sidecar so an earlier release reads the sidecar unchanged. Rows go with the document. |
-| `chat_session_state` | One row per document with top-level Chat compactions, context usage, Atomic session entries/leaf and per-entry fork points (`entry_forks_json`), fenced by the writer lease and removed with the document. |
+| `chat_threads` | One row per Chat thread in a document, keyed by `(channel_id, root_id)`: the root message snapshot, fork timestamp, creator, reply entries (with the server-only marks that keep a reaction from being answered twice: an answer to a reaction, and which readings of a reaction were answered), the last entry sequence the thread gave out (`last_seq`), compaction records, latest context usage, fork provenance (`bootstrapEntries`, Atomic branched session entries/leaf or remote `from`), the Decision cards the thread's Planner asked (`asked_questions_json`), update time and writer-lease fencing token. Stored outside the document sidecar so an earlier release reads the sidecar unchanged. Rows go with the document. |
+| `chat_session_state` | One row per document with top-level Chat compactions, context usage, Atomic session entries/leaf, per-entry fork points (`entry_forks_json`), the notes threads' Planners sent the Chat Planner that it has not read (`thread_notes_json`), every Decision card a note was sent for (`noted_questions_json`) and the notes its latest turn for a message was given, for a Retry (`given_notes_json`), fenced by the writer lease and removed with the document. |
 | `plan_images` | Images a document holds, one row per document and SHA-256 of the image's bytes: its type (PNG, JPEG, WebP, GIF, AVIF, BMP or ICO), the bytes, their size, and who stored them and when. `size` is always the length of `bytes` and has no limit of its own in the table; what brings an image bounds it: the 1 MiB of `upload_image`, and for an image a tool made, whichever harness ran the tool, the server's `MAX_STORED_IMAGE_BYTES` (10 MiB by default) and, over the agent connection, its 2 MiB message limit. The server refuses a larger one before it decodes it, so the table never holds one. Rows go with the document. |
 
 `channel_state.unanswered_decisions` is maintained in JavaScript rather than a
@@ -148,6 +163,19 @@ projection: value, independent description revision, source plan revision and
 hash, generator version, source job ID, and projection timestamp. A newer job
 does not clear the current projection when it is enqueued or fails, so the last
 completed description remains visible and searchable.
+
+`channels.archive_generation` counts how many times a document has been
+archived, and a restore never takes it back. An AI launch on a document writes
+its placeholders only while the document is open in the generation the launch
+began in, checked under a shared lock on the document's row, which archiving
+locks for update; so a launch prepared before an archive keeps nothing after it,
+whether or not the document was restored.
+
+`channels.planner_reset_at` is when a repository writer last reset the document's
+Planner (migration 052), written before the reset ends the Planner's link; each reset
+is later than the one before. A paired machine's Planner credential names it, and the
+machine removes its Planner's disk made before it (see
+[NVX microVMs](nvx-sandbox.md)).
 
 Display titles may repeat. Slug values remain unique per repository, with one
 canonical slug per channel. Authored title changes commit the document state,
@@ -192,15 +220,32 @@ Workspace compatibility listing apply the same active-only default; the current
 browser does not use that listing as a product surface.
 
 Archive and restore lock and update the channel row and are no-ops when it is
-already in the requested state. Deletion also locks the row and refuses an
-active channel. A parent cannot be deleted while it still has a child, and a
-published child cannot be deleted while its research request or investigation
-record retains that link. Deleting an eligible archived channel is one transaction: foreign
-keys cascade every channel-owned sidecar, snapshot, journal, event, operation,
-Planner state, implementation state, slug, background job and artifact, and
-research staging record. A saved navigation reference is set to null.
+already in the requested state.
 
-Full deletion leaves no live tombstone. It removes historical aliases and the
+Deletion (`channels.delete`) is the permanent counterpart: archive is reversible
+and keeps every row, deletion keeps none. It takes the writer lease and checks it in
+its own transaction, as every write that ends AI authority does, and counts as an AI
+cutoff. It locks the document's row and then its children's, refuses a child (a
+child goes only with its parent), and deletes active and archived documents alike.
+Children reference their parent, and the research requests and investigations that
+published a child reference that child, with `ON DELETE RESTRICT`, so the
+transaction deletes in order: those requests and investigations (all the parent's
+own), then the children, then the document. Foreign keys cascade the rest of each:
+sidecar, snapshot, journal, event, operation, Planner state and holds, AI
+placeholders, machine choices and Planner credentials, model choices and lists,
+Chat threads and attachments, images, decision answers, history, MCP invocation
+records, implementation state, slugs, background jobs and artifacts, and research
+staging. A saved navigation reference is set to null. All of it goes, or none: a
+transaction that fails, such as one whose writer lease was lost, changes nothing. It
+answers the documents it deleted, the document first, and nothing for one already
+gone, so a repeat is harmless. A write that arrives after it, whatever store it is
+for, finds no channel row and is refused, so no row comes back; the memory adapter
+behaves the same, and the storage contract runs these rules against both
+(`deletion-contract.ts`).
+
+Full deletion leaves no live tombstone. The serving process remembers a deleted
+document in memory for ten minutes, only so a repeated delete is answered as the
+first was; nothing of it is stored. Deletion removes historical aliases and the
 MCP creation idempotency identity, so former slugs can be reused and the same
 MCP idempotency key can create a fresh document at its deterministic UUID. Reads
 and implementation lifecycle reports for the deleted document return
@@ -322,7 +367,7 @@ when it attaches.
 
 A child document has no Chat of its own. Next, still under the writer lease and
 before any room opens, `CollaborationStore.dropChildConversations` empties each
-child's transcript and removes its workflow runs, conversation analysis, card
+child's transcript and removes the run cards an earlier release saved, conversation analysis, card
 mirrors, and effect outbox from both `channel_state` and the latest
 `channel_snapshots` row, and resets that child's reserved summary and transcript
 cursor. Question records, comment threads, and the document are untouched. A

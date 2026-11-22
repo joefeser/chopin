@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { contractId as id, openedStorage, userAndChannel } from "./contract-support";
+import { contractId as id, openedStorage, testLease, userAndChannel } from "./contract-support";
 import { StorageError } from "./errors";
 
 import type { StorageFactory } from "./contract-support";
@@ -105,8 +105,9 @@ export function decisionAnswerContract(name: string, factory: StorageFactory) {
 					{ decisionId: "d1", generation: 3, savedAt: AT },
 				]);
 
-				await storage.channels.archive({ id: first.channelId, now: AT });
-				expect(await storage.channels.delete(first.channelId)).toBe(true);
+				expect(
+					await storage.channels.delete({ id: first.channelId, lease: await testLease(storage) }),
+				).toHaveLength(1);
 				expect(await answers.pending(first.channelId)).toEqual([]);
 				expect(await answers.pending(second.channelId)).toHaveLength(1);
 

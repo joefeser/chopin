@@ -41,7 +41,7 @@ export function OverlayScrollbar(
 		let height = 0;
 		// The thumb is drawn never shorter than its floor. It is read once, from style alone, so the
 		// thumb's travel always counts the box it is drawn in: counted from the size it is asked for, a
-		// thumb held at its floor (a long transcript, or one the runs card has shortened) was moved past
+		// thumb held at its floor (a long transcript, or one the build card has shortened) was moved past
 		// the lane's end, where the lane's paint containment cut it off.
 		let floor = Number.parseFloat(getComputedStyle(bar).minHeight) || 0;
 		let size = 0;
@@ -53,9 +53,14 @@ export function OverlayScrollbar(
 		let scrolling = false;
 		let pointed = false;
 		let frame = 0;
+		let progress = scrollProgress(view);
 		// Every write is the thumb's and waits for the next frame, where the page is styled anyway.
 		let draw = () => {
 			frame = 0;
+			// Where the thumb is comes from how far the view has scrolled in this frame. An offset taken
+			// in an earlier scroll event against the range then is stale once the transcript grows with no
+			// scroll after it, as a thread opened at its newest line does while its rows mount.
+			if (progress) offset = progress() * range;
 			if (bar.style.height !== `${size}px`) bar.style.height = `${size}px`;
 			bar.style.translate = range > 0
 				? `0 ${Math.round(Math.min(1, offset / range) * travel * 100) / 100}px`
@@ -95,7 +100,6 @@ export function OverlayScrollbar(
 		observer.observe(stack, { box: "border-box" });
 		observer.observe(lane, { box: "border-box" });
 
-		let progress = scrollProgress(view);
 		let scrolled = () => {
 			offset = progress ? progress() * range : view.scrollTop;
 			scrolling = true;

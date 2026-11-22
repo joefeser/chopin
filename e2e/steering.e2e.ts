@@ -214,6 +214,11 @@ async function machine(
 				return finishTurn(context);
 			}
 			prompts.push(context.message.prompt);
+			if (context.message.prompt.includes("FAIL")) {
+				context.emit({ type: "stream-start", modelId: "scripted" });
+				context.end("failed", "The provider went away.");
+				return;
+			}
 			received.push(Date.now());
 			context.emit({ type: "stream-start", modelId: "scripted" });
 			speak(context, "first", "Reading the plan.");
@@ -429,6 +434,110 @@ test("a message to a machine that is away is refused with the draft kept, nothin
 	}
 });
 
+test("someone with no AI account chopin can use is told so where only they see it, with a link to AI accounts, and their words return to the draft", async ({ browser, page }) => {
+	test.setTimeout(120_000);
+	let room = await open(page);
+	let planner = await machine(room);
+	let other = await teammate(browser, room, "no-copilot-ana");
+	try {
+		await say(other, "outline the plan");
+		let refusal = chat(other).locator("[data-quiet-note]");
+		await expect(refusal).toContainText("Only visible to you");
+		await expect(refusal).toContainText(
+			"chopin needs an AI account to answer, so this message wasn't sent. Add one, then send it again.",
+		);
+		await expect(refusal).not.toContainText(/subscription/i);
+		await expect(refusal.getByRole("link", { name: "Open AI accounts", exact: true }))
+			.toHaveAttribute("href", "/ai-accounts");
+		await expectChatValue(chatInput(other), "@chopin outline the plan");
+		await expect(message(other, "outline the plan")).toHaveCount(0);
+		await expect(chat(other).locator("[data-chat-failed]")).toHaveCount(0);
+
+		await expect(chat(page).locator("[data-quiet-note]")).toHaveCount(0);
+		await expect(message(page, "outline the plan")).toHaveCount(0);
+		expect(planner.prompts).toEqual([]);
+
+		// The link is followed in place, as the page's own links are: no new page load.
+		await other.evaluate(() => Object.assign(window, { stayedOnPage: true }));
+		await refusal.getByRole("link", { name: "Open AI accounts", exact: true }).click();
+		await expect(other).toHaveURL(`${ORIGIN}/ai-accounts`);
+		expect(await other.evaluate(() => "stayedOnPage" in window)).toBe(true);
+	} finally {
+		await planner.client.detach();
+	}
+});
+
+test("a reply in a thread from someone with no AI account is refused where only they see it, with a link to AI accounts, and stays in the thread's draft", async ({ browser, page }) => {
+	test.setTimeout(120_000);
+	let room = await open(page);
+	let planner = await machine(room);
+	let other = await teammate(browser, room, "no-copilot-ana");
+	try {
+		let input = chatInput(page);
+		await fillChat(input, "The rollback needs a plan.");
+		await input.press("Enter");
+		let root = chat(other).locator(".chat-message-body", { hasText: "The rollback needs a plan." });
+		await root.hover();
+		await root.getByRole("button", { name: "Reply in thread" }).click();
+		let panel = other.locator("[data-thread-panel]");
+		await expect(panel).toBeVisible();
+
+		let reply = chatInput(panel);
+		await fillChat(reply, "@chopin draft the rollback");
+		await reply.press("Enter");
+		let refusal = panel.locator("[data-quiet-note]");
+		await expect(refusal).toContainText("Only visible to you");
+		await expect(refusal).toContainText(
+			"chopin needs an AI account to answer, so this message wasn't sent. Add one, then send it again.",
+		);
+		await expect(refusal.getByRole("link", { name: "Open AI accounts", exact: true }))
+			.toHaveAttribute("href", "/ai-accounts");
+		await expectChatValue(reply, "@chopin draft the rollback");
+		await expect(panel.locator('[data-slot="error-state"]')).toHaveCount(0);
+		await expect(panel.locator(".chat-message-body", { hasText: "draft the rollback" }))
+			.toHaveCount(0);
+		await expect(page.locator("[data-quiet-note]")).toHaveCount(0);
+		expect(planner.prompts.filter(prompt => prompt.includes("draft the rollback"))).toEqual([]);
+	} finally {
+		await planner.client.detach();
+	}
+});
+
+test("a Retry refused because its sender no longer has an AI account keeps the failed reply, says why and points to AI accounts", async ({ browser, page }) => {
+	test.setTimeout(120_000);
+	let room = await open(page);
+	let planner = await machine(room);
+	let other = await teammate(browser, room, "no-copilot-ana");
+	let key = `${ORIGIN}/api/ai/credentials/openai`;
+	try {
+		let added = await other.request.put(key, {
+			headers: { origin: ORIGIN },
+			data: { kind: "api-key", secret: "sk-e2e-ana-0001" },
+		});
+		expect(added.ok()).toBe(true);
+		await say(other, "FAIL the outline");
+		let failure = chat(other).locator('[data-slot="error-state"]');
+		await expect(failure).toContainText("The provider went away.");
+		let retry = failure.getByRole("button", { name: "Retry", exact: true });
+		await expect(retry).toBeVisible();
+
+		expect((await other.request.delete(key, { headers: { origin: ORIGIN } })).status()).toBe(204);
+		await retry.click();
+		await expect(failure).toContainText(
+			"chopin needs an AI account to answer, so this message wasn't sent. Add one, then send it again.",
+		);
+		await expect(failure).toContainText("Couldn't finish the reply.");
+		await expect(failure.getByRole("link", { name: "Open AI accounts", exact: true }))
+			.toHaveAttribute("href", "/ai-accounts");
+		await expect(retry).toBeVisible();
+		await expect(message(other, "FAIL the outline")).toHaveCount(1);
+		await expect(message(page, "FAIL the outline")).toHaveCount(1);
+		expect(planner.prompts).toHaveLength(1);
+	} finally {
+		await planner.client.detach();
+	}
+});
+
 test("alone, a message without the mention is Chopin's: refused while no machine is there, then a turn at once, and given to the turn that runs", async ({ page }) => {
 	test.setTimeout(90_000);
 	let room = await open(page);
@@ -530,6 +639,40 @@ test("a machine that takes no message mid-run refuses one sent while it works, k
 		expect(planner.prompts[1]).toContain("cover the rollback too");
 		await expect(refusal).toHaveCount(0);
 		await expectChatValue(input, "");
+		planner.release();
+	} finally {
+		await planner.client.detach();
+	}
+});
+
+test("chopin's note only one person sees stays at its own time, above what is said after it", async ({ browser, page }) => {
+	test.setTimeout(120_000);
+	let room = await open(page);
+	let planner = await machine(room, { steers: false });
+	let other = await teammate(browser, room, "hubot");
+	try {
+		await say(page, "outline the plan");
+		await expect(READING(page)).toBeVisible();
+		await say(page, "and cover the rollback too");
+		let refusal = chat(page).locator("[data-quiet-note]");
+		await expect(refusal).toContainText(CANNOT);
+
+		// A later second than the note's, so that the order is the note's time and not a tie.
+		await page.waitForTimeout(1_100);
+		let otherInput = chatInput(other);
+		await fillChat(otherInput, "sounds good to me");
+		await otherInput.press("Enter");
+		let later = chat(page).locator("[data-chat-message-id]").filter({
+			hasText: "sounds good to me",
+		});
+		await expect(later).toHaveCount(1);
+		await expect(refusal).toHaveCount(1);
+		let noteFirst = await refusal.evaluate(
+			(note, after) =>
+				!!(note.compareDocumentPosition(after as Node) & Node.DOCUMENT_POSITION_FOLLOWING),
+			await later.elementHandle(),
+		);
+		expect(noteFirst).toBe(true);
 		planner.release();
 	} finally {
 		await planner.client.detach();

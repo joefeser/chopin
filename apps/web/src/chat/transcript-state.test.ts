@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 
 import { group } from "./model";
+import { refusedWhileBusy } from "./assistant-ui/send-stop";
 import {
 	initialTranscript,
 	offersStop,
@@ -11,6 +12,7 @@ import {
 } from "./transcript-state";
 
 import type { Chat } from "@chopin/protocol";
+import type { TranscriptState } from "./transcript-state";
 
 let turn: Chat.Turn = {
 	id: "turn-1",
@@ -129,6 +131,49 @@ describe("transcript work retention", () => {
 			id: "read-b",
 		}]);
 	});
+
+	it("draws a turn's work on the row it began on when an entry read before that row arrives later", () => {
+		let messages = (state: TranscriptState) =>
+			group(state.entries, progressOf(state, true, false).working, state.completedWork).flatMap(
+				item => item.kind === "messages" ? item.messages : [],
+			);
+		let state = transcriptReducer(initialTranscript, {
+			kind: "history",
+			entries: [entry("prompt", { kind: "member", handle: "ana" })],
+			turn,
+		});
+		state = transcriptReducer(state, {
+			kind: "message",
+			entry: {
+				...entry("prose", { kind: "agent" }, "I found it."),
+				ts: 1_700_000_002,
+				streaming: true,
+			},
+		});
+		// Its earlier time places the tool's entry above the prose that arrived first.
+		state = transcriptReducer(state, {
+			kind: "message",
+			entry: entry("tool-entry", { kind: "agent" }),
+		});
+		state = transcriptReducer(state, {
+			kind: "tool",
+			entryId: "tool-entry",
+			activity: { id: "read", name: "read_plan", status: "running" },
+		});
+
+		expect(state.entries.map(item => item.id)).toEqual(["prompt", "tool-entry", "prose"]);
+		let working = messages(state);
+		expect(working.filter(message => message.working)).toMatchObject([{
+			id: "prose",
+			tools: [{ id: "read" }],
+		}]);
+		expect(working.find(message => message.id === "tool-entry")?.tools).toBeUndefined();
+
+		state = transcriptReducer(state, { kind: "turn" });
+		let ended = messages(state);
+		expect(ended.find(message => message.id === "prose")?.tools).toMatchObject([{ id: "read" }]);
+		expect(ended.find(message => message.id === "tool-entry")?.tools).toBeUndefined();
+	});
 });
 
 describe("how a turn in progress is shown while its connection is lost", () => {
@@ -234,7 +279,8 @@ describe("a quiet turn: nothing left of it is for people to watch", () => {
 		let quiet = { ...turn, quiet: true };
 		expect(offersStop(true, turn, false)).toBe(true);
 		expect(offersStop(true, quiet, false)).toBe(false);
-		expect(offersStop(true, quiet, true)).toBe(true);
+		expect(offersStop(true, quiet, refusedWhileBusy(true, "planner-busy", true))).toBe(true);
+		expect(offersStop(true, quiet, refusedWhileBusy(true, "planner-starting", true))).toBe(false);
 		expect(offersStop(false, undefined, false)).toBe(false);
 		// A server that does not say which turn runs keeps its Stop.
 		expect(offersStop(true, undefined, false)).toBe(true);
@@ -337,17 +383,24 @@ describe("message reactions", () => {
 		expect(next.turn).toBe(state.turn);
 	});
 
-	it("clears them when the last one is taken back, and ignores a message it does not have", () => {
+	it("clears them when the last one is taken back, and keeps those of a message not yet shown for it", () => {
 		let state = transcriptReducer(initialTranscript, {
 			kind: "history",
 			entries: [{ ...entry("a", { kind: "agent" }, "one"), reactions: [reaction("✅", "ana")] }],
 		});
 		let cleared = transcriptReducer(state, { kind: "reactions", id: "a", reactions: [] });
 		expect(cleared.entries[0]!.reactions).toBeUndefined();
-		expect(
-			transcriptReducer(state, { kind: "reactions", id: "gone", reactions: [reaction("✅", "x")] }),
-		)
-			.toBe(state);
+		let early = transcriptReducer(state, {
+			kind: "reactions",
+			id: "later",
+			reactions: [reaction("✅", "x")],
+		});
+		expect(early.entries).toEqual(state.entries);
+		let arrived = transcriptReducer(early, {
+			kind: "message",
+			entry: entry("later", { kind: "agent" }, "two"),
+		});
+		expect(arrived.entries.at(-1)!.reactions).toEqual([reaction("✅", "x")]);
 	});
 
 	it("keeps a message's reactions when its entry is replaced by a streamed one", () => {

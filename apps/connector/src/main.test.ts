@@ -1,7 +1,8 @@
 import { afterAll, expect, test } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, delimiter, join } from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -13,7 +14,10 @@ import {
 import { installService, type ServiceHost } from "./service";
 import { collectStatus, formatStatus } from "./status";
 import { CONNECTOR_PROTOCOL, VERSION } from "./version";
-import { git } from "./workspace";
+import { runCli } from "./main";
+import { answerTokens } from "./testing/github-grant";
+import { hostRecipes, hostSandbox, SUPPORTED_HOST } from "./testing/host-sandbox";
+import { git, lockWorkspace } from "./workspace";
 
 let scratch = await mkdtemp(join(tmpdir(), "chopin-main-"));
 afterAll(() => rm(scratch, { recursive: true, force: true }));
@@ -121,7 +125,7 @@ async function connect(
 	let connector = Bun.spawn([
 		process.execPath,
 		"--no-env-file",
-		join(import.meta.dir, "main.ts"),
+		join(import.meta.dir, "testing", "chopin-on-host.ts"),
 		"connect",
 		...args ?? [await checkout(), "--", "agent"],
 	], {
@@ -173,6 +177,7 @@ test("connect stops without retrying when the connector endpoint refuses its ver
 	expect(result.requests).toEqual([
 		["/api/connector/pairings", ...headers],
 		["/api/connector/pairings/pairing/claim", ...headers],
+		["/api/connector/machine-store", ...headers],
 		["/api/connector/connections", ...headers],
 		["/connector/mcp", ...headers],
 	]);
@@ -357,7 +362,7 @@ test("connect --keep-runs saves how many finished runs to keep, and removes olde
 });
 
 test.skipIf(process.platform === "win32")(
-	"the start check that names the agent once connected runs in an empty folder of its own where no checkout is registered, not the home directory, and in the checkout where one is",
+	"the start check that names the agent once connected runs in an empty folder in chopin's state directory, never the home directory, a checkout or the shared temporary directory",
 	async () => {
 		let record = join(scratch, "check-cwd");
 		await writeFile(
@@ -367,32 +372,29 @@ test.skipIf(process.platform === "win32")(
 		);
 		let asked = async (args: string[]) => {
 			await rm(record, { force: true });
-			let result = await connect("nothing", args, undefined, { PROBE_CWD: record });
+			// Only --env reaches an agent: nothing of the connector's own environment does.
+			let result = await connect("nothing", [`--env=PROBE_CWD=${record}`, ...args]);
 			expect(result.code).toBe(0);
 			for (let wait = 0; wait < 100 && !(await Bun.file(record).exists()); wait++) {
 				await Bun.sleep(50);
 			}
 			let [where = "", ...names] = (await readFile(record, "utf8")).trim().split("\n");
-			return { where, names };
+			return { where, names, directory: result.directory };
 		};
-		let alone = await asked(["--no-sandbox", "--", "probe-cwd"]);
-		expect(alone.where).not.toBe(homedir());
-		expect(await realpath(dirname(alone.where))).toBe(await realpath(tmpdir()));
-		// Nothing in it to read, and it is gone with the connector.
-		expect(alone.names).toEqual([]);
-		await expect(stat(alone.where)).rejects.toThrow();
-		let root = await checkout();
-		let registered = await asked([root, "--no-sandbox", "--", "probe-cwd"]);
-		expect(registered.where).toBe(await realpath(root));
+		for (let args of [["--", "probe-cwd"], [await checkout(), "--", "probe-cwd"]]) {
+			let { where, names, directory } = await asked(args);
+			expect(await realpath(where)).toBe(await realpath(join(directory, "nvx", "check")));
+			// Nothing in it to read.
+			expect(names).toEqual([]);
+		}
 	},
 );
 
-test("connect saves the sandbox options for service install, says what the sandbox is, and refuses nonsense before it pairs", async () => {
+test("connect saves the sandbox options for service install, says where agents run, and refuses nonsense before it pairs", async () => {
 	let root = await checkout();
 	let write = join(scratch, "extra-writable");
 	let started = await connect("nothing", [
 		root,
-		"--require-sandbox",
 		"--sandbox-host",
 		"store.example.com:8443",
 		"--sandbox-host=*.corp.test",
@@ -404,39 +406,44 @@ test("connect saves the sandbox options for service install, says what the sandb
 		"agent",
 	]);
 	expect(started.code).toBe(0);
-	// Where this machine has no sandbox it says so, and that runs are refused.
-	expect(started.stdout).toMatch(
-		/Sandboxed \((macOS Seatbelt|Linux bubblewrap|Windows ProcessContainer)\)|Not sandboxed: .* Runs are refused \(--require-sandbox is on\)\./,
-	);
+	expect(started.stdout).toContain("Each agent in its own microVM (NVX on KVM)");
 	expect(JSON.parse(await readFile(join(started.directory, "config.json"), "utf8")).connect.sandbox)
 		.toEqual({
-			require: true,
 			hosts: ["store.example.com:8443", "*.corp.test"],
 			writable: [write],
 			hidden: [join(write, "sign-in")],
 		});
-	let off = await connect("nothing", [root, "--no-sandbox", "--", "agent"]);
-	expect(off.code).toBe(0);
-	expect(off.stdout).toContain(
-		"Not sandboxed: It is turned off with --no-sandbox. Runs go on without it.",
-	);
-	expect(JSON.parse(await readFile(join(off.directory, "config.json"), "utf8")).connect.sandbox)
-		.toEqual({ off: true });
 	for (
 		let [args, message] of [
-			[
-				["--require-sandbox", "--no-sandbox"],
-				"--require-sandbox and --no-sandbox can't be used together.",
-			],
+			// There is no process sandbox to require or turn off: every agent runs in a microVM.
+			[["--require-sandbox"], "Unknown option: --require-sandbox"],
+			[["--no-sandbox"], "Unknown option: --no-sandbox"],
 			[["--sandbox-host", "https://example.com"], "--sandbox-host takes a host like example.com"],
 			[["--sandbox-host", "*"], "--sandbox-host takes a host like example.com"],
 		] as const
 	) {
 		let refused = await connect("pairing", [root, ...args, "--", "agent"]);
-		expect(refused.code).toBe(1);
+		expect(refused.code).not.toBe(0);
 		expect(refused.stderr).toContain(message);
 		expect(refused.requests).toEqual([]);
 	}
+});
+
+test("a machine that can't run microVMs is told what it needs and the fix, and pairs nothing", async () => {
+	let root = await checkout();
+	let refused = await connect("pairing", [root, "--", "agent"], undefined, {
+		CHOPIN_TEST_KVM: "denied",
+	});
+	expect(refused.code).toBe(1);
+	expect(refused.stderr).toContain(
+		"This machine can't run Chopin's work: Chopin runs each agent in its own microVM, which needs "
+			+ "Linux or Windows on x86_64 with hardware virtualization. Your user can't read and write "
+			+ "/dev/kvm.",
+	);
+	expect(refused.stderr).toContain("Fix: sudo usermod -aG kvm $USER");
+	// Nothing reached Chopin: no pairing key was spent and no browser opened.
+	expect(refused.requests).toEqual([]);
+	expect(await Bun.file(join(refused.directory, "config.json")).exists()).toBe(false);
 });
 
 test("connect refuses a --keep-runs that isn't a whole number, before it pairs", async () => {
@@ -517,7 +524,15 @@ test.skipIf(process.platform === "win32")(
  * an older chopin saved them.
  */
 function installed(directory: string, server: string, checkout: string) {
-	let settings = { server, checkout, command: ["old-agent"], planners: [], plannerCommand: [] };
+	let settings = {
+		server,
+		checkout,
+		command: ["old-agent"],
+		// How its microVMs' image gets it.
+		install: ["npm install -g old-agent"],
+		planners: [],
+		plannerCommand: [],
+	};
 	let service = {
 		executable: "/opt/chopin",
 		directory,
@@ -679,63 +694,117 @@ test.skipIf(process.platform === "win32")(
 );
 
 test.skipIf(process.platform === "win32")(
-	"connect stops before it pairs when the agent or Planner isn't installed, saying how to get it",
+	"an agent runs from its microVM's own install, and one chopin can't install there is refused before it pairs",
 	async () => {
 		let root = await checkout();
-		// A PATH with git and nothing else, so no coding agent installed here is found.
+		// A PATH with git and nothing else: no coding agent is installed on this machine itself.
 		let tools = join(scratch, "tools");
 		await mkdir(tools, { recursive: true });
 		await symlink(Bun.which("git")!, join(tools, "git")).catch(() => {});
+		await symlink(Bun.which("env")!, join(tools, "env")).catch(() => {});
 		let only = { PATH: tools };
+		// A built-in agent needs no install here: its image has it.
 		let copilot = await connect(
 			"nothing",
 			[root, "--", "copilot", "--acp", "--allow-all"],
 			undefined,
 			only,
 		);
-		expect(copilot.code).toBe(1);
-		expect(copilot.stderr).toBe(
-			[
-				"copilot isn't installed, so nothing was paired or connected. Install GitHub Copilot CLI "
-				+ "(it needs Node.js 22 or newer) and sign in to it:",
-				"  (npm comes with Node.js: install Node.js 22 or newer from https://nodejs.org first)",
-				"  npm install -g @github/copilot",
-				"  copilot login",
-				"Then run this command again.",
-				"",
-			].join("\n"),
-		);
-		expect(copilot.requests).toEqual([]);
-
-		// Behind env, the program env starts is the one looked for.
+		expect(copilot.stdout).toContain("✓ Connected.");
+		// Behind env, the program env starts is the one its image is made for.
 		let atomic = await connect(
 			"nothing",
 			[root, "--", "env", "ATOMIC_ACP_HEADLESS=1", "atomic-acp"],
 			undefined,
-			{ PATH: [tools, dirname(Bun.which("env")!)].join(delimiter) },
+			only,
 		);
-		expect(atomic.code).toBe(1);
-		expect(atomic.stderr).toContain("atomic-acp isn't installed");
-		expect(atomic.stderr).toContain("  npm install -g @bastani/atomic @bastani/atomic-acp\n");
-		expect(atomic.requests).toEqual([]);
+		expect(atomic.stdout).toContain("✓ Connected.");
 
-		let unknown = await connect("nothing", [root, "--", "my-agent"], undefined, only);
+		let unknown = await connect("pairing", [root, "--", "my-agent"], undefined, only);
 		expect(unknown.code).toBe(1);
 		expect(unknown.stderr).toBe(
-			"my-agent isn't on your PATH, so nothing was paired or connected. Install it or give its "
-				+ "full path, then run this command again.\n",
+			"chopin runs my-agent in a microVM of its own and doesn't know how to install it there. "
+				+ "Add --install '<the command that installs it>', such as --install 'npm install -g "
+				+ "my-agent', then run this command again.\n",
 		);
 		expect(unknown.requests).toEqual([]);
+		let installed = await connect(
+			"nothing",
+			[root, "--install", "npm install -g my-agent", "--", "my-agent"],
+			undefined,
+			only,
+		);
+		expect(installed.stdout).toContain("✓ Connected.");
+		expect(JSON.parse(await readFile(join(installed.directory, "config.json"), "utf8")).connect)
+			.toMatchObject({ command: ["my-agent"], install: ["npm install -g my-agent"] });
 
 		let planner = await connect(
-			"nothing",
-			[root, "--planner", "https://x/d/1", "--planner-command", "my-planner --x", "--", "agent"],
+			"pairing",
+			[root, "--planner", "https://x/d/1", "--planner-command", "my-planner --x", "--", "copilot"],
 			undefined,
 			only,
 		);
 		expect(planner.code).toBe(1);
-		expect(planner.stderr).toContain("my-planner isn't on your PATH");
+		expect(planner.stderr).toContain("chopin runs my-planner in a microVM of its own");
+		expect(planner.stderr).toContain("--planner-install");
 		expect(planner.requests).toEqual([]);
+	},
+	60_000,
+);
+
+test.skipIf(process.platform === "win32")(
+	"--install-from saves its folder by full path, and is refused without a folder or a command to read it",
+	async () => {
+		let root = await checkout();
+		let inputs = await mkdtemp(join(scratch, "inputs-"));
+		let named = basename(inputs);
+		let install = "npm install -g /install-from/my-agent.tgz";
+		let installed = await connect("nothing", [
+			root,
+			"--install",
+			install,
+			"--planner-command",
+			"my-planner",
+			"--planner-install",
+			install,
+			// Relative to where connect runs; the service reads it from anywhere.
+			"--install-from",
+			named,
+			"--",
+			"my-agent",
+		]);
+		expect(installed.stdout).toContain("✓ Connected.");
+		expect(JSON.parse(await readFile(join(installed.directory, "config.json"), "utf8")).connect)
+			.toMatchObject({
+				install: [install],
+				plannerInstall: [install],
+				installFrom: await realpath(inputs),
+			});
+
+		let missing = await connect("pairing", [
+			root,
+			"--install",
+			install,
+			"--install-from",
+			"no-such-folder",
+			"--",
+			"my-agent",
+		]);
+		expect(missing.code).toBe(1);
+		expect(missing.stderr).toBe(
+			`--install-from no-such-folder: there is no folder at ${
+				join(await realpath(scratch), "no-such-folder")
+			}.\n`,
+		);
+		expect(missing.requests).toEqual([]);
+
+		let unread = await connect("pairing", [root, "--install-from", named, "--agent", "copilot"]);
+		expect(unread.code).toBe(1);
+		expect(unread.stderr).toBe(
+			"--install-from names a folder for the commands of --install and --planner-install to read, "
+				+ "and this connect has neither.\n",
+		);
+		expect(unread.requests).toEqual([]);
 	},
 	60_000,
 );
@@ -753,3 +822,221 @@ test("connect refuses --planner without a Planner command, before it pairs", asy
 	expect(refused.stderr).toContain("--planner <document URL> needs --planner-command <command>.");
 	expect(refused.requests).toEqual([]);
 });
+
+test("a connect another connector's base dir is locked by opens no microVMs, so it builds and prunes no image and exits", async () => {
+	let root = await realpath(await checkout());
+	let directory = await mkdtemp(join(scratch, "state-"));
+	let before = { state: process.env.CHOPIN_CONNECTOR_STATE_DIR, url: process.env.CHOPIN_URL };
+	process.env.CHOPIN_CONNECTOR_STATE_DIR = directory;
+	process.env.CHOPIN_URL = "http://127.0.0.1:9";
+	// The running connector.
+	let release = await lockWorkspace(directory, directory);
+	let opened = 0;
+	let closed = 0;
+	try {
+		await runCli(["connect", root, "--install", "true", "--", "agent"], {
+			support: SUPPORTED_HOST,
+			recipes: hostRecipes,
+			openSandbox: async options => {
+				opened++;
+				return hostSandbox({
+					work: join(options.directory, "work"),
+					close: async () => void closed++,
+				});
+			},
+		});
+		expect(process.exitCode).toBe(1);
+		expect({ opened, closed }).toEqual({ opened: 0, closed: 0 });
+	} finally {
+		process.exitCode = 0;
+		await release();
+		for (
+			let [name, value] of [["CHOPIN_CONNECTOR_STATE_DIR", before.state], [
+				"CHOPIN_URL",
+				before.url,
+			]]
+		) {
+			if (value === undefined) delete process.env[name!];
+			else process.env[name!] = value;
+		}
+	}
+});
+
+test("a connect whose agent fails its start check lets go of its microVMs and the base dir", async () => {
+	let root = await realpath(await checkout());
+	let directory = await mkdtemp(join(scratch, "state-"));
+	let before = { state: process.env.CHOPIN_CONNECTOR_STATE_DIR, url: process.env.CHOPIN_URL };
+	process.env.CHOPIN_CONNECTOR_STATE_DIR = directory;
+	process.env.CHOPIN_URL = "http://127.0.0.1:9";
+	let opened = 0;
+	let closed = 0;
+	try {
+		await runCli(
+			["connect", root, "--install-service", "--install", "true", "--", "no-such-agent"],
+			{
+				executable: process.execPath,
+				support: SUPPORTED_HOST,
+				recipes: hostRecipes,
+				openSandbox: async options => {
+					opened++;
+					return hostSandbox({
+						work: join(options.directory, "work"),
+						close: async () => void closed++,
+					});
+				},
+			},
+		);
+		expect(process.exitCode).toBe(1);
+		expect({ opened, closed }).toEqual({ opened: 1, closed: 1 });
+		// Nothing holds the base dir: another connector takes it.
+		await (await lockWorkspace(directory, directory))();
+	} finally {
+		process.exitCode = 0;
+		for (
+			let [name, value] of [["CHOPIN_CONNECTOR_STATE_DIR", before.state], [
+				"CHOPIN_URL",
+				before.url,
+			]]
+		) {
+			if (value === undefined) delete process.env[name!];
+			else process.env[name!] = value;
+		}
+	}
+});
+
+test.skipIf(process.platform === "win32")(
+	"a machine whose user loses /dev/kvm tells Chopin why, leaves, starts no Planner until it can run microVMs again, then connects again",
+	async () => {
+		let root = await realpath(await checkout());
+		let directory = await mkdtemp(join(scratch, "state-"));
+		// While it is there, this machine's user can't open /dev/kvm (see chopin-on-host).
+		let lost = join(scratch, `kvm-lost-${basename(directory)}`);
+		/** What Chopin saw, in order. */
+		let seen: string[] = [];
+		let told: unknown;
+		let interrupted = false;
+		let chopin = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				let path = new URL(request.url).pathname;
+				let tokens = await answerTokens(request);
+				if (tokens) return tokens;
+				if (path === "/api/connector/pairings") {
+					return Response.json({ id: "pairing", secret: "secret", url: "http://x", code: "AB" });
+				}
+				if (path === "/api/connector/pairings/pairing/claim") {
+					return Response.json({ token: `chopin_m_${"M".repeat(43)}` });
+				}
+				if (path === "/api/connector/connections") {
+					seen.push("connected");
+					return Response.json({ token: "connection-token" });
+				}
+				if (path === "/api/connector/planner") {
+					seen.push("planner");
+					return Response.json({
+						token: `chopin_p_${"P".repeat(43)}`,
+						expiresAt: Date.now() + 15 * 60_000,
+						document: {
+							id: "D_1",
+							repository: "octo-org/score",
+							url: "https://chopin.example/d/one",
+						},
+					});
+				}
+				if (path === "/api/connector/capability") {
+					told = await request.json();
+					seen.push("told");
+					// Someone fixes the machine a while later, longer than a Planner's first waits.
+					setTimeout(() => {
+						seen.push("fixed");
+						rmSync(lost, { force: true });
+					}, 4_000);
+					return Response.json({ reported: true });
+				}
+				if (path === "/connector/mcp") {
+					let server = new Server({ name: "fake-chopin", version: "1" }, {
+						capabilities: { tools: {} },
+					});
+					server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [] }));
+					server.setRequestHandler(CallToolRequestSchema, async request => {
+						let { name } = request.params;
+						if (name === "disconnect_workspace") seen.push("left");
+						if (name === "wait_for_work") {
+							let connections = seen.filter(event => event === "connected").length;
+							// Its user loses /dev/kvm once it is connected; once it is back, Ctrl-C.
+							if (connections === 1 && !seen.includes("told")) writeFileSync(lost, "");
+							if (seen.includes("fixed") && connections > 1 && !interrupted) {
+								interrupted = true;
+								connector.kill("SIGINT");
+							}
+							await Bun.sleep(200);
+						}
+						return { content: [{ type: "text", text: "{}" }] };
+					});
+					let transport = new WebStandardStreamableHTTPServerTransport({
+						sessionIdGenerator: undefined,
+						enableJsonResponse: true,
+					});
+					await server.connect(transport);
+					return transport.handleRequest(request);
+				}
+				return new Response(null, { status: 404 });
+			},
+		});
+		let connector = Bun.spawn([
+			process.execPath,
+			"--no-env-file",
+			join(import.meta.dir, "testing", "chopin-on-host.ts"),
+			"connect",
+			root,
+			"--planner",
+			"https://chopin.example/d/one",
+			"--planner-command",
+			"planner",
+			"--no-planner-spare",
+			"--",
+			"agent",
+		], {
+			cwd: scratch,
+			env: {
+				...process.env,
+				CHOPIN_URL: `http://127.0.0.1:${chopin.port}`,
+				CHOPIN_CONNECTOR_STATE_DIR: directory,
+				CHOPIN_TEST_KVM_LOST: lost,
+				PATH: [process.env.PATH, programs].join(delimiter),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		try {
+			let code = await Promise.race([connector.exited, Bun.sleep(45_000).then(() => "timed out")]);
+			if (code === "timed out") connector.kill("SIGKILL");
+			let stderr = await new Response(connector.stderr).text();
+			expect(code, `${seen.join(" ")}\n${stderr}`).toBe(0);
+			let reason = "Your user can't read and write /dev/kvm.";
+			let fix = "sudo usermod -aG kvm $USER, then log out and back in (for the chopin service, "
+				+ 'restart the machine). Or have an administrator add a udev rule, such as KERNEL=="kvm", '
+				+ 'GROUP="kvm", MODE="0660", RUN+="/usr/bin/setfacl -m u:<user>:rw /dev/kvm" (logind '
+				+ "may drop that ACL)";
+			// Chopin keeps why, for its Machines page, and chopin says it.
+			expect(told).toEqual({ reason, fix });
+			expect(stderr).toContain(
+				`Chopin runs each agent in its own microVM, which needs Linux or Windows on x86_64 with hardware virtualization. ${reason}\nFix: ${fix}`,
+			);
+			// It left, and started no Planner nor connected again until its user could open /dev/kvm.
+			let from = seen.indexOf("told");
+			let until = seen.indexOf("fixed");
+			expect(from).toBeGreaterThan(seen.indexOf("connected"));
+			expect(seen.slice(from + 1, until)).toEqual(["left"]);
+			// Then it connected again, and its Planner started again.
+			expect(seen.slice(until + 1)).toContain("connected");
+			expect(seen.slice(until + 1)).toContain("planner");
+		} finally {
+			connector.kill("SIGKILL");
+			await chopin.stop(true);
+			rmSync(lost, { force: true });
+		}
+	},
+	60_000,
+);

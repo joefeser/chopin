@@ -11,15 +11,20 @@ import { PostgresBackgroundJobStore } from "./jobs";
 import { PostgresExperimentStore } from "./experiments";
 import { PostgresChatAttachmentStore } from "./chat-attachments";
 import { PostgresImageStore } from "./images";
-import { PostgresRunStageStore } from "./run-stages";
 import { PostgresDecisionAnswerStore } from "./decision-answers";
 import { PostgresDocumentVersionStore } from "./versions";
 import { PostgresMachineStore } from "./machines";
 import { PostgresDeferredTurnStore } from "./deferred-turns";
+import { PostgresMcpInvocationStore } from "./mcp-invocations";
 import { PostgresMcpSessionStore } from "./mcp-sessions";
 import { PostgresPlannerCredentialStore } from "./planner-credentials";
+import { PostgresMachineDatabaseStore } from "./machine-databases";
+import { PostgresAiCredentialStore, PostgresAiPlaceholderStore } from "./ai-credentials";
+import { PostgresAiUsageStore } from "./ai-usage";
+import { AiCutoffs } from "../ai-cutoffs";
 import { PostgresChatThreadStore } from "./chat-threads";
 import { PostgresPlannerLinkHoldStore } from "./planner-holds";
+import { PostgresPlannerCatalogStore } from "./planner-catalogs";
 import { PostgresPlannerModelChoiceStore } from "./planner-model-choices";
 import { PostgresResearchWorkspaceStore } from "./research";
 import { researchProjectionAllowed, ResearchProjectionConflict } from "../model";
@@ -32,6 +37,7 @@ import type {
 	ChannelArchiveResult,
 	ChannelCursor,
 	ChannelDecisionCount,
+	ChannelDelete,
 	ChannelPage,
 	ChannelRecord,
 	ChannelScanCursor,
@@ -530,6 +536,7 @@ function leaseConnection(url: string): LeaseConnection {
 export class PostgresStorage implements StorageAdapter {
 	readonly driver = "postgres";
 	readonly #sql: SQL;
+	readonly #aiCutoffs = new AiCutoffs();
 	readonly #url: string;
 	// Renewal has its own connection so a busy pool cannot delay it past the lease.
 	#renewal: LeaseConnection;
@@ -555,10 +562,6 @@ export class PostgresStorage implements StorageAdapter {
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
-		this.runStages = new PostgresRunStageStore(
-			this.#sql,
-			(action, execute) => this.#run(action, execute),
-		);
 		this.decisionAnswers = new PostgresDecisionAnswerStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
@@ -570,6 +573,8 @@ export class PostgresStorage implements StorageAdapter {
 		this.machines = new PostgresMachineStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+			() => this.#aiCutoffs.cut(),
 		);
 		this.plannerHolds = new PostgresPlannerLinkHoldStore(
 			this.#sql,
@@ -577,6 +582,11 @@ export class PostgresStorage implements StorageAdapter {
 			(transaction, lease) => this.#assertLease(transaction, lease),
 		);
 		this.plannerModelChoices = new PostgresPlannerModelChoiceStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+		);
+		this.plannerCatalogs = new PostgresPlannerCatalogStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 			(transaction, lease) => this.#assertLease(transaction, lease),
@@ -590,9 +600,35 @@ export class PostgresStorage implements StorageAdapter {
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
 		);
+		this.machineDatabases = new PostgresMachineDatabaseStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+		);
+		this.aiCredentials = new PostgresAiCredentialStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+			this.#aiCutoffs,
+		);
+		this.aiPlaceholders = new PostgresAiPlaceholderStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+			this.#aiCutoffs,
+		);
+		this.aiUsage = new PostgresAiUsageStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
+		);
 		this.mcpSessions = new PostgresMcpSessionStore(
 			this.#sql,
 			(action, execute) => this.#run(action, execute),
+		);
+		this.mcpInvocations = new PostgresMcpInvocationStore(
+			this.#sql,
+			(action, execute) => this.#run(action, execute),
+			(transaction, lease) => this.#assertLease(transaction, lease),
 		);
 		this.deferredTurns = new PostgresDeferredTurnStore(
 			this.#sql,
@@ -766,15 +802,20 @@ export class PostgresStorage implements StorageAdapter {
 	readonly research: ResearchWorkspaceStore;
 	readonly images: PostgresImageStore;
 	readonly chatAttachments: PostgresChatAttachmentStore;
-	readonly runStages: PostgresRunStageStore;
 	readonly decisionAnswers: PostgresDecisionAnswerStore;
 	readonly versions: PostgresDocumentVersionStore;
 	readonly machines: PostgresMachineStore;
 	readonly plannerHolds: PostgresPlannerLinkHoldStore;
 	readonly plannerModelChoices: PostgresPlannerModelChoiceStore;
+	readonly plannerCatalogs: PostgresPlannerCatalogStore;
 	readonly chatThreads: PostgresChatThreadStore;
 	readonly plannerCredentials: PostgresPlannerCredentialStore;
+	readonly machineDatabases: PostgresMachineDatabaseStore;
+	readonly aiCredentials: PostgresAiCredentialStore;
+	readonly aiPlaceholders: PostgresAiPlaceholderStore;
+	readonly aiUsage: PostgresAiUsageStore;
 	readonly mcpSessions: PostgresMcpSessionStore;
+	readonly mcpInvocations: PostgresMcpInvocationStore;
 	readonly deferredTurns: PostgresDeferredTurnStore;
 
 	readonly channels: ChannelStore = {
@@ -821,9 +862,12 @@ export class PostgresStorage implements StorageAdapter {
 			}),
 		rename: input => this.#renameChannel(input),
 		setFullWidth: input => this.#setChannelWidth(input),
-		archive: input => this.#setChannelArchived(input, true),
+		markPlannerReset: (id, now) => this.#markPlannerReset(id, now),
+		plannerReset: id => this.#plannerReset(id),
+		archive: input =>
+			this.#setChannelArchived(input, true, input.lease).finally(() => this.#aiCutoffs.cut()),
 		restore: input => this.#setChannelArchived(input, false),
-		delete: id => this.#deleteChannel(id),
+		delete: input => this.#deleteChannel(input).finally(() => this.#aiCutoffs.cut()),
 		publishDescription: input => this.#publishChannelDescription(input),
 		list: (repositoryId, limit, after, query, includeArchived) =>
 			this.#listChannels(repositoryId, limit, after, query, includeArchived),
@@ -896,6 +940,11 @@ export class PostgresStorage implements StorageAdapter {
 		transaction: TransactionSQL,
 		input: CreateChannel,
 	): Promise<ChannelRecord> {
+		if (input.modelChoice) {
+			await this.#assertLease(transaction, input.modelChoice.lease).catch((err: unknown) => {
+				throw unavailable("a document's model choice needs the writer lease", err);
+			});
+		}
 		await this.#lockChannelTitles(transaction, input.repositoryId);
 		if (input.parentChannelId !== undefined) {
 			if (input.parentChannelId.length === 0) throw missing("parent channel id is required");
@@ -956,6 +1005,18 @@ export class PostgresStorage implements StorageAdapter {
 					${input.initial.source}, ${input.initial.sourceHash},
 					${input.initial.document}, ${JSON.stringify(input.initial.sidecar)}::jsonb,
 					${input.now}
+				)
+			`;
+		}
+		let chosen = input.modelChoice?.choice;
+		if (chosen && (chosen.model !== undefined || chosen.thinkingLevel !== undefined)) {
+			await transaction`
+				INSERT INTO planner_model_choices (
+					channel_id, model, model_name, thinking_level, user_id, updated_at, fencing
+				) VALUES (
+					${input.id}, ${chosen.model ?? null}, ${chosen.modelName ?? null},
+					${chosen.thinkingLevel ?? null}, ${chosen.userId}, ${chosen.updatedAt},
+					${input.modelChoice!.lease.fencing}
 				)
 			`;
 		}
@@ -1032,14 +1093,38 @@ export class PostgresStorage implements StorageAdapter {
 			}));
 	}
 
+	#markPlannerReset(id: string, now: Date): Promise<void> {
+		return this.#run("mark planner reset", async () => {
+			let [saved] = await this.#sql<{ id: string }[]>`
+				UPDATE channels
+				SET planner_reset_at = GREATEST(${now}, planner_reset_at + interval '1 millisecond')
+				WHERE id = ${id}
+				RETURNING id
+			`;
+			if (!saved) throw missing(`channel ${id} does not exist`);
+		});
+	}
+
+	#plannerReset(id: string): Promise<Date | undefined> {
+		return this.#run("read planner reset", async () => {
+			let [row] = await this.#sql<{ at: Date | null }[]>`
+				SELECT planner_reset_at AS at FROM channels WHERE id = ${id}
+			`;
+			return row?.at ?? undefined;
+		});
+	}
+
 	#setChannelArchived(
 		input: ChannelArchiveInput,
 		archived: boolean,
+		lease?: Lease,
 	): Promise<ChannelArchiveResult> {
 		return this.#run(
 			archived ? "archive channel" : "restore channel",
 			() =>
 				this.#sql.begin(async transaction => {
+					// An archive ends AI authority, which only the writer lease's holder counts.
+					if (lease) await this.#assertLease(transaction, lease);
 					let [current] = await transaction<ChannelRow[]>`
 					SELECT ${transaction.unsafe(CHANNEL_COLUMNS)}
 					FROM channels
@@ -1057,48 +1142,63 @@ export class PostgresStorage implements StorageAdapter {
 					let archivedAt = archived ? updatedAt : null;
 					let [saved] = await transaction<ChannelRow[]>`
 					UPDATE channels
-					SET archived_at = ${archivedAt}, updated_at = ${updatedAt}
+					SET archived_at = ${archivedAt}, updated_at = ${updatedAt},
+						archive_generation = archive_generation + ${archived ? 1 : 0}
 					WHERE id = ${input.id}
 					RETURNING ${transaction.unsafe(CHANNEL_RETURNING)}
 				`;
 					if (!saved) throw corrupt("changing channel archival returned no record");
+					if (archived) {
+						await transaction`DELETE FROM ai_placeholders WHERE channel_id = ${input.id}`;
+					}
 					return { channel: channel({ ...saved, slug: existing.slug }), changed: true };
 				}),
 		);
 	}
 
-	#deleteChannel(id: string): Promise<boolean> {
-		return this.#run("delete archived channel", () =>
+	#deleteChannel(input: ChannelDelete): Promise<ChannelRecord[]> {
+		return this.#run("delete channel", () =>
 			this.#sql.begin(async transaction => {
-				let [current] = await transaction<{ archivedAt: Timestamp | null }[]>`
-					SELECT archived_at AS "archivedAt"
+				// Deleting ends AI authority, which only the writer lease's holder counts.
+				await this.#assertLease(transaction, input.lease);
+				let [current] = await transaction<ChannelRow[]>`
+					SELECT ${transaction.unsafe(CHANNEL_COLUMNS)}
 					FROM channels
-					WHERE id = ${id}
+					WHERE id = ${input.id}
 					FOR UPDATE
 				`;
-				if (!current) return false;
-				if (current.archivedAt === null) {
-					throw conflict(`channel ${id} must be archived before deletion`);
+				if (!current) return [];
+				let document = channel(current);
+				if (document.parentChannelId) {
+					throw conflict(`channel ${input.id} is a child, deleted only with its parent`);
 				}
-				let [child] = await transaction<{ id: string }[]>`
-					SELECT id FROM channels WHERE parent_channel_id = ${id} LIMIT 1
+				// A child can't be published under a parent locked here, so these are all of them.
+				let children = (await transaction<ChannelRow[]>`
+					SELECT ${transaction.unsafe(CHANNEL_COLUMNS)}
+					FROM channels
+					WHERE parent_channel_id = ${input.id}
+					ORDER BY created_at, id
+					FOR UPDATE
+				`).map(channel);
+				let ids = [document.id, ...children.map(child => child.id)];
+				// What links a child restricts its deletion: the research requests and investigations
+				// that published it, all the document's own, go first. The rest cascades.
+				await transaction`
+					DELETE FROM research_workspaces
+					WHERE channel_id = ANY(${ids}) OR published_channel_id = ANY(${ids})
 				`;
-				if (child) throw conflict(`channel ${id} still has child channels`);
-				let [publication] = await transaction<{ id: string }[]>`
-					SELECT id FROM research_workspaces WHERE published_channel_id = ${id} LIMIT 1
+				await transaction`
+					DELETE FROM experiments
+					WHERE channel_id = ANY(${ids}) OR child_channel_id = ANY(${ids})
 				`;
-				if (publication) {
-					throw conflict(`channel ${id} is still published by a research workspace`);
+				if (children.length) {
+					await transaction`DELETE FROM channels WHERE parent_channel_id = ${input.id}`;
 				}
-				let [investigation] = await transaction<{ id: string }[]>`
-					SELECT id FROM experiments WHERE child_channel_id = ${id} LIMIT 1
-				`;
-				if (investigation) throw conflict(`channel ${id} is still published by an investigation`);
 				let deleted = await transaction<{ id: string }[]>`
-					DELETE FROM channels WHERE id = ${id} RETURNING id
+					DELETE FROM channels WHERE id = ${input.id} RETURNING id
 				`;
 				if (deleted.length !== 1) throw corrupt("deleting a channel returned no record");
-				return true;
+				return [document, ...children];
 			}));
 	}
 

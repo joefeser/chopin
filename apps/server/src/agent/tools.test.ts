@@ -85,6 +85,7 @@ test("document tool names and schemas remain available to the Planner", async ()
 		"list_background_jobs",
 		"read_background_job",
 		"create_research_workspace",
+		"create_document",
 		"upload_plan_image",
 		"assess_visual",
 		"edit_plan",
@@ -270,6 +271,66 @@ test("read_plan and edit_plan give a child document its nested canonical URL", a
 		operations: [{ op: "replace", index: 0, source: "Edited child.\n" }],
 	});
 	expect(edited).toMatchObject({ ok: true, document: identity });
+});
+
+test("create_document hands checked arguments to the member turn and refuses without one", async () => {
+	let { plan, server } = await opened("Split context.\n");
+	let room = {
+		plan,
+		server,
+		room: "test",
+		persist: () => Service.persist(plan),
+		exclusive: <T>(action: () => Promise<T>) => Service.exclusive(plan, action),
+		async publish() {},
+		anchors() {},
+		changes() {},
+	};
+	let call = async (tools: ReturnType<typeof fixtureTools>, raw: unknown) => {
+		let createDocument = tools.find(tool => tool.name === "create_document");
+		if (!createDocument?.handler) throw new Error("create_document is missing");
+		let text = String(await createDocument.handler(raw as never, { toolCallId: "call" }));
+		return text.startsWith("Error: ") ? text : JSON.parse(text);
+	};
+	let draft = {
+		idempotencyKey: "settings-page",
+		title: "Settings page",
+		brief: {
+			goal: "Add the settings page.",
+			constraints: [],
+			settledDecisions: [],
+			openQuestions: [],
+			repositoryFindings: [],
+		},
+		document: "# Settings page\n",
+		instruction: "Draft it.",
+	};
+	expect(await call(fixtureTools(room), draft)).toEqual({
+		ok: false,
+		reason: "member-request-required",
+		message: "Only a turn a person asked for in Chat can create documents.",
+	});
+	let received: unknown[] = [];
+	let tools = fixtureTools({
+		...room,
+		createDocument: async args => {
+			received.push(args);
+			return {
+				ok: true,
+				document: { id: "doc", title: "Settings page", url: "https://chopin.test/d" },
+				next: "done",
+			};
+		},
+	});
+	expect(await call(tools, draft)).toMatchObject({ ok: true, document: { id: "doc" } });
+	expect(received).toEqual([draft]);
+	let error = spyOn(console, "error").mockImplementation(() => {});
+	try {
+		expect(await call(tools, { ...draft, repository: "octo/other" }))
+			.toBe("Error: create_document does not take `repository`");
+	} finally {
+		error.mockRestore();
+	}
+	expect(received).toHaveLength(1);
 });
 
 test("create_research_workspace validates one question and waits for immediate research start", async () => {
@@ -576,8 +637,9 @@ test("anchor_plan keeps same-block decisions in original ask order", async () =>
 	expect(second).toBeLessThan(source.indexOf("The second paragraph."));
 });
 
-test("ask publishes a pending questionnaire beside its validated prose", async () => {
+test("ask publishes a pending questionnaire beside its validated prose, and tells the room it asked it", async () => {
 	let published: unknown[] = [];
+	let asked: string[] = [];
 	let { broadcasts, plan, server } = await opened("Related prose.\n");
 	let anchors = 0;
 	let created = Promise.withResolvers<void>();
@@ -595,6 +657,7 @@ test("ask publishes a pending questionnaire beside its validated prose", async (
 			created.resolve();
 		},
 		changes() {},
+		decisionsAsked: ids => asked.push(...ids),
 	}).find(tool => tool.name === "ask");
 	if (!ask?.handler) throw new Error("ask has no handler");
 	let digest = room.digests(plan.document)[0]!;
@@ -630,6 +693,7 @@ test("ask publishes a pending questionnaire beside its validated prose", async (
 	expect(JSON.parse(result as string).outcomes).toEqual([
 		{ status: "cancelled", cancelled_by: "test" },
 	]);
+	expect(asked).toEqual([record.id]);
 });
 
 test("a stale ask does not announce an anchor snapshot", async () => {

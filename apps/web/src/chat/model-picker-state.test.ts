@@ -1,16 +1,22 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+	ACCOUNTS_OUTDATED,
+	ACCOUNTS_STATUS,
 	chooseLevel,
 	chooseModel,
 	composerModelNotice,
 	fallbackNotice,
+	LAST_KNOWN_OUTDATED,
+	LAST_KNOWN_STATUS,
 	levelSteps,
 	matchesQuery,
+	MODELS_OUTDATED,
 	pendingLabel,
 	pendingTrigger,
 	pickerGroups,
 	pickerOptions,
+	pickerView,
 	reasoningLevels,
 	sameChoice,
 	shownLevel,
@@ -18,11 +24,13 @@ import {
 	triggerLabel,
 	triggerText,
 	triggerTitle,
+	UNAVAILABLE_STATUS,
 } from "./model-picker-state";
 
 import { levelLabel } from "@chopin/protocol/model-choice";
 
 import type { Chat } from "@chopin/protocol";
+import type { PickerView, PlannerPlace } from "./model-picker-state";
 
 let catalog: Chat.ModelCatalog = {
 	models: [
@@ -549,5 +557,183 @@ describe("the pill that waits for the machine's models", () => {
 			"Loading the machine's models (reasoning xhigh)",
 		);
 		expect(pendingLabel({ name: "Large" })).not.toMatch(/^Model: /);
+	});
+});
+
+describe("what the pill draws while the machine has yet to say which models it runs", () => {
+	let live: Chat.ModelCatalog = { models: [{ id: "acme/large", name: "Large" }] };
+	let before: Chat.ModelCatalog = {
+		models: [{ id: "acme/large", name: "Large" }, { id: "acme/retired", name: "Retired" }],
+	};
+	let places: Array<PlannerPlace | undefined> = [
+		"starting",
+		"attached",
+		"failed",
+		"held",
+		"away",
+		"none",
+		undefined,
+	];
+	let waits: Array<Chat.ModelState["waiting"]> = [
+		undefined,
+		{},
+		{ choice: { model: "acme/large" }, modelName: "Large" },
+		{ outdated: true },
+		{ choice: { model: "acme/large" }, modelName: "Large", outdated: true },
+	];
+	let lists = [undefined, { catalog: before }, { catalog: { models: [] } }];
+	let theirs: Chat.ModelCatalog = {
+		models: [{ id: "acme/large", name: "Large" }, { id: "acme/new", name: "New" }],
+	};
+	let fromAccounts = [undefined, { catalog: theirs }, { catalog: { models: [] } }];
+
+	/**
+	 * Every state the pill can be asked about: the live list or none, the list from the person's
+	 * accounts or none, a kept list or none, ...
+	 */
+	function* states() {
+		for (let catalog of [undefined, live]) {
+			for (let accounts of fromAccounts) {
+				for (let lastKnown of lists) {
+					for (let waiting of waits) {
+						for (let place of places) yield { catalog, accounts, lastKnown, waiting, place };
+					}
+				}
+			}
+		}
+	}
+
+	function listOf(view: PickerView | undefined): Chat.ModelCatalog | undefined {
+		return view && (view.kind === "live" || view.kind === "last-known" || view.kind === "accounts")
+			? view.catalog
+			: undefined;
+	}
+
+	test("a list drawn unmarked is always the live one, and a kept list is always marked with why", () => {
+		for (let state of states()) {
+			let view = pickerView(state);
+			let label = JSON.stringify(state);
+			if (view?.kind === "live") expect(view.catalog, label).toBe(state.catalog!);
+			if (view?.kind === "last-known") {
+				expect(state.catalog, label).toBeUndefined();
+				expect(view.catalog, label).toBe(state.lastKnown!.catalog);
+				expect(view.status, label).toBe(
+					state.waiting?.outdated ? LAST_KNOWN_OUTDATED : LAST_KNOWN_STATUS[state.place!],
+				);
+			}
+			// The live list, whenever there is one, is what is drawn.
+			if (state.catalog) expect(view, label).toEqual({ kind: "live", catalog: live });
+		}
+	});
+
+	test("a kept list is drawn at once wherever there is no live one nor one from the person's accounts", () => {
+		for (let state of states()) {
+			if (state.catalog || !state.lastKnown?.catalog.models.length || !state.place) continue;
+			if (state.accounts?.catalog.models.length) continue;
+			expect(listOf(pickerView(state)), JSON.stringify(state)).toBe(before);
+		}
+	});
+
+	test("the list from the person's accounts is drawn at once wherever there is no live one, ahead of a kept list, and marked so", () => {
+		for (let state of states()) {
+			let view = pickerView(state);
+			let label = JSON.stringify(state);
+			if (view?.kind === "accounts") {
+				expect(state.catalog, label).toBeUndefined();
+				expect(view.catalog, label).toBe(theirs);
+				expect(view.status, label).toBe(
+					state.waiting?.outdated ? ACCOUNTS_OUTDATED : ACCOUNTS_STATUS[state.place!],
+				);
+			}
+			if (state.catalog || !state.accounts?.catalog.models.length || !state.place) continue;
+			expect(view, label).toMatchObject({ kind: "accounts", catalog: theirs });
+		}
+	});
+
+	test("never waits on a machine that isn't coming: it says why instead", () => {
+		for (let state of states()) {
+			let view = pickerView(state);
+			let label = JSON.stringify(state);
+			let outdated = state.waiting?.outdated === true;
+			let coming = !outdated && (state.place === "starting" || state.place === "attached");
+			if (view?.kind === "loading") expect(coming, label).toBe(true);
+			if (view?.kind === "last-known") expect(view.loading, label).toBe(coming);
+			if (view?.kind === "accounts") expect(view.loading, label).toBe(coming);
+			let listless = !state.catalog && !state.lastKnown?.catalog.models.length
+				&& !state.accounts?.catalog.models.length;
+			// A machine that needs an update to list the accounts' models says so wherever it is.
+			if (listless && outdated && state.place) {
+				expect(view, label).toMatchObject({ kind: "unavailable", status: MODELS_OUTDATED });
+			} else if (
+				listless && (state.place === "failed" || state.place === "held" || state.place === "away")
+			) {
+				expect(view, label).toMatchObject({
+					kind: "unavailable",
+					status: UNAVAILABLE_STATUS[state.place],
+				});
+			}
+		}
+	});
+
+	test("says the machine needs an update, and waits for nothing, while its list can't follow a change of AI accounts", () => {
+		let waiting = { choice: { model: "acme/large" }, modelName: "Large", outdated: true as const };
+		expect(pickerView({ waiting, place: "attached" })).toEqual({
+			kind: "unavailable",
+			name: "Large",
+			status: "The machine needs an update to switch AI accounts.",
+		});
+		expect(pickerView({ waiting, accounts: { catalog: theirs }, place: "attached" })).toEqual({
+			kind: "accounts",
+			catalog: theirs,
+			status:
+				"These models are from your AI accounts. The machine needs an update to switch AI accounts.",
+			loading: false,
+		});
+	});
+
+	test("keeps the saved choice's words on a pill with no list", () => {
+		let waiting = { choice: { model: "acme/large", thinkingLevel: "high" }, modelName: "Large" };
+		expect(pickerView({ waiting, place: "starting" })).toEqual({
+			kind: "loading",
+			name: "Large",
+			level: "high",
+		});
+		expect(pickerView({ waiting, place: "failed" })).toEqual({
+			kind: "unavailable",
+			name: "Large",
+			level: "high",
+			status: "The machine's models can't load right now.",
+		});
+		// No machine and nothing kept: nothing is drawn, as the machine button says what to do.
+		expect(pickerView({ waiting, place: "none" })).toBeUndefined();
+		// A machine there that says no models are coming (it reported none): nothing either.
+		expect(pickerView({ place: "starting" })).toBeUndefined();
+		expect(pickerView({ place: "attached" })).toBeUndefined();
+		// Away, the server holds the saved choice back: the pill says why with no model named.
+		expect(pickerView({ place: "held" })).toEqual({
+			kind: "unavailable",
+			name: "Model",
+			status: "The machine's models can't load right now.",
+		});
+	});
+
+	test("its words name the machine, never the agent or its internals, nor the machine's state", () => {
+		for (
+			let text of [
+				...Object.values(LAST_KNOWN_STATUS),
+				...Object.values(ACCOUNTS_STATUS),
+				...Object.values(UNAVAILABLE_STATUS),
+				MODELS_OUTDATED,
+				ACCOUNTS_OUTDATED,
+				LAST_KNOWN_OUTDATED,
+			]
+		) {
+			expect(text).not.toMatch(/planner|attach|chopin|decision/i);
+			// The machine's state is its button's to say: Chat never draws it.
+			expect(text).not.toMatch(
+				/offline|connect|stepped away|no machine|couldn't start|kept|last seen/i,
+			);
+			expect(text).toMatch(/machine/);
+		}
 	});
 });

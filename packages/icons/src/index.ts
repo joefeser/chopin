@@ -1,4 +1,4 @@
-export { GitHubIcon } from "./brand";
+export { AnthropicIcon, GitHubIcon, OpenAIIcon } from "./brand";
 export {
 	BallIcon,
 	BotIcon,
@@ -68,6 +68,7 @@ export {
 	CodeIcon,
 	CollapseIcon,
 	ColumnsIcon,
+	ContrastIcon,
 	DecisionIcon,
 	DiagramIcon,
 	DiffIcon,
@@ -93,6 +94,8 @@ export {
 	MessagePlusIcon,
 	MicIcon,
 	MinusIcon,
+	MonitorIcon,
+	MoonIcon,
 	PaperclipIcon,
 	PauseIcon,
 	PencilIcon,
@@ -106,6 +109,7 @@ export {
 	SirenIcon,
 	SparkleIcon,
 	StarIcon,
+	SunIcon,
 	TableIcon,
 	TabsIcon,
 	UsersIcon,
@@ -118,10 +122,12 @@ export {
 	ArchiveIcon,
 	CloudIcon,
 	DocumentIcon,
+	KeyIcon,
 	LoaderIcon,
 	MachineIcon,
 	SearchIcon,
 	ServerIcon,
+	TrashIcon,
 } from "./system";
 export { TextStyleIcon } from "./text-style";
 export {

@@ -160,36 +160,6 @@ test("a Markdown question keeps its exact text, indentation included, in its rec
 	expect((await response).answers[0]).toMatchObject({ question, answer: "Confirm all" });
 });
 
-test("Atomic's own HostInput validator accepts every answer a member can give", async () => {
-	let { HostInputBridge, getHostQuestionnaire } = await import(
-		new URL("./core/extensions/host-input.js", import.meta.resolve("@bastani/atomic")).href
-	);
-	let f = await fixture();
-	let bridge = new HostInputBridge(() => "session", () => undefined);
-	bridge.bind(f.input, "chopin");
-	let questionnaire = getHostQuestionnaire(bridge.wrap({}));
-	let [preview, multiple, plain] = params.questions;
-	for (
-		let [question, value, expected] of [
-			[preview!, [1], { kind: "option", answer: "B" }],
-			[preview!, [0], { kind: "option", answer: " A ", preview: "preview A" }],
-			[preview!, "  typed\n", { kind: "chat", answer: "  typed\n" }],
-			[multiple!, [1, 0], { kind: "multi", answer: null, selected: ["C", "D"] }],
-			[multiple!, "several\n", { kind: "chat", answer: "several\n" }],
-			[plain!, [1], { kind: "option", answer: "F" }],
-			[plain!, " own ", { kind: "custom", answer: " own " }],
-		] as const
-	) {
-		let response = questionnaire({ questions: [question] }, new AbortController().signal);
-		let [card] = await f.cards(1);
-		await f.answer(card!.id, typeof value === "string" ? value : [...value]);
-		expect(await response).toEqual({
-			cancelled: false,
-			answers: [{ questionIndex: 0, question: question.question, ...expected }],
-		});
-	}
-});
-
 test("maps confirm/select dialogs without treating custom text as approval or a selection", async () => {
 	let f = await fixture();
 	for (let [value, approved] of [[[0], true], [[1], false], ["Yes", false]] as const) {
@@ -401,7 +371,7 @@ test("host input open past half an hour is withdrawn when its Planner stops", as
 test("a session counts a request as open from its call until a member answers it or it is withdrawn", async () => {
 	let f = await fixture();
 	let pending = new PendingInputs();
-	let input = createHumanInput(f.room, undefined, undefined, pending);
+	let input = createHumanInput(f.room, undefined, pending);
 	let ended = 0;
 	pending.watch(() => ended++);
 	let confirmed = input.confirm("Confirm", "Proceed?", f.options);
@@ -421,26 +391,6 @@ test("a session counts a request as open from its call until a member answers it
 	expect(await questionnaire).toEqual({ answers: [], cancelled: true });
 	expect(pending.open()).toBe(0);
 	expect(ended).toBe(2);
-});
-
-test("a workflow card shows its question as asked, without run or stage ids", async () => {
-	let f = await fixture();
-	let response = f.input.questionnaire(params, {
-		...f.options,
-		workflowRunId: "run-123",
-		workflowStageId: "review",
-	});
-	let cards = await f.cards(3);
-	for (let card of cards) {
-		expect(params.questions.map(question => question.question)).toContain(
-			card.definition.questions[0].question,
-		);
-		expect(card.definition.questions[0].question).not.toContain("run-123");
-		await f.answer(card.id, [0]);
-	}
-	expect((await response).answers.map(answer => answer.question)).toEqual(
-		params.questions.map(question => question.question),
-	);
 });
 
 /** A document of a title and two sections, whose first section is block 1. */
@@ -599,7 +549,7 @@ test("dialogs beyond the Planner's per-field limits become verbatim cards and an
 	]);
 });
 
-test("a workflow question at the length limit is stored verbatim", async () => {
+test("a question at the length limit is stored verbatim", async () => {
 	let f = await fixture();
 	let question = "Should the review stage accept this change? ".repeat(23).slice(0, 990);
 	let long: QuestionParams = {
@@ -609,11 +559,7 @@ test("a workflow question at the length limit is stored verbatim", async () => {
 			options: [{ label: "Ship", description: "" }, { label: "Hold", description: "" }],
 		}],
 	};
-	let response = f.input.questionnaire(long, {
-		...f.options,
-		workflowRunId: "run-123",
-		workflowStageId: "review",
-	});
+	let response = f.input.questionnaire(long, f.options);
 	let [card] = await f.cards(1);
 	expect(card!.definition.questions[0].question).toBe(question);
 	expect(await documentQuestionnaires(Plan.source(f.plan))).toMatchObject([{ prompt: question }]);
@@ -907,30 +853,18 @@ test(
 	30_000,
 );
 
-test("a workflow question's answer is returned only after its paused run is released", async () => {
-	let release!: () => void;
-	let gate = new Promise<void>(resolve => {
-		release = resolve;
-	});
-	let held: string[] = [];
-	let f = await hostInputRoom(async runId => {
-		held.push(runId);
-		await gate;
-	});
-	cleanups.push(f.close);
-	let settled = false;
-	let response = f.input.questionnaire(
-		{ questions: [params.questions[0]!] },
-		{ ...f.options, workflowRunId: "run-1", workflowStageId: "stage-1" },
-	).then(result => {
-		settled = true;
-		return result;
+test("the room hears which Decision cards its Planner's request asked, as the request does", async () => {
+	let f = await fixture();
+	let heard: string[][] = [];
+	let told: string[][] = [];
+	let input = createHumanInput({ ...f.room, decisionsAsked: ids => heard.push(ids) });
+	let confirmed = input.confirm("Confirm", "Proceed?", {
+		...f.options,
+		asked: ids => told.push(ids),
 	});
 	let [card] = await f.cards(1);
+	expect(heard).toEqual([[card!.id]]);
+	expect(told).toEqual(heard);
 	await f.answer(card!.id, [0]);
-	await Bun.sleep(20);
-	expect(held).toEqual(["run-1"]);
-	expect(settled).toBe(false);
-	release();
-	expect((await response).answers).toMatchObject([{ kind: "option", answer: " A " }]);
+	expect(await confirmed).toBe(true);
 });

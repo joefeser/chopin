@@ -10,12 +10,27 @@
  * notice naming the caller instead of their message. Only the root's creator,
  * or the account whose client holds its Planner, may start one, and each root
  * takes a bounded number an hour.
+ *
+ * A call made under an idempotency key settles the key against the root's Chat after the caller's
+ * authorization and before the hourly limit, which a follow-up whose notice is already posted does
+ * not count again; see `IdempotentInvocations`.
  */
+import { createHash } from "node:crypto";
+
+import { ulid } from "@chopin/dialect";
+import { PLANNER_NAME } from "@chopin/protocol/address";
+
 import { resolveChild } from "../chat/children";
 import * as Chat from "../chat/service";
 
-import type { InvokePlannerError } from "../mcp";
-import type { ChannelStore } from "../storage/port";
+import type { InvokePlanner, InvokePlannerError } from "../mcp";
+import type {
+	Lease,
+	McpInvocation,
+	McpInvocationResult,
+	McpInvocationScope,
+} from "../storage/model";
+import type { ChannelStore, McpInvocationStore } from "../storage/port";
 import type { PlannerInvocation } from "./hosted";
 
 export type InvocationRoute = {
@@ -84,43 +99,231 @@ export async function invokeRouted(
 			if (!child) return "document-unavailable";
 			focus = { channelId: child.id, title: child.title };
 		}
-		if (input.system) {
-			if (input.user.id !== root.createdBy && input.user.id !== route.plannerAccount(rootId)) {
-				console.warn(`[mcp] @${input.user.login} may not start a system turn on ${rootId}`);
-				return "system-turn-forbidden";
-			}
-			if (!route.systemTurns.take(rootId)) {
-				console.warn(`[mcp] system turns on ${rootId} are limited; @${input.user.login} refused`);
-				return "system-turn-limited";
-			}
+		if (
+			input.system && input.user.id !== root.createdBy
+			&& input.user.id !== route.plannerAccount(rootId)
+		) {
+			console.warn(`[mcp] @${input.user.login} may not start a system turn on ${rootId}`);
+			return "system-turn-forbidden";
 		}
+		let { context, release } = await route.open(rootId, input);
+		let posted = (entryId: string) => context.chat.entries.some(entry => entry.id === entryId);
+		let delivery: Chat.InvokedEntry = { entryId: ulid() };
+		let charged = false;
 		let code: InvokePlannerError | undefined;
 		try {
-			let { context, release } = await route.open(rootId, input);
-			try {
-				// Released once the invoked turn itself ends, even when it waits behind others.
-				code = await Chat.invoke(
-					context,
-					input.user,
-					input.instruction,
-					input.checkout,
-					focus,
-					release,
-					input.system ? `Automatic follow-up requested by @${input.user.login}.` : undefined,
-				);
-			} catch (err) {
-				release();
-				throw err;
+			let reconciled = await input.keyed?.reconcile(posted);
+			if (reconciled === "idempotency-conflict") code = reconciled;
+			else if (reconciled) delivery = reconciled;
+			if (!code && input.system && !posted(delivery.entryId)) {
+				charged = route.systemTurns.take(rootId);
+				if (!charged) {
+					console.warn(`[mcp] system turns on ${rootId} are limited; @${input.user.login} refused`);
+					code = "system-turn-limited";
+				}
 			}
-			if (code) release();
+			// Released once the invoked turn itself ends, even when it waits behind others.
+			code ??= await Chat.invoke(
+				context,
+				input.user,
+				input.instruction,
+				input.checkout,
+				focus,
+				release,
+				input.system ? `Automatic follow-up requested by @${input.user.login}.` : undefined,
+				delivery,
+			);
 		} catch (err) {
-			if (input.system) route.systemTurns.refund(rootId);
+			release();
+			if (charged && !posted(delivery.entryId)) route.systemTurns.refund(rootId);
 			throw err;
 		}
-		if (input.system) {
-			if (code) route.systemTurns.refund(rootId);
-			else console.info(`[mcp] @${input.user.login} started a system turn on ${rootId}`);
+		if (!code) {
+			if (input.system) {
+				console.info(`[mcp] @${input.user.login} started a system turn on ${rootId}`);
+			}
+			return undefined;
+		}
+		release();
+		if (!posted(delivery.entryId)) {
+			if (charged) route.systemTurns.refund(rootId);
+			if (code !== "idempotency-conflict") await input.keyed?.unused();
 		}
 		return code;
 	});
+}
+
+/** What a call is told whose instruction a running turn's session did not confirm taking. */
+export const UNCONFIRMED = `${PLANNER_NAME}'s machine did not confirm it received this `
+	+ "instruction, so it may already have been read. It is in the document's Chat, and it is not "
+	+ "sent again under this key.";
+
+/** How long a caller's idempotency key keeps its first `invoke_planner` call's result. */
+export const INVOCATION_KEY_MS = 7 * 24 * 60 * 60_000;
+
+type Invoked = Awaited<ReturnType<InvokePlanner<unknown>["invoke"]>>;
+
+/** What makes two calls under one key the same request: their instruction, `as` and focus. */
+export function invocationFingerprint(
+	request: { instruction: string; as?: "system" },
+	focus: string,
+): string {
+	return createHash("sha256")
+		.update(JSON.stringify({ instruction: request.instruction, as: request.as ?? null, focus }))
+		.digest("hex");
+}
+
+/** An `invoke_planner` call's idempotency key, as its route settles it against the root's Chat. */
+export type KeyedInvocation = {
+	/**
+	 * Settles the key against the Chat, whose `posted` says whether it holds an entry: the delivery
+	 * this call makes, or a conflict when the key holds a different request whose entry is posted.
+	 */
+	reconcile(
+		posted: (entryId: string) => boolean,
+	): Promise<Chat.InvokedEntry | "idempotency-conflict">;
+	/** Frees the key: this call was refused, and Chat holds nothing it posted. */
+	unused(): Promise<void>;
+};
+
+/**
+ * `invoke_planner` calls made under an idempotency key, so a caller that lost a reply can ask
+ * again and post nothing more, and start no second turn.
+ *
+ * The first call claims the key before anything is posted, naming the Chat entry its instruction
+ * will be and the result it answers. The call waits, past the Chat's sending queue and the
+ * document's transition, to hear whether the instruction reached a turn: its own turn started, or
+ * the person's turn running took it. Only then is the claim marked invoked and the call answered,
+ * so a claim marked invoked is evidence the instruction reached a turn, every later call with the
+ * same request is given the claim's result, and a different one is refused. An instruction posted
+ * that reached none (the turn it was given to ended first, or a stopping process or a closing Chat
+ * let go of the turn waiting behind a job) is refused with `planner-unavailable`, and its claim is
+ * left for a retry. One given to a running turn whose session did not confirm taking it may have
+ * been read: its claim is marked uncertain, and it and every retry are refused with
+ * `planner-unavailable` and `UNCONFIRMED`, so it is never delivered twice.
+ *
+ * A claim not marked invoked says nothing alone: the root's Chat does. When it holds the entry, an
+ * earlier call saved it and started no turn, or started one whose start it could not record. A
+ * retry starts that turn without posting again, unless this process remembers starting it, when
+ * it only records the start. When the Chat does not hold the entry, nothing was kept: a retry posts
+ * it, and a different request takes the key. A refusal that kept nothing frees the key, and one
+ * that could not is freed by the next call.
+ *
+ * So a process that stops after the instruction reached a turn, or was given to one without a
+ * confirmation, and before that was recorded, or after recording it failed, leaves a claim whose
+ * retry, in the next process, delivers it again.
+ * Calls with one key run one at a time in this process, the only one holding the writer lease.
+ */
+export class IdempotentInvocations {
+	#running = new Map<string, Promise<unknown>>();
+	/** Each key's claim whose delivery this process could not record, and how it went. */
+	#unrecorded = new Map<string, { entryId: string; outcome: "reached" | "unknown" }>();
+
+	constructor(
+		private store: McpInvocationStore,
+		private lease: () => Lease,
+		private clock: () => Date,
+	) {}
+
+	run(
+		scope: McpInvocationScope,
+		fingerprint: string,
+		result: McpInvocationResult,
+		deliver: (keyed: KeyedInvocation) => Promise<Invoked>,
+	): Promise<Invoked> {
+		let key = JSON.stringify([scope.userId, scope.channelId, scope.key]);
+		let previous = this.#running.get(key) ?? Promise.resolve();
+		let operation = previous.then(() => this.#once(key, scope, fingerprint, result, deliver));
+		let settled = operation.then(() => {}, () => {});
+		this.#running.set(key, settled);
+		void settled.then(() => {
+			if (this.#running.get(key) === settled) this.#running.delete(key);
+		});
+		return operation;
+	}
+
+	async #once(
+		key: string,
+		scope: McpInvocationScope,
+		fingerprint: string,
+		result: McpInvocationResult,
+		deliver: (keyed: KeyedInvocation) => Promise<Invoked>,
+	): Promise<Invoked> {
+		let lease = this.lease();
+		let claim = async () => {
+			let now = this.clock();
+			let claimed = await this.store.claim(lease, {
+				...scope,
+				fingerprint,
+				entryId: ulid(),
+				result,
+				createdAt: now,
+				expiresAt: new Date(now.getTime() + INVOCATION_KEY_MS),
+			});
+			return claimed.record;
+		};
+		let record = await claim();
+		if (record.invokedAt || record.uncertainAt) {
+			if (record.fingerprint !== fingerprint) {
+				return { kind: "refused", code: "idempotency-conflict" };
+			}
+			return record.invokedAt
+				? { kind: "invoked", document: record.result.document }
+				: { kind: "refused", code: "planner-unavailable", message: UNCONFIRMED };
+		}
+		let unrecorded = this.#unrecorded.get(key);
+		if (record.fingerprint === fingerprint && unrecorded?.entryId === record.entryId) {
+			return this.#record(key, lease, record, unrecorded.outcome);
+		}
+		let delivered: Promise<Chat.Reached> | undefined;
+		let outcome = await deliver({
+			reconcile: async posted => {
+				if (record.fingerprint !== fingerprint) {
+					if (posted(record.entryId)) return "idempotency-conflict";
+					await this.store.release(lease, record);
+					record = await claim();
+					if (record.invokedAt || record.fingerprint !== fingerprint) {
+						return "idempotency-conflict";
+					}
+				}
+				let told = Promise.withResolvers<Chat.Reached>();
+				delivered = told.promise;
+				return { entryId: record.entryId, delivered: outcome => told.resolve(outcome) };
+			},
+			unused: async () => {
+				await this.store.release(lease, record).catch(err => {
+					console.error("[mcp] could not free an idempotency key after a refusal:", err);
+				});
+			},
+		});
+		if (outcome.kind !== "invoked") return outcome;
+		let reached = await delivered ?? "reached";
+		if (reached === "unread") return { kind: "refused", code: "planner-unavailable" };
+		return this.#record(key, lease, record, reached);
+	}
+
+	/**
+	 * Marks `claim` invoked, its instruction having reached a turn, and answers its result; or marks
+	 * it uncertain and refuses, its turn not having confirmed taking it. When that can't be saved the
+	 * call fails, and this process remembers how the delivery went, so a retry here records it and
+	 * delivers nothing.
+	 */
+	async #record(
+		key: string,
+		lease: Lease,
+		claim: McpInvocation,
+		outcome: "reached" | "unknown",
+	): Promise<Invoked> {
+		try {
+			if (outcome === "reached") await this.store.complete(lease, claim, this.clock());
+			else await this.store.uncertain(lease, claim, this.clock());
+		} catch (err) {
+			this.#unrecorded.set(key, { entryId: claim.entryId, outcome });
+			throw err;
+		}
+		if (this.#unrecorded.get(key)?.entryId === claim.entryId) this.#unrecorded.delete(key);
+		return outcome === "reached"
+			? { kind: "invoked", document: claim.result.document }
+			: { kind: "refused", code: "planner-unavailable", message: UNCONFIRMED };
+	}
 }

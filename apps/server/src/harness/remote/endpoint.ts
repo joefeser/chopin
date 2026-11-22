@@ -36,11 +36,12 @@ import { forbiddenMessage } from "./attachments";
 import { AgentLink } from "./link";
 import { MachinePlanners } from "./machine-planners";
 
+import type { CapabilityCatalog } from "@chopin/agent-link";
 import type { ServerWebSocket } from "bun";
 import type { HostedAuth } from "../../auth/routes";
 import type { HostedCaller } from "../../mcp/hosted";
 import type { PlannerAttachments } from "./attachments";
-import type { AttachOutcome, LinkOptions, LinkSocket } from "./link";
+import type { AttachOutcome, LinkAi, LinkOptions, LinkSocket } from "./link";
 import type { MachineGrant } from "./machine-planners";
 
 export type AgentAuth = Pick<HostedAuth, "admission" | "config" | "github" | "storage">;
@@ -62,6 +63,26 @@ export type AgentSocketData = {
 	alive?: { heard(): void; stop(): void };
 };
 
+/**
+ * AI launches for the people links act for: the attached account, which for a paired machine's
+ * Planner credential is the machine's owner, on that machine.
+ */
+export type AgentAi = {
+	/** Prepares a launch owned by the session `sessionId` (see `LinkAi.launch`). */
+	launch(
+		input: { userId: string; machineId?: string; channelId: string; sessionId: string },
+	): ReturnType<LinkAi["launch"]>;
+	/** Prepares a catalog launch owned by the link `linkId` (see `LinkAi.catalog`). */
+	catalog?(
+		input: { userId: string; machineId?: string; channelId: string; linkId: string },
+	): ReturnType<LinkAi["launch"]>;
+	end(launchId: string): void;
+	/** Calls `listener` with a person's id whenever what a launch for them may be given changes. */
+	onChanged(listener: (userId: string) => void): () => void;
+	/** Hears that a session holds a launch now, or no longer does (see `LinkAi.held`). */
+	held?(launchId: string, holding: boolean): void;
+};
+
 export type AgentHooks = {
 	/** One Planner per document, and its ownership. */
 	attachments: PlannerAttachments;
@@ -69,8 +90,14 @@ export type AgentHooks = {
 	unavailable?: (channelId: string) => boolean;
 	/** Observes attached links. */
 	register?: LinkOptions["register"];
-	/** A document's attached client reported what it offers, which may be nothing now. */
-	catalogChanged?: (channelId: string) => void;
+	/**
+	 * A document's attached client reported what it offers, which may be nothing now: `reported` is
+	 * what it reported and the account it attached for.
+	 */
+	catalogChanged?: (
+		channelId: string,
+		reported: { userId: string; catalog: CapabilityCatalog | undefined },
+	) => void;
 	timeoutMs?: number;
 	revalidateEveryMs?: number;
 	/** How often the link is sent a protocol ping. */
@@ -85,6 +112,8 @@ export type AgentHooks = {
 	 * queue drains meanwhile, before it is closed as dropped. 15 minutes by default.
 	 */
 	maxSilenceMs?: number;
+	/** Hands a client that offered `ai-credentials` what its sessions call models with. */
+	ai?: AgentAi;
 };
 
 const BEARER = /^Bearer ([A-Za-z0-9._~+/-]+=*)$/i;
@@ -299,15 +328,38 @@ export function agentLink(
 			throw err;
 		}
 	}
+	let ai = hooks.ai;
+	let userId = caller.user.id;
+	let machineId = machine?.machine.id;
 	link = new AgentLink(socket, {
 		attach,
 		revalidate,
+		...(ai
+			? {
+				ai: {
+					launch: (channelId, sessionId) =>
+						ai.launch({ userId, ...(machineId ? { machineId } : {}), channelId, sessionId }),
+					...(ai.catalog
+						? {
+							catalog: (channelId: string, linkId: string) =>
+								ai.catalog!({ userId, ...(machineId ? { machineId } : {}), channelId, linkId }),
+						}
+						: {}),
+					end: launchId => ai.end(launchId),
+					watch: changed =>
+						ai.onChanged(person => {
+							if (person === userId) changed();
+						}),
+					...(ai.held ? { held: (launchId, holding) => ai.held!(launchId, holding) } : {}),
+				},
+			}
+			: {}),
 		register: hooks.register,
 		timeoutMs: hooks.timeoutMs,
 		revalidateEveryMs: hooks.revalidateEveryMs,
 		features,
 		catalogChanged: () => {
-			if (channelId) hooks.catalogChanged?.(channelId);
+			if (channelId) hooks.catalogChanged?.(channelId, { userId, catalog: link.catalog });
 		},
 	});
 	return link;

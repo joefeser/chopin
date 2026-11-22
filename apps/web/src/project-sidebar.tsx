@@ -3,9 +3,11 @@ import chopinIcon from "./assets/figma/navigation/chopin.svg";
 import collapseIcon from "./assets/icons/panel-close.svg";
 import documentActionsIcon from "./assets/figma/navigation/document-actions.svg";
 import { unansweredDecisionsLabel, useDecisionAttention } from "./decision-view-control";
+import { mayDeleteDocument } from "@chopin/protocol/document-delete";
 import { DocumentActionsMenu } from "./document-actions-menu";
 import { addressOfHref, documentIntent, DWELL_MS } from "./document-intent";
 import { IconButton } from "./icon-button";
+import { AiAccountsEntry } from "./ai-accounts/entry";
 import { MachinesEntry } from "./machines-entry";
 import { ProjectSidebarSkeleton } from "./project-sidebar-chrome";
 import { motionContract } from "./motion-contract";
@@ -200,6 +202,7 @@ export function ProjectSidebarProject(
 		onLoadMore,
 		onToggle,
 		revealed,
+		userId,
 	}: {
 		archiveMode: boolean;
 		pendingCreations: ReadonlyMap<string, DocumentCreationPhase>;
@@ -213,6 +216,8 @@ export function ProjectSidebarProject(
 		onLoadMore: (entry: ProjectDocuments) => void;
 		onToggle: () => void;
 		revealed: boolean;
+		/** Who is reading, for who may delete a document. */
+		userId: string;
 	},
 ) {
 	let item = useRef<HTMLLIElement>(null);
@@ -272,6 +277,7 @@ export function ProjectSidebarProject(
 			)}
 			{(groups.length > 0 || presence.rows.length > 0) && (
 				<ul
+					aria-busy={documents.status === "loading" || undefined}
 					className="project-sidebar-documents"
 					onBlur={intent.onBlur}
 					onClick={intent.onClick}
@@ -324,6 +330,8 @@ export function ProjectSidebarProject(
 										<div className="project-sidebar-document-actions">
 											<DocumentActionsMenu
 												channel={channel}
+												deletable={!!project.repository
+													&& mayDeleteDocument(channel, project.repository.permissions, userId)}
 												iconButton
 												onAction={action => documentAction(channel, action)}
 												trigger={
@@ -338,9 +346,6 @@ export function ProjectSidebarProject(
 						);
 					})}
 				</ul>
-			)}
-			{documents.status === "loading" && groups.length > 0 && (
-				<p className="project-sidebar-status" data-loading="" role="status">Loading more…</p>
 			)}
 			{documents.status === "ready" && documents.nextCursor && (
 				<button
@@ -433,6 +438,7 @@ export function ProjectSidebar(
 		accountMenuId,
 		accountTriggerRef,
 		accountWrapRef,
+		aiAccountsCurrent,
 		canCreateDocument,
 		newDocumentPhase,
 		pendingCreations,
@@ -460,6 +466,7 @@ export function ProjectSidebar(
 		accountMenuId?: string;
 		accountTriggerRef?: Ref<HTMLButtonElement>;
 		accountWrapRef?: Ref<HTMLDivElement>;
+		aiAccountsCurrent?: boolean;
 		canCreateDocument: boolean;
 		catalogueMode: "active" | "archived";
 		newDocumentPhase?: DocumentCreationPhase | "loading";
@@ -642,6 +649,7 @@ export function ProjectSidebar(
 				</button>
 			)}
 			<MachinesEntry current={machinesCurrent} placement="sidebar" />
+			<AiAccountsEntry current={aiAccountsCurrent} placement="sidebar" />
 		</div>
 	);
 	return (
@@ -708,6 +716,7 @@ export function ProjectSidebar(
 									onFocused={onFocusedProject ?? noop}
 									onLoadMore={onLoadMore}
 									revealed={revealedId === entry.project.repositoryId}
+									userId={user.id}
 									onToggle={() =>
 										setCollapsedProjectIds(current =>
 											toggleCollapsedProjectIds(current, entry.project.repositoryId)

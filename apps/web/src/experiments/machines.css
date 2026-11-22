@@ -77,10 +77,16 @@
 	z-index: 60;
 	width: min(22rem, calc(100vw - var(--spacing) * 4));
 	border-radius: var(--radius-lg);
-	background: var(--color-page);
+	background: var(--color-raised);
 	padding: var(--menu-padding);
 	box-shadow: var(--shadow-raised);
 	transform-origin: var(--motion-origin-x, right) top;
+}
+
+/* Found by its shadow by day; at night, where shadows hardly show, by a light hairline too. */
+:where(.machines-add-menu) {
+	outline: var(--edge-width) solid var(--color-raised-edge);
+	outline-offset: calc(-1 * var(--edge-width));
 }
 
 .machines-add-icon {
@@ -845,10 +851,16 @@
 	z-index: 60;
 	min-width: 13rem;
 	border-radius: var(--radius-md);
-	background: var(--color-page);
+	background: var(--color-raised);
 	padding: var(--menu-padding);
 	box-shadow: var(--shadow-raised);
 	transform-origin: top right;
+}
+
+/* Found by its shadow by day; at night, where shadows hardly show, by a light hairline too. */
+:where(.machine-actions-menu) {
+	outline: var(--edge-width) solid var(--color-raised-edge);
+	outline-offset: calc(-1 * var(--edge-width));
 }
 
 /* A copy item names its action, with the command it copies underneath. */

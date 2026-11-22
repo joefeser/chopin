@@ -135,11 +135,6 @@ export type Backend = {
 	/** Product documents enforce a leading title; standalone domain rooms remain generic. */
 	documentTitles?: boolean;
 	/**
-	 * Whether a rebuilt remote Planner hold still keeps the document's workflow runs for its client,
-	 * so the cards Chat stored stay live when it opens, marked disconnected once its client is away.
-	 */
-	plannerKeepsRuns?: (channelId: string) => "live" | "down" | undefined;
-	/**
 	 * A document's room has opened: a rebuilt remote Planner hold waits again, for its client, for
 	 * the answers to the questions it left open there.
 	 */
@@ -380,19 +375,20 @@ type Sidecar = {
 	openQuestions: Questions.StoredOpen[];
 	threads: Comments.Record[];
 	transcript: Chat.Chat["entries"];
+	/** The last sequence Chat gave out, which taking entries out moves past (`chat/chronology.ts`). */
+	transcriptSeq?: number;
 	conversationPlan?: ConversationPlan.State;
 	conversationPlanRetries?: Array<{ id: string; messageId: string }>;
 	conversationPlanJobs?: ConversationPlan.Job[];
 	conversationPlanEffects?: string[];
 	conversationPlanPendingEffects?: Effect[];
 	pendingCardActions?: PendingCardAction[];
-	workflowRuns?: NonNullable<Chat.Chat["runs"]>;
 	initiativePaused?: boolean;
 	plannerTitle?: string;
 	titleChosen?: true;
 };
 
-type ChatView = Pick<Chat.Chat, "entries" | "runs" | "initiativePaused">;
+type ChatView = Pick<Chat.Chat, "entries" | "initiativePaused" | "lastSeq">;
 
 function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 	return {
@@ -415,6 +411,7 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 		openQuestions: Questions.dump(plan.questions),
 		threads: [...plan.threads.values()],
 		transcript: entriesForStorage(chat.entries),
+		...transcriptSeqOf(chat, plan.chat.lastSeq),
 		conversationPlan: plan.conversationPlan,
 		...(plan.conversationPlanRetries.length
 			? { conversationPlanRetries: plan.conversationPlanRetries }
@@ -429,11 +426,19 @@ function state(plan: Plan, chat: ChatView = plan.chat): Sidecar {
 			? { conversationPlanPendingEffects: plan.conversationPlanPendingEffects }
 			: {}),
 		...(plan.pendingCardActions.length ? { pendingCardActions: plan.pendingCardActions } : {}),
-		...(chat.runs?.length ? { workflowRuns: chat.runs } : {}),
 		...((chat.initiativePaused ?? plan.chat.initiativePaused) ? { initiativePaused: true } : {}),
 		...(plan.plannerTitle !== undefined ? { plannerTitle: plan.plannerTitle } : {}),
 		...(plan.titleChosen ? { titleChosen: true as const } : {}),
 	};
+}
+
+/**
+ * Chat's last sequence, saved only when its entries do not say it: after a Retry took out the
+ * entries that held it. An earlier release refuses a sidecar with it, so it is written only then.
+ */
+function transcriptSeqOf(chat: ChatView, live?: number): { transcriptSeq?: number } {
+	let seq = Math.max(chat.lastSeq ?? 0, live ?? 0);
+	return seq > (chat.entries.at(-1)?.seq ?? 0) ? { transcriptSeq: seq } : {};
 }
 
 function jsonState(plan: Plan, chat?: ChatView): { value: JsonValue; text: string } {
@@ -625,10 +630,12 @@ function restoredState(
 		expected.push("conversationPlanPendingEffects");
 	}
 	if (Object.hasOwn(item, "pendingCardActions")) expected.push("pendingCardActions");
+	// The run cards Chat showed, which an earlier release saved: nothing reads them now.
 	if (Object.hasOwn(item, "workflowRuns")) expected.push("workflowRuns");
 	if (Object.hasOwn(item, "initiativePaused")) expected.push("initiativePaused");
 	if (Object.hasOwn(item, "plannerTitle")) expected.push("plannerTitle");
 	if (Object.hasOwn(item, "titleChosen")) expected.push("titleChosen");
+	if (Object.hasOwn(item, "transcriptSeq")) expected.push("transcriptSeq");
 	expected.sort();
 	if (
 		keys.length !== expected.length
@@ -647,6 +654,8 @@ function restoredState(
 		|| (Object.hasOwn(item, "initiativePaused") && typeof item.initiativePaused !== "boolean")
 		|| (Object.hasOwn(item, "plannerTitle") && typeof item.plannerTitle !== "string")
 		|| (Object.hasOwn(item, "titleChosen") && item.titleChosen !== true)
+		|| (Object.hasOwn(item, "transcriptSeq")
+			&& !(Number.isSafeInteger(item.transcriptSeq) && (item.transcriptSeq as number) >= 0))
 	) throw new Error("hosted channel has an invalid sidecar");
 	let execution = Object.hasOwn(item, "execution")
 		? restoreRun(item.execution, graph, item.revision)
@@ -816,7 +825,6 @@ function restoredState(
 		|| conversationPlan.analysis.some(entry => !messageIds.has(entry.messageId))
 		|| conversationPlanRetries.some(entry => !messageIds.has(entry.messageId))
 	) throw new Error("hosted channel has conversation analysis without a source message");
-	let workflowRuns = restoreWorkflowRuns(item.workflowRuns);
 	return {
 		version: 1,
 		revision: item.revision,
@@ -835,13 +843,13 @@ function restoredState(
 		openQuestions: openQuestions as unknown as Questions.StoredOpen[],
 		threads: threads as never[],
 		transcript: transcript as unknown as Chat.Chat["entries"],
+		...(typeof item.transcriptSeq === "number" ? { transcriptSeq: item.transcriptSeq } : {}),
 		conversationPlan,
 		...(conversationPlanRetries.length ? { conversationPlanRetries } : {}),
 		...(conversationPlanJobs.length ? { conversationPlanJobs } : {}),
 		...(outbox.receipts.length ? { conversationPlanEffects: outbox.receipts } : {}),
 		...(outbox.pending.length ? { conversationPlanPendingEffects: outbox.pending } : {}),
 		...(pendingCardActions.length ? { pendingCardActions } : {}),
-		...(workflowRuns.length > 0 ? { workflowRuns } : {}),
 		...(item.initiativePaused === true ? { initiativePaused: true } : {}),
 		...(typeof item.plannerTitle === "string" ? { plannerTitle: item.plannerTitle } : {}),
 		...(item.titleChosen === true ? { titleChosen: true as const } : {}),
@@ -870,63 +878,6 @@ function restoreConversationPlanRetries(
 		seen.add(item.id);
 		return { id: item.id, messageId: item.messageId };
 	});
-}
-
-const RUN_STATUSES = new Set([
-	"running",
-	"waiting",
-	"paused",
-	"finished",
-	"blocked",
-	"failed",
-	"stopped",
-]);
-const RUN_STAGE_STATUSES = new Set([
-	"pending",
-	"running",
-	"awaiting_input",
-	"paused",
-	"blocked",
-	"completed",
-	"failed",
-	"skipped",
-	"stopped",
-]);
-
-function seconds(value: JsonValue | undefined, optional = false): boolean {
-	if (value === undefined) return optional;
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-
-/** Workflow run cards Chat showed, as `Chat.Run` values. */
-function restoreWorkflowRuns(value: JsonValue | undefined): NonNullable<Chat.Chat["runs"]> {
-	if (value === undefined) return [];
-	if (!Array.isArray(value)) throw new Error("hosted channel has invalid workflow runs");
-	let runs = objects(value, "workflow run");
-	for (let run of runs) {
-		let stages = run.stages;
-		if (
-			typeof run.name !== "string"
-			|| !RUN_STATUSES.has(run.status as string)
-			|| !seconds(run.started)
-			|| !seconds(run.updated)
-			|| !seconds(run.ended, true)
-			|| !seconds(run.earlierStages, true)
-			|| !seconds(run.waiting)
-			|| !Array.isArray(stages)
-			|| stages.some(stage =>
-				!stage || typeof stage !== "object" || Array.isArray(stage)
-				|| typeof stage.id !== "string" || typeof stage.name !== "string"
-				|| stage.kind !== undefined && stage.kind !== "tool"
-				|| stage.parentIds !== undefined && (!Array.isArray(stage.parentIds)
-						|| stage.parentIds.length > 64
-						|| stage.parentIds.some(id => typeof id !== "string" || !id || id.length > 128))
-				|| !RUN_STAGE_STATUSES.has(stage.status as string)
-				|| !seconds(stage.started, true) || !seconds(stage.ended, true)
-			)
-		) throw new Error("hosted channel has invalid workflow runs");
-	}
-	return runs as unknown as NonNullable<Chat.Chat["runs"]>;
 }
 
 function restoreMcpUpdates(value: JsonValue | undefined): McpUpdateRecord[] {
@@ -1621,13 +1572,10 @@ export async function open(
 			sidecar.questions.map(Questions.normalizeRecord),
 		),
 		comments: Comments.create(),
-		chat: Chat.restore(
-			sidecar.transcript,
-			sidecar.workflowRuns,
-			sidecar.initiativePaused,
-			// An archived document's Planner ended with it: its runs come back stopped.
-			loaded.channel.archivedAt ? undefined : backend.plannerKeepsRuns?.(id),
-		),
+		chat: {
+			...Chat.restore(sidecar.transcript, sidecar.initiativePaused),
+			...(sidecar.transcriptSeq !== undefined ? { lastSeq: sidecar.transcriptSeq } : {}),
+		},
 		conversationPlan: sidecar.conversationPlan ?? restoreConversationPlan(undefined),
 		conversationPlanRetries: sidecar.conversationPlanRetries ?? [],
 		conversationPlanJobs: sidecar.conversationPlanJobs ?? [],

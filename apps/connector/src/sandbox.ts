@@ -1,668 +1,1209 @@
-import { type ChildProcess, spawn } from "node:child_process";
-import type { Readable } from "node:stream";
+import { type ChildProcess, execFile, spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { EventEmitter } from "node:events";
 import {
 	accessSync,
 	chmodSync,
+	closeSync,
 	constants,
 	existsSync,
+	fstatSync,
 	lstatSync,
 	mkdirSync,
-	mkdtempSync,
+	openSync,
 	readdirSync,
 	readFileSync,
-	realpathSync,
+	readSync,
+	renameSync,
 	rmSync,
 	statSync,
+	truncateSync,
 	writeFileSync,
 } from "node:fs";
-import { arch, homedir, release, tmpdir } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import { readdir, readFile, rm } from "node:fs/promises";
+import { arch, userInfo } from "node:os";
+import { basename, join, posix, win32 } from "node:path";
+import { PassThrough, type Readable, Writable } from "node:stream";
 import type { SandboxReport } from "@chopin/protocol/connector";
-import { removePlantedRedirects, worktreeEntry } from "./git-directories";
-import { type Repository, repositoryAt } from "./git-host";
-import { type Host, probeSandbox } from "./sandbox-probe";
+import { type AiRelay, startAiRelay } from "./ai-relay";
+import { GUEST_BRIDGE_PATH, guestBridge, guestBridgeCommand } from "./bridge";
 import {
-	agentStateDirectories,
-	allowedHosts,
-	CLONES,
-	type Disk,
-	inside,
-	mxcRequest,
-	type Policy,
-	readableRoots,
-	readGrantsAround,
-	type SandboxEngine,
-	sandboxPath,
-	type SandboxSettings,
-	secretPaths,
-	windowsReadRoots,
-} from "./sandbox-policy";
+	type Downloader,
+	type GuestUser,
+	type ImageBuilder,
+	type ImageRecipe,
+	type ImageStore,
+	imageStore,
+	pruneImages,
+	vmBuilder,
+} from "./images";
+import {
+	type AgentImage,
+	artifactsAt,
+	deviceDenied,
+	environmentFile,
+	GUEST_WORK,
+	guestProgram,
+	type GuestRepository,
+	type Hypervisor,
+	type HypervisorDevice,
+	makeWritable,
+	nvxArguments,
+	type NvxArtifacts,
+	nvxDirectory,
+	type NvxSupport,
+	nvxSupport,
+	programAt,
+	SandboxRefused,
+	STARTED_LINE,
+	type SupportHost,
+	unsupportedWords,
+	type VmSpec,
+	vmSpec,
+} from "./nvx";
+import { allowedHosts, type SandboxSettings, validAllowedEntry } from "./sandbox-policy";
 import { type Proxy, startProxy } from "./sandbox-proxy";
+import { killJob, sparseFile } from "./windows-host";
+import { processStart, type StartProbe } from "./workspace";
 
-/** What one agent or Planner process is started with, and what it may touch. */
+export { SandboxRefused } from "./nvx";
+
+/** What one agent or Planner process is started with, and what its microVM is given. */
 export type Launch = {
 	command: string[];
 	cwd: string;
-	/** The whole environment the process gets. */
+	/** The whole environment the process gets, before the guest's own (see `vmSpec`). */
 	env: NodeJS.ProcessEnv;
 	/** Whether it has a stdin to write to; its stdout and stderr are always pipes. */
 	stdin: "pipe" | "ignore";
-	/**
-	 * Directories it may write beside its working directory, such as a Planner's own worktree,
-	 * which are made empty where they aren't there yet: a sandbox can't be given a path that does
-	 * not exist.
-	 */
+	/** Directories it writes beside its working directory, which are made where they aren't yet. */
 	writable?: string[];
 	/**
-	 * Its own paths in the connector's state directory: its worktree and the folder of its tokens,
-	 * each by name. It reads them, and writes the ones that are also writable. Nothing else in the
-	 * state directory is in its sight, however it came to be there, and the folder of a token must
-	 * hold only that launch's, as a token is renewed by replacing its file. A worktree among them
-	 * is one the connector made for this launch, so it is written, and its entry in the repository's
-	 * git directory with it; a working directory that is not among them, a Planner's checkout, is the
-	 * person's own and is read, whole, whatever is in it: its files, its submodules and its git
-	 * directory, but for where commits go (see `gitAccess`).
+	 * Its own paths in the connector's state directory: its worktree, its token folder and its agent
+	 * state. It reads them, and writes the ones that are also writable. A working directory among
+	 * them is one the connector made for the launch, which it writes; any other is the person's
+	 * checkout, which it only reads.
 	 */
 	own?: string[];
+	/** The agent's state directory, made for this launch and among `own`, which it writes. */
+	agentHome?: string;
+	/** Host folders it only reads: a Planner's checkout, the person's, uncommitted files and all. */
+	reads?: string[];
+	/**
+	 * The repository its guest clones and works in (see `GuestRepository`), from a git directory named
+	 * by the connector's record of a checkout, never by a file in one.
+	 */
+	repository?: GuestRepository;
+	/** The scratch disk its guest's writable root is on, which outlives it (a Planner's). */
+	disk?: string;
 };
 
-/** A started process: its stdout and stderr are always pipes. */
-export type Spawned = ChildProcess & { stdout: Readable; stderr: Readable };
+/**
+ * A started process: its stdout and stderr are always pipes. A microVM's is its launch, which may
+ * start `nvx` more than once (see `startVm`): its `pid` is its current start's, and its process
+ * group. It emits `workload` once its guest has booted and starts the agent (`STARTED_LINE`). On
+ * Windows it carries `stopMicrovm`, which ends it as `nvx` and OpenVMM need there (see
+ * `startNvx`).
+ */
+export type Spawned = ChildProcess & {
+	stdout: Readable;
+	stderr: Readable;
+	stopMicrovm?: (graceMs: number) => Promise<void>;
+};
 
-/** Where agents are started: through the machine's process sandbox, or plainly. */
+/** Where agents are started: each in a microVM of its own. */
 export type Sandbox = {
 	report: SandboxReport;
-	/** Start `launch` in the sandbox. Throws a `SandboxRefused` when the owner requires one and there is none. */
+	/** Start `launch` in a microVM of its own. Throws a `SandboxRefused` for a launch it can't give one. */
 	spawn(launch: Launch): Spawned;
+	/** The loopback relay through which its launches reach Chopin's credential proxy. */
+	aiRelay?: AiRelay;
+	/** What a process its guest starts needs to reach out: the proxy's variables. */
+	guestEnvironment?: Record<string, string>;
+	/** How a run's agent starts the MCP bridge to Chopin's tools for its run, beside it. */
+	bridge: { command: string; args: string[] };
+	/** The folder its guests clone their repositories in (see `guestRepositoryPath`). */
+	work: string;
+	/**
+	 * Makes the disk at `path` a launch's writable root lasts on (a Planner's, see `plannerDisk`):
+	 * a sparse ext4 image of `DISK_GIB` GiB, made in a microVM; one already there is kept.
+	 */
+	makeDisk?(path: string): Promise<void>;
+	allow?(entry: string): void;
 	close(): Promise<void>;
 };
 
-/** A run the owner asked chopin not to start without the sandbox. */
-export class SandboxRefused extends Error {
-	override name = "SandboxRefused";
-}
-
-/** Start a process as the operating system would, in its own process group. */
-export function plainSpawn(launch: Launch): Spawned {
-	return spawn(launch.command[0]!, launch.command.slice(1), {
-		cwd: launch.cwd,
-		env: launch.env,
-		stdio: [launch.stdin, "pipe", "pipe"],
-		detached: process.platform !== "win32",
-	}) as Spawned;
-}
-
-/**
- * Start `launch` through `sandbox`, or as it started before there was one. A process with no
- * sandbox to start it in is what the tests and the `chopin` scripts of earlier releases do.
- */
-export function spawnIn(sandbox: Sandbox | undefined, launch: Launch): Spawned {
-	return sandbox ? sandbox.spawn(launch) : plainSpawn(launch);
-}
-
-/** The words that start MXC's executor on each system, as the SDK names its files. */
-const EXECUTOR = { linux: "lxc-exec", darwin: "mxc-exec-mac", win32: "wxc-exec.exe" } as const;
-/** The executor's companions on Windows, which must sit beside it. */
-const COMPANIONS = ["winhttp-proxy-shim.exe"];
-
-/** Prefix of the files `build-binaries.ts` embeds into the chopin binary. */
-export const EMBEDDED_PREFIX = "mxc-";
-
-/**
- * The MXC SDK package nearest above `from`, looked for in each node_modules on the way up. It is
- * never resolved through Bun's own resolver, which installs a package it can't find from npm.
- */
-export function sdkRoot(from: string): string | undefined {
-	for (let directory = from;; directory = dirname(directory)) {
-		let candidate = join(directory, "node_modules", "@microsoft", "mxc-sdk");
-		if (existsSync(join(candidate, "package.json"))) return candidate;
-		if (dirname(directory) === directory) return undefined;
+/** A machine that can't run NVX: nothing pairs, connects or starts, and `words` say why. */
+export class MachineUnsupported extends Error {
+	override name = "MachineUnsupported";
+	constructor(readonly support: Extract<NvxSupport, { supported: false }>) {
+		super(unsupportedWords(support).join("\n"));
 	}
 }
 
-function sdkBin(platform: NodeJS.Platform, architecture: string): string | undefined {
-	let root = sdkRoot(import.meta.dir);
-	if (!root || !(platform in EXECUTOR)) return undefined;
-	let folder = join(root, "bin", architecture === "arm64" ? "arm64" : "x64");
-	return existsSync(folder) ? folder : undefined;
+/** Start `launch` in `sandbox`. There is no other way to start an agent. */
+export function spawnIn(sandbox: Sandbox, launch: Launch): Spawned {
+	return sandbox.spawn(launch);
 }
 
-/**
- * MXC's executor for this system: the one the chopin binary carries, written under
- * `<base>/sandbox/<hash>` on first use, or, in a source checkout, the one in the SDK package.
- * Undefined where this chopin has none, as for the downloaded script.
- */
-export async function locateExecutor(
-	directory: string,
-	platform: NodeJS.Platform = process.platform,
-	architecture: string = arch(),
-): Promise<string | undefined> {
-	if (!(platform in EXECUTOR)) return undefined;
-	let name = EXECUTOR[platform as keyof typeof EXECUTOR];
-	if (Bun.isStandaloneExecutable) {
-		let files = Bun.embeddedFiles as Array<Blob & { name: string }>;
-		let main = files.find(file => file.name.startsWith(`${EMBEDDED_PREFIX}executor-`));
-		if (!main) return undefined;
-		let bytes = new Uint8Array(await main.arrayBuffer());
-		let hash = new Bun.CryptoHasher("sha256").update(bytes).digest("hex").slice(0, 16);
-		let folder = join(directory, "sandbox", hash);
-		let target = join(folder, name);
-		if (!existsSync(target) || statSync(target).size !== bytes.length) {
-			mkdirSync(folder, { recursive: true, mode: 0o700 });
-			writeFileSync(target, bytes, { mode: 0o755 });
-			chmodSync(target, 0o755);
-			for (let companion of COMPANIONS) {
-				let stem = companion.replace(/\.exe$/, "");
-				let file = files.find(item => item.name.startsWith(`${EMBEDDED_PREFIX}${stem}-`));
-				if (file) writeFileSync(join(folder, companion), new Uint8Array(await file.arrayBuffer()));
-			}
-		}
-		return target;
-	}
-	let folder = sdkBin(platform, architecture);
-	let target = folder && join(folder, name);
-	return target && existsSync(target) ? target : undefined;
-}
-
-/** Find `program` as MXC does: on PATH, then in the system directories. */
-function findProgram(program: string, env: NodeJS.ProcessEnv): string | undefined {
-	let directories = [
-		...(env.PATH ?? "").split(delimiter).filter(entry => entry.startsWith("/")),
-		"/usr/local/sbin",
-		"/usr/local/bin",
-		"/usr/sbin",
-		"/usr/bin",
-		"/sbin",
-		"/bin",
-	];
-	for (let directory of directories) {
-		let path = join(directory, program);
-		try {
-			if (statSync(path).isFile()) return realpathSync(path);
-		} catch { /* Not in this directory. */ }
-	}
-	return undefined;
-}
-
-/** The machine the connector runs on, as the probe asks about it. */
-export function systemHost(env: NodeJS.ProcessEnv = process.env): Host {
+/** The machine as the support check reads it. */
+export function systemSupportHost(): SupportHost {
 	return {
 		platform: process.platform,
 		arch: arch(),
-		release: release(),
-		env,
-		read(path) {
+		...process.getuid ? { uid: process.getuid() } : {},
+		...process.env.SystemRoot ? { systemRoot: process.env.SystemRoot } : {},
+		exists: existsSync,
+		readWrite(path) {
 			try {
-				return readFileSync(path, "utf8");
+				accessSync(path, constants.R_OK | constants.W_OK);
+				return true;
 			} catch {
-				return undefined;
+				return false;
 			}
 		},
-		exists: existsSync,
-		find: program => findProgram(program, env),
-		async run(executor, request) {
-			let folder = mkdtempSync(join(tmpdir(), "chopin-probe-"));
-			let file = join(folder, "request.json");
+		joinedLater(path) {
 			try {
-				writeFileSync(file, JSON.stringify(request), { mode: 0o600 });
-				let child = spawn(executor, ["--config", file], {
-					stdio: ["ignore", "pipe", "pipe"],
-					windowsHide: true,
+				let group = statSync(path).gid;
+				if (group === 0 || process.getgid?.() === group) return false;
+				if (process.getgroups?.().includes(group)) return false;
+				// The group database as it is now, which `id` reads, where this process's groups are
+				// those its login began with.
+				let listed = spawnSync("id", ["-G", userInfo().username], {
+					encoding: "utf8",
+					timeout: 5_000,
 				});
-				let output = "";
-				child.stdout.on("data", chunk => output += chunk);
-				child.stderr.on("data", chunk => output += chunk);
-				let timer = setTimeout(() => child.kill("SIGKILL"), 30_000);
-				let code = await new Promise<number | null>(done => {
-					child.once("error", error => {
-						output += error.message;
-						done(null);
-					});
-					child.once("close", done);
-				});
-				clearTimeout(timer);
-				return { code, output };
-			} finally {
-				rmSync(folder, { recursive: true, force: true });
+				return listed.status === 0
+					&& listed.stdout.trim().split(/\s+/).map(Number).includes(group);
+			} catch {
+				return false;
 			}
 		},
 	};
 }
+
+/**
+ * How `nvx` is started: with a stdin or not, for a guest that owns nothing shared, who hears of a
+ * microVM that outlived its stop (on Windows), and how long it waits first (a start tried again).
+ */
+export type StartOptions = {
+	stdin: "pipe" | "ignore";
+	open?: boolean;
+	wedged?: (detail: string) => void;
+	delayMs?: number;
+};
+
+/** Why this machine can't run microVMs, with the fix where there is one. */
+export type Unsupported = Extract<NvxSupport, { supported: false }>;
+
+/** How `startVm` starts `nvx`, and who hears what happens to its microVM. */
+export type VmOptions = {
+	/** Stands in for `nvx` in tests: what starts the command line. */
+	start?: (program: string, words: string[], launch: StartOptions) => Spawned;
+	/** Hears of a microVM that outlived its stop (on Windows). */
+	wedged?: (detail: string) => void;
+	/** Hears of a microVM that didn't start and is started again. */
+	retrying?: (detail: string) => void;
+	/**
+	 * Hears, before the launch ends, that this machine can't run microVMs any more: OpenVMM wasn't
+	 * allowed to open the hypervisor's device, as when logind took back a login's access to
+	 * /dev/kvm. Nothing more starts until it can (see `connect`).
+	 */
+	unsupported?: (problem: Unsupported) => void;
+	/** What those words read of the machine (`joinedLater`); the machine itself unless said. */
+	host?: Pick<SupportHost, "joinedLater">;
+};
+
+/** What a microVM is built from: NVX and the hypervisor. */
+export type NvxSetup = {
+	artifacts: NvxArtifacts;
+	hypervisor: Hypervisor;
+};
 
 export type SandboxOptions = {
 	/** The connector's state directory. */
 	directory: string;
-	/** Chopin's origin, which every run may reach. */
+	/** Chopin's origin, which every guest may reach through the proxy. */
 	server: string;
 	settings?: SandboxSettings;
+	setup: NvxSetup;
+	/** How to make the image of each program an agent's command may start, by its file name. */
+	recipes: Map<string, ImageRecipe>;
+	/** Fetches what images are made from; `fetch` by default. */
+	download?: Downloader;
+	/** Hears that an image is being built, which takes minutes the first time: whose it is. */
+	building?: (recipes: ImageRecipe[]) => void;
+	/** Hears that another chopin on the base dir is building an image this one needs, and waits. */
+	waiting?: (recipes: ImageRecipe[]) => void;
 	/** Hears each host the proxy refuses, once. */
 	refused?: (host: string, port: number) => void;
-	/** Hears the `commondir` files an earlier agent left in a checkout's git directory, which were removed. */
-	planted?: (files: string[]) => void;
-	host?: Host;
-	executor?: string | undefined;
-	/** The person's home directory, whose credentials stay out of sight; this account's by default. */
-	home?: string;
+	/** Hears of a microVM that outlived its stop (on Windows), which a restart may be needed to end. */
+	wedged?: (detail: string) => void;
+	/** Hears of a microVM that didn't start and is started again. */
+	retrying?: (detail: string) => void;
+	/** Hears that this machine can't run microVMs any more, and why (see `VmOptions`). */
+	unsupported?: (problem: Unsupported) => void;
+	/** The machine as the support check reads it; the machine itself unless said. */
+	host?: SupportHost;
+	/** Stands in for `nvx` in tests: what starts the command line. */
+	start?: (program: string, words: string[], launch: StartOptions) => Spawned;
+	/** Stands in for the microVMs that make images, in tests (`vmBuilder`). */
+	builder?: ImageBuilder;
+	/**
+	 * Whether the images no recipe here names go, as a connector that holds the base dir removes
+	 * them. False for a check beside a running connector, whose images they may be.
+	 */
+	prune?: boolean;
 };
 
-/** The sandbox that doesn't confine: where none works or the owner turned it off. */
-function unconfined(report: SandboxReport, refusal?: string): Sandbox {
-	return {
-		report,
-		spawn(launch) {
-			if (refusal) throw new SandboxRefused(refusal);
-			return plainSpawn(launch);
-		},
-		close: async () => {},
-	};
+/** The connector's records of the microVMs it started, which a connector that died left behind. */
+function launchesFolder(base: string) {
+	return join(base, "nvx", "launches");
 }
 
-/** What the probe finds, without starting anything that stays: the report and MXC's executor. */
-export async function inspectSandbox(options: {
-	directory: string;
-	settings?: SandboxSettings | undefined;
-	host?: Host;
-	executor?: string | undefined;
-}): Promise<{ report: SandboxReport; executor?: string | undefined }> {
-	let host = options.host ?? systemHost();
-	if (options.settings?.off) {
-		return { report: { engine: "none", reason: "It is turned off with --no-sandbox." } };
-	}
+/**
+ * Ends what a connector that died left running: each recorded `nvx` process group, OpenVMM in it,
+ * whose connector is gone, and removes the records with the folder each `nvx` kept in the temporary
+ * directory. A process is ended only while it is still the one recorded (`processStart`'s id,
+ * recorded as it started): a number reused since, after a restart or days later, is never
+ * signalled, and a record without one ends nothing. A launch of a chopin still running beside this
+ * one on the state directory (the service, while a terminal's `service install` checks the agent) is
+ * left alone. On Windows a connector's job objects ended its microVMs as it died (see
+ * `windowsStop`), so only the records and folders go.
+ */
+export async function endOrphans(base: string, probe: StartProbe = processStart()) {
+	let folder = launchesFolder(base);
+	let names: string[];
 	try {
-		let executor = "executor" in options
-			? options.executor
-			: await locateExecutor(options.directory, host.platform, host.arch);
-		return { report: await probeSandbox(host, executor, "http://127.0.0.1:9"), executor };
-	} catch (error) {
-		let reason = error instanceof Error ? error.message : String(error);
-		return {
-			report: { engine: "none", reason: `The sandbox check failed: ${reason}`.slice(0, 300) },
+		names = readdirSync(folder);
+	} catch {
+		return;
+	}
+	let same = async (pid: unknown, start: unknown) =>
+		typeof pid === "number" && pid > 1 && typeof start === "string"
+		&& (await probe(pid).catch(() => undefined))?.id === start;
+	for (let name of names) {
+		let record = join(folder, name, "launch.json");
+		let launch: {
+			pid?: unknown;
+			start?: unknown;
+			owner?: unknown;
+			ownerStart?: unknown;
+			run?: unknown;
 		};
+		try {
+			launch = JSON.parse(readFileSync(record, "utf8"));
+		} catch {
+			// No record: an interrupted start, or one of another chopin's still being made.
+			let made = statSync(join(folder, name), { throwIfNoEntry: false })?.mtimeMs ?? 0;
+			if (Date.now() - made < 60_000) continue;
+			rmSync(join(folder, name), { recursive: true, force: true });
+			continue;
+		}
+		let { owner } = launch;
+		if (typeof owner === "number" && owner !== process.pid) {
+			// Its chopin still runs: by its recorded start where there is one, else by its number.
+			if (launch.ownerStart === undefined ? alive(owner) : await same(owner, launch.ownerStart)) {
+				continue;
+			}
+		}
+		if (process.platform !== "win32" && await same(launch.pid, launch.start)) {
+			try {
+				process.kill(-(launch.pid as number), "SIGKILL");
+			} catch { /* Gone already. */ }
+		}
+		if (typeof launch.run === "string" && RUN_FOLDER.test(basename(launch.run))) {
+			removeRunFolder(launch.run);
+		}
+		rmSync(join(folder, name), { recursive: true, force: true });
+	}
+}
+
+/** What `nvx sandbox run` calls the folder it keeps in the temporary directory for one run. */
+const RUN_FOLDER = /^nvx-sandbox-run-[0-9a-f]+$/;
+
+/**
+ * The folder `nvx` keeps for a run, from the OpenVMM command line it prints as it starts one, where
+ * OpenVMM's report and log are: `--microvm-report <folder>/outcome.json`. Undefined for a line that
+ * names none.
+ */
+export function runFolderOf(line: string, platform: NodeJS.Platform = process.platform) {
+	let match = /--microvm-report[ =](?:"([^"]+)"|'([^']+)'|(\S+))/.exec(line);
+	let report = match?.[1] ?? match?.[2] ?? match?.[3];
+	if (!report) return undefined;
+	let paths = platform === "win32" ? win32 : posix;
+	let folder = paths.dirname(report);
+	return RUN_FOLDER.test(paths.basename(folder)) ? folder : undefined;
+}
+
+/**
+ * Removes a run's folder of `nvx`'s. On Windows OpenVMM may hold its log a moment after `nvx`
+ * ended, and it is tried again for a few seconds; one that still can't go is left to the next sweep.
+ */
+function removeRunFolder(path: string) {
+	try {
+		rmSync(path, { recursive: true, force: true });
+	} catch {
+		void rm(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 }).catch(() => {});
 	}
 }
 
 /**
- * The sandbox this machine can give: probed once, here, by launching a command that does nothing
- * in it. Where none works, runs go on unsandboxed and the report says why; with `require` they
- * are refused instead.
+ * Where `nvx` keeps its runs' folders: the temporary directory as Rust finds it (`std::env::temp_dir`),
+ * which on Linux is `TMPDIR` alone, where Node's would read `TMP` and `TEMP` too, and on Windows is
+ * `GetTempPath`'s.
  */
-export async function createSandbox(options: SandboxOptions): Promise<Sandbox> {
-	let settings = options.settings ?? {};
-	let host = options.host ?? systemHost();
-	let { report, executor } = await inspectSandbox({
-		directory: options.directory,
-		settings,
-		host,
-		...("executor" in options ? { executor: options.executor } : {}),
-	});
-	if (report.engine === "none" || !executor) {
-		let refusal = settings.require
-			? `Not run: the sandbox is required (--require-sandbox) and ${
-				report.engine === "none" ? report.reason : "there is none"
-			}`
-			: undefined;
-		return unconfined(report, refusal);
-	}
-	let engine = report.engine;
-	let proxy: Proxy = await startProxy({
-		hosts: allowedHosts(options.server, settings.hosts),
-		refused: (name, port) => options.refused?.(name, port),
-	});
-	return {
-		report,
-		spawn: launch => spawnConfined(executor, engine, host, proxy, options, launch),
-		close: () => proxy.close(),
-	};
+export function nvxTemporary(
+	env: Record<string, string | undefined> = process.env,
+	platform: NodeJS.Platform = process.platform,
+) {
+	if (platform !== "win32") return env.TMPDIR || "/tmp";
+	return env.TMP || env.TEMP || env.USERPROFILE || env.SystemRoot || "C:\\Windows";
 }
 
-function exists(path: string) {
+/** The command lines of the processes running on this machine; undefined where they can't be read. */
+async function commandLines(): Promise<string[] | undefined> {
+	if (process.platform === "linux") {
+		let entries = await readdir("/proc").catch(() => undefined);
+		if (!entries) return undefined;
+		let lines = await Promise.all(
+			entries.filter(entry => /^\d+$/.test(entry)).map(entry =>
+				readFile(`/proc/${entry}/cmdline`, "latin1").catch(() => "")
+			),
+		);
+		return lines.filter(Boolean);
+	}
+	if (process.platform === "win32") {
+		return new Promise(resolve =>
+			execFile(
+				"powershell.exe",
+				[
+					"-NoProfile",
+					"-NonInteractive",
+					"-Command",
+					"Get-CimInstance Win32_Process | ForEach-Object { $_.CommandLine }",
+				],
+				{ timeout: 30_000, maxBuffer: 64 * 1024 * 1024, windowsHide: true },
+				(error, stdout) => resolve(error ? undefined : stdout.split(/\r?\n/).filter(Boolean)),
+			)
+		);
+	}
+	return undefined;
+}
+
+/**
+ * Removes the folders `nvx sandbox run` kept in the temporary directory that no microVM uses any
+ * more. `nvx` removes its own as a run ends by itself, but not one ended by force, as the
+ * connector ends a launch it stops: that keeps OpenVMM's log and little else, and one is left for
+ * each. A launch removes its own as it ends (see `startVm`); this finds those of a connector that
+ * died first, or of an earlier `chopin`. Only the connector's user's folders are looked at, and a
+ * folder is kept while a launch's record names it, while it is younger than a minute (an `nvx`
+ * starting), or while a running process names it, as OpenVMM's command line does for its whole run:
+ * a microVM of another chopin, on another base dir, or of anything else of the person's that runs
+ * NVX. Where the processes can't be read, every folder is kept.
+ */
+export async function sweepRunFolders(
+	base: string,
+	temporary = nvxTemporary(),
+	running: () => Promise<string[] | undefined> = commandLines,
+) {
+	let names: string[];
 	try {
-		return existsSync(path);
+		names = readdirSync(temporary).filter(name => RUN_FOLDER.test(name));
 	} catch {
-		return false;
+		return;
 	}
-}
-
-/** A directory this user can read, which MXC refuses to grant otherwise. */
-function readableDirectory(path: string) {
+	if (!names.length) return;
+	let recorded = new Set<string>();
+	let launches = launchesFolder(base);
+	let records: string[];
 	try {
-		accessSync(path, constants.R_OK | constants.X_OK);
-		return statSync(path).isDirectory();
+		records = readdirSync(launches);
 	} catch {
-		return false;
+		records = [];
 	}
-}
-
-function real(path: string) {
-	try {
-		return realpathSync(path);
-	} catch {
-		return path;
-	}
-}
-
-/** The directory or file this user can read at `path`, by its real path; not a socket or a device. */
-function readableAt(path: string) {
-	try {
-		let resolved = realpathSync(path);
-		let directory = statSync(resolved).isDirectory();
-		if (!directory && !statSync(resolved).isFile()) return undefined;
-		accessSync(resolved, directory ? constants.R_OK | constants.X_OK : constants.R_OK);
-		return resolved;
-	} catch {
-		return undefined;
-	}
-}
-
-const disk: Disk = {
-	list(directory) {
+	for (let name of records) {
 		try {
-			return readdirSync(directory);
-		} catch {
-			return [];
-		}
-	},
-	resolve: readableAt,
+			let { run } = JSON.parse(readFileSync(join(launches, name, "launch.json"), "utf8")) as {
+				run?: unknown;
+			};
+			if (typeof run === "string") recorded.add(basename(run));
+		} catch { /* A launch still starting, which has no folder yet. */ }
+	}
+	let uid = process.getuid?.();
+	let left = names.filter(name => {
+		if (recorded.has(name)) return false;
+		let stat = lstatSync(join(temporary, name), { throwIfNoEntry: false });
+		return !!stat && stat.isDirectory() && (uid === undefined || stat.uid === uid)
+			&& Date.now() - stat.mtimeMs > 60_000;
+	});
+	if (!left.length) return;
+	let lines = await running();
+	if (!lines) return;
+	for (let name of left) {
+		if (lines.some(line => line.includes(name))) continue;
+		removeRunFolder(join(temporary, name));
+	}
+}
+
+/** This process's start, as `processStart` reads it, asked once. */
+let ownStart: Promise<string | undefined> | undefined;
+
+function alive(pid: number) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** How `nvx` starts on Linux: as it is. */
+export const NVX_LAUNCHER = 'exec "$0" "$@"';
+
+/**
+ * How `nvx` starts for a guest of the layer's `nobody` (an image's build), which owns nothing
+ * shared: OpenVMM makes what it asks for in its shares with the guest's modes narrowed by its own
+ * umask, which is cleared, so it can write what it made. Only an image's build folder, in the
+ * `0700` state directory, is shared with one.
+ */
+export const OPEN_NVX_LAUNCHER = `umask 000; ${NVX_LAUNCHER}`;
+
+/** What OpenVMM's log says when it couldn't set up a microVM's disk, as under heavy load it can't. */
+export const IO_URING_FAILURE = "driver does not support io-uring";
+
+/** What OpenVMM's log says when this machine's user may not open the hypervisor's device. */
+export const DEVICE_DENIED =
+	/failed to open file `(\/dev\/(?:kvm|mshv))`: Permission denied(?: \(os error \d+\))?/;
+
+/** How many times one launch's microVM is started at most: once, and twice more after that. */
+export const VM_STARTS = 3;
+
+/** How long each start after the first waits before it starts, in milliseconds. */
+export const START_AGAIN_MS = [500, 1_500];
+
+/** The most of OpenVMM's log a start's failure says, in characters. */
+const LOG_TAIL_CHARS = 1_000;
+
+/** One start of a launch's microVM: one `nvx` process. */
+type Attempt = {
+	child: Spawned;
+	/** Whether `nvx` printed the OpenVMM command line it starts (see `runFolderOf`). */
+	launched: boolean;
+	/** The folder `nvx` keeps for the run, which its launch line names. */
+	run?: string;
+	/** OpenVMM's log in it, open from the launch line on: `nvx` removes it as a failed start ends. */
+	log?: number;
+	/** Whether the guest said its workload starts (see `STARTED_LINE`). */
+	started: boolean;
+	/** What `nvx` said on stderr before then: its own words, as why a start failed. */
+	said: Buffer[];
+	/** The end of OpenVMM's log, read as a start that never started its workload exits. */
+	tail: string;
+	/** Why it didn't start, where that is that this machine can't run microVMs any more. */
+	unsupported?: Unsupported;
+	/** How it exited. */
+	code: number | null;
+	signal: NodeJS.Signals | null;
+	/** Resolves once it has exited and its stdout and stderr have ended. */
+	closed: Promise<void>;
 };
 
-/** What a launch may write in the repository's git directory: where its commits, refs and LFS objects go. */
-const GIT_WRITES = ["objects", "refs", "logs", "lfs"];
+/** The end of OpenVMM's log: its last fatal error with its causes, else its last lines. */
+function logTail(fd: number | undefined): string {
+	if (fd === undefined) return "";
+	let text: string;
+	try {
+		let size = fstatSync(fd).size;
+		let length = Math.min(size, 16_384);
+		let buffer = Buffer.alloc(length);
+		readSync(fd, buffer, 0, length, size - length);
+		text = buffer.toString("utf8");
+	} catch {
+		return "";
+	}
+	let lines = text.split("\n").map(line => line.trim()).filter(Boolean);
+	let fatal = lines.findLastIndex(line => line.startsWith("fatal error"));
+	let tail = (fatal >= 0 ? lines.slice(fatal) : lines.slice(-5)).join(" / ");
+	return tail.length > LOG_TAIL_CHARS ? `…${tail.slice(-LOG_TAIL_CHARS)}` : tail;
+}
 
 /**
- * The directories of the repository's git directory that are read-only there, and are in a launch's
- * own worktree entry too: made empty where there is none, and held. Git doesn't read hooks or
- * what `info` says of attributes from an entry, so they are not a place for them, and a
- * worktree's `modules` holds git directories of submodules, each with a configuration of its own.
- */
-const ENTRY_HELD = ["hooks", "info", "modules"];
-
-/**
- * What a launch may write of its repository's git directory, as an allow-list. It writes a
- * working tree only where the connector made it for the launch (`own`: a run's worktree, a
- * Planner's worktree from `preparePlannerWorktree`), and for each such linked worktree it writes
- * that worktree's own entry in `worktrees`, where its HEAD, index, fetch results and the locks
- * beside them are, with the three files git reads there to find configuration, and the three
- * directories the repository's git directory holds read-only too (`ENTRY_HELD`), held read-only
- * inside it, and `objects`, `refs`, `logs` and `lfs` of the repository's git directory, where
- * its commits, branches, fetched objects and LFS objects go. Everything else is read-only, and
- * the directories that hold it can't be renamed or made again, because they are mounted: the
- * repository's `config`, `hooks`, `info`, `HEAD`, `packed-refs` and the git directories of its
- * submodules, `worktrees` itself and every worktree's but the launch's own, and any file git adds
- * to the top level later, such as a `commondir`. A sandbox can only hold back a path that exists,
- * and a new name can't be refused one by one, so the top level is not granted at all. The one
- * place that has to be is the launch's own entry: git takes the lock of its `HEAD` and its index
- * by creating a file beside each and renaming it over them, which a sandbox can't grant for these
- * names and refuse for the others (measured: with the entry read-only and `HEAD`, `index` and `logs`
- * granted as paths, `git add` and `git commit` say `Unable to create 'index.lock': Read-only file
- * system`), so a name made at the top of the entry is made. Git reads nothing there as a hook or a
- * program, and what it reads as a pointer or as configuration is held. A launch with no worktree
- * of its own writes none of it. What it costs is in `docs/chopin-cli.md`.
+ * Starts the microVM `spec` describes: its writable folders made and opened to the guest, its
+ * environment in a private file `nvx` reads, and a record of its process group, which a connector
+ * that died leaves for the next to end (see `endOrphans`). The record names the folder `nvx` keeps
+ * in the temporary directory too. All of them go when the launch ends, however it ends.
  *
- * A working directory that is not among `own` is the person's: a Planner's checkout, a regular
- * one or a linked worktree of theirs. It is read-only whole, in `launchPolicy`, so what the
- * person's own git reads and runs there is not the agent's to write: its files, its submodules'
- * (a `.git` file in one sends git to the directory it names), its `.git`, its `HEAD`, its `index`
- * and an unfinished rebase's `exec` lines. Where the entry of an own worktree is is read from the
- * repository's side: the entry whose `gitdir` file names the folder (see `worktreeEntry`), never
- * the `.git` file in a folder an agent writes. That file, which says where a worktree's entry is,
- * is read-only too. An entry's `config.worktree` is made empty where there is none, which git
- * ignores unless `extensions.worktreeConfig` is on, so an agent can't be the one to make it, and
- * so are its `hooks`, `info` and `modules`; an entry that can't be held this way is not granted.
+ * What it returns is the launch, not one `nvx`: OpenVMM sometimes fails to start a microVM under
+ * heavy load, saying `IO_URING_FAILURE` in its log, and such a start is tried again, up to
+ * `VM_STARTS` times in all, after a short wait. Only a start whose workload never started is: the
+ * guest says the workload starts on its stdout before it runs it (`STARTED_LINE`), and until then
+ * nothing of the launch's stdin reaches the guest and nothing of `nvx`'s stderr reaches the
+ * caller, so an agent never sees two starts. A start that fails for good says why on stderr, with
+ * the end of OpenVMM's log, where `nvx` itself says only `vmm-failure status 1`.
+ *
+ * On Linux the wait before a new start is in that start's own process group (`delayMs`), so a
+ * caller that ends the launch's process group meanwhile ends it. On Windows, where a caller stops a
+ * launch through `stopMicrovm`, the launch waits, and a stop meanwhile ends it.
  */
-function gitAccess(
-	repository: Repository,
-	launch: Pick<Launch, "cwd" | "writable" | "own">,
-): { writable: string[]; readonlyInside: string[] } {
-	let { commonDir } = repository;
-	let writable: string[] = [];
-	// The repository's git directory is read-only whole, inside whatever the launch may write.
-	let readonlyInside: string[] = [commonDir];
-	let owned = new Set((launch.own ?? []).map(real));
-	let granted = false;
-	for (let place of writtenPlaces(launch)) {
-		let entry = owned.has(real(place)) ? worktreeEntry(commonDir, place) : undefined;
-		// A launch in a linked worktree of its own is in the one the connector recorded, and no other.
-		if (entry && place === launch.cwd && real(entry) !== real(repository.gitDir)) entry = undefined;
-		if (entry) {
-			try {
-				writeFileSync(join(entry, "config.worktree"), "", { flag: "wx" });
-			} catch { /* There is one, or it can't be made. */ }
-			for (let name of ENTRY_HELD) {
-				try {
-					mkdirSync(join(entry, name));
-				} catch { /* There is one, or it can't be made. */ }
-			}
-			let held = ["commondir", "gitdir", "config.worktree", ...ENTRY_HELD].map(name =>
-				join(entry, name)
-			);
-			if (held.every(file => exists(file))) {
-				writable.push(entry);
-				readonlyInside.push(...held);
-				granted = true;
-			}
-		}
-		// A linked worktree's `.git` is a file that says where its entry is.
-		try {
-			if (lstatSync(join(place, ".git")).isFile()) readonlyInside.push(join(place, ".git"));
-		} catch { /* No `.git` here. */ }
-	}
-	// Commits, branches and objects go to the repository's git directory from a worktree of its own.
-	if (granted) writable.push(...GIT_WRITES.map(name => join(commonDir, name)));
-	return { writable, readonlyInside: [...new Set(readonlyInside)] };
-}
-
-/**
- * The places a launch writes: the folders it was given beside its working directory, and the
- * working directory itself where the connector made it for the launch (`own`). Any other working
- * directory is the person's, which no sandboxed agent writes.
- */
-function writtenPlaces(launch: Pick<Launch, "cwd" | "writable" | "own">) {
-	let owned = new Set((launch.own ?? []).map(real));
-	return [
-		...owned.has(real(launch.cwd)) ? [launch.cwd] : [],
-		...launch.writable ?? [],
-	];
-}
-
-/** The policy for one launch, from what is on the disk now. */
-export function launchPolicy(
-	engine: SandboxEngine,
-	host: Host,
-	launch: Launch,
-	options: Pick<SandboxOptions, "directory" | "settings" | "home">,
-	proxy: string,
-	temporary: string,
-): Policy {
-	let { platform } = host;
-	let home = options.home ?? homedir();
-	let state = agentStateDirectories(launch.command, launch.env, home, platform);
-	for (let directory of state) {
-		try {
-			mkdirSync(directory, { recursive: true, mode: 0o700 });
-		} catch { /* The agent says so if it needs it. */ }
-	}
-	for (let directory of launch.writable ?? []) {
-		try {
-			mkdirSync(directory, { recursive: true, mode: 0o700 });
-		} catch { /* The agent says so if it needs it. */ }
-	}
-	let places = writtenPlaces(launch);
-	// The working directory is written only where the connector made it for this launch. Any
-	// other is the person's own checkout, which is read, whole, and never written: what their git
-	// reads and runs in it (its files and submodules' `.git`, its `.git`, its index) stays theirs.
-	let person = places.includes(launch.cwd) ? undefined : real(launch.cwd);
-	// Only the connector's record of the working directory says which repository this is, and so
-	// where its git directories are: a folder the agent made itself, as a Planner's worktree,
-	// names one in a file of its own, and what that file says is the agent's word.
-	let repository = repositoryAt(real(launch.cwd));
-	let git = repository ? gitAccess(repository, launch) : undefined;
-	let hidden = real(options.directory);
-	// The person's checkout and its git directory, which nothing the owner adds may open: a path
-	// they add that is one of them, or inside one (a submodule's folder, `.git/hooks`), is not
-	// granted, and one that holds one is granted with it held read-only. The person's own git reads
-	// and runs what is in them.
-	let checkout = repository && basename(repository.commonDir) === ".git"
-		? dirname(repository.commonDir)
-		: undefined;
-	let theirs = [
-		...person ? [person] : [],
-		...repository ? [repository.commonDir] : [],
-		...checkout ? [checkout] : [],
-	];
-	// What the owner hides is in no grant, read or write, whatever holds it: the grants that hold
-	// one are listed around it, as for the state directory, and it is denied as well.
-	let concealed = (options.settings?.hidden ?? []).map(real);
-	let around = (paths: readonly string[]) =>
-		concealed.reduce(
-			(grants, path) => readGrantsAround(grants, path, disk, platform),
-			readGrantsAround(paths, hidden, disk, platform),
-		);
-	// What the owner adds is written around the state directory as well, never in it.
-	let added = around(options.settings?.writable ?? []).filter(
-		path => !theirs.some(kept => inside(real(path), kept, platform)),
-	);
-	let reopened = theirs.filter(kept =>
-		added.some(path => real(path) !== kept && inside(kept, real(path), platform))
-	);
-	let writable = [
-		...places,
-		...git?.writable ?? [],
-		...state,
-		temporary,
-		...added,
-	].filter(path => exists(path));
-	let roots: string[];
-	if (platform === "win32") {
-		roots = windowsReadRoots(launch.env, home, {
-			directory: readableDirectory,
-			list: directory => disk.list(directory),
-		});
-	} else if (platform === "darwin") {
-		roots = ["/"];
-	} else {
-		roots = readableRoots(readdirSync("/")).filter(readableDirectory);
-	}
-	// Everything in the connector's state directory is out of sight but what the launch is given.
-	// That holds for the working directory too, which may hold the state directory (a home, a
-	// dotfiles checkout): it is read as the roots are, around the state directory, and a working
-	// directory inside it is read whole only where it is a clone the connector made.
-	let named = (path: string) => {
-		let at = real(path);
-		if (!inside(at, hidden, platform)) return readGrantsAround([at], hidden, disk, platform);
-		let clones = join(hidden, CLONES);
-		return at !== clones && inside(at, clones, platform) ? [at] : [];
-	};
-	// MXC takes a path granted both ways as read-only, so a grant that is also writable is dropped.
-	let written = new Set(writable.map(real));
-	let readable = [
-		...around(roots),
-		...(launch.own ?? []).filter(exists),
-		...person ? named(person) : [],
-		// The repository's git directory is read, whole, where only some roots are read (Windows).
-		...repository ? named(repository.commonDir) : [],
-	].filter(path => !written.has(real(path)));
-	let readonlyInside = [...git?.readonlyInside ?? [], ...reopened];
-	let denied = [...secretPaths(platform, home), ...concealed].filter(path => exists(path));
-	let env: Record<string, string | undefined> = { ...launch.env };
-	let pathKey = Object.keys(env).find(key => key.toUpperCase() === "PATH") ?? "PATH";
-	env[pathKey] = sandboxPath(env[pathKey], platform, real);
-	env.NODE_USE_ENV_PROXY = "1";
-	for (let key of platform === "win32" ? ["TEMP", "TMP"] : ["TMPDIR"]) env[key] = temporary;
-	return {
-		platform,
-		engine,
-		command: launch.command,
-		cwd: launch.cwd,
-		env,
-		readable,
-		writable,
-		readonlyInside,
-		denied,
-		proxy,
-	};
-}
-
-/** The variable the launcher finds the launch's environment file by. */
-const ENVIRONMENT_FILE = "CHOPIN_LAUNCH_ENVIRONMENT";
-/** What a shell can export: other names stay on the command line, and none of ours is one. */
-const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
-/** The proxy MXC points a launch at, which a variable of the person's must not replace. */
-const PROXY = /^(https?|ftp|all)_proxy$/i;
-
-/**
- * The shell that starts every sandboxed launch on Linux and macOS: it exports the environment
- * written to the file `CHOPIN_LAUNCH_ENVIRONMENT` names, deletes the file, then becomes the
- * launch's own command. The file is in the launch's private temporary directory (mode 0600).
- */
-export const LAUNCHER = `f=$${ENVIRONMENT_FILE}; unset ${ENVIRONMENT_FILE}; `
-	+ `set -a; . "$f" || exit 127; set +a; rm -f "$f"; exec "$@"`;
-
-/** A value as a POSIX shell reads it, quoted whole. */
-function shellQuote(value: string) {
-	return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
-/**
- * `policy` with its environment handed over in a file instead of on a command line. MXC starts a
- * process with each variable on the sandbox tool's command line (`bwrap --setenv NAME VALUE`),
- * which every process on the machine can read in `/proc/<pid>/cmdline` or `ps`; a launch's
- * environment holds its credentials, a Planner's and a GitHub token among them, and the person's
- * `--env` values. So on Linux and macOS the command line carries only the file's path, and
- * `LAUNCHER` exports what is in the file before the command starts: the launch has every variable
- * as before, readable by the person's own processes alone. The proxy MXC adds still wins. On
- * Windows the policy is as it was: ProcessContainer passes the environment as an environment.
- */
-export function sealedEnvironment(policy: Policy, folder: string): Policy {
-	if (policy.platform === "win32") return policy;
-	let file = join(folder, ".chopin-launch-environment");
-	let lines: string[] = [];
-	let shown: Record<string, string | undefined> = {};
-	for (let [name, value] of Object.entries(policy.env)) {
-		if (value === undefined || PROXY.test(name)) continue;
-		if (SHELL_NAME.test(name)) lines.push(`${name}=${shellQuote(value)}`);
-		else shown[name] = value;
-	}
-	writeFileSync(file, lines.join("\n") + "\n", { mode: 0o600 });
-	return {
-		...policy,
-		command: ["/bin/sh", "-c", LAUNCHER, "chopin-launch", ...policy.command],
-		env: { ...shown, PATH: policy.env.PATH, [ENVIRONMENT_FILE]: file },
-	};
-}
-
-function spawnConfined(
-	executor: string,
-	engine: SandboxEngine,
-	host: Host,
-	proxy: Proxy,
-	options: SandboxOptions,
-	launch: Launch,
+export function startVm(
+	spec: VmSpec,
+	setup: NvxSetup,
+	base: string,
+	stdin: "pipe" | "ignore",
+	options: VmOptions = {},
 ): Spawned {
-	let folder = mkdtempSync(join(tmpdir(), "chopin-sandbox-"));
-	let temporary = join(folder, "tmp");
-	mkdirSync(temporary, { mode: 0o700 });
-	let file = join(folder, "request.json");
-	// The policy leaves an agent no way to make a `commondir`, which would send git to configuration
-	// it wrote (see `gitAccess`). One that an agent of an earlier release, or one that ran without a
-	// sandbox, left is still removed, and said, when a launch starts and when it ends.
-	let cleared = () => {
-		let removed = removePlantedRedirects(launch.cwd);
-		if (removed.length) options.planted?.(removed);
+	let start = options.start ?? startNvx;
+	makeWritable(spec);
+	let folder = join(launchesFolder(base), randomBytes(8).toString("hex"));
+	mkdirSync(folder, { recursive: true, mode: 0o700 });
+	let file = join(folder, "environment.json");
+	writeFileSync(file, environmentFile(spec.environment), { mode: 0o600 });
+	let words = nvxArguments(spec, setup.artifacts, setup.hypervisor, file);
+	let current: Attempt | undefined;
+	let starts = 0;
+	let stopped = false;
+	let settled = false;
+	/** A start waiting to be tried again, on Windows. */
+	let waiting: ReturnType<typeof setTimeout> | undefined;
+	/** What the launch's stdin was given before its workload started, and whether it was ended. */
+	let queue: Buffer[] = [];
+	let ending = false;
+	let record: Record<string, unknown> = {};
+	let save = (attempt: Attempt, fields: Record<string, unknown>) => {
+		if (attempt !== current || !existsSync(folder)) return;
+		Object.assign(record, fields);
+		writeFileSync(join(folder, "launch.json"), JSON.stringify(record), { mode: 0o600 });
 	};
-	cleared();
-	let request = mxcRequest(
-		sealedEnvironment(launchPolicy(engine, host, launch, options, proxy.url, temporary), temporary),
-	);
-	writeFileSync(file, JSON.stringify(request), { mode: 0o600 });
-	let child = spawn(executor, ["--config", file], {
+	let input = stdin === "pipe"
+		? new Writable({
+			write(chunk: Buffer, _encoding, done) {
+				if (current?.started) current.child.stdin?.write(chunk);
+				else queue.push(chunk);
+				done();
+			},
+			final(done) {
+				if (current?.started) current.child.stdin?.end();
+				else ending = true;
+				done();
+			},
+		})
+		: null;
+	let launch = Object.assign(new EventEmitter(), {
+		stdin: input,
+		stdout: new PassThrough(),
+		stderr: new PassThrough(),
+		exitCode: null as number | null,
+		signalCode: null as NodeJS.Signals | null,
+		kill(signal?: NodeJS.Signals | number) {
+			stopped = true;
+			if (waiting) return giveUp();
+			return current?.child.kill(signal) ?? false;
+		},
+	});
+	Object.defineProperty(launch, "pid", { enumerable: true, get: () => current?.child.pid });
+	if (process.platform === "win32") {
+		Object.assign(launch, {
+			stopMicrovm(graceMs: number) {
+				stopped = true;
+				if (waiting) giveUp();
+				return current?.child.stopMicrovm?.(graceMs) ?? Promise.resolve();
+			},
+		});
+	}
+	let release = (attempt: Attempt) => {
+		if (attempt.log !== undefined) {
+			try {
+				closeSync(attempt.log);
+			} catch { /* Closed already. */ }
+			attempt.log = undefined;
+		}
+		if (attempt.run) removeRunFolder(attempt.run);
+	};
+	let started = (attempt: Attempt) => {
+		attempt.started = true;
+		launch.emit("workload");
+		for (let chunk of attempt.said) launch.stderr.write(chunk);
+		attempt.said = [];
+		for (let chunk of queue) attempt.child.stdin?.write(chunk);
+		queue = [];
+		if (ending) attempt.child.stdin?.end();
+	};
+	/** The launch ends with `attempt`, the last start of its microVM. */
+	let settle = async (attempt: Attempt, errored = false) => {
+		if (settled) return;
+		settled = true;
+		launch.exitCode = attempt.code;
+		launch.signalCode = attempt.signal;
+		if (!errored) launch.emit("exit", attempt.code, attempt.signal);
+		await attempt.closed;
+		if (!attempt.started) {
+			let said = Buffer.concat(attempt.said).toString("utf8").trim();
+			let log = attempt.tail || logTail(attempt.log);
+			if (attempt.unsupported) {
+				launch.stderr.write(
+					`${unsupportedWords(attempt.unsupported).join(" ")} (OpenVMM: ${
+						DEVICE_DENIED.exec(log)?.[0]
+					})\n`,
+				);
+			} else if (attempt.code !== null && attempt.code !== 0 && log) {
+				launch.stderr.write(
+					`The microVM didn't start${starts > 1 ? ` after ${starts} tries` : ""}: ${log}${
+						said ? ` (nvx: ${said.split(/\s*\n\s*/).join(" ")})` : ""
+					}\n`,
+				);
+			} else if (said) launch.stderr.write(`${said}\n`);
+			input?.destroy();
+		}
+		release(attempt);
+		rmSync(folder, { recursive: true, force: true });
+		launch.stdout.end();
+		launch.stderr.end();
+		launch.emit("close", attempt.code, attempt.signal);
+	};
+	/** A launch stopped while it waited to start again ends with the start that failed. */
+	let giveUp = () => {
+		clearTimeout(waiting);
+		waiting = undefined;
+		if (current) void settle(current);
+		return true;
+	};
+	let begin = (delayMs: number) => {
+		let child = start(setup.artifacts.nvx, words, {
+			stdin,
+			open: !spec.image,
+			...options.wedged ? { wedged: options.wedged } : {},
+			...delayMs ? { delayMs } : {},
+		});
+		starts++;
+		let attempt: Attempt = {
+			child,
+			launched: false,
+			started: false,
+			said: [],
+			tail: "",
+			code: null,
+			signal: null,
+			closed: new Promise(resolve => {
+				child.once("close", () => resolve());
+				child.once("error", () => resolve());
+			}),
+		};
+		current = attempt;
+		if (child.pid) {
+			let pid = child.pid;
+			record = { pid, owner: process.pid };
+			save(attempt, {});
+			// What identifies it and this process, so a later connector ends only this process.
+			let probe = processStart();
+			ownStart ??= probe(process.pid).then(found => found?.id, () => undefined);
+			void Promise.all([probe(pid).catch(() => undefined), ownStart]).then(([found, owner]) => {
+				if (found) save(attempt, { start: found.id, ...owner ? { ownerStart: owner } : {} });
+			}).catch(() => {});
+		}
+		child.stdin?.on("error", error => {
+			if (attempt === current && attempt.started) input?.destroy(error);
+		});
+		let pending = "";
+		child.stdout.on("data", (chunk: Buffer) => {
+			if (attempt !== current) return;
+			if (attempt.started) {
+				launch.stdout.write(chunk);
+				return;
+			}
+			// `nvx`'s launch line, then the guest's started line; anything else is the workload's own.
+			pending += chunk.toString("latin1");
+			for (;;) {
+				let end = pending.indexOf("\n");
+				let line = (end < 0 ? pending : pending.slice(0, end)).replace(/\r$/, "");
+				if (end < 0 && (line.startsWith(">> ") || ">> ".startsWith(line))) return;
+				if (end >= 0 && line === STARTED_LINE) {
+					pending = pending.slice(end + 1);
+				} else if (end >= 0 && line.startsWith(">> ") && !attempt.launched) {
+					pending = pending.slice(end + 1);
+					attempt.launched = true;
+					attempt.run = runFolderOf(line);
+					if (!attempt.run) continue;
+					save(attempt, { run: attempt.run });
+					try {
+						attempt.log = openSync(join(attempt.run, "openvmm.log"), "r");
+					} catch { /* Gone already: a start that failed at once. */ }
+					continue;
+				}
+				break;
+			}
+			started(attempt);
+			if (pending) launch.stdout.write(Buffer.from(pending, "latin1"));
+			pending = "";
+		});
+		child.stderr.on("data", (chunk: Buffer) => {
+			if (attempt !== current) return;
+			if (attempt.started) launch.stderr.write(chunk);
+			else attempt.said.push(chunk);
+		});
+		child.once("exit", (code, signal) => {
+			attempt.code = code;
+			attempt.signal = signal;
+			if (attempt !== current) return;
+			if (!attempt.started) attempt.tail = logTail(attempt.log);
+			let denied = !attempt.started && code !== 0 && DEVICE_DENIED.exec(attempt.tail)?.[1];
+			if (denied) {
+				let device = denied as HypervisorDevice;
+				attempt.unsupported = deviceDenied(device, options.host ?? systemSupportHost());
+				options.unsupported?.(attempt.unsupported);
+			}
+			let again = !attempt.started && !stopped && code !== null && code !== 0
+				&& starts < VM_STARTS && attempt.tail.includes(IO_URING_FAILURE);
+			if (!again) {
+				void settle(attempt);
+				return;
+			}
+			release(attempt);
+			options.retrying?.(
+				`A microVM didn't start (OpenVMM: ${IO_URING_FAILURE}), so chopin starts it again (${
+					starts + 1
+				} of ${VM_STARTS}).`,
+			);
+			let wait = START_AGAIN_MS[starts - 1] ?? 0;
+			let next = () => {
+				try {
+					begin(process.platform === "win32" ? 0 : wait);
+				} catch (error) {
+					launch.emit("error", error);
+					void settle(attempt, true);
+				}
+			};
+			if (process.platform !== "win32") next();
+			else {
+				waiting = setTimeout(() => {
+					waiting = undefined;
+					next();
+				}, wait);
+			}
+		});
+		child.once("error", error => {
+			if (attempt !== current || settled) return;
+			launch.emit("error", error);
+			void settle(attempt, true);
+		});
+	};
+	try {
+		begin(0);
+	} catch (error) {
+		// A launch that never started, as on Windows without its job object, leaves no tokens.
+		rmSync(folder, { recursive: true, force: true });
+		throw error;
+	}
+	return launch as unknown as Spawned;
+}
+
+/**
+ * A launch whose microVM starts once `starting` gives it its start: one that arrived while its image
+ * was being made waits for that build. Until then its stdin is kept for the workload, a stop starts
+ * nothing and ends it, and a start that can't be made (the build failed) ends it with exit 1 and
+ * why on its stderr. Once started it is the microVM's launch.
+ */
+export function awaitingImage(
+	stdin: "pipe" | "ignore",
+	starting: Promise<() => Spawned>,
+): Spawned {
+	let child: Spawned | undefined;
+	let stopped: NodeJS.Signals | undefined;
+	let queue: Buffer[] = [];
+	let ending = false;
+	let input = stdin === "pipe"
+		? new Writable({
+			write(chunk: Buffer, _encoding, done) {
+				if (child) child.stdin?.write(chunk);
+				else queue.push(chunk);
+				done();
+			},
+			final(done) {
+				if (child) child.stdin?.end();
+				else ending = true;
+				done();
+			},
+		})
+		: null;
+	let launch = Object.assign(new EventEmitter(), {
+		stdin: input,
+		stdout: new PassThrough(),
+		stderr: new PassThrough(),
+		exitCode: null as number | null,
+		signalCode: null as NodeJS.Signals | null,
+		kill(signal?: NodeJS.Signals | number) {
+			if (child) return child.kill(signal);
+			stopped ??= typeof signal === "string" ? signal : "SIGTERM";
+			return true;
+		},
+	});
+	Object.defineProperty(launch, "pid", { enumerable: true, get: () => child?.pid });
+	if (process.platform === "win32") {
+		Object.assign(launch, {
+			stopMicrovm(graceMs: number) {
+				if (child) return child.stopMicrovm?.(graceMs) ?? Promise.resolve();
+				stopped ??= "SIGTERM";
+				return Promise.resolve();
+			},
+		});
+	}
+	let end = (code: number | null, signal: NodeJS.Signals | null, said?: string) => {
+		if (said) launch.stderr.write(said);
+		launch.exitCode = code;
+		launch.signalCode = signal;
+		launch.emit("exit", code, signal);
+		launch.stdout.end();
+		launch.stderr.end();
+		input?.destroy();
+		launch.emit("close", code, signal);
+	};
+	let failed = (error: unknown) =>
+		end(1, null, `${error instanceof Error ? error.message : String(error)}\n`);
+	starting.then(start => {
+		if (stopped) return end(null, stopped);
+		let started: Spawned;
+		try {
+			started = start();
+		} catch (error) {
+			return failed(error);
+		}
+		child = started;
+		// Its close comes once what it printed has passed through.
+		let flushed = Promise.all(
+			[launch.stdout, launch.stderr].map(stream =>
+				new Promise(resolve => stream.once("finish", resolve))
+			),
+		);
+		started.stdout.pipe(launch.stdout);
+		started.stderr.pipe(launch.stderr);
+		for (let chunk of queue) started.stdin?.write(chunk);
+		queue = [];
+		if (ending) started.stdin?.end();
+		started.once("exit", (code, signal) => {
+			launch.exitCode = code;
+			launch.signalCode = signal;
+			launch.emit("exit", code, signal);
+		});
+		started.once("close", (code, signal) => {
+			void flushed.then(() => launch.emit("close", code, signal));
+		});
+		started.once("error", error => launch.emit("error", error));
+		started.once("workload", () => launch.emit("workload"));
+	}, failed);
+	return launch as unknown as Spawned;
+}
+
+/** Runs `spec`'s microVM to its end, as an image build or the start check does. */
+export function runVm(
+	spec: VmSpec,
+	setup: NvxSetup,
+	base: string,
+	options: VmOptions = {},
+): Promise<{ code: number | null; output: string }> {
+	let child = startVm(spec, setup, base, "ignore", options);
+	let output = "";
+	child.stdout.on("data", chunk => output = (output + chunk).slice(-65_536));
+	child.stderr.on("data", chunk => output = (output + chunk).slice(-65_536));
+	return new Promise(resolve => {
+		child.once("error", error => resolve({ code: null, output: output + error.message }));
+		child.once("close", code => resolve({ code, output }));
+	});
+}
+
+/**
+ * The guest's user: the connector's own on Linux, so it owns what is shared with it. Windows
+ * reports every shared file as everyone's, so any account would do; the image's is 1000.
+ */
+export function guestUser(): GuestUser {
+	return process.getuid && process.getgid
+		? { uid: process.getuid(), gid: process.getgid() }
+		: { uid: 1000, gid: 1000 };
+}
+
+/** How large a Planner's disk may grow, in GiB: its image is sparse, so it takes what it holds. */
+export const DISK_GIB = 32;
+
+/**
+ * Makes a sparse ext4 image at `path`: the file made sparse on the host, which takes on disk only
+ * what is written to it (on Windows NTFS fills a file a guest grows), then formatted in a microVM of
+ * the release's own layer, whose `mkfs.ext4` needs nothing of the host's, without discards, which
+ * NTFS doesn't take. A new sparse file reads as zeros, which `mkfs.ext4` is told, so the guest's
+ * kernel never writes zeros over its inode tables (half a GiB at 32 GiB). One that is there already
+ * is kept.
+ */
+export async function makeDisk(
+	path: string,
+	setup: NvxSetup,
+	base: string,
+	proxyPort: number,
+	options: VmOptions = {},
+) {
+	if (existsSync(path)) return;
+	let work = join(base, "nvx", "disks", randomBytes(6).toString("hex"));
+	mkdirSync(work, { recursive: true });
+	let made = join(work, "disk.ext4");
+	try {
+		let bytes = DISK_GIB * 1024 ** 3;
+		if (process.platform === "win32") sparseFile(made, bytes);
+		else {
+			writeFileSync(made, "");
+			truncateSync(made, bytes);
+			// The guest that formats it is the layer's own `nobody`.
+			chmodSync(work, 0o777);
+			chmodSync(made, 0o666);
+		}
+		let result = await runVm(
+			{
+				shares: [{ host: work, guest: "/out", mode: "rw" }],
+				proxyPort,
+				environment: { PATH: "/usr/sbin:/usr/bin:/sbin:/bin" },
+				command: [
+					"mkfs.ext4",
+					"-q",
+					"-F",
+					"-m",
+					"0",
+					"-E",
+					"lazy_itable_init=1,lazy_journal_init=1,assume_storage_prezeroed=1,nodiscard",
+					"/out/disk.ext4",
+				],
+				cwd: "/tmp",
+				memoryMib: 512,
+				processors: 1,
+				hostname: "chopin-disk",
+			},
+			setup,
+			base,
+			options,
+		);
+		if (result.code !== 0) {
+			throw new Error(
+				`Couldn't make a disk for a microVM (exit ${result.code}): ${
+					result.output.trim().split("\n").at(-1) ?? ""
+				}`,
+			);
+		}
+		if (process.platform !== "win32") chmodSync(made, 0o600);
+		renameSync(made, path);
+	} finally {
+		rmSync(work, { recursive: true, force: true });
+	}
+}
+
+/**
+ * Where an agent's start check runs in its microVM: an empty folder in the state directory, which a
+ * guest only reads. It needs nothing of a checkout, and never the home folder, which holds the state
+ * directory and everything a person keeps.
+ */
+export function checkFolder(base: string) {
+	let folder = join(base, "nvx", "check");
+	mkdirSync(folder, { recursive: true });
+	return folder;
+}
+
+/** Fetches `url` into `path`. */
+export async function fetchTo(url: string, path: string) {
+	let response = await fetch(url, { redirect: "follow" });
+	if (!response.ok || !response.body) {
+		throw new Error(`Couldn't download ${url} (${response.status}).`);
+	}
+	await Bun.write(path, response);
+}
+
+/**
+ * The guest starts nothing but `nvx`'s own command line, with the environment in a private file.
+ * A start that waits first waits in its own process group (see `startVm`); on Windows the launch
+ * waits instead.
+ */
+export function startNvx(program: string, words: string[], launch: StartOptions): Spawned {
+	let launcher = `${launch.delayMs ? `sleep ${launch.delayMs / 1000}; ` : ""}${
+		launch.open ? OPEN_NVX_LAUNCHER : NVX_LAUNCHER
+	}`;
+	let [command, args] = process.platform === "win32"
+		? [program, words]
+		: ["/bin/sh", ["-c", launcher, program, ...words]];
+	let child = spawn(command, args, {
 		stdio: [launch.stdin, "pipe", "pipe"],
+		// Its own process group, with OpenVMM in it, so ending the launch ends the microVM.
 		detached: process.platform !== "win32",
 		windowsHide: true,
 	}) as Spawned;
-	child.once("close", () => {
-		rmSync(folder, { recursive: true, force: true });
-		cleared();
-	});
-	child.once("error", () => rmSync(folder, { recursive: true, force: true }));
+	if (process.platform === "win32" && child.pid) windowsStop(child, launch.wedged);
 	return child;
+}
+
+/**
+ * How a microVM ends on Windows, where killing `nvx.exe` leaves OpenVMM running and a VM killed in
+ * the middle of share I/O can wedge until Windows restarts. `nvx.exe` goes in a job that ends
+ * OpenVMM with it. Stopping first ends its stdin and waits `graceMs` for the workload, and so the
+ * VM, to end by itself; only then is the job killed. A VM still running 10 seconds after that is
+ * reported as wedged rather than taken for gone.
+ */
+function windowsStop(child: Spawned, wedged?: (detail: string) => void) {
+	let job = killJob(child.pid!);
+	// Without its job a VM would outlive its stop and chopin itself: it never runs.
+	if (!job) {
+		child.kill();
+		throw new SandboxRefused(
+			"Not run: chopin couldn't put the microVM in a job object, which ends it with chopin.",
+		);
+	}
+	let exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
+	let ended = (ms: number) =>
+		Promise.race([exited.then(() => true), Bun.sleep(ms).then(() => false)]);
+	child.once("close", () => job.close());
+	let stopping: Promise<void> | undefined;
+	child.stopMicrovm = graceMs =>
+		stopping ??= (async () => {
+			if (child.exitCode !== null || child.signalCode !== null) return;
+			try {
+				child.stdin?.end();
+			} catch { /* Already closed. */ }
+			if (await ended(graceMs)) return;
+			job.kill();
+			if (await ended(10_000) && !job.active()) return;
+			wedged?.(
+				`A microVM (nvx.exe ${child.pid}) didn't end when it was stopped, so OpenVMM may still `
+					+ "hold its memory until Windows restarts.",
+			);
+		})();
+}
+
+/**
+ * The machine's microVMs: every launch in an NVX guest of its own, its only way out the allow-list
+ * proxy on loopback, through which it reaches Chopin, the hosts it may and the AI relay.
+ */
+export async function createSandbox(options: SandboxOptions): Promise<Sandbox> {
+	let settings = options.settings ?? {};
+	let { setup, directory } = options;
+	mkdirSync(directory, { recursive: true, mode: 0o700 });
+	// The state directory keeps what guests may write from the host's other users.
+	if (process.platform !== "win32") chmodSync(directory, statSync(directory).mode & 0o700);
+	await endOrphans(directory);
+	await sweepRunFolders(directory);
+	// Before anything is started that would have to be stopped again were it to fail.
+	let bridge = await guestBridge(directory);
+	let aiRelay = startAiRelay();
+	let hosts = [...allowedHosts(options.server, settings.hosts), aiRelay.host];
+	let proxy: Proxy = await startProxy({
+		hosts,
+		refused: (name, port) => options.refused?.(name, port),
+	});
+	let vm: VmOptions = {
+		...options.start ? { start: options.start } : {},
+		...options.wedged ? { wedged: options.wedged } : {},
+		...options.retrying ? { retrying: options.retrying } : {},
+		...options.unsupported ? { unsupported: options.unsupported } : {},
+		...options.host ? { host: options.host } : {},
+	};
+	let images: ImageStore;
+	try {
+		images = await imageStore(options.recipes, {
+			base: directory,
+			layer: setup.artifacts.layer.uuid,
+			user: guestUser(),
+			builder: options.builder ?? vmBuilder({
+				base: directory,
+				layer: setup.artifacts.layer,
+				user: guestUser(),
+				run: spec => runVm(spec, setup, directory, vm),
+				download: options.download ?? fetchTo,
+				proxyPort: proxy.port,
+			}),
+			...options.building ? { building: options.building } : {},
+			...options.waiting ? { waiting: options.waiting } : {},
+		});
+		// Every image a launch here may need, ready before anything starts.
+		await images.ready();
+		if (options.prune !== false) await pruneImages(directory, images.keys());
+	} catch (error) {
+		await proxy.close();
+		await aiRelay.close();
+		throw error;
+	}
+	return {
+		report: { engine: "nvx", hypervisor: setup.hypervisor },
+		spawn(launch) {
+			let program = guestProgram(
+				launch.command[programAt(launch.command)] ?? "",
+				process.platform,
+			);
+			if (!images.has(program)) {
+				throw new SandboxRefused(
+					`Not run: chopin has no image with ${program || "this command"} for its microVM.`,
+				);
+			}
+			let start = (image: AgentImage) =>
+				startVm(
+					vmSpec(launch, {
+						platform: process.platform,
+						base: directory,
+						image,
+						proxyPort: proxy.port,
+						...settings.writable ? { writable: settings.writable } : {},
+						...settings.hidden ? { hidden: settings.hidden } : {},
+						files: [{ host: bridge, guest: GUEST_BRIDGE_PATH }],
+					}),
+					setup,
+					directory,
+					launch.stdin,
+					vm,
+				);
+			let image = images.found(program);
+			if (image) return start(image);
+			// Gone since it was made, or being made again: the launch waits for that one build, with
+			// every other launch that wants it meanwhile, and starts in what it made.
+			return awaitingImage(launch.stdin, images.image(program).then(made => () => start(made)));
+		},
+		aiRelay,
+		bridge: guestBridgeCommand(),
+		work: GUEST_WORK,
+		makeDisk: path => makeDisk(path, setup, directory, proxy.port, vm),
+		guestEnvironment: {
+			HTTPS_PROXY: `http://10.0.0.1:${proxy.port}`,
+			HTTP_PROXY: `http://10.0.0.1:${proxy.port}`,
+			NO_PROXY: "",
+			NODE_USE_ENV_PROXY: "1",
+		},
+		allow(entry) {
+			if (validAllowedEntry(entry) && !hosts.includes(entry)) hosts.push(entry);
+		},
+		close: async () => {
+			await proxy.close();
+			await aiRelay.close();
+		},
+	};
+}
+
+/**
+ * NVX where the connector keeps it, or where `CHOPIN_NVX_ROOT` names an extracted package (a
+ * machine without the network, or a build of one's own).
+ */
+export function installedArtifacts(
+	directory: string,
+	env: Record<string, string | undefined> = process.env,
+	platform = process.platform,
+): NvxArtifacts | undefined {
+	let root = env.CHOPIN_NVX_ROOT;
+	if (root) return artifactsAt(root, platform);
+	let at = nvxDirectory(directory);
+	return existsSync(join(at, ".verified")) ? artifactsAt(at, platform) : undefined;
+}
+
+/**
+ * What `chopin status` and Chopin hear of where this machine's agents run: NVX on its hypervisor,
+ * or why it can't, with the fix.
+ */
+export function machineReport(host: SupportHost = systemSupportHost()): SandboxReport {
+	let support = nvxSupport(host);
+	return support.supported
+		? { engine: "nvx", hypervisor: support.hypervisor }
+		: { engine: "none", reason: support.reason, ...support.fix ? { fix: support.fix } : {} };
+}
+
+/** Whether this machine can run NVX, or why not; throws `MachineUnsupported` when it can't. */
+export function requireSupport(host: SupportHost = systemSupportHost()) {
+	let support = nvxSupport(host);
+	if (!support.supported) throw new MachineUnsupported(support);
+	return support;
 }

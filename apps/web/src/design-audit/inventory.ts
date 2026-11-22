@@ -158,7 +158,21 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 				id: "navigation",
 				label: "Navigation",
 				source: "apps/web/src/project-sidebar.tsx",
-				states: ["current", "ancestor", "unanswered", "loading", "empty"],
+				states: ["current", "ancestor", "unanswered", "loading", "empty", "sheet-search"],
+			},
+			{
+				id: "ai-accounts",
+				label: "AI accounts",
+				source: "apps/web/src/ai-accounts/rows.tsx",
+				states: [
+					"connected",
+					"no-access",
+					"unchecked",
+					"check-failed",
+					"unreadable",
+					"refused",
+					"missing",
+				],
 			},
 			{
 				id: "chat",
@@ -167,10 +181,10 @@ export const AUDIT_INVENTORY: readonly AuditGroup[] = [
 				states: ["member", "planner", "tool", "busy", "error", "planner-status"],
 			},
 			{
-				id: "workflow-runs",
-				label: "Workflow runs",
+				id: "running-build",
+				label: "Running build",
 				source: "apps/web/src/chat/run-card.tsx",
-				states: ["running", "concurrent", "disconnected", "ended"],
+				states: ["building", "queued"],
 			},
 			{
 				id: "identity",

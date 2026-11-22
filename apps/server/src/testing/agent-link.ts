@@ -15,7 +15,7 @@ import type { AddressInfo, Socket } from "node:net";
 import type { ServerWebSocket } from "bun";
 import type { Repository, RepositoryPage } from "../github/client";
 import type { AttachmentAuth, PlannerAttachmentOptions } from "../harness/remote/attachments";
-import type { AgentAuth, AgentSocketData } from "../harness/remote/endpoint";
+import type { AgentAi, AgentAuth, AgentHooks, AgentSocketData } from "../harness/remote/endpoint";
 import type { AgentLink } from "../harness/remote/link";
 import type { MachinePlanners } from "../harness/remote/machine-planners";
 
@@ -225,7 +225,8 @@ export function linkServer(
 	holds: {
 		attachments?: PlannerAttachments;
 		options?: PlannerAttachmentOptions;
-		catalogChanged?: (channelId: string) => void;
+		catalogChanged?: AgentHooks["catalogChanged"];
+		ai?: AgentAi;
 	} = {},
 ) {
 	let links: AgentLink[] = [];
@@ -253,6 +254,7 @@ export function linkServer(
 					revalidateEveryMs,
 					...liveness,
 					catalogChanged: holds.catalogChanged,
+					...(holds.ai ? { ai: holds.ai } : {}),
 					register(_channelId, link) {
 						links.push(link);
 						return () => {

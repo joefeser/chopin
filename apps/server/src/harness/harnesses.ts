@@ -2,7 +2,7 @@ import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
 import { ATOMIC_AUTH_MODES, createAtomicAdapter } from "./atomic/adapter";
-import { forgetWorkspaces, workflowJournal } from "./atomic/workspace";
+import { forgetWorkspaces } from "./atomic/workspace";
 import { createCopilotSdk } from "./copilot-sdk/adapter";
 import { withModelOutput } from "./model-output";
 import { createRemoteAdapter } from "./remote/adapter";
@@ -31,11 +31,10 @@ function createAtomicHarness(
 	settings: { auth?: string; extensions?: readonly string[] },
 ): HarnessV1 & { shutdown(): Promise<void>; steers: true } {
 	// Atomic takes neither a GitHub credential nor a credit limit; only `auth` (validated by
-	// `harnessFor` below), the extensions, and the workflow journal reach the real adapter.
+	// `harnessFor` below) and the extensions reach the real adapter.
 	return createAtomicAdapter({
 		auth: settings.auth as AtomicAuthMode,
 		extensions: settings.extensions,
-		journal: workflowJournal(),
 	});
 }
 
@@ -169,7 +168,7 @@ export async function plannerCommands(
 	channelId: string,
 	repository: { owner: string; name: string },
 ): Promise<Wire.CommandOption[] | undefined> {
-	if (harness === "remote") return remoteCommands(attachedLink(channelId)?.catalog);
+	if (harness === "remote") return remoteCommands(attachedLink(channelId)?.lastReport);
 	let atomic = selected as { commands?: (cwd: string) => Promise<Wire.CommandOption[]> };
 	if (harness !== "atomic" || !atomic?.commands) return undefined;
 	let { cwd } = await plannerWorkspace(channelId, repository);
@@ -212,6 +211,31 @@ export function plannerOfferKnown(harness: string, channelId: string): boolean {
 	return link !== undefined && !link.catalogPending;
 }
 
+/** How long a turn waits for an attached client to report what it offers before it runs. */
+export const PLANNER_OFFER_WAIT_MS = 10_000;
+
+/**
+ * Waits, at most `timeoutMs`, for the attached remote client that offered its models to report
+ * them, so a turn that starts as it attaches (the first after a restart, or one nobody typed) runs
+ * the document's chosen model rather than falling back for want of a catalog. Returns at once for
+ * every other harness, for a client that has reported or offered none, and with nobody attached.
+ */
+export async function plannerOffered(
+	harness: string,
+	channelId: string,
+	timeoutMs = PLANNER_OFFER_WAIT_MS,
+): Promise<void> {
+	if (harness !== "remote") return;
+	let link = attachedLink(channelId);
+	if (!link?.catalogPending) return;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	await Promise.race([
+		link.offered,
+		new Promise<void>(resolve => timer = setTimeout(resolve, timeoutMs)),
+	]);
+	clearTimeout(timer);
+}
+
 /**
  * Whether the document's Planner's models are on their way, so a composer may wait for them: an
  * attached remote client that offered its models and has yet to report them, or, with none
@@ -224,6 +248,14 @@ export function plannerOfferIncoming(harness: string, channelId: string, held: b
 	if (harness !== "remote") return false;
 	let link = attachedLink(channelId);
 	return link ? link.catalogPending : !held;
+}
+
+/**
+ * Whether the document's remote Planner can't list the models of the AI accounts it runs on as they
+ * are now, for want of an update (see `AgentLink.outdated`). Never for any other harness.
+ */
+export function plannerOutdated(harness: string, channelId: string): boolean {
+	return harness === "remote" && attachedLink(channelId)?.outdated === true;
 }
 
 /**

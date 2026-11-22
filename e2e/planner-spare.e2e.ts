@@ -2,7 +2,7 @@
  * A new document's Planner on a paired machine: `chopin connect` keeps a spare Planner ready for its
  * checkout's repository, so the document's model selector shows about a second after New document; a
  * Planner command from before spare mode still starts its Planner cold. The machine is a real
- * connector (`apps/connector/src/main.ts connect`, no sandbox) with the backend in
+ * connector (`apps/connector/src/testing/chopin-on-host.ts connect`, its agents on the host) with the backend in
  * spare-planner-backend.ts, against a server of its own under `HARNESS=remote` with a GitHub App.
  */
 import { execFileSync, spawn } from "node:child_process";
@@ -137,14 +137,17 @@ async function connect(page: Page, log: string, stub?: string) {
 	let state = await mkdtemp(join(tmpdir(), "chopin-spare-state-"));
 	scratch.push(state);
 	let child = spawn(process.execPath, [
-		join(ROOT, "apps/connector/src/main.ts"),
+		join(ROOT, "apps/connector/src/testing/chopin-on-host.ts"),
 		"connect",
 		root,
-		"--no-sandbox",
 		"--key",
 		minted.key,
 		"--planner-command",
-		`${process.execPath} ${BACKEND}`,
+		// What the backend reports where goes in its own command: a backend for a Chopin that runs its
+		// sessions on people's AI accounts gets only an allow-list of the connector's environment.
+		`env CHOPIN_SPARE_STUB_LOG=${log}${
+			stub ? ` CHOPIN_SPARE_STUB=${stub}` : ""
+		} ${process.execPath} ${BACKEND}`,
 		"--",
 		process.execPath,
 		join(ROOT, "apps/connector/src/testing/fake-agent.ts"),
@@ -155,8 +158,6 @@ async function connect(page: Page, log: string, stub?: string) {
 			...process.env,
 			CHOPIN_URL: ORIGIN,
 			CHOPIN_CONNECTOR_STATE_DIR: state,
-			CHOPIN_SPARE_STUB_LOG: log,
-			...(stub ? { CHOPIN_SPARE_STUB: stub } : {}),
 		},
 		stdio: ["ignore", "pipe", "pipe"],
 	});

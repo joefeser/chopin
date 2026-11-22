@@ -67,35 +67,6 @@ export type PutChatAttachment =
 /** What a person has uploaded to one document and not yet sent. */
 export type StagedChatAttachments = { count: number; bytes: number };
 
-/** One stage of a workflow run whose card Chat shows, as its run last reported it. */
-export type RunStageRecord = {
-	id: string;
-	name: string;
-	parentIds?: string[];
-	kind?: "tool";
-	status:
-		| "pending"
-		| "running"
-		| "awaiting_input"
-		| "paused"
-		| "blocked"
-		| "completed"
-		| "failed"
-		| "skipped"
-		| "stopped";
-	/** Seconds since the epoch. */
-	started?: number;
-	ended?: number;
-};
-
-export type PutRunStages = {
-	channelId: string;
-	runId: string;
-	stages: RunStageRecord[];
-	/** The run keeps only these stages, in this order, instead of adding them to its own. */
-	replace?: boolean;
-};
-
 /** A saved answer to a decision the Planner left open, waiting for a Planner turn to act on it. */
 export type DecisionAnswer = {
 	decisionId: string;
@@ -248,8 +219,15 @@ export type StoredMachine = {
 	/** GitHub refused its stored authorization; the owner must pair it again. */
 	reauthorizeAt?: Date;
 	revokedAt?: Date;
+	/**
+	 * Why its connector said it can't run agents in microVMs, and the fix where there is one, until a
+	 * connection that runs them clears it.
+	 */
+	vmProblem?: MachineVmProblem;
 };
-export type CreateMachine = Omit<StoredMachine, "reauthorizeAt" | "revokedAt">;
+export type CreateMachine = Omit<StoredMachine, "reauthorizeAt" | "revokedAt" | "vmProblem">;
+/** What a connector said a machine lacks to run agents in microVMs, in its own words. */
+export type MachineVmProblem = { reason: string; fix?: string };
 
 /**
  * Which of a person's machines works on one document for them. No row is the automatic choice:
@@ -313,6 +291,8 @@ export type CreateChannel =
 		now: Date;
 		/** A complete revision-zero checkpoint published in the channel's creation transaction. */
 		initial?: InitialChannel;
+		/** A Planner model choice stored in the creation transaction, fenced by the writer lease. */
+		modelChoice?: { lease: Lease; choice: Omit<PlannerModelChoice, "channelId"> };
 	};
 
 export type RenameChannel = {
@@ -338,9 +318,24 @@ export type ChannelArchiveInput = {
 	now: Date;
 };
 
+/**
+ * An archive, which ends the AI authority of the document's launches: only the writer lease's holder
+ * counts that cutoff, so it is written under `lease`, checked in the same transaction.
+ */
+export type ChannelArchive = ChannelArchiveInput & { lease: Lease };
+
 export type ChannelArchiveResult = {
 	channel: ChannelRecord;
 	changed: boolean;
+};
+
+/**
+ * A permanent deletion, active or archived, which ends the AI authority of the document's launches
+ * as an archive does, so it is written under `lease` too.
+ */
+export type ChannelDelete = {
+	id: string;
+	lease: Lease;
 };
 
 export type PublishChannelDescription = {
@@ -1004,8 +999,16 @@ export type PlannerHeldSession = {
 	asked?: PlannerAskedInput[];
 	/** Answers the client has not acknowledged. */
 	owed: JsonValue[];
-	/** Stops pressed while the link was down, for the client to hear first. */
+	/**
+	 * Always empty: an earlier release kept here the Stops of workflow runs pressed while the link
+	 * was down, and reads the field when it rebuilds a hold.
+	 */
 	stops: JsonValue[];
+	/**
+	 * The AI launch the client holds for the session, so the next process ends it with the session
+	 * or replaces it when the client resumes. An id, not a credential.
+	 */
+	aiLaunchId?: string;
 };
 
 /**
@@ -1056,6 +1059,19 @@ export type PlannerModelChoice = {
 	updatedAt: Date;
 };
 
+/**
+ * The last models a document's remote Planner reported for one account: what the composer shows,
+ * marked as the last known list, to that account alone while no Planner of the document has said
+ * what it offers now. One row per document and account; a row goes with its document or account.
+ */
+export type PlannerCatalog = {
+	channelId: string;
+	/** The account the reporting Planner ran for. */
+	userId: string;
+	catalog: import("@chopin/protocol").Chat.ModelCatalog;
+	reportedAt: Date;
+};
+
 export type EntryForkPoint = {
 	atomicLeafId?: string | null;
 	remote?: { session: string; turn?: string };
@@ -1079,10 +1095,31 @@ export type ChatThreadRecord = {
 	forkedAt: number;
 	createdBy: string;
 	entries: import("@chopin/protocol").Chat.Entry[];
+	/**
+	 * The last sequence the thread gave out (`Entry.seq`), which taking entries out moves past.
+	 * Absent on a thread saved before it existed, whose entries' own sequences are all it gave.
+	 */
+	lastSeq?: number;
 	compactions: import("@chopin/protocol").Chat.CompactionRecord[];
 	usage?: import("@chopin/protocol").Chat.ContextUsage;
 	forkState: ChatThreadForkState;
+	/** Decision cards this thread's Planner asked: the only cards it may tell the Chat's Planner about. */
+	askedQuestions?: string[];
 	updatedAt: Date;
+};
+
+/** What a thread's Planner told the document's Chat Planner a person decided in the thread. */
+export type ChatThreadNote = {
+	id: string;
+	/** The thread's root message id. */
+	rootId: string;
+	/** Who wrote the root message, and its opening words, when the note was sent. */
+	root: { author: string; excerpt: string };
+	decision: string;
+	decidedBy: string[];
+	/** The answered Decision card the note is about; one card is noted at most once. */
+	question?: string;
+	ts: number;
 };
 
 export type ChatSessionState = {
@@ -1092,7 +1129,29 @@ export type ChatSessionState = {
 	atomicEntries?: JsonValue[];
 	atomicLeafId?: string | null;
 	entryForks: Record<string, EntryForkPoint>;
+	/** Notes from threads that the Chat Planner has not read yet, oldest first. */
+	threadNotes?: ChatThreadNote[];
+	/** Every Decision card a thread's Planner has sent a note for, read or not. */
+	notedQuestions?: string[];
+	/** The notes the Chat Planner's latest turn for a message was given, for a Retry of it. */
+	givenNotes?: { entryId: string; notes: ChatThreadNote[] };
 	updatedAt: Date;
+};
+
+export type MachineDatabaseState = "pending" | "ready" | "failed" | "disabled" | "dropped";
+
+export type StoredMachineDatabase = {
+	machineId: string;
+	role: string;
+	revision: number;
+	ciphertext: Uint8Array;
+	candidate?: { revision: number; ciphertext: Uint8Array };
+	state: MachineDatabaseState;
+	failure?: string;
+	connectorProblem?: string;
+	updatedAt: Date;
+	disabledAt?: Date;
+	droppedAt?: Date;
 };
 
 /** A paired machine's Planner credential, known by the digest of its token and never the token. */
@@ -1104,6 +1163,125 @@ export type PlannerCredential = {
 	expiresAt: Date;
 };
 
+/**
+ * A provider a person connected for their launches' agents. `ciphertext` holds their key, encrypted
+ * by the server, and `suffix` its last four characters, to tell keys apart; a GitHub sign-in has
+ * neither, as Chopin reads the sign-in it already holds. `lastUsedAt` is when a launch last sent a
+ * request with this credential, since it was connected, and `rejectedAt` when its provider answered
+ * a request with it that the key itself is invalid, after which no launch is given it until it is
+ * connected again.
+ */
+export type AiCredentialRecord = {
+	userId: string;
+	provider: import("@chopin/protocol/ai-credentials").AiProvider;
+	kind: import("@chopin/protocol/ai-credentials").AiCredentialKind;
+	/**
+	 * The secret as it was connected, encrypted: a key, or a sign-in's tokens. Every connect makes it
+	 * anew, so it names the connection.
+	 */
+	ciphertext?: Uint8Array;
+	/** A sign-in's tokens as its latest refresh returned them, encrypted; absent until one has. */
+	tokens?: Uint8Array;
+	suffix?: string;
+	updatedAt: Date;
+	lastUsedAt?: Date;
+	rejectedAt?: Date;
+};
+
+/**
+ * A placeholder one launch was handed for one provider, known by its digest and never the
+ * placeholder itself. It stands for the credential of the person the launch runs for.
+ */
+export type AiPlaceholder = {
+	/** SHA-256 of the placeholder. */
+	digest: Uint8Array;
+	launchId: string;
+	/** SHA-256 of the credential the launch's runner presents beside the placeholder. */
+	launchDigest: Uint8Array;
+	userId: string;
+	provider: import("@chopin/protocol/ai-credentials").AiProvider;
+	/** The paired machine the launch runs on, whose revocation ends it. */
+	machineId?: string;
+	/** The document the launch works on, whose archiving or deletion ends it. */
+	channelId?: string;
+	/**
+	 * With `channelId`, the document's archive generation the launch was prepared in: how many times
+	 * it had been archived. A placeholder is stored only while the document is open in that
+	 * generation, so one prepared before an archive is never stored after it, a restore included.
+	 */
+	generation?: number;
+	/**
+	 * What the launch is for, whose end ends it: `run:<id>` for a run on a paired machine,
+	 * `session:<id>` for a Planner session, or `link:<id>` for an attached link's catalog launch,
+	 * which lists models and runs none. Absent on a launch prepared before owners were kept.
+	 */
+	owner?: string;
+	expiresAt: Date;
+};
+
+/**
+ * The token counts a provider reported for one request: `input` is what was read without the
+ * cache, `cacheRead` what was read from it and `cacheWrite` what was written to it. A count the
+ * provider didn't report is absent.
+ */
+export type AiTokenCounts = {
+	input?: number;
+	output?: number;
+	cacheRead?: number;
+	cacheWrite?: number;
+};
+
+/**
+ * Where a proxied request stands: `pending` from before it is sent until its answer ends, `ok` or
+ * `error` once it was sent and has ended, `unsent` when the proxy refused it, or couldn't record or
+ * check it, before the send, and `unknown` when the process that recorded it stopped before
+ * recording how it ended.
+ */
+export type AiAttemptOutcome = "pending" | "ok" | "error" | "unsent" | "unknown";
+
+/** What a proxied request is recorded with before it is sent. */
+export type AiAttemptStart = {
+	id: string;
+	launchId: string;
+	userId: string;
+	provider: import("@chopin/protocol/ai-credentials").AiProvider;
+	/** The model the request named, when it named one. */
+	model?: string;
+	startedAt: Date;
+};
+
+/** How a proxied request ended: the provider's status, if it answered, and a short error code. */
+export type AiAttemptResult = {
+	outcome: "ok" | "error" | "unsent";
+	status?: number;
+	error?: string;
+	tokens: AiTokenCounts;
+	completedAt: Date;
+};
+
+export type AiAttempt = AiAttemptStart & {
+	outcome: AiAttemptOutcome;
+	status?: number;
+	error?: string;
+	tokens: AiTokenCounts;
+	completedAt?: Date;
+};
+
+/**
+ * One person's requests to one provider's model since a time: those sent that ended (`ok` or
+ * `error`), those of them that ended in an error, those still pending and those whose end is
+ * unknown, which are not among the sent, and the tokens the providers reported.
+ */
+export type AiModelTotals = {
+	provider: import("@chopin/protocol/ai-credentials").AiProvider;
+	model?: string;
+	requests: number;
+	errors: number;
+	pending: number;
+	unknown: number;
+	tokens: Required<AiTokenCounts>;
+};
+
 export type McpSession = {
 	id: string;
 	userId: string;
@@ -1111,4 +1289,36 @@ export type McpSession = {
 	clientVersion: string;
 	createdAt: Date;
 	lastSeenAt: Date;
+};
+
+/** One caller's idempotency key for one document's `invoke_planner` calls. */
+export type McpInvocationScope = {
+	userId: string;
+	channelId: string;
+	key: string;
+};
+
+/** What a call answers once its instruction's turn starts, given again to every retry. */
+export type McpInvocationResult = {
+	document: { id: string; title: string; description?: string; url: string };
+};
+
+export type McpInvocation = McpInvocationScope & {
+	fingerprint: string;
+	/** The Chat entry, or system notice, the instruction is posted as. */
+	entryId: string;
+	/** Fixed when the key is claimed, so a retry is given what the first call was. */
+	result: McpInvocationResult;
+	createdAt: Date;
+	expiresAt: Date;
+	/**
+	 * Set once the instruction reached a turn, before the call answers. Until then the
+	 * instruction may be posted or not, which only the document's Chat says.
+	 */
+	invokedAt?: Date;
+	/**
+	 * Set instead when the instruction was given to a running turn that did not confirm taking it:
+	 * it may have been read, so it is never delivered again under the key.
+	 */
+	uncertainAt?: Date;
 };

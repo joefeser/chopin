@@ -6,10 +6,11 @@
 import { expect, test } from "bun:test";
 
 import * as Chat from "./service";
-import { alone, announceAlone, people } from "./initiative";
+import { alone, announceAlone, pacing, people } from "./initiative";
 import { installInitiativeCleanup, message } from "./initiative.test-fixtures";
 import { until } from "./job.test-fixtures";
 import { sessionContextOf } from "./session-context";
+import { createTypingPresence, typed } from "./typing";
 
 import type { Chat as Wire } from "@chopin/protocol";
 import type { Socket } from "../wire";
@@ -171,4 +172,50 @@ test("Chat is told when its conversation comes to hold one person, or more, and 
 	announceAlone(off.chat, off.context.server, "room", new Set(["U_ana"]));
 	expect((off.frames as Frame[]).filter(frame => frame.kind === "chat:participation"))
 		.toEqual([]);
+});
+
+function quiet(socket: Socket): Socket {
+	return Object.assign(socket, { send() {} });
+}
+
+test("what Chat shows of typing, in Chat, a thread or chopin's, never changes who is alone with chopin; Chat's pacing counts as it always has", async () => {
+	let h = await setup.harness();
+	let ana = tab("U_ana", "ana-1");
+	quiet(ana);
+	let bo = quiet(tab("U_bo", "bo-1"));
+	let seq = 0;
+	h.chat.entries.push({
+		id: "root",
+		author: { kind: "member", handle: "ana" },
+		text: "Root",
+		ts: 1,
+	});
+	h.chat.typists = createTypingPresence({
+		threadExists: rootId => h.chat.entries.some(entry => entry.id === rootId),
+		members: () => [ana, bo],
+		reads: async () => "allowed",
+		writes: async () => "allowed",
+	});
+	h.context.people = () => people(h.chat, [ana]);
+	expect(alone(h.context, "U_ana")).toBe(true);
+
+	for (let thread of [undefined, "root", "unknown", 7]) {
+		typed(h.context, bo, { active: true, thread, seq: ++seq, at: Date.now() });
+		expect(alone(h.context, "U_ana")).toBe(true);
+		expect(h.chat.initiative?.people() ?? new Set()).toEqual(new Set());
+	}
+
+	h.chat.typists.composing(undefined, "turn", true);
+	h.chat.typists.composing("root", "thread-turn", true);
+	expect(alone(h.context, "U_ana")).toBe(true);
+	expect(h.chat.initiative?.people() ?? new Set()).toEqual(new Set());
+
+	pacing(h.context, bo, true);
+	expect(alone(h.context, "U_ana")).toBe(false);
+	typed(h.context, bo, { active: false, seq: ++seq });
+	typed(h.context, bo, { active: false, thread: "root", seq: ++seq });
+	expect(alone(h.context, "U_ana")).toBe(false);
+	pacing(h.context, bo, false);
+	expect(alone(h.context, "U_ana")).toBe(true);
+	h.chat.typists.close();
 });

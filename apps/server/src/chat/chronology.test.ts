@@ -1,0 +1,208 @@
+import { describe, expect, it } from "bun:test";
+
+import { appendEntries, snapshotSeq, stampEntries, takeOut } from "./chronology";
+
+import type { Chat as Wire } from "@chopin/protocol";
+import type { Transcript } from "./chronology";
+
+function said(id: string, ts: number): Wire.Entry {
+	return { id, author: { kind: "system" }, text: id, ts };
+}
+
+function order(transcript: Transcript): string[] {
+	return [...transcript.entries]
+		.sort((a, b) => a.ts - b.ts || a.seq! - b.seq!)
+		.map(entry => entry.id);
+}
+
+describe("a transcript's entries in time", () => {
+	it("adds entries at the end, those of one second in the order they came", () => {
+		let transcript: Transcript = { entries: [said("a", 10)] };
+		appendEntries(transcript, said("b", 10), said("c", 12));
+		expect(transcript.entries.map(entry => [entry.id, entry.ts])).toEqual([
+			["a", 10],
+			["b", 10],
+			["c", 12],
+		]);
+	});
+
+	it("never puts an entry before the second of the one ahead of it", () => {
+		let transcript: Transcript = { entries: [said("a", 20)] };
+		let late = said("made-earlier", 18);
+		appendEntries(transcript, late);
+		expect(late.ts).toBe(20);
+		expect(transcript.entries.map(entry => entry.ts)).toEqual([20, 20]);
+	});
+
+	it("gives every entry a larger sequence than the one ahead, so time and sequence read in stored order", () => {
+		let transcript: Transcript = { entries: [said("legacy", 10)] };
+		for (let index = 0; index < 50; index++) appendEntries(transcript, said(`e${index}`, 10));
+		let seqs = transcript.entries.slice(1).map(entry => entry.seq!);
+		expect(seqs.every((seq, index) => index === 0 || seq > seqs[index - 1]!)).toBe(true);
+		expect(order({ entries: transcript.entries.slice(1) })).toEqual(
+			transcript.entries.slice(1).map(entry => entry.id),
+		);
+	});
+
+	it("gives an entry appended after a snapshot a larger sequence than the snapshot", () => {
+		let transcript: Transcript = { entries: [] };
+		appendEntries(transcript, said("a", 10));
+		let snapshot = snapshotSeq(transcript);
+		expect(snapshot).toBeGreaterThanOrEqual(transcript.entries[0]!.seq!);
+		appendEntries(transcript, said("b", 10));
+		expect(transcript.entries[1]!.seq).toBeGreaterThan(snapshot);
+		expect(snapshotSeq(transcript)).toBeGreaterThanOrEqual(transcript.entries[1]!.seq!);
+	});
+
+	it("does not take back a sequence when the last entry is taken out", () => {
+		let transcript: Transcript = { entries: [] };
+		appendEntries(transcript, said("a", 10), said("b", 10));
+		let before = snapshotSeq(transcript);
+		let removed = transcript.entries[1]!;
+		takeOut(transcript, ["b"]);
+		expect(transcript.entries.map(entry => entry.id)).toEqual(["a"]);
+		expect(snapshotSeq(transcript)).toBeGreaterThan(before);
+		appendEntries(transcript, said("c", 10));
+		expect(transcript.entries[1]!.seq).toBeGreaterThan(removed.seq!);
+	});
+
+	it("gives out nothing for a snapshot, so a restart whose clock is behind gives out no snapshot's sequence again", () => {
+		let realNow = Date.now;
+		try {
+			let clock = 1000;
+			Date.now = () => clock;
+			let transcript: Transcript = { entries: [] };
+			appendEntries(transcript, said("old", 10));
+			clock = 2000;
+			let seen = snapshotSeq(transcript);
+			clock = 1500;
+			let restarted: Transcript = {
+				entries: structuredClone(transcript.entries),
+				lastSeq: transcript.lastSeq,
+			};
+			expect(snapshotSeq(restarted)).toBeGreaterThanOrEqual(seen);
+			appendEntries(restarted, said("new", 10));
+			expect(restarted.entries[1]!.seq).toBeGreaterThan(seen);
+		} finally {
+			Date.now = realNow;
+		}
+	});
+
+	it("gives out nothing a removal moved past once its sequence is restored after a restart", () => {
+		let realNow = Date.now;
+		try {
+			let clock = 1000;
+			Date.now = () => clock;
+			let transcript: Transcript = { entries: [] };
+			appendEntries(transcript, said("old", 10));
+			clock = 2000;
+			appendEntries(transcript, said("failed", 10));
+			takeOut(transcript, ["failed"]);
+			let seen = snapshotSeq(transcript);
+			clock = 1500;
+			let restarted: Transcript = {
+				entries: structuredClone(transcript.entries),
+				lastSeq: transcript.lastSeq,
+			};
+			expect(snapshotSeq(restarted)).toBe(seen);
+			appendEntries(restarted, said("new", 10));
+			expect(restarted.entries[1]!.seq).toBeGreaterThan(seen);
+		} finally {
+			Date.now = realNow;
+		}
+	});
+
+	it("keeps the time and sequence an entry was stamped with when nothing came ahead of it", () => {
+		let transcript: Transcript = { entries: [said("a", 10)] };
+		appendEntries(transcript, said("b", 11));
+		let next = said("c", 12);
+		stampEntries(transcript, next);
+		let stamped = { ts: next.ts, seq: next.seq };
+		expect(appendEntries(transcript, next)).toBe(false);
+		expect({ ts: next.ts, seq: next.seq }).toEqual(stamped);
+	});
+
+	it("moves an entry stamped before something else was appended, and says so", () => {
+		let transcript: Transcript = { entries: [said("a", 10)] };
+		let next = said("b", 10);
+		stampEntries(transcript, next);
+		appendEntries(transcript, said("meanwhile", 15));
+		let before = next.seq!;
+		expect(appendEntries(transcript, next)).toBe(true);
+		expect(next.ts).toBe(15);
+		expect(next.seq).toBeGreaterThan(before);
+		expect(order(transcript)).toEqual(["a", "meanwhile", "b"]);
+	});
+
+	it("stamps an entry another transcript will hold too after that transcript's last", () => {
+		let chat: Transcript = { entries: [] };
+		appendEntries(chat, said("ahead", 100));
+		let thread: Transcript = {
+			entries: [],
+			sharedWith: entry => entry.id === "shared" ? chat : undefined,
+		};
+		let shared = said("shared", 40);
+		let own = said("own", 40);
+		appendEntries(thread, own, shared);
+		expect(own.ts).toBe(40);
+		expect(shared.ts).toBe(100);
+		expect(shared.seq).toBeGreaterThan(chat.entries[0]!.seq!);
+		expect(appendEntries(chat, shared)).toBe(false);
+		expect(order(chat)).toEqual(["ahead", "shared"]);
+	});
+
+	it("keeps the sequence high-water mark past an unsequenced entry appended during a rollback", () => {
+		let realNow = Date.now;
+		try {
+			Date.now = () => 50;
+			let transcript: Transcript = {
+				entries: [
+					{ ...said("sequenced", 10), seq: 100 },
+					said("rolled-back", 10),
+				],
+			};
+			expect(snapshotSeq(transcript)).toBe(100);
+			let next = said("after-upgrade", 10);
+			appendEntries(transcript, next);
+			expect(next.seq).toBeGreaterThan(100);
+		} finally {
+			Date.now = realNow;
+		}
+	});
+
+	it("keeps a shared thread entry's sequence and order when a later thread entry is copied to Chat first", () => {
+		let realNow = Date.now;
+		try {
+			Date.now = () => 1000;
+			let chat: Transcript = { entries: [] };
+			appendEntries(chat, said("root", 10));
+			let thread: Transcript = {
+				entries: [],
+				sharedWith: () => chat,
+			};
+			let replyA = said("reply-a", 10);
+			appendEntries(thread, replyA);
+			let seqA = replyA.seq!;
+
+			let agentC = said("agent-c", 10);
+			appendEntries(thread, agentC);
+			appendEntries(chat, agentC);
+
+			expect(appendEntries(chat, replyA)).toBe(false);
+			expect(replyA.seq).toBe(seqA);
+			expect(replyA.seq).toBeLessThan(agentC.seq!);
+			expect(thread.entries.map(entry => entry.id)).toEqual(["reply-a", "agent-c"]);
+			expect(order(thread)).toEqual(["reply-a", "agent-c"]);
+			expect(chat.entries.map(entry => entry.id)).toEqual(["root", "reply-a", "agent-c"]);
+			expect(order(chat)).toEqual(["root", "reply-a", "agent-c"]);
+			expect(snapshotSeq(thread)).toBe(agentC.seq!);
+			expect(snapshotSeq(chat)).toBe(agentC.seq!);
+
+			let later = said("later", 10);
+			appendEntries(thread, later);
+			expect(later.seq).toBeGreaterThan(agentC.seq!);
+		} finally {
+			Date.now = realNow;
+		}
+	});
+});

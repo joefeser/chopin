@@ -1,0 +1,289 @@
+.ai-accounts-page {
+	position: absolute;
+	inset: 0;
+	display: flex;
+	flex-direction: column;
+	overflow-y: auto;
+	background: var(--color-ground);
+	container: ai-accounts-page / inline-size;
+}
+
+.ai-accounts-main {
+	display: flex;
+	width: 100%;
+	max-width: 44rem;
+	flex: 1;
+	flex-direction: column;
+	gap: calc(var(--spacing) * 8);
+	margin-inline: auto;
+	padding: calc(var(--spacing) * 12 + env(safe-area-inset-top)) calc(var(--spacing) * 6)
+		calc(var(--spacing) * 20 + env(safe-area-inset-bottom));
+}
+
+@container ai-accounts-page (width < 56rem) {
+	.navigation-content[data-project-sidebar-trigger] .ai-accounts-main {
+		padding-top: calc(var(--spacing) * 14 + env(safe-area-inset-top));
+	}
+}
+
+.ai-accounts-heading {
+	display: flex;
+	flex-direction: column;
+	gap: var(--spacing);
+
+	& h1 {
+		text-wrap: balance;
+	}
+}
+
+.ai-accounts-description {
+	text-wrap: pretty;
+}
+
+.ai-accounts-loading {
+	color: var(--color-text-tertiary);
+	font-size: var(--text-sm);
+}
+
+.ai-accounts-section {
+	display: flex;
+	flex-direction: column;
+	gap: calc(var(--spacing) * 3);
+}
+
+.ai-accounts-section-title {
+	margin: 0;
+	color: var(--color-text-secondary);
+	font-size: var(--text-sm);
+	font-weight: 600;
+}
+
+.ai-accounts-list {
+	display: flex;
+	flex-direction: column;
+	margin: 0;
+	border-radius: var(--radius-lg);
+	background: var(--color-page);
+	box-shadow: var(--shadow-resting);
+	outline: var(--edge-width) solid var(--color-edge);
+	outline-offset: calc(-1 * var(--edge-width));
+	padding: 0;
+	list-style: none;
+	container: ai-accounts-list / inline-size;
+}
+
+/*
+ * One account, laid out as a table row: the mark, the text (the name, then its lines under it), and
+ * three fixed columns (its state, the action that state asks for, its menu), so a row's controls
+ * never move with what its neighbours hold and its words never run under them. The name's line is as
+ * tall as the controls, which are centred on it.
+ */
+.ai-account {
+	--ai-account-line: calc(var(--text-sm--line-height) * 1em);
+	--ai-account-head: max(var(--ai-account-line), var(--icon-button-size));
+	display: grid;
+	grid-template-columns:
+		calc(var(--spacing) * 4.5) minmax(0, 1fr) 10rem 7rem
+		var(--icon-button-size);
+	align-items: start;
+	gap: calc(var(--spacing) * 0.5) calc(var(--spacing) * 4);
+	padding: calc(var(--spacing) * 4) calc(var(--spacing) * 5);
+	font-size: var(--text-sm);
+
+	& + & {
+		border-top: var(--edge-width) solid var(--color-edge);
+	}
+}
+
+.ai-account-mark {
+	grid-area: 1 / 1;
+	display: grid;
+	place-items: center;
+	height: var(--ai-account-head);
+	color: var(--color-text-primary);
+}
+
+.ai-account-text {
+	display: contents;
+}
+
+.ai-account-name {
+	grid-row: 1;
+	grid-column: 2;
+	display: flex;
+	min-height: var(--ai-account-head);
+	align-items: center;
+	margin: 0;
+	color: var(--color-text-primary);
+	font-size: var(--text-sm);
+	font-weight: 600;
+}
+
+.ai-account-line,
+.ai-account-problem {
+	grid-column: 2;
+	margin: 0;
+	text-wrap: pretty;
+}
+
+.ai-account-line {
+	color: var(--color-text-secondary);
+}
+
+.ai-account-problem {
+	color: var(--color-destructive-ink);
+}
+
+.ai-account-status,
+.ai-account-action,
+.ai-account-menu-slot {
+	grid-row: 1;
+	display: flex;
+	height: var(--ai-account-head);
+	align-items: center;
+}
+
+.ai-account-status {
+	grid-column: -4 / -3;
+}
+
+.ai-account-unconnected {
+	padding-inline-start: calc(var(--spacing) * 1.5);
+	color: var(--color-text-tertiary);
+	font-size: var(--text-xs);
+}
+
+.ai-account-action {
+	grid-column: -3 / -2;
+	justify-content: flex-end;
+}
+
+/* The menu's glyph, not its button, meets the content edge; the button overhangs the padding. */
+.ai-account-menu-slot {
+	grid-column: -2 / -1;
+	justify-content: flex-end;
+	margin-inline-end: calc((var(--icon-button-size) - var(--icon-size-default)) / -2);
+}
+
+/* Placed below its button by measurement; see AccountMenu. */
+.ai-account-menu {
+	position: fixed;
+	z-index: 60;
+	display: flex;
+	min-width: 12rem;
+	flex-direction: column;
+	border-radius: var(--radius-md);
+	background: var(--color-raised);
+	padding: var(--menu-padding);
+	box-shadow: var(--shadow-raised);
+	transform-origin: top right;
+}
+
+/* Found by its shadow by day; at night, where shadows hardly show, by a light hairline too. */
+:where(.ai-account-menu) {
+	outline: var(--edge-width) solid var(--color-raised-edge);
+	outline-offset: calc(-1 * var(--edge-width));
+}
+
+/* The Checking… badge turns its loader; reduced motion keeps it still, and its word says it. */
+@media (prefers-reduced-motion: no-preference) {
+	.ai-account [data-checking] [data-slot="icon-label-icon"] {
+		animation: button-loader-spin calc(var(--duration-base) * 4) linear infinite;
+	}
+}
+
+/*
+ * On touch the row's controls keep their size, as the touch-target rule asks, and answer a 44px
+ * press around them (the shared target of `btn-sm` and `btn-icon`), rather than growing to 44px as
+ * this page's other buttons do.
+ */
+:root[data-plan-coarse-pointer] .ai-accounts-list .ai-account .btn {
+	min-width: 0;
+	min-height: 0;
+}
+
+/*
+ * Where the text column would be too narrow beside the three (a phone, a narrow pane), the state
+ * moves under the name and the lines run under the controls' columns, which hold only the name's
+ * line; the action and menu columns stay where they are.
+ */
+@container ai-accounts-list (width < 38rem) {
+	.ai-account {
+		grid-template-columns:
+			calc(var(--spacing) * 4.5) minmax(0, 1fr) 7rem
+			var(--icon-button-size);
+		column-gap: calc(var(--spacing) * 3);
+		padding-inline: calc(var(--spacing) * 4);
+	}
+
+	.ai-account-line,
+	.ai-account-problem {
+		grid-column: 2 / -1;
+	}
+
+	.ai-account-status {
+		grid-row: 2;
+		grid-column: 2 / -1;
+		height: auto;
+		margin-block: var(--spacing) calc(var(--spacing) * 0.5);
+	}
+
+	/* The row's own Sign in or Add key says it isn't connected. */
+	.ai-account-status:has(.ai-account-unconnected) {
+		display: none;
+	}
+}
+
+.ai-accounts-dialog {
+	display: flex;
+	width: min(100%, 28rem);
+	flex-direction: column;
+	font-size: var(--text-sm);
+}
+
+.ai-accounts-dialog-close {
+	position: absolute;
+	top: calc(var(--spacing) * 3.5);
+	right: calc(var(--spacing) * 3.5);
+}
+
+.ai-accounts-dialog-body {
+	display: flex;
+	flex-direction: column;
+	gap: calc(var(--spacing) * 4);
+	margin-top: calc(var(--spacing) * 3);
+}
+
+.ai-accounts-dialog-lead {
+	margin: 0;
+	color: var(--color-text-secondary);
+	font-size: var(--text-sm);
+	text-wrap: pretty;
+}
+
+.ai-accounts-field {
+	display: flex;
+	flex-direction: column;
+	gap: calc(var(--spacing) * 1.5);
+}
+
+.ai-accounts-sign-in-link {
+	align-self: flex-start;
+
+	&[aria-disabled="true"] {
+		opacity: 0.4;
+	}
+}
+
+.ai-accounts-field-hint {
+	margin: 0;
+	color: var(--color-text-tertiary);
+	font-size: var(--text-xs);
+	text-wrap: pretty;
+}
+
+.ai-accounts-dialog-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: calc(var(--spacing) * 2);
+}
