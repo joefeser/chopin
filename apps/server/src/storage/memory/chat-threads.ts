@@ -16,6 +16,19 @@ function cloneSession(value: ChatSessionState): ChatSessionState {
 }
 
 export class MemoryChatThreadStore implements ChatThreadStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			threads: this.#threads,
+			sessions: this.#sessions,
+		};
+	}
+
+	restore(state: ReturnType<MemoryChatThreadStore["checkpoint"]>): void {
+		this.#threads = state.threads;
+		this.#sessions = state.sessions;
+	}
+
 	#threads = new Map<string, Map<string, ChatThreadRecord>>();
 	#sessions = new Map<string, ChatSessionState>();
 

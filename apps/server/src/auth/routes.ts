@@ -1,3 +1,4 @@
+import { OfflineIdentity, registerOfflineLogin } from "./offline";
 import { GitHubClient, GitHubError } from "../github/client";
 import { StorageError } from "../storage/errors";
 import { demoRoster } from "../demo/roster";
@@ -179,7 +180,10 @@ export function registerAuthRoutes(
 	let clock = dependencies.clock ?? (() => new Date());
 	let config = dependencies.config;
 	let storage = dependencies.storage;
-	let github = dependencies.github ?? new GitHubClient();
+	let offline = config.offline
+		? new OfflineIdentity(config.offline, config.encryptionKey)
+		: undefined;
+	let github: GitHub = offline ?? dependencies.github ?? new GitHubClient();
 	let admission = new Admission(config, github, () => clock().getTime());
 	let secure = new URL(config.origin).protocol === "https:";
 	let local: LocalAuth | undefined;
@@ -325,7 +329,7 @@ export function registerAuthRoutes(
 		});
 	}
 
-	if (!local) {
+	if (!local && !offline) {
 		router.on("GET", "/auth/github", async (_request, url) => {
 			let issued = await attempts.issue(returnPath(url, config.origin));
 			let location = github.authorize({
@@ -355,12 +359,15 @@ export function registerAuthRoutes(
 		});
 	}
 
+	if (offline) registerOfflineLogin(router, context, offline);
 	router.on("GET", "/auth/github/install", () =>
-		redirected(
-			`https://github.com/apps/${encodeURIComponent(config.appSlug)}/installations/new`,
-			302,
-			[],
-		));
+		offline
+			? new Response("GitHub is disabled", { status: 404 })
+			: redirected(
+				`https://github.com/apps/${encodeURIComponent(config.appSlug)}/installations/new`,
+				302,
+				[],
+			));
 
 	// GitHub's installation_id query parameter is intentionally ignored. API access is
 	// always re-established from the signed-in user's token.
@@ -370,7 +377,7 @@ export function registerAuthRoutes(
 		return redirected("/?repository_access=changed", 303, []);
 	});
 
-	if (!local) {
+	if (!local && !offline) {
 		router.on("GET", "/auth/github/callback", async (request, url) => {
 			let clear = attempts.clearCookie();
 			try {
@@ -448,7 +455,7 @@ export function registerAuthRoutes(
 				? json({
 					agent: dependencies.agent ?? true,
 					...(dependencies.liveBuild ? { liveBuild: true } : {}),
-					...(local ? { auth: "local" } : {}),
+					...(local ? { auth: "local" } : offline ? { auth: "offline" } : {}),
 					...(config.demoPersonas ? { demo: { actors: demoRoster(config).list() } } : {}),
 					...(dependencies.setupAgents?.length ? { setupAgents: dependencies.setupAgents } : {}),
 					installUrl: "/auth/github/install",
@@ -463,7 +470,7 @@ export function registerAuthRoutes(
 					user: null,
 					agent: dependencies.agent ?? true,
 					...(dependencies.liveBuild ? { liveBuild: true } : {}),
-					...(local ? { auth: "local" } : {}),
+					...(local ? { auth: "local" } : offline ? { auth: "offline" } : {}),
 				});
 			if (restoredCookie) reply.headers.append("set-cookie", restoredCookie);
 			if (clearBinding) reply.headers.append("set-cookie", local!.clearBinding);

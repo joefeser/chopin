@@ -8,8 +8,21 @@
  * here: a process sends nothing once its lease is released, lost or past its deadline.
  */
 export class AiCutoffs {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			all: this.#all,
+			people: this.#people,
+		};
+	}
+
+	restore(state: ReturnType<AiCutoffs["checkpoint"]>): void {
+		this.#all = state.all;
+		this.#people = state.people;
+	}
+
 	#all = 0;
-	readonly #people = new Map<string, number>();
+	#people = new Map<string, number>();
 
 	cut(userId?: string): void {
 		this.#all++;

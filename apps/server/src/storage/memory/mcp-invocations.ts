@@ -19,6 +19,17 @@ function scopeKey(scope: McpInvocationScope): string {
 }
 
 export class MemoryMcpInvocationStore implements McpInvocationStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			records: this.#records,
+		};
+	}
+
+	restore(state: ReturnType<MemoryMcpInvocationStore["checkpoint"]>): void {
+		this.#records = state.records;
+	}
+
 	#records = new Map<string, McpInvocation>();
 	constructor(
 		private deps: {

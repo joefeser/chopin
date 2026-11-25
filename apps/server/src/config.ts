@@ -344,6 +344,11 @@ function imageMaxBytes(): number {
 
 function storage(): StorageConfig {
 	let driver = process.env.STORAGE_DRIVER || "postgres";
+	if (driver === "sqlite") {
+		let path = process.env.SQLITE_PATH;
+		if (!path || path === ":memory:") throw new Error("SQLITE_PATH must name a durable local file");
+		return { driver, path };
+	}
 	if (driver !== "postgres") {
 		throw new Error(`STORAGE_DRIVER must be "postgres", got ${JSON.stringify(driver)}`);
 	}
@@ -529,7 +534,9 @@ export function load(): Config {
 export function describe(config: Config): string {
 	let users = config.auth.allowedUsers?.size ?? 0;
 	let organizations = config.auth.allowedOrganizations?.size ?? 0;
-	let admission = users || organizations
+	let admission = config.auth.offline
+		? "auth: offline local principals (no GitHub)"
+		: users || organizations
 		? `auth: github${
 			config.auth.local ? " local device flow" : ""
 		} (restricted: ${users} users, ${organizations} organizations)`

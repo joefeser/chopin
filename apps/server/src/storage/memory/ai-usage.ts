@@ -31,6 +31,17 @@ function counted(tokens: AiTokenCounts): AiTokenCounts {
 }
 
 export class MemoryAiUsageStore implements AiUsageStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			attempts: this.#attempts,
+		};
+	}
+
+	restore(state: ReturnType<MemoryAiUsageStore["checkpoint"]>): void {
+		this.#attempts = state.attempts;
+	}
+
 	#attempts = new Map<string, Stored>();
 	constructor(
 		private deps: { userExists: (id: string) => boolean; assertLease: (lease: Lease) => void },

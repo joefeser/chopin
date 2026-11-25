@@ -32,6 +32,8 @@ The document model supports any repository-connected technical document, while t
 
 ## Run locally
 
+For the model-free, GitHub-independent SQLite PoC, use [local runtime](docs/local-modernization-poc.md#local-runtime). The instructions below describe the existing GitHub/PostgreSQL profile.
+
 You need these prerequisites on your machine:
 
 - Bun 1.4.5, selected automatically by `mise.toml` if you use [mise](https://mise.jdx.dev)

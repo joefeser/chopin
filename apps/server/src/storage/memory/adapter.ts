@@ -63,9 +63,7 @@ import type {
 	UserRecord,
 } from "../model";
 import type {
-	AiCredentialStore,
 	AiPlaceholderStore,
-	AiUsageStore,
 	BackgroundJobStore,
 	ChannelStore,
 	ChatAttachmentStore,
@@ -76,10 +74,8 @@ import type {
 	DocumentVersionStore,
 	ImageStore,
 	LeaseStore,
-	MachineDatabaseStore,
 	MachineStore,
 	McpInvocationStore,
-	McpSessionStore,
 	NavigationStore,
 	PlannerCatalogStore,
 	PlannerCredentialStore,
@@ -160,8 +156,90 @@ function lease(value: Lease): Lease {
 
 type Operation = CommitResult;
 
-/** A strict in-memory adapter used by domain tests, not a production fallback. */
+/** Contract engine used by domain tests and by SQLite inside its durable transaction.
+ * Never select this engine directly as a runtime persistence fallback. */
 export class MemoryStorage implements StorageAdapter {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			users: this.#users,
+			sessions: this.#sessions,
+			projects: this.#projects,
+			navigation: this.#navigation,
+			channels: this.#channels,
+			plannerResets: this.#plannerResets,
+			channelSlugs: this.#channelSlugs,
+			snapshots: this.#snapshots,
+			sequences: this.#sequences,
+			updates: this.#updates,
+			events: this.#events,
+			sidecars: this.#sidecars,
+			operations: this.#operations,
+			agents: this.#agents,
+			leases: this.#leases,
+			archiveGenerations: this.#archiveGenerations,
+			experiments: this.experiments.checkpoint(),
+			images: this.#images.checkpoint(),
+			chatAttachments: this.#chatAttachments.checkpoint(),
+			decisionAnswers: this.#decisionAnswers.checkpoint(),
+			versions: this.#versions.checkpoint(),
+			aiCutoffs: this.#aiCutoffs.checkpoint(),
+			machines: this.#machines.checkpoint(),
+			plannerHolds: this.#plannerHolds.checkpoint(),
+			plannerModelChoices: this.#plannerModelChoices.checkpoint(),
+			plannerCatalogs: this.#plannerCatalogs.checkpoint(),
+			chatThreads: this.#chatThreads.checkpoint(),
+			plannerCredentials: this.#plannerCredentials.checkpoint(),
+			machineDatabases: this.machineDatabases.checkpoint(),
+			aiCredentials: this.aiCredentials.checkpoint(),
+			aiPlaceholders: this.#aiPlaceholders.checkpoint(),
+			aiUsage: this.aiUsage.checkpoint(),
+			mcpSessions: this.mcpSessions.checkpoint(),
+			mcpInvocations: this.#mcpInvocations.checkpoint(),
+			jobs: this.#jobs.checkpoint(),
+			research: this.#research.checkpoint(),
+		};
+	}
+
+	restore(state: ReturnType<MemoryStorage["checkpoint"]>): void {
+		this.#users = state.users;
+		this.#sessions = state.sessions;
+		this.#projects = state.projects;
+		this.#navigation = state.navigation;
+		this.#channels = state.channels;
+		this.#plannerResets = state.plannerResets;
+		this.#channelSlugs = state.channelSlugs;
+		this.#snapshots = state.snapshots;
+		this.#sequences = state.sequences;
+		this.#updates = state.updates;
+		this.#events = state.events;
+		this.#sidecars = state.sidecars;
+		this.#operations = state.operations;
+		this.#agents = state.agents;
+		this.#leases = state.leases;
+		this.#archiveGenerations = state.archiveGenerations;
+		this.experiments.restore(state.experiments);
+		this.#images.restore(state.images);
+		this.#chatAttachments.restore(state.chatAttachments);
+		this.#decisionAnswers.restore(state.decisionAnswers);
+		this.#versions.restore(state.versions);
+		this.#aiCutoffs.restore(state.aiCutoffs);
+		this.#machines.restore(state.machines);
+		this.#plannerHolds.restore(state.plannerHolds);
+		this.#plannerModelChoices.restore(state.plannerModelChoices);
+		this.#plannerCatalogs.restore(state.plannerCatalogs);
+		this.#chatThreads.restore(state.chatThreads);
+		this.#plannerCredentials.restore(state.plannerCredentials);
+		this.machineDatabases.restore(state.machineDatabases);
+		this.aiCredentials.restore(state.aiCredentials);
+		this.#aiPlaceholders.restore(state.aiPlaceholders);
+		this.aiUsage.restore(state.aiUsage);
+		this.mcpSessions.restore(state.mcpSessions);
+		this.#mcpInvocations.restore(state.mcpInvocations);
+		this.#jobs.restore(state.jobs);
+		this.#research.restore(state.research);
+	}
+
 	readonly driver = "memory";
 	readonly experiments = new MemoryExperimentStore({
 		exists: id => this.#channels.has(id),
@@ -248,11 +326,11 @@ export class MemoryStorage implements StorageAdapter {
 		channelExists: id => this.#channels.has(id),
 	});
 	readonly plannerCredentials: PlannerCredentialStore = this.#plannerCredentials;
-	readonly machineDatabases: MachineDatabaseStore = new MemoryMachineDatabaseStore({
+	readonly machineDatabases = new MemoryMachineDatabaseStore({
 		machineExists: id => this.#machines.has(id),
 		machineRevoked: id => this.#machines.isRevoked(id),
 	});
-	readonly aiCredentials: AiCredentialStore = new MemoryAiCredentialStore({
+	readonly aiCredentials = new MemoryAiCredentialStore({
 		userExists: id => this.#users.has(id),
 		assertLease: held => this.#assertLease(held),
 		cutoffs: this.#aiCutoffs,
@@ -269,11 +347,11 @@ export class MemoryStorage implements StorageAdapter {
 		cutoffs: this.#aiCutoffs,
 	});
 	readonly aiPlaceholders: AiPlaceholderStore = this.#aiPlaceholders;
-	readonly aiUsage: AiUsageStore = new MemoryAiUsageStore({
+	readonly aiUsage = new MemoryAiUsageStore({
 		userExists: id => this.#users.has(id),
 		assertLease: held => this.#assertLease(held),
 	});
-	readonly mcpSessions: McpSessionStore = new MemoryMcpSessionStore();
+	readonly mcpSessions = new MemoryMcpSessionStore();
 	readonly #mcpInvocations = new MemoryMcpInvocationStore({
 		channelExists: id => this.#channels.has(id),
 		assertLease: held => this.#assertLease(held),

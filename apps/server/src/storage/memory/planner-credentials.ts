@@ -12,6 +12,17 @@ function copy(value: PlannerCredential): PlannerCredential {
 }
 
 export class MemoryPlannerCredentialStore implements PlannerCredentialStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			credentials: this.#credentials,
+		};
+	}
+
+	restore(state: ReturnType<MemoryPlannerCredentialStore["checkpoint"]>): void {
+		this.#credentials = state.credentials;
+	}
+
 	#credentials = new Map<string, PlannerCredential>();
 	constructor(
 		private deps: {

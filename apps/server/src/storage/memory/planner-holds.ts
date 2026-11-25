@@ -14,6 +14,17 @@ function copy(value: StoredPlannerLinkHold): StoredPlannerLinkHold {
 }
 
 export class MemoryPlannerLinkHoldStore implements PlannerLinkHoldStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			holds: this.#holds,
+		};
+	}
+
+	restore(state: ReturnType<MemoryPlannerLinkHoldStore["checkpoint"]>): void {
+		this.#holds = state.holds;
+	}
+
 	#holds = new Map<string, StoredPlannerLinkHold>();
 	constructor(
 		private deps: {

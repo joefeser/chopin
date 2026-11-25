@@ -31,6 +31,17 @@ function copyPlaceholder(value: AiPlaceholder): AiPlaceholder {
 }
 
 export class MemoryAiCredentialStore implements AiCredentialStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			records: this.#records,
+		};
+	}
+
+	restore(state: ReturnType<MemoryAiCredentialStore["checkpoint"]>): void {
+		this.#records = state.records;
+	}
+
 	#records = new Map<string, AiCredentialRecord>();
 	constructor(
 		private deps: {
@@ -111,6 +122,17 @@ function sameBytes(left: Uint8Array | undefined, right: Uint8Array | undefined):
 }
 
 export class MemoryAiPlaceholderStore implements AiPlaceholderStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			placeholders: this.#placeholders,
+		};
+	}
+
+	restore(state: ReturnType<MemoryAiPlaceholderStore["checkpoint"]>): void {
+		this.#placeholders = state.placeholders;
+	}
+
 	#placeholders = new Map<string, AiPlaceholder>();
 	constructor(
 		private deps: {

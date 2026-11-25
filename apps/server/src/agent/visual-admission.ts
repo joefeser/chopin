@@ -234,3 +234,33 @@ export function createVisualAdmission(decide: Decide | undefined): VisualAdmissi
 		return issues;
 	};
 }
+
+/** Offline authoring checks syntax and explicit visuals; it never infers a visual requirement. */
+export const offlineVisualAdmission: VisualAdmission = async input => {
+	if (
+		input.sources.reduce((bytes, source) => bytes + Buffer.byteLength(source), 0) > MAX_SOURCE_BYTES
+	) {
+		return issue("E_VISUAL_LIMIT", "Split the local write into bounded sources.");
+	}
+	let issues: Issue[] = [];
+	try {
+		for (let source of input.sources) {
+			let tree = parse(source);
+			let checked = validate(tree);
+			if (!checked.ok) issues.push(...checked.issues);
+			let visit = (node: Nodes): void => {
+				if (node.type === "code" && node.lang === SEECODE_LANGUAGE) {
+					let parsed = parseDiagramSource(node.value);
+					if (!parsed.ok || !renderDiagram(parsed.spec).ok) {
+						issues.push(...issue("E_VISUAL_INVALID", "Repair the explicit diagram before saving."));
+					}
+				}
+				for (let child of (node as Parent).children ?? []) visit(child);
+			};
+			visit(tree);
+		}
+	} catch {
+		return issue("E_VISUAL_SOURCE", "Repair the MDX syntax before saving.");
+	}
+	return issues;
+};

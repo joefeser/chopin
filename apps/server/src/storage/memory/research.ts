@@ -109,6 +109,37 @@ function same(left: string | undefined, right: string | undefined): boolean {
 
 /** Serialized, deeply-cloned research persistence for provider contract and domain tests. */
 export class MemoryResearchWorkspaceStore implements ResearchWorkspaceStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			workspaces: this.#workspaces,
+			idempotency: this.#idempotency,
+			turns: this.#turns,
+			turnIds: this.#turnIds,
+			turnRequests: this.#turnRequests,
+			messages: this.#messages,
+			messageIds: this.#messageIds,
+			agentMessagesByJob: this.#agentMessagesByJob,
+			nextOrdinals: this.#nextOrdinals,
+			nextSequences: this.#nextSequences,
+			linkedJobs: this.#linkedJobs,
+		};
+	}
+
+	restore(state: ReturnType<MemoryResearchWorkspaceStore["checkpoint"]>): void {
+		this.#workspaces = state.workspaces;
+		this.#idempotency = state.idempotency;
+		this.#turns = state.turns;
+		this.#turnIds = state.turnIds;
+		this.#turnRequests = state.turnRequests;
+		this.#messages = state.messages;
+		this.#messageIds = state.messageIds;
+		this.#agentMessagesByJob = state.agentMessagesByJob;
+		this.#nextOrdinals = state.nextOrdinals;
+		this.#nextSequences = state.nextSequences;
+		this.#linkedJobs = state.linkedJobs;
+	}
+
 	#options: Options;
 	#workspaces = new Map<string, ResearchWorkspace>();
 	#idempotency = new Map<string, string>();

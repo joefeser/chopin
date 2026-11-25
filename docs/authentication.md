@@ -531,3 +531,7 @@ with a one-time `persona` hint. The tab consumes the hint before any socket
 opens, removes it from the URL, and keeps the actor only in that tab's
 `sessionStorage`, so a plain document link never adopts one. Private Chat drafts
 are keyed by actor, and presence keeps the presenter and each persona apart.
+
+## Offline local identities
+
+`AUTH_MODE=offline` is separate from the GitHub device-flow mode named `local`. It uses a private local directory of human and machine principals, explicit workspace grants, and durable encrypted browser sessions in SQLite. No GitHub OAuth or App install is used. See [local runtime](local-modernization-poc.md#local-runtime). The hosted contract in this document continues to apply to the existing GitHub profiles.

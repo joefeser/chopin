@@ -85,6 +85,25 @@ function compareId(left: string, right: string): number {
 
 /** Provider-independent job state machine used by the memory contract adapter. */
 export class MemoryBackgroundJobStore implements BackgroundJobStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			revisions: this.#revisions,
+			targets: this.#targets,
+			jobs: this.#jobs,
+			idempotency: this.#idempotency,
+			artifacts: this.#artifacts,
+		};
+	}
+
+	restore(state: ReturnType<MemoryBackgroundJobStore["checkpoint"]>): void {
+		this.#revisions = state.revisions;
+		this.#targets = state.targets;
+		this.#jobs = state.jobs;
+		this.#idempotency = state.idempotency;
+		this.#artifacts = state.artifacts;
+	}
+
 	#options: Options;
 	#revisions = new Map<string, number>();
 	#targets = new Map<string, BackgroundJobTarget>();

@@ -1,4 +1,5 @@
 import { createHash, createPrivateKey } from "node:crypto";
+import { loadOfflineDirectory, offlineAuthConfig, type OfflineDirectory } from "./offline";
 import { readFileSync } from "node:fs";
 
 import type { KeyObject } from "node:crypto";
@@ -7,6 +8,7 @@ import type { KeyObject } from "node:crypto";
 export type AppCredentials = { id: string; privateKey: KeyObject };
 
 export type AuthConfig = {
+	offline?: OfflineDirectory;
 	origin: string;
 	/** Origins the deployment was served from before APP_ORIGIN (PREVIOUS_ORIGINS). */
 	previousOrigins?: readonly string[];
@@ -133,6 +135,29 @@ function allowed(
 }
 
 export function loadAuth(port = 8787, host = process.env.SERVER_HOST || "127.0.0.1"): AuthConfig {
+	if (process.env.AUTH_MODE === "offline") {
+		let appOrigin = origin(process.env.APP_ORIGIN);
+		let url = new URL(appOrigin);
+		if (
+			!["127.0.0.1", "::1"].includes(host) || !["127.0.0.1", "[::1]"].includes(url.hostname)
+			|| Number(url.port || 80) !== port || process.env.STORAGE_DRIVER !== "sqlite"
+			|| process.env.AGENT !== "off" || process.env.BACKGROUND_JOBS !== "off"
+			|| ["LIVE_BUILD", "LIVE_SPIKES", "CONVERSATION_PLAN", "PLANNER_VISUALS"].some(name =>
+				process.env[name] === "on"
+			)
+			|| process.env.TRANSCRIPTION_MODEL
+		) {
+			throw new Error("offline requires a loopback IP, SQLite, AGENT=off, and no live build");
+		}
+		if (!process.env.CHOPIN_OFFLINE_DIRECTORY) {
+			throw new Error("CHOPIN_OFFLINE_DIRECTORY is required");
+		}
+		return offlineAuthConfig(
+			appOrigin,
+			encryptionKey(process.env.SESSION_ENCRYPTION_KEY),
+			loadOfflineDirectory(process.env.CHOPIN_OFFLINE_DIRECTORY),
+		);
+	}
 	let appSlug = process.env.GITHUB_APP_SLUG;
 	let clientId = process.env.GITHUB_APP_CLIENT_ID;
 	let clientSecret = process.env.GITHUB_APP_CLIENT_SECRET;

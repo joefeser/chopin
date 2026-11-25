@@ -2,16 +2,20 @@ import { GitHubIcon } from "@chopin/icons";
 
 import { LocalLoginShell } from "./local-login-shell";
 
-export function HostedLogin() {
-	let href = githubLoginHref(location.pathname, location.search, location.hash);
+export function HostedLogin({ offline = false }: { offline?: boolean }) {
+	let href = offline
+		? "/auth/offline"
+		: githubLoginHref(location.pathname, location.search, location.hash);
 	return (
 		<LocalLoginShell>
 			<p className="mt-2 text-sm text-text-secondary">
-				Sign in with GitHub to open your projects and documents.
+				{offline
+					? "Sign in locally to open your workspaces and documents."
+					: "Sign in with GitHub to open your projects and documents."}
 			</p>
 			<a className="btn btn-md btn-primary mt-6 w-full" href={href}>
-				<GitHubIcon />
-				Continue with GitHub
+				{!offline && <GitHubIcon />}
+				{offline ? "Continue locally" : "Continue with GitHub"}
 			</a>
 		</LocalLoginShell>
 	);

@@ -22,6 +22,17 @@ function copy(value: StoredChatAttachment): StoredChatAttachment {
 }
 
 export class MemoryChatAttachmentStore implements ChatAttachmentStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			attachments: this.#attachments,
+		};
+	}
+
+	restore(state: ReturnType<MemoryChatAttachmentStore["checkpoint"]>): void {
+		this.#attachments = state.attachments;
+	}
+
 	#attachments = new Map<string, StoredChatAttachment>();
 	constructor(
 		private options: {

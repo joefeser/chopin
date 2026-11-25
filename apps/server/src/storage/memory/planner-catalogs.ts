@@ -8,6 +8,17 @@ function copy(value: PlannerCatalog): PlannerCatalog {
 }
 
 export class MemoryPlannerCatalogStore implements PlannerCatalogStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			catalogs: this.#catalogs,
+		};
+	}
+
+	restore(state: ReturnType<MemoryPlannerCatalogStore["checkpoint"]>): void {
+		this.#catalogs = state.catalogs;
+	}
+
 	#catalogs = new Map<string, PlannerCatalog>();
 	constructor(
 		private deps: {

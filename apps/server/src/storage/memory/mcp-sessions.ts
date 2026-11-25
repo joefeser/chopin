@@ -10,6 +10,17 @@ function copy(value: McpSession): McpSession {
 }
 
 export class MemoryMcpSessionStore implements McpSessionStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			sessions: this.#sessions,
+		};
+	}
+
+	restore(state: ReturnType<MemoryMcpSessionStore["checkpoint"]>): void {
+		this.#sessions = state.sessions;
+	}
+
 	#sessions = new Map<string, McpSession>();
 	async create(session: McpSession) {
 		if (!this.#sessions.has(session.id)) this.#sessions.set(session.id, copy(session));

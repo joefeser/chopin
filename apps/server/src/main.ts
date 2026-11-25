@@ -133,13 +133,14 @@ import { spikeHost } from "./experiments/spike-host";
 import { spikeSettler, startSettle } from "./experiments/spike-settle";
 import { resolveInstruction } from "./experiments/spikes";
 import { openDecisions } from "./conversation-plan/decisions";
-import { createVisualAdmission } from "./agent/visual-admission";
+import { createVisualAdmission, offlineVisualAdmission } from "./agent/visual-admission";
 import { locksEditing, requestBuild } from "./tasks/builds";
 import { pendingLinks, relinkInstruction } from "./tasks/relink";
 import { BuildReadiness } from "./tasks/readiness";
 import { createDocument as createHostedDocument, MCP_SESSION_IDLE_MS } from "./mcp/hosted";
 import { CANNOT_STEER } from "./chat/steering";
 import { registerMcpRoutes } from "./mcp/routes";
+import { registerOfflineDecisions } from "./auth/offline-decisions";
 import { registerScriptedDraftRoutes } from "./coordination/scripted-drafts";
 import { livePlanAccess } from "./coordination/live-plan";
 import { registerNavigationRoutes } from "./navigation/routes";
@@ -242,7 +243,9 @@ const config = load();
 const chatAttachmentLimits = attachmentLimits(config);
 /** The one decisions boundary, checked against Atomic's registry before anything starts. */
 const decide = await openDecisions(config);
-const visualAdmission = createVisualAdmission(decide);
+const visualAdmission = config.auth.offline
+	? offlineVisualAdmission
+	: createVisualAdmission(decide);
 harnessFor(config);
 const storage = createStorage(config.storage);
 const documentHistory = new DocumentHistory(storage);
@@ -3716,39 +3719,58 @@ jobRunner = new JobRunner({
 	},
 	fatal: err => console.error("chopin: background job runner failed -", err),
 });
-registerMcpRoutes(router, hostedAuth, {
-	lease() {
-		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
-		return writerLease.held;
+registerMcpRoutes(
+	router,
+	hostedAuth,
+	{
+		lease() {
+			if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+			return writerLease.held;
+		},
 	},
-}, {
-	// A child's instruction runs on its root's Chat with the child as focus.
-	visualAdmission,
-	invokePlanner: input =>
-		invokeRouted({
-			channels: storage.channels,
-			deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
-			transition: withDocumentTransition,
-			open: rootId => openRootChat(rootId, input.session?.session.id, input.repository),
-			plannerAccount: rootId => plannerAttachments?.holding(rootId)?.userId,
-			systemTurns,
-		}, input),
-	plannerNotAttached,
-	...(experiments ? { launchCaller: experiments.mcpCaller } : {}),
-	archiveChannel,
-	isChannelDeleting: channelId => deletingChannels.has(channelId),
-	onChannelRenamed: announceChannel,
-	onChannelCreated: announceCatalogue,
-	onDocumentPersisted: documentPersisted,
-	restoreChannel,
-	serializeDocument: (channelId, action) =>
-		withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),
-	onPlannerAnswer: answerDecision,
-},
-config.externalCoordination
-	? { approvers: config.coordinationApprovers ?? [] }
-	: undefined,
+	{
+		// A child's instruction runs on its root's Chat with the child as focus.
+		visualAdmission,
+		invokePlanner: input =>
+			invokeRouted({
+				channels: storage.channels,
+				deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
+				transition: withDocumentTransition,
+				open: rootId => openRootChat(rootId, input.session?.session.id, input.repository),
+				plannerAccount: rootId => plannerAttachments?.holding(rootId)?.userId,
+				systemTurns,
+			}, input),
+		plannerNotAttached,
+		...(experiments ? { launchCaller: experiments.mcpCaller } : {}),
+		archiveChannel,
+		isChannelDeleting: channelId => deletingChannels.has(channelId),
+		onChannelRenamed: announceChannel,
+		onChannelCreated: announceCatalogue,
+		onDocumentPersisted: documentPersisted,
+		restoreChannel,
+		serializeDocument: (channelId, action) =>
+			withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),
+		onPlannerAnswer: answerDecision,
+	},
+	config.externalCoordination
+		? { approvers: config.coordinationApprovers ?? [] }
+		: undefined,
 );
+if (config.auth.offline) {
+	registerOfflineDecisions(
+		router,
+		hostedAuth,
+		livePlanAccess({
+			transition: withDocumentTransition,
+			unavailable: id => deletingChannels.has(id) || archivingChannels.has(id),
+			closing: id => Rooms.get(id)?.closing,
+			hold: Rooms.hold,
+			evict,
+			plan: room => plan(room, server),
+		}),
+		() => server,
+	);
+}
 if (config.coordinationScriptedDrafts) {
 	registerScriptedDraftRoutes(router, hostedAuth, {
 		approvers: config.coordinationApprovers ?? [],

@@ -10,6 +10,17 @@ function copy({ deliveredAt: _deliveredAt, ...row }: Row): DecisionAnswer {
 }
 
 export class MemoryDecisionAnswerStore implements DecisionAnswerStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			rows: this.#rows,
+		};
+	}
+
+	restore(state: ReturnType<MemoryDecisionAnswerStore["checkpoint"]>): void {
+		this.#rows = state.rows;
+	}
+
 	/** Per document, per decision. */
 	#rows = new Map<string, Map<string, Row>>();
 	constructor(private channelExists: (id: string) => boolean) {}

@@ -307,3 +307,13 @@ test.each(["removed", "changed"])(
 		expect(requests).toHaveLength(3);
 	},
 );
+
+test("offline admission accepts prose without a model while rejecting invalid explicit diagrams", async () => {
+	let { offlineVisualAdmission } = await import("./visual-admission");
+	expect(await offlineVisualAdmission({ sources: ["# Local proof\n\nSynthetic evidence.\n"] }))
+		.toEqual([]);
+	expect(
+		(await offlineVisualAdmission({ sources: ['```seecode\n{"type":"not-a-diagram"}\n```\n'] }))
+			.length,
+	).toBeGreaterThan(0);
+});

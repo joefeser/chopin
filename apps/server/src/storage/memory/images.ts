@@ -8,6 +8,17 @@ function copy(value: StoredImage): StoredImage {
 }
 
 export class MemoryImageStore implements ImageStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			images: this.#images,
+		};
+	}
+
+	restore(state: ReturnType<MemoryImageStore["checkpoint"]>): void {
+		this.#images = state.images;
+	}
+
 	#images = new Map<string, StoredImage>();
 	constructor(
 		private options: {

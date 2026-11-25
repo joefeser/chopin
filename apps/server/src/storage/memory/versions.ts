@@ -14,6 +14,17 @@ type Row = Omit<StoredDocumentVersion, "authorLogin" | "authorAvatarUrl" | "summ
 };
 
 export class MemoryDocumentVersionStore implements DocumentVersionStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			versions: this.#versions,
+		};
+	}
+
+	restore(state: ReturnType<MemoryDocumentVersionStore["checkpoint"]>): void {
+		this.#versions = state.versions;
+	}
+
 	#versions = new Map<string, Row[]>();
 	constructor(
 		private options: {

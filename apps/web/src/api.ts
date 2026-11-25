@@ -14,7 +14,7 @@ export type Session = {
 	setupAgents?: SetupAgent[];
 	installUrl?: string;
 	expiresAt?: string;
-	auth?: "local";
+	auth?: "local" | "offline";
 	demo?: { actors: { id: string; name: string; avatar: string }[] };
 };
 

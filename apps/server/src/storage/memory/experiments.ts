@@ -6,6 +6,17 @@ import type { ChannelRecord, CreateChannel, Lease } from "../model";
 import { conflict, missing } from "../errors";
 
 export class MemoryExperimentStore implements ExperimentStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			records: this.#records,
+		};
+	}
+
+	restore(state: ReturnType<MemoryExperimentStore["checkpoint"]>): void {
+		this.#records = state.records;
+	}
+
 	#records = new Map<string, Investigation>();
 	constructor(
 		private options: {

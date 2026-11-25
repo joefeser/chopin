@@ -115,7 +115,7 @@ reconcile into the live tree, and produce one Yjs delta. Unchanged or moved
 MDAST object identity preserves existing Lexical nodes, selections, and undo
 history.
 
-PostgreSQL is the only runtime storage adapter. One renewable `chopin:writer`
+PostgreSQL is the default runtime storage adapter. The offline PoC also has a bounded SQLite checkpoint adapter (see docs/local-modernization-poc.md). One renewable `chopin:writer`
 lease permits one application process per database. A second process started with
 `HANDOVER=wait` waits beside the holder in standby, reading the lease without a lock,
 and takes it when the holder's cut releases it; only the holder serves.

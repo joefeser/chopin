@@ -22,6 +22,17 @@ function copy(value: StoredMachineDatabase): StoredMachineDatabase {
 }
 
 export class MemoryMachineDatabaseStore implements MachineDatabaseStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			records: this.#records,
+		};
+	}
+
+	restore(state: ReturnType<MemoryMachineDatabaseStore["checkpoint"]>): void {
+		this.#records = state.records;
+	}
+
 	#records = new Map<string, StoredMachineDatabase>();
 	constructor(
 		private deps: {

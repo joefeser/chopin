@@ -82,7 +82,9 @@ export function App() {
 	if (!session.user) {
 		return (
 			<Suspense fallback={<HostedLoading />}>
-				{session.auth === "local" ? <LocalLogin /> : <HostedLogin />}
+				{session.auth === "local"
+					? <LocalLogin />
+					: <HostedLogin offline={session.auth === "offline"} />}
 			</Suspense>
 		);
 	}

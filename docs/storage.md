@@ -2,9 +2,11 @@
 
 Chopin's durable boundary is `StorageAdapter` in
 `apps/server/src/storage/port.ts`. Domain services depend on that port rather
-than a database driver or query language. PostgreSQL is the only selectable
-runtime adapter. `MemoryStorage` exists for unit and contract tests and is not a
-runtime `STORAGE_DRIVER`.
+than a database driver or query language. PostgreSQL is the default runtime adapter.
+The offline PoC also supports a bounded SQLite checkpoint adapter; see
+[Local modernization PoC](local-modernization-poc.md#local-runtime). `MemoryStorage`
+supplies contract-tested domain transitions inside SQLite transactions and remains
+unselectable as a runtime `STORAGE_DRIVER`.
 
 ## State model
 

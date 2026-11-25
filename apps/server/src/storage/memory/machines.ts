@@ -20,6 +20,23 @@ function hex(value: Uint8Array): string {
 }
 
 export class MemoryMachineStore implements MachineStore {
+	/** Internal transaction checkpoint; callbacks and pending work are not persisted. */
+	checkpoint() {
+		return {
+			machines: this.#machines,
+			tokens: this.#tokens,
+			choices: this.#choices,
+			favorites: this.#favorites,
+		};
+	}
+
+	restore(state: ReturnType<MemoryMachineStore["checkpoint"]>): void {
+		this.#machines = state.machines;
+		this.#tokens = state.tokens;
+		this.#choices = state.choices;
+		this.#favorites = state.favorites;
+	}
+
 	#machines = new Map<string, StoredMachine>();
 	#tokens = new Map<string, string>();
 	/** Keyed by document and person. */

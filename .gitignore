@@ -53,3 +53,6 @@ vite.config.ts.timestamp-*
 
 # Python bytecode from dataset tooling
 __pycache__/
+
+# Private local proof credentials and databases
+.tmp/local-proof/
