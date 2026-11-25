@@ -518,7 +518,7 @@ export function registerAuthRoutes(
 					return json({ error: "page must be an integer between 1 and 10000" }, 400);
 				}
 				let installationId = params.installationId!;
-				if (!/^\d+$/.test(installationId)) {
+				if (!(config.offline ? installationId === "local" : /^\d+$/.test(installationId))) {
 					return json({ error: "installation not found" }, 404);
 				}
 				let authenticated = await sessions.authenticate(request);

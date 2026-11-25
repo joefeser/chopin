@@ -88,6 +88,30 @@ test("real login persists its encrypted browser session through a fresh router a
 		auth: "offline",
 		user: { id: "local:human:operator" },
 	});
+	// Exercise the browser picker through the actual route, not only the provider port.
+	let listing = await router.handle(
+		new Request(
+			`${config.origin}/api/github/installations/local/repositories`,
+			{ headers: { cookie } },
+		),
+	);
+	expect(listing?.status).toBe(200);
+	expect(await listing!.json()).toMatchObject({ repositories: [{ fullName: "local/proof" }] });
+	let anonymous = await router.handle(
+		new Request(
+			`${config.origin}/api/github/installations/local/repositories`,
+		),
+	);
+	expect(anonymous?.status).toBe(401);
+	for (let id of ["other", "123"]) {
+		let foreign = await router.handle(
+			new Request(
+				`${config.origin}/api/github/installations/${id}/repositories`,
+				{ headers: { cookie } },
+			),
+		);
+		expect(foreign?.status).toBe(404);
+	}
 	let install = await router.handle(new Request(`${config.origin}/auth/github/install`));
 	expect(install?.status).toBe(404);
 	let logout = await router.handle(
