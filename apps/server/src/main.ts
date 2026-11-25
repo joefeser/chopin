@@ -110,6 +110,7 @@ import { finishTurns } from "./handover/turns";
 import { Readiness, registerHealthRoutes } from "./http/health";
 import { registerMachinesPath } from "./http/machines-path";
 import { Router } from "./http/router";
+import { applyRequestTimeout, serverIdleTimeoutSeconds } from "./http/timeout";
 import { JobExecutionError, JobRegistry } from "./jobs/registry";
 import * as JobBrowser from "./jobs/browser";
 import { DocumentDescriptionProjector } from "./jobs/document-description";
@@ -120,8 +121,11 @@ import { researchAnswerDefinition, researchEvidenceDefinition } from "./jobs/res
 import { JobService } from "./jobs/service";
 import { DocumentSummaryCoordinator } from "./jobs/summary-coordinator";
 import { invokeRouted, SystemTurns } from "./mcp/invoke";
-import { createNewDocument, NewDocumentLimits } from "./agent/new-documents";
+import { createNewDocument } from "./agent/new-documents";
+import { buildState, orchestrate } from "./agent/orchestrate";
 import type { NewDocumentDeps } from "./agent/new-documents";
+import type { OrchestrateDeps } from "./agent/orchestrate";
+import type { BuildRequest } from "@chopin/protocol/implementation";
 import { liveClassifier } from "./tasks/live-gate";
 import { LiveSyncCoordinator } from "./tasks/live-sync";
 import { heuristicJudge, jevJudge, SpikeScout } from "./experiments/spike-scout";
@@ -330,8 +334,6 @@ let ownerBindings: ActiveOwnerBindings | undefined;
 let plannerAttachments: PlannerAttachments | undefined;
 /** Each document's recent automatic follow-ups through `invoke_planner`, for their hourly limit. */
 let systemTurns = new SystemTurns();
-/** How many documents each turn, and each person in an hour, had the Planner create. */
-let newDocumentLimits = new NewDocumentLimits();
 /** Browser sockets by login, so a login that ends closes them before another broadcast. */
 let sessionSockets = new SessionSockets(sessionId => hostedAuth.sessions.isLive(sessionId));
 const openSockets = new OpenSockets();
@@ -1112,6 +1114,9 @@ function conversation(
 		},
 		createDocument: config.agent
 			? request => createNewDocument(plannerDocuments(), { ...request, sourceId: room.id })
+			: undefined,
+		orchestrate: config.agent
+			? request => orchestrate(createdDocuments(), { ...request, sourceId: room.id })
 			: undefined,
 		createResearch: config.agent
 			? async request => {
@@ -2377,8 +2382,10 @@ function listen(): Server<SocketData> {
 	return Bun.serve<SocketData | SidebarSocketData | AgentSocketData>({
 		hostname: config.host,
 		port: config.port,
+		idleTimeout: serverIdleTimeoutSeconds(config.handover.holdMs),
 
 		fetch(req, self) {
+			applyRequestTimeout(req, self);
 			return requests.handle(req, abandoned => route(req, self, abandoned));
 		},
 
@@ -2749,7 +2756,28 @@ function plannerDocuments(): NewDocumentDeps {
 			);
 		},
 		appOrigin: hostedAuth.config.origin,
-		limits: newDocumentLimits,
+	};
+}
+
+/** The Planner's `orchestrate`: `create_document`'s rules, and the state of what a document created. */
+function createdDocuments(): OrchestrateDeps {
+	return {
+		...plannerDocuments(),
+		createdFrom: (sourceId, limit) => storage.channels.createdFrom(sourceId, limit),
+		planner: channelId => {
+			let chat = Rooms.get(channelId)?.plan?.chat;
+			if (chat?.busy || chat?.starting) return "working";
+			if (chat?.agent || plannerAttachments?.holding(channelId)?.attached) return "idle";
+			return "stopped";
+		},
+		build: async channelId => {
+			let plan = Rooms.get(channelId)?.plan;
+			if (plan) return buildState(plan);
+			let stored = await storage.collaboration.load(channelId, hostedAuth.clock());
+			let sidecar = stored?.sidecar as { builds?: unknown; live?: unknown } | null | undefined;
+			let builds = Array.isArray(sidecar?.builds) ? sidecar.builds as BuildRequest[] : [];
+			return buildState({ builds, live: sidecar?.live });
+		},
 	};
 }
 

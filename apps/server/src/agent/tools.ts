@@ -35,6 +35,9 @@ import { experimentTools } from "./experiment-tools";
 import { planImage } from "./plan-images";
 import { NEW_DOCUMENT_SCHEMA, newDocumentArguments } from "./new-documents";
 import type { NewDocumentArguments, NewDocumentResult } from "./new-documents";
+import { ORCHESTRATE_SCHEMA, orchestrateArguments } from "./orchestrate";
+import { writeIndex } from "./orchestrate-index";
+import type { IndexWriter, OrchestrateArguments, OrchestrateResult } from "./orchestrate";
 import type { InvestigationTools } from "./experiment-tools";
 
 import type { ActiveOwnerBinding } from "./active-owner";
@@ -194,6 +197,15 @@ export type DocumentRoom = {
 		args: NewDocumentArguments,
 		signal?: AbortSignal,
 	) => Promise<NewDocumentResult>;
+	/**
+	 * Works with the documents this one created, for the person whose message drives the current
+	 * turn; absent, or refusing, where `createDocument` is.
+	 */
+	orchestrate?: (
+		args: OrchestrateArguments,
+		index: IndexWriter,
+		signal?: AbortSignal,
+	) => Promise<OrchestrateResult>;
 	/** Starts the exact research request represented by the current member turn. */
 	createResearch?: (question: string) => Promise<ResearchWorkspaceRequest>;
 	/** Reads one reference retained by this room's active Planner session. */
@@ -347,7 +359,7 @@ export const documentTools = {
 			+ "large to review, unless the person asked for a single document. Give each a "
 			+ "complete first draft and brief; `instruction`, when given, starts its own Planner on "
 			+ "it as the person's message, so the documents run in parallel. Only a turn a person "
-			+ "asked for can create documents, at most 10 a turn. The result gives each document's "
+			+ "asked for can create documents. The result gives each document's "
 			+ "id and url; mention its link when you tell the person.",
 		inputSchema: jsonSchema(NEW_DOCUMENT_SCHEMA),
 		execute: (raw, { context: { room: context }, abortSignal }) =>
@@ -361,6 +373,37 @@ export const documentTools = {
 					};
 				}
 				return context.createDocument(args, abortSignal);
+			}),
+	}),
+
+	orchestrate: tool({
+		contextSchema: roomContext,
+		description: "Work with the documents this document created, each with its own Chat, "
+			+ "Decisions and Planner. `open` creates several at once, each exactly as "
+			+ "`create_document` would, remembered as created from this document. `list` gives each "
+			+ "one's link, whether its Planner is working, idle or stopped, its open Decisions and "
+			+ "its build. `instruct` sends one instruction to their Planners, or only to `targets`, "
+			+ "as the person's message in each document's Chat, starting a Planner that isn't "
+			+ "running; use it when the person asks to resume, continue or change the work in them. "
+			+ "`index` writes a table of them, kept current by later calls, under its own heading in "
+			+ "this document. Only a turn a person asked for can use it, and it reaches only the "
+			+ "documents this one created.",
+		inputSchema: jsonSchema(ORCHESTRATE_SCHEMA),
+		execute: (raw, { context: { room: context }, abortSignal }) =>
+			answer("orchestrate", async () => {
+				let args = orchestrateArguments(raw);
+				if (!context.orchestrate) {
+					return {
+						ok: false,
+						reason: "member-request-required",
+						message: "Only a turn a person asked for in Chat can work with created documents.",
+					};
+				}
+				return context.orchestrate(
+					args,
+					(documents, create) => writeIndex(context, documents, create, abortSignal),
+					abortSignal,
+				);
 			}),
 	}),
 

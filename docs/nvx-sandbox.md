@@ -183,7 +183,7 @@ round trip, so loading Atomic's 34,000 files from a share took 36–46 seconds a
   archive path and SHA-256 (`guest-packages.ts`); the release's layer has no git;
 - the agent's install commands: the built-in agents' npm packages at the versions
   this release pins (`AGENT_PACKAGES`: `@github/copilot` 1.0.114, `@bastani/atomic`
-  0.10.4, `@bastani/atomic-acp` 0.0.18), or the commands the owner gives for another
+  0.10.9, `@bastani/atomic-acp` 0.0.18), or the commands the owner gives for another
   agent with `--install` and for a Planner command with `--planner-install`;
 - what is in the folder the owner names with `--install-from` for those commands, if
   any: each file's path in it, content and whether it is executable;
@@ -502,8 +502,8 @@ pool before anything else runs, and the others start cold.
 
 ### Bursts of new documents
 
-People open several documents at once, and a Planner's `create_document` makes up to
-10 in one turn, all in one repository, all wanting a Planner at once:
+People open several documents at once, and a Planner's `create_document` can open
+many in one turn, all in one repository, all wanting a Planner at once:
 
 - **A burst refills more than one spare.** A new document that finds no spare ready
   within 10 seconds of another of its repository's asking starts a burst

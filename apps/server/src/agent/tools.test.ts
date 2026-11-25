@@ -8,6 +8,7 @@ import { forgetWorkspaces, rememberCheckout } from "../harness/atomic/workspace"
 import { Admission } from "../auth/admission";
 import { Sessions } from "../auth/session";
 import * as Chat from "../chat/service";
+import * as edit from "../plan/edit";
 import * as room from "../plan/room";
 import * as Service from "../plan/service";
 import * as Store from "../questions/store";
@@ -86,6 +87,7 @@ test("document tool names and schemas remain available to the Planner", async ()
 		"read_background_job",
 		"create_research_workspace",
 		"create_document",
+		"orchestrate",
 		"upload_plan_image",
 		"assess_visual",
 		"edit_plan",
@@ -271,6 +273,54 @@ test("read_plan and edit_plan give a child document its nested canonical URL", a
 		operations: [{ op: "replace", index: 0, source: "Edited child.\n" }],
 	});
 	expect(edited).toMatchObject({ ok: true, document: identity });
+});
+
+async function callOrchestrate(tools: ReturnType<typeof fixtureTools>, raw: unknown) {
+	let orchestrate = tools.find(tool => tool.name === "orchestrate");
+	if (!orchestrate?.handler) throw new Error("orchestrate is missing");
+	let text = String(await orchestrate.handler(raw as never, { toolCallId: "call" }));
+	return text.startsWith("Error: ") ? text : JSON.parse(text);
+}
+
+test("orchestrate hands checked arguments and this room's index to the member turn, and refuses without one", async () => {
+	let { plan, server } = await opened("# Whole app\n\nWhat the app does.\n");
+	let room = {
+		plan,
+		server,
+		room: "test",
+		persist: () => Service.persist(plan),
+		exclusive: <T>(action: () => Promise<T>) => Service.exclusive(plan, action),
+		async publish() {},
+		anchors() {},
+		changes() {},
+	};
+	expect(await callOrchestrate(fixtureTools(room), { operation: "list" })).toEqual({
+		ok: false,
+		reason: "member-request-required",
+		message: "Only a turn a person asked for in Chat can work with created documents.",
+	});
+	let received: unknown[] = [];
+	let tools = fixtureTools({
+		...room,
+		orchestrate: async (args, index) => {
+			received.push(args);
+			let written = await index([{
+				id: "doc",
+				title: "Login",
+				url: "https://chopin.test/d",
+				planner: "idle",
+				openDecisions: 0,
+				build: "not built",
+			}], true);
+			return { ok: true, operation: "index", documents: [], index: written };
+		},
+	});
+	expect(await callOrchestrate(tools, { operation: "index" })).toMatchObject({
+		ok: true,
+		index: { state: "written" },
+	});
+	expect(received).toEqual([{ operation: "index" }]);
+	expect(edit.source(plan)).toContain("[Login](https://chopin.test/d)");
 });
 
 test("create_document hands checked arguments to the member turn and refuses without one", async () => {

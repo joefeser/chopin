@@ -850,10 +850,11 @@ session is one launch, prepared before its `start` or `fork` and carried in `ai`
   back), half an hour before the launch's deadline, and after a
   [resume](#resuming-after-a-dropped-link), because the launch a session held may have
   ended with its link or with the server's process. A change while the session starts
-  is sent once the client answers `started`, as the accounts are then. The earlier
-  launch ends once the new one is sent, so use the new grants from then on: a request
-  still waiting at Chopin on the earlier one is refused. An empty `providers` says the
-  session has no grant now.
+  is sent once the client answers `started`, as the accounts are then. Switch to the
+  new grants right away. The replaced launch stays live for a two-minute grace period
+  (`REPLACED_LAUNCH_GRACE_MS`) before ending, so requests the client already sent on
+  it or is still streaming are not refused as ended; if the session ends first, both
+  launches end at once. An empty `providers` says the session has no grant now.
 - A launch ends with its session (`destroy`, or a link that closes for good), and
   when its machine is revoked or its document archived; Chopin's proxy then answers
   `launch-ended`, or `unknown-placeholder` once its placeholders are gone (401, `{
@@ -1401,14 +1402,15 @@ not apply to it.
   first and handle `resumed`, then the redelivered `input-result`s; retry the same
   `resume` on a `refused` with `retry`, and treat any other `refused` or `error` as final.
 - **What still ends it for good.** Its own `detach`; any definitive `refused` (every
-  one without `retry`) or protocol error; the owner's sign-out or its expiry; a Planner reset; revoking or unpairing
-  the machine that attached it; the document's owner choosing another machine for it;
-  archiving or deleting the document; a Stop that withdraws its last question; and the
-  same account attaching with a client that does not resume, which includes a browser
-  sign-in attaching over a paired machine's parked work, since that client cannot
-  resume it. All of these withdraw the questions, and a later `resume` finds nothing. A
-  server restart does not end it: see below. A person
-  with write access can always end a disconnected Planner by resetting it.
+  one without `retry`) or protocol error; the owner's sign-out or a credential that
+  cannot be renewed (routine credential renewal does not end it); a Planner reset;
+  revoking or unpairing the machine that attached it; the document's owner choosing
+  another machine for it; archiving or deleting the document; a Stop that withdraws
+  its last question; and the same account attaching with a client that does not
+  resume, which includes a browser sign-in attaching over a paired machine's parked
+  work, since that client cannot resume it. All of these withdraw the questions, and
+  a later `resume` finds nothing. A server restart does not end it: see below. A
+  person with write access can always end a disconnected Planner by resetting it.
 
 #### When the server is restarting
 
@@ -1576,6 +1578,27 @@ is archived or gone, when a writer resets the document's Planner in Chopin (the
 credential's `reset` names when; a disk from before goes before the next launch), when
 no Planner has run on it for 30 days, or when the machine is unpaired or revoked;
 commits never pushed go with it.
+
+### Forgotten-document cleanup
+
+When the connector removes a Planner's disk because Chopin says its document is archived
+or gone (never for a Planner reset, 30-day age, or unpair/revocation) and
+`--planner-command` is configured, it runs that command once before removing the slot
+while holding the disk lock, so the Planner can clean up state it kept for the document
+outside the disk (for example sessions in the machine's agent store).
+
+- **Environment**: `CHOPIN_FORGOTTEN_DOCUMENT=<document id>`, `CHOPIN_URL`, `CHOPIN_AI=chopin`,
+  the slot's agent state directories (`ATOMIC_CODING_AGENT_DIR`, etc., with the machine's
+  agent store settings written there when present), and the connector's `--env` values.
+  No Chopin credential (`CHOPIN_PLANNER_TOKEN*`, `CHOPIN_MCP_TOKEN_FILE`), no GitHub
+  token (`CHOPIN_GITHUB_TOKEN*`, `GITHUB_TOKEN`, `GH_TOKEN`), no `CHOPIN_DOCUMENT`, no
+  checkout or worktree (`CHOPIN_CHECKOUT`, `CHOPIN_WORKTREE`), and no agent connection.
+- **Sandbox**: runs in the machine's microVM from the Planner's image with the slot's
+  agent folder mounted writable as its working directory and `HOME`, and no repository or
+  disk mounted.
+- **Bounds**: at most 2 minutes; a non-zero exit, error, or timeout logs one dimmed line
+  (`Couldn't let the Planner of <document id> clean up: …`) and never stops the disk's
+  removal. On exit 0, only the usual disk-removal line is logged.
 
 The connector renews the Planner credential in `CHOPIN_PLANNER_TOKEN_FILE` 5 minutes
 before it expires, for as long as the backend runs and Chopin still lets the machine run

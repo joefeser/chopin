@@ -38,7 +38,8 @@ import { plannerInstructions } from "../agent/planner";
 import type { AiAccountRefusal } from "../ai/account-check";
 import type { ActiveOwnerBinding } from "../agent/active-owner";
 import type { DocumentRoom, ResearchWorkspaceRequest } from "../agent/tools";
-import type { NewDocumentRequest, NewDocumentResult, TurnDocuments } from "../agent/new-documents";
+import type { NewDocumentRequest, NewDocumentResult } from "../agent/new-documents";
+import type { OrchestrateRequest, OrchestrateResult } from "../agent/orchestrate";
 import type { VisualAdmission } from "../agent/visual-admission";
 import type { ChildDocuments } from "./children";
 import type { TellChat } from "./thread-notes";
@@ -75,7 +76,7 @@ import { broadcast, fail, PASSING, reply, tell } from "../wire";
 import { introduce } from "../people";
 import { MAX_MESSAGE_BYTES } from "./limits";
 import { actor, alone, contributed } from "./initiative";
-import { checkPlannerReply, PlannerReplyError, publishPlannerReplies } from "./reply-policy";
+import { checkPlannerReply, publishPlannerReplies } from "./reply-policy";
 import { withSessionContext } from "./session-context";
 import { TOOL_UNAVAILABLE, turnFailureOf } from "./turn-failure";
 import { retryTarget } from "./retry";
@@ -180,8 +181,6 @@ export type ActiveMemberRequest = {
 	turnId: string;
 	lifecycle: number;
 	focus?: Focus;
-	/** The documents this turn had the Planner create, counted for as long as the turn runs. */
-	documents?: TurnDocuments;
 };
 
 /** `retry` runs the message's turn again after it failed: the same message, once in context. */
@@ -926,6 +925,8 @@ export type Room = {
 	}) => Promise<ResearchWorkspaceRequest>;
 	/** Creates a top-level document for the person whose message drives the turn. */
 	createDocument?: (request: Omit<NewDocumentRequest, "sourceId">) => Promise<NewDocumentResult>;
+	/** Works with the documents this one created, for the person whose message drives the turn. */
+	orchestrate?: (request: Omit<OrchestrateRequest, "sourceId">) => Promise<OrchestrateResult>;
 	/** Keeps the room loaded while a retained Planner still waits on a question; returns the release. */
 	hold?: () => () => void;
 	/** The task draft the turn being started carries. */
@@ -976,6 +977,8 @@ type Retained = {
 	release: () => Promise<void>;
 	/** Called when `binding` ends; a rebound session watches its new binding with it. */
 	ended: () => void;
+	/** The rebind under way from a binding that ended, which every caller of `rebindRetained` shares. */
+	rebinding?: { from: ActiveOwnerBinding; done: Promise<boolean> };
 };
 
 const RENEWED_CREDENTIAL = new Set(["credential-rotated", "credential-expired"]);
@@ -988,12 +991,92 @@ function credentialRenewed(binding: ActiveOwnerBinding): boolean {
 }
 
 /**
+ * What a running turn stops on for its owner: the binding ending for any reason but its credential being renewed. A
+ * renewal (the owner's GitHub token expiring and being refreshed, every few hours) gives the session a binding to the
+ * renewed credential and the turn goes on; before, the turn was aborted, failing the reply and withdrawing every
+ * question it waited on. A session that can't take a new binding stops as before.
+ */
+function ownerSignal(
+	context: Room,
+	opened: { session: PlannerSession; binding: ActiveOwnerBinding },
+): { signal: AbortSignal; release: () => void } {
+	let ended = new AbortController();
+	let released = false;
+	let watched: ActiveOwnerBinding | undefined;
+	let onAbort = () => void follow();
+	let watch = (binding: ActiveOwnerBinding) => {
+		watched = binding;
+		if (binding.signal.aborted) void follow();
+		else binding.signal.addEventListener("abort", onAbort, { once: true });
+	};
+	let follow = async () => {
+		let previous = opened.binding;
+		if (released) return;
+		if (!opened.session.rebind || !credentialRenewed(previous)) {
+			ended.abort(previous.signal.reason);
+			return;
+		}
+		// A turn on the retained session follows the retained session's own rebind, so the session
+		// takes one binding, which the retained session releases with it.
+		let retained = context.chat.retained;
+		if (retained?.session === opened.session) {
+			let rebound = await rebindRetained(context, retained).catch(() => false);
+			if (released) return;
+			if (!rebound || context.chat.retained !== retained) {
+				ended.abort(previous.signal.reason);
+				return;
+			}
+			opened.binding = retained.binding;
+			watch(retained.binding);
+			return;
+		}
+		let binding = await context.activeOwner?.().catch(() => undefined);
+		if (released) {
+			binding?.release();
+			return;
+		}
+		if (
+			!binding || binding.ownerSessionId !== previous.ownerSessionId
+			|| binding.ownerGeneration !== previous.ownerGeneration
+			|| binding.repository.id !== previous.repository.id || binding.signal.aborted
+		) {
+			binding?.release();
+			ended.abort(previous.signal.reason);
+			return;
+		}
+		opened.session.rebind(binding);
+		opened.binding = binding;
+		previous.release();
+		watch(binding);
+	};
+	watch(opened.binding);
+	return {
+		signal: ended.signal,
+		release: () => {
+			released = true;
+			watched?.signal.removeEventListener("abort", onAbort);
+		},
+	};
+}
+
+/**
  * Gives a retained session whose owner's credential was renewed a binding to the renewed one, so
  * work a disconnected Planner kept does not end with the old credential. False when the owner is
  * no longer the same, or the session cannot take a new binding.
  */
-async function rebindRetained(context: Room, retained: Retained): Promise<boolean> {
+function rebindRetained(context: Room, retained: Retained): Promise<boolean> {
 	let previous = retained.binding;
+	if (retained.rebinding?.from === previous) return retained.rebinding.done;
+	let done = rebindRetainedFrom(context, retained, previous);
+	retained.rebinding = { from: previous, done };
+	return done;
+}
+
+async function rebindRetainedFrom(
+	context: Room,
+	retained: Retained,
+	previous: ActiveOwnerBinding,
+): Promise<boolean> {
 	if (!retained.session.rebind || !credentialRenewed(previous)) return false;
 	let binding = await context.activeOwner?.();
 	if (!binding) return false;
@@ -1008,6 +1091,7 @@ async function rebindRetained(context: Room, retained: Retained): Promise<boolea
 	}
 	retained.session.rebind(binding);
 	retained.binding = binding;
+	previous.release();
 	binding.signal.addEventListener("abort", retained.ended, { once: true });
 	return true;
 }
@@ -2283,7 +2367,8 @@ function retain(
 ): boolean {
 	let { chat } = context;
 	if (chat.retained && chat.retained.session !== opened.session) return false;
-	if (opened.binding.signal.aborted) return false;
+	// A credential renewed as the turn closed is taken below, like one renewed later.
+	if (opened.binding.signal.aborted && !credentialRenewed(opened.binding)) return false;
 	// A question no member has answered is open work: its request ends with the session. So does
 	// an answer its client has not received.
 	if (!owesInput(opened.session)) return false;
@@ -2326,11 +2411,20 @@ function retain(
 			// A Planner whose client is away keeps its work through a renewed credential, however
 			// long that is; its session takes the renewed one when it is next used.
 			if (opened.session.suspended?.() && credentialRenewed(retained.binding)) return;
+			// One whose client is here takes the renewed credential at once, so its open questions stay
+			// open; only an owner who left, or a credential that can't be renewed, ends them.
+			if (credentialRenewed(retained.binding)) {
+				void rebindRetained(context, retained).then(rebound => {
+					if (!rebound) void retained.release();
+				}, () => void retained.release());
+				return;
+			}
 			void retained.release();
 		};
 		retained.ended = ended;
-		opened.binding.signal.addEventListener("abort", ended, { once: true });
 		chat.retained = retained;
+		if (opened.binding.signal.aborted) ended();
+		else opened.binding.signal.addEventListener("abort", ended, { once: true });
 	}
 	return true;
 }
@@ -2482,28 +2576,28 @@ export function documentRoom(context: Room): DocumentRoom {
 		},
 		...(!chat.job && context.createDocument && !context.rootChannelId && {
 			createDocument: async (args, signal) => {
-				let active = currentMemberRequest(chat);
-				if (chat.job || !active) {
+				let request = creatorRequest(context, signal);
+				if (!request) {
 					return {
 						ok: false,
 						reason: "member-request-required",
 						message: "Only a turn a person asked for in Chat can create documents.",
 					};
 				}
-				let signals = [signal, chat.turnController?.signal].filter(
-					(value): value is AbortSignal => !!value,
-				);
-				return context.createDocument!({
-					turn: active.documents ??= { created: 0 },
-					creator: {
-						userId: active.userId,
-						handle: active.handle,
-						...(active.claimantSessionId ? { claimantSessionId: active.claimantSessionId } : {}),
-					},
-					arguments: args,
-					...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
-					announce: document => createdNotice(context, active.handle, document),
-				});
+				return context.createDocument!({ ...request, arguments: args });
+			},
+		}),
+		...(!chat.job && context.orchestrate && !context.rootChannelId && {
+			orchestrate: async (args, index, signal) => {
+				let request = creatorRequest(context, signal);
+				if (!request) {
+					return {
+						ok: false,
+						reason: "member-request-required",
+						message: "Only a turn a person asked for in Chat can work with created documents.",
+					};
+				}
+				return context.orchestrate!({ ...request, arguments: args, index });
 			},
 		}),
 		createResearch: async _question => {
@@ -2523,6 +2617,31 @@ export function documentRoom(context: Room): DocumentRoom {
 				question: active.text,
 			});
 		},
+	};
+}
+
+/**
+ * Who creates or instructs documents for the current turn: the person whose message drives it,
+ * with the turn's cancellation. Undefined in a turn nobody typed and in a background job.
+ */
+function creatorRequest(
+	context: Room,
+	signal: AbortSignal | undefined,
+): Omit<NewDocumentRequest, "sourceId" | "arguments"> | undefined {
+	let { chat } = context;
+	let active = currentMemberRequest(chat);
+	if (chat.job || !active) return undefined;
+	let signals = [signal, chat.turnController?.signal].filter(
+		(value): value is AbortSignal => !!value,
+	);
+	return {
+		creator: {
+			userId: active.userId,
+			handle: active.handle,
+			...(active.claimantSessionId ? { claimantSessionId: active.claimantSessionId } : {}),
+		},
+		...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
+		announce: document => createdNotice(context, active.handle, document),
 	};
 }
 
@@ -2989,7 +3108,6 @@ async function run(
 	// Where this turn's own messages begin, so its last word can be found again.
 	let firstEntry = chat.entries.length;
 	let failed = false;
-	let replyOnly = false;
 	// The turn a failure notice names, kept past `finally`, which clears the live fields.
 	let began: { request?: string; focus?: string } = {};
 	let skipped = false;
@@ -3063,6 +3181,7 @@ async function run(
 	let releaseJobAbort: (() => void) | undefined;
 
 	let opened: { session: PlannerSession; binding: ActiveOwnerBinding } | undefined;
+	let ownerWatch: ReturnType<typeof ownerSignal> | undefined;
 	let turnController = new AbortController();
 	let retiring = chat.turn?.id;
 	turnController.signal.addEventListener("abort", () => {
@@ -3155,7 +3274,8 @@ async function run(
 			};
 			chat.toolProgress = (id, output) => progressed(context, id, output);
 		}
-		let signal = AbortSignal.any([opened.binding.signal, turnController.signal]);
+		ownerWatch = ownerSignal(context, opened);
+		let signal = AbortSignal.any([ownerWatch.signal, turnController.signal]);
 		if (jobTurn) releaseJobAbort = watchJobAbort(chat, jobTurn, signal);
 		if (jobTurn) {
 			let result = await opened.session.stream(prompt, signal, await turnChoice(context));
@@ -3235,8 +3355,6 @@ async function run(
 		if (!jobTurn?.preempted) console.error("[chat] turn failed:", err);
 		// A stop the room asked for is not a failure; an interruption is.
 		failed = !turnController.signal.aborted || !!chat.interruption;
-		// A reply the check refused answered no question.
-		replyOnly = err instanceof PlannerReplyError && !chat.interruption;
 		turnController.abort();
 		if (jobTurn) {
 			outcome = chat.closed
@@ -3277,6 +3395,7 @@ async function run(
 		}
 		chat.interruption = undefined;
 	} finally {
+		ownerWatch?.release();
 		steered?.end();
 		if (chat.steering === steered) chat.steering = undefined;
 		about?.signal?.removeEventListener("abort", invalidate);
@@ -3290,12 +3409,9 @@ async function run(
 		chat.toolProgress = undefined;
 		let kept = false;
 		try {
-			// A turn the Planner's link dropped under fails, but its client may come back for the
-			// questions the session still holds.
-			if (
-				opened && !chat.closed && !isolated
-				&& (!failed || replyOnly || opened.session.suspended?.())
-			) kept = retain(context, opened);
+			// A turn that failed, or whose link dropped under it, still leaves its open questions to the
+			// session: a member can answer them, and the client may come back for them.
+			if (opened && !chat.closed && !isolated) kept = retain(context, opened);
 			if (!kept) {
 				if (!isolated && chat.retained?.session === opened?.session) await chat.retained?.release();
 				else await opened?.session.destroy();
