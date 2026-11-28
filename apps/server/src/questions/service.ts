@@ -24,6 +24,29 @@ export { retitle } from "./card-retitle";
 export { addServerOption } from "./card-server-options";
 export { suggest } from "./card-suggestions";
 export {
+	DECISION_ORIGINS,
+	DECISION_STATUSES,
+	isCardDraftUntouched,
+	isDraftUntouched,
+	parseDecisionOrigin,
+	parseDecisionStatusFilter,
+	readDecisions,
+	readDecisionSnapshot,
+	resolveDecisionRecord,
+} from "./read-decisions";
+export type {
+	DecisionCounts,
+	DecisionFilter,
+	DecisionOrigin,
+	DecisionOutcome,
+	DecisionQuestion,
+	DecisionQuestionOption,
+	DecisionSnapshot,
+	DecisionStatus,
+	DecisionStatusFilter,
+	ReadDecisionsResult,
+} from "./read-decisions";
+export {
 	isOpenStatus,
 	matchesQuestionSource,
 	normalizeRecord,
@@ -32,7 +55,7 @@ export {
 export type { DecisionEntry, OptionOrigin, Record } from "./records";
 export { appendCriterion as addCriterion } from "./service-append-criterion";
 export { appendOption as addOption } from "./service-append-option";
-export { ask, rejoin } from "./service-ask";
+export { ask, DETACH_WAITER, rejoin } from "./service-ask";
 export { cancel, withdraw } from "./service-cancel";
 export { capture, captureDecisions, createDecision } from "./service-capture";
 export type { CaptureDecisionsInput, CaptureDecisionsResult } from "./service-capture";
@@ -55,8 +78,12 @@ export {
 } from "./service-relationships";
 export type { Placement, Sections } from "./service-relationships";
 export { reopen } from "./service-reopen";
-export { answerExternal, submit } from "./service-submit";
-export type { ExternalAnswer, ExternalAnswerInput } from "./service-submit";
+export { answerDecision, submit } from "./service-submit";
+export type {
+	AnswerDecisionInput,
+	AnswerDecisionResult,
+	DecisionAnswerValue,
+} from "./service-submit";
 export { setWhy } from "./service-why";
 export type { Questions, StoredOpen } from "./store";
 

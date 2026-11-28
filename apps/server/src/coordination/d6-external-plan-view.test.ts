@@ -1,12 +1,14 @@
 /**
  * D6: external coordination state must survive the room's own concurrent
- * publications, and late claims must name what actually happened.
+ * publications.
  *
  * Born from the Part B rehearsal (2026-10-31): after an external scripted
  * draft committed, the live room's publications left the external graph and
- * the open questionnaire entry invisible to every external read, and a late
- * claim against a settled card reported "cancelled by system" though nothing
- * was cancelled. These tests pin the interleavings in both orders.
+ * the open questionnaire entry invisible to every external read.
+ *
+ * The other half of that finding, a late claim naming what actually happened
+ * rather than "cancelled by system", is pinned where the answer path now
+ * lives: `mcp/decisions.test.ts`, upstream's `answer_decision`.
  */
 
 import { describe, expect, it } from "bun:test";
@@ -145,229 +147,24 @@ describe("external coordination state under concurrent room publications (D6)", 
 			let entry = Store.get(state.plan.questions, state.id);
 			if (!entry) throw new Error("open entry vanished after the option publication");
 
-			let answered = await Questions.answerExternal(
-				state.plan,
-				state.plan.server,
-				state.context.channel.id,
-				{
-					questionId: state.id,
-					revision: entry.revision,
-					optionIds: [state.optionId],
-					resolver: "octocat",
-					idempotencyKey: "d6:answer:1",
-				},
-			);
-			if (answered.kind === "refused") {
-				throw new Error(`external answer refused: ${JSON.stringify(answered)}`);
-			}
-			expect(answered.kind).toBe("answered");
-		} finally {
-			await Service.close(state.plan).catch(() => {});
-		}
-	});
-
-	it("names the resolver when a late claim meets an already-settled card", async () => {
-		let state = await cardPlan();
-		try {
-			let answered = await Questions.answerExternal(
-				state.plan,
-				state.plan.server,
-				state.context.channel.id,
-				{
-					questionId: state.id,
-					revision: state.revision,
-					optionIds: [state.optionId],
-					resolver: "octocat",
-					idempotencyKey: "d6:answer:2",
-				},
-			);
-			if (answered.kind !== "answered") {
-				throw new Error(`first answer was not settled: ${JSON.stringify(answered)}`);
-			}
-			// The live settle's own answer set — in derive's shape, the question
-			// text with labels and ids, never a custom summary.
-			let question = state.plan.records.get(state.id)!.definition.questions[0]!;
-			expect(answered.answers).toEqual([{
-				question: question.question,
-				choices: ["Markdown"],
+		// The answer goes through the room's own decision core, the one the
+		// MCP `answer_decision` and the room's Save share.
+		let answered = await Questions.answerDecision(
+			state.plan,
+			state.plan.server,
+			state.context.channel.id,
+			{
+				decisionId: state.id,
+				revision: entry.revision,
 				optionIds: [state.optionId],
-			}]);
-			await Service.close(state.plan);
-
-			// A fresh open models every later reader: the room after an
-			// eviction, the bridge after a restart. The entry is no longer
-			// open — a claim must say who settled it, not that the system
-			// cancelled it.
-			let reopened = await Service.open(
-				state.context.channel.id,
-				state.context.backend,
-				state.context.server,
-			);
-			try {
-				let late = await Questions.answerExternal(
-					reopened,
-					reopened.server,
-					state.context.channel.id,
-					{
-						questionId: state.id,
-						revision: state.revision,
-						optionIds: [state.optionId],
-						resolver: "octocat",
-						idempotencyKey: "d6:answer:3",
-					},
-				);
-				expect(late).toMatchObject({
-					kind: "refused",
-					code: "resolved",
-					message: "already answered by octocat",
-				});
-
-				// The seeded tombstone carries the durable answers, so a late
-				// submit's refusal reads exactly like the settle it just
-				// missed — the complete answer set, field for field.
-				let lateSubmit = Store.claimSubmit(
-					reopened.questions,
-					state.id,
-					state.revision,
-					"hubot",
-				);
-				if (lateSubmit.ok || lateSubmit.reason !== "resolved") {
-					throw new Error(`late submit was not resolved: ${JSON.stringify(lateSubmit)}`);
-				}
-				expect(lateSubmit.status).toBe("answered");
-				expect(lateSubmit.resolver).toBe("octocat");
-				expect(lateSubmit.answers).toEqual(answered.answers);
-			} finally {
-				await Service.close(reopened);
-			}
-		} finally {
-			await Service.close(state.plan).catch(() => {});
+				resolver: "octocat",
+			},
+		);
+		if (!answered.ok) {
+			throw new Error(`decision answer refused: ${JSON.stringify(answered)}`);
 		}
-	});
-
-	it("names the divergence when an open card's entry is missing from the plan", async () => {
-		let state = await cardPlan();
-		try {
-			// The split-brain signature from the rehearsal: the record says
-			// open, but the shared-draft entry is gone from this instance.
-			state.plan.questions.open.delete(state.id);
-			let diverged = await Questions.answerExternal(
-				state.plan,
-				state.plan.server,
-				state.context.channel.id,
-				{
-					questionId: state.id,
-					revision: state.revision,
-					optionIds: [state.optionId],
-					resolver: "octocat",
-					idempotencyKey: "d6:answer:4",
-				},
-			);
-			expect(diverged).toMatchObject({
-				kind: "refused",
-				code: "state-diverged",
-			});
-		} finally {
-			await Service.close(state.plan).catch(() => {});
-		}
-	});
-
-	it("answers honestly when a mis-keyed late claim meets a settled card", async () => {
-		// The rehearsal's exact shape (run 2, finding D7): the caller names
-		// the question inside the card instead of the card itself, and the
-		// card was already settled through the room's own path. Whatever the
-		// plan's entry maps hold, the durable record is the truth a claim
-		// must meet — the refusal names the settle, never a cancellation
-		// nobody performed.
-		let state = await cardPlan();
-		try {
-			let first = await Questions.answerExternal(
-				state.plan,
-				state.plan.server,
-				state.context.channel.id,
-				{
-					questionId: state.id,
-					revision: state.revision,
-					optionIds: [state.optionId],
-					resolver: "octocat",
-					idempotencyKey: "d7:answer:1",
-				},
-			);
-			if (first.kind !== "answered") {
-				throw new Error(`first answer failed: ${JSON.stringify(first)}`);
-			}
-			// Strip every entry: whatever happened to this instance's maps,
-			// the answered record survives.
-			state.plan.questions.open.delete(state.id);
-			state.plan.questions.closed.delete(state.id);
-			let late = await Questions.answerExternal(
-				state.plan,
-				state.plan.server,
-				state.context.channel.id,
-				{
-					questionId: state.questionId,
-					revision: state.revision,
-					optionIds: [state.optionId],
-					resolver: "octocat",
-					idempotencyKey: "d7:answer:2",
-				},
-			);
-			expect(late).toMatchObject({
-				kind: "refused",
-				code: "resolved",
-				message: "already answered by octocat",
-			});
-		} finally {
-			await Service.close(state.plan).catch(() => {});
-		}
-	});
-
-	it("omits attribution when the settled record never carried a resolver", async () => {
-		let state = await cardPlan();
-		try {
-			let settled = await Questions.answerExternal(
-				state.plan,
-				state.plan.server,
-				state.context.channel.id,
-				{
-					questionId: state.id,
-					revision: state.revision,
-					optionIds: [state.optionId],
-					resolver: "octocat",
-					idempotencyKey: "d7:answer:3",
-				},
-			);
-			if (settled.kind !== "answered") {
-				throw new Error(`settle failed: ${JSON.stringify(settled)}`);
-			}
-			let record = state.plan.records.get(state.id);
-			if (!record) throw new Error("card record missing");
-			// Records permit a resolver-less settle. A restored plan seeds no
-			// tombstone for one, so every entry map is empty and only the
-			// durable record knows the outcome — the refusal must name the
-			// outcome without inventing who performed it.
-			let stripped = { ...record };
-			delete stripped.resolver;
-			state.plan.records.set(state.id, stripped);
-			state.plan.questions.open.delete(state.id);
-			state.plan.questions.closed.delete(state.id);
-			let late = await Questions.answerExternal(
-				state.plan,
-				state.plan.server,
-				state.context.channel.id,
-				{
-					questionId: state.questionId,
-					revision: state.revision,
-					optionIds: [state.optionId],
-					resolver: "octocat",
-					idempotencyKey: "d7:answer:4",
-				},
-			);
-			expect(late).toMatchObject({
-				kind: "refused",
-				code: "resolved",
-				message: "already answered",
-			});
+		expect(answered.decisionId).toBe(state.id);
+		expect(answered.resolver).toBe("octocat");
 		} finally {
 			await Service.close(state.plan).catch(() => {});
 		}

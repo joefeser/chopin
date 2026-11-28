@@ -121,10 +121,11 @@ import { researchAnswerDefinition, researchEvidenceDefinition } from "./jobs/res
 import { JobService } from "./jobs/service";
 import { DocumentSummaryCoordinator } from "./jobs/summary-coordinator";
 import { invokeRouted, SystemTurns } from "./mcp/invoke";
+import { answerDecisionFingerprint, IdempotentDecisionAnswers } from "./mcp/decisions";
 import { createNewDocument } from "./agent/new-documents";
 import { buildState, orchestrate } from "./agent/orchestrate";
 import type { NewDocumentDeps } from "./agent/new-documents";
-import type { OrchestrateDeps } from "./agent/orchestrate";
+import type { OrchestrateDeps, PlannerState } from "./agent/orchestrate";
 import type { BuildRequest } from "@chopin/protocol/implementation";
 import { liveClassifier } from "./tasks/live-gate";
 import { LiveSyncCoordinator } from "./tasks/live-sync";
@@ -133,7 +134,6 @@ import { spikeHost } from "./experiments/spike-host";
 import { spikeSettler, startSettle } from "./experiments/spike-settle";
 import { resolveInstruction } from "./experiments/spikes";
 import { openDecisions } from "./conversation-plan/decisions";
-import { createVisualAdmission } from "./agent/visual-admission";
 import { locksEditing, requestBuild } from "./tasks/builds";
 import { pendingLinks, relinkInstruction } from "./tasks/relink";
 import { BuildReadiness } from "./tasks/readiness";
@@ -242,7 +242,6 @@ const config = load();
 const chatAttachmentLimits = attachmentLimits(config);
 /** The one decisions boundary, checked against Atomic's registry before anything starts. */
 const decide = await openDecisions(config);
-const visualAdmission = createVisualAdmission(decide);
 harnessFor(config);
 const storage = createStorage(config.storage);
 const documentHistory = new DocumentHistory(storage);
@@ -596,6 +595,18 @@ function answerDecision(channelId: string, id: string, generation: number): void
 }
 
 /**
+ * Hands answered Planner decisions whose asking client could not receive the answer (dropped,
+ * detached, or abandoned before acknowledgement) to `decisionAnswers` for durable turn delivery.
+ */
+function unsentPlannerDecisions(plan: Service.Plan, decisions: string[]): void {
+	for (let id of decisions) {
+		let record = plan.records.get(id);
+		if (record?.status !== "answered" || record.origin !== "planner") continue;
+		answerDecision(plan.id, id, decisionGeneration(record));
+	}
+}
+
+/**
  * What a remote Planner's rebuilt hold needs from a document that has opened, to wait again for
  * the answers to the questions its client left open before a restart: it asks them of the
  * members again, and an answer its client can never be given becomes a turn of its own.
@@ -611,13 +622,7 @@ function plannerQuestions(plan: Service.Plan, server: Server<SocketData>): Rejoi
 				{ id: plan.id, plan, server, anchors: () => Service.anchors(plan, server, plan.id) },
 				report,
 			),
-		unsent: decisions => {
-			for (let id of decisions) {
-				let record = plan.records.get(id);
-				if (record?.status !== "answered" || record.origin !== "planner") continue;
-				answerDecision(plan.id, id, decisionGeneration(record));
-			}
-		},
+		unsent: decisions => unsentPlannerDecisions(plan, decisions),
 	};
 }
 
@@ -860,7 +865,6 @@ function conversation(
 		room: room.id,
 		config,
 		decide,
-		visualAdmission,
 		auth: hostedAuth,
 		claimantSessionId,
 		repository,
@@ -940,6 +944,7 @@ function conversation(
 		readsImages: () => turnReadsImages(modelChoices, room.id),
 		activeOwner: () => ownerBindings!.resolve(room.id),
 		ownerAvailable: () => ownerAvailable(room.id),
+		unsentDecisions: decisions => unsentPlannerDecisions(opened, decisions),
 		jobs: config.backgroundJobs ? jobService : undefined,
 		references: referenceService,
 		investigations: experiments
@@ -2711,7 +2716,6 @@ function plannerDocuments(): NewDocumentDeps {
 			createHostedDocument(
 				hostedAuth,
 				{
-					visualAdmission,
 					isChannelDeleting: id => deletingChannels.has(id),
 					// One with an instruction is in use at once, so its Planner is started as New document's is.
 					onChannelCreated: instructed ? documentCreated : announceCatalogue,
@@ -2759,17 +2763,51 @@ function plannerDocuments(): NewDocumentDeps {
 	};
 }
 
+const mcpDecisionAnswers = new IdempotentDecisionAnswers(
+	storage.mcpInvocations,
+	() => {
+		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+		return writerLease.held;
+	},
+	() => hostedAuth.clock(),
+);
+
+function plannerStateOf(channelId: string): PlannerState {
+	let chat = Rooms.get(channelId)?.plan?.chat;
+	if (chat?.busy || chat?.starting) return "working";
+	if (chat?.agent || plannerAttachments?.holding(channelId)?.attached) return "idle";
+	return "stopped";
+}
+
+async function readDocumentDecisions(
+	channelId: string,
+	filter?: Questions.DecisionFilter,
+): Promise<Questions.ReadDecisionsResult> {
+	let live = Rooms.get(channelId)?.plan;
+	if (live) {
+		return Service.exclusive(
+			live,
+			async () =>
+				Questions.readDecisions(live.records, live.questions, live.conversationPlan, filter),
+		);
+	}
+	let stored = await storage.collaboration.load(channelId, hostedAuth.clock());
+	if (!stored) return Questions.readDecisions([], undefined, undefined, filter);
+	let projected = await Service.readStored(stored);
+	return Questions.readDecisions(
+		projected.records ?? [],
+		projected.openQuestions,
+		projected.conversationPlan,
+		filter,
+	);
+}
+
 /** The Planner's `orchestrate`: `create_document`'s rules, and the state of what a document created. */
 function createdDocuments(): OrchestrateDeps {
 	return {
 		...plannerDocuments(),
 		createdFrom: (sourceId, limit) => storage.channels.createdFrom(sourceId, limit),
-		planner: channelId => {
-			let chat = Rooms.get(channelId)?.plan?.chat;
-			if (chat?.busy || chat?.starting) return "working";
-			if (chat?.agent || plannerAttachments?.holding(channelId)?.attached) return "idle";
-			return "stopped";
-		},
+		planner: plannerStateOf,
 		build: async channelId => {
 			let plan = Rooms.get(channelId)?.plan;
 			if (plan) return buildState(plan);
@@ -2777,6 +2815,70 @@ function createdDocuments(): OrchestrateDeps {
 			let sidecar = stored?.sidecar as { builds?: unknown; live?: unknown } | null | undefined;
 			let builds = Array.isArray(sidecar?.builds) ? sidecar.builds as BuildRequest[] : [];
 			return buildState({ builds, live: sidecar?.live });
+		},
+		decisions: readDocumentDecisions,
+		answerDecision: input =>
+			mcpDecisionAnswers.run(
+				{ userId: input.user.id, channelId: input.channel.id, key: input.idempotencyKey },
+				answerDecisionFingerprint(input),
+				async () => {
+					let current = await storage.channels.get(input.channel.id);
+					if (
+						!current || deletingChannels.has(input.channel.id)
+						|| archivingChannels.has(input.channel.id)
+					) {
+						return { kind: "refused", refusal: { code: "document-unavailable" } };
+					}
+					if (current.archivedAt) {
+						return { kind: "refused", refusal: { code: "document-archived" } };
+					}
+					return withImplementationPlan(input.channel.id, async opened => {
+						let settled = await Questions.answerDecision(
+							opened,
+							opened.server,
+							input.channel.id,
+							{
+								decisionId: input.decisionId,
+								revision: input.revision,
+								resolver: input.user.login,
+								...(input.optionIds !== undefined ? { optionIds: input.optionIds } : {}),
+								...(input.text !== undefined ? { text: input.text } : {}),
+								...(input.answers !== undefined ? { answers: input.answers } : {}),
+							},
+							{
+								onCommitted: () => conversationRuntime.wake(opened),
+								onPlannerAnswer: (id, generation) =>
+									answerDecision(input.channel.id, id, generation),
+							},
+						);
+						if (!settled.ok) {
+							let { ok: _ok, ...refusal } = settled;
+							return { kind: "refused" as const, refusal };
+						}
+						return {
+							kind: "answered" as const,
+							result: {
+								status: "answered" as const,
+								replayed: false,
+								decisionId: settled.decisionId,
+								committedAt: settled.committedAt,
+								resolver: settled.resolver,
+								answers: settled.answers,
+								decision: settled.decision,
+							},
+						};
+					});
+				},
+			),
+		startBuild: input => {
+			if (!implementations) {
+				return Promise.resolve({
+					status: "refused" as const,
+					code: "planner-unavailable" as const,
+					message: "Builds are unavailable.",
+				});
+			}
+			return implementations.startPlanBuild(input);
 		},
 	};
 }
@@ -3716,39 +3818,6 @@ jobRunner = new JobRunner({
 	},
 	fatal: err => console.error("chopin: background job runner failed -", err),
 });
-registerMcpRoutes(router, hostedAuth, {
-	lease() {
-		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
-		return writerLease.held;
-	},
-}, {
-	// A child's instruction runs on its root's Chat with the child as focus.
-	visualAdmission,
-	invokePlanner: input =>
-		invokeRouted({
-			channels: storage.channels,
-			deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
-			transition: withDocumentTransition,
-			open: rootId => openRootChat(rootId, input.session?.session.id, input.repository),
-			plannerAccount: rootId => plannerAttachments?.holding(rootId)?.userId,
-			systemTurns,
-		}, input),
-	plannerNotAttached,
-	...(experiments ? { launchCaller: experiments.mcpCaller } : {}),
-	archiveChannel,
-	isChannelDeleting: channelId => deletingChannels.has(channelId),
-	onChannelRenamed: announceChannel,
-	onChannelCreated: announceCatalogue,
-	onDocumentPersisted: documentPersisted,
-	restoreChannel,
-	serializeDocument: (channelId, action) =>
-		withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),
-	onPlannerAnswer: answerDecision,
-},
-config.externalCoordination
-	? { approvers: config.coordinationApprovers ?? [] }
-	: undefined,
-);
 if (config.coordinationScriptedDrafts) {
 	registerScriptedDraftRoutes(router, hostedAuth, {
 		approvers: config.coordinationApprovers ?? [],
@@ -3783,7 +3852,87 @@ implementations = registerImplementationRoutes(router, hostedAuth, {
 			item.connectionId === connectionId && ["running", "publishing"].includes(item.state)
 		),
 	withPlan: withImplementationPlan,
+	draftBuild: async ({ channel, repository, user, session, planRevision }) => {
+		let openedChat: { context: Chat.Room; release: () => void };
+		try {
+			openedChat = await openRootChat(channel.id, session?.session.id, repository);
+		} catch {
+			return { kind: "planner-unavailable", message: "The document is unavailable." };
+		}
+		let { context, release } = openedChat;
+		let opened = context.plan;
+		let refusal = draftRefusal(opened);
+		if (refusal) {
+			release();
+			return { kind: "planner-unavailable", message: refusal };
+		}
+		let { text, said } = draftInstruction(opened, user.login, true);
+		let done = Promise.withResolvers<void>();
+		let result = await Chat.draftTasks(
+			context,
+			user.login,
+			planRevision,
+			text,
+			said,
+			() => done.resolve(),
+		);
+		if (!result.ok) {
+			release();
+			if (result.code === "planner-not-attached") {
+				return { kind: "planner-not-attached", message: result.reason };
+			}
+			if (result.reason === Chat.BUSY_DRAFT) {
+				return { kind: "planner-busy", message: result.reason };
+			}
+			return { kind: "planner-unavailable", message: result.reason };
+		}
+		requestBuild(opened, user.id);
+		if (result.state === "ended") done.resolve();
+		return {
+			kind: "drafting",
+			planRevision: result.draft.planRevision,
+			ended: done.promise,
+			release,
+		};
+	},
 });
+registerMcpRoutes(router, hostedAuth, {
+	lease() {
+		if (!writerLease.held) throw new Error("storage writer lease is unavailable");
+		return writerLease.held;
+	},
+}, {
+	// A child's instruction runs on its root's Chat with the child as focus.
+	invokePlanner: input =>
+		invokeRouted({
+			channels: storage.channels,
+			deleting: id => deletingChannels.has(id) || archivingChannels.has(id),
+			transition: withDocumentTransition,
+			open: rootId => openRootChat(rootId, input.session?.session.id, input.repository),
+			plannerAccount: rootId => plannerAttachments?.holding(rootId)?.userId,
+			systemTurns,
+		}, input),
+	plannerNotAttached,
+	...(experiments ? { launchCaller: experiments.mcpCaller } : {}),
+	archiveChannel,
+	isChannelDeleting: channelId => deletingChannels.has(channelId),
+	onChannelRenamed: announceChannel,
+	onChannelCreated: announceCatalogue,
+	onDocumentPersisted: documentPersisted,
+	onDecisionCommitted: opened => conversationRuntime.wake(opened),
+	onPlannerAnswer: (channelId, id, generation) => answerDecision(channelId, id, generation),
+	decisionAnswers: mcpDecisionAnswers,
+	startBuild: input => implementations!.startPlanBuild(input),
+	plannerState: plannerStateOf,
+	modelChoice: (from, userId) => plannerDocuments().modelChoice(from, userId),
+	restoreChannel,
+	serializeDocument: (channelId, action) =>
+		withDocumentTransition(channelId, () => withDocumentLock(channelId, action)),
+},
+config.externalCoordination
+	? { approvers: config.coordinationApprovers ?? [] }
+	: undefined,
+);
 if (config.liveBuild) {
 	let runtime = experiments;
 	liveSync = new LiveSyncCoordinator({

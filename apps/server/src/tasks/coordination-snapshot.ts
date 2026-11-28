@@ -68,7 +68,8 @@ export type CoordinationGraph = {
 	definition?: Definition;
 	digest?: string;
 	draftedBy?: string;
-	approver?: string;
+	/** Who approved the current version, under the name `build_plan` records. */
+	approvedBy?: string;
 	operationKey?: string;
 };
 
@@ -164,7 +165,7 @@ export function coordinationSnapshot(input: {
 				? { definition: checked.value, digest: definitionDigest(checked.value) }
 				: {}),
 			...(current.draftedBy !== undefined ? { draftedBy: current.draftedBy } : {}),
-			...(current.approver !== undefined ? { approver: current.approver } : {}),
+			...(current.approvedBy !== undefined ? { approvedBy: current.approvedBy } : {}),
 			...(current.operationKey !== undefined ? { operationKey: current.operationKey } : {}),
 		};
 	}

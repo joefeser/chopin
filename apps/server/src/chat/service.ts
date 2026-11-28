@@ -40,7 +40,6 @@ import type { ActiveOwnerBinding } from "../agent/active-owner";
 import type { DocumentRoom, ResearchWorkspaceRequest } from "../agent/tools";
 import type { NewDocumentRequest, NewDocumentResult } from "../agent/new-documents";
 import type { OrchestrateRequest, OrchestrateResult } from "../agent/orchestrate";
-import type { VisualAdmission } from "../agent/visual-admission";
 import type { ChildDocuments } from "./children";
 import type { TellChat } from "./thread-notes";
 import * as Service from "../plan/service";
@@ -78,6 +77,7 @@ import { MAX_MESSAGE_BYTES } from "./limits";
 import { actor, alone, contributed } from "./initiative";
 import { checkPlannerReply, publishPlannerReplies } from "./reply-policy";
 import { withSessionContext } from "./session-context";
+import { isPlannerDisconnectedError } from "../harness/remote/link";
 import { TOOL_UNAVAILABLE, turnFailureOf } from "./turn-failure";
 import { retryTarget } from "./retry";
 import { appendEntries, snapshotSeq, takeOut } from "./chronology";
@@ -89,7 +89,6 @@ import type { TextStreamPart, ToolSet } from "ai";
 import type { Chat as Wire, ConversationPlan, Request } from "@chopin/protocol";
 import type { Config } from "../config";
 import type { Decide } from "../conversation-plan/decisions";
-import type { JevRequest } from "../conversation-plan/jev";
 import type { HostedAuth } from "../auth/routes";
 import type { HostedRepository } from "../agent/repository";
 import type { JobService } from "../jobs/service";
@@ -170,6 +169,8 @@ export type TaskDraft = {
 	state: "running";
 	/** The running turn, once it has begun. */
 	turn?: string;
+	/** In-memory listeners called once after the draft turn finishes and persists. */
+	ended?: Array<() => void>;
 };
 
 export type ActiveMemberRequest = {
@@ -828,8 +829,6 @@ export type Room = {
 	config: Config;
 	/** The deployment's decisions boundary; absent when no decisions model is configured. */
 	decide?: Decide;
-	/** Shared admission for new Planner-authored passages, independent of harness or request kind. */
-	visualAdmission?: VisualAdmission;
 	auth: HostedAuth;
 	/**
 	 * Login session that may claim Planner ownership for this room's turns.
@@ -946,6 +945,11 @@ export type Room = {
 	tellChat?: TellChat;
 	/** Set only on a thread's room: hears the ids of the Decision cards the thread's Planner asks. */
 	threadAsked?: (ids: string[]) => void;
+	/**
+	 * Decisions answered whose answer could not be delivered directly to the asking client.
+	 * Hands them to the Planner as a turn through `answerTurns`.
+	 */
+	unsentDecisions?: (decisions: string[]) => void;
 	/** Session-tree and remote fork hooks for top-level Chat and threads. */
 	sessionForks?: {
 		/** Resolves once the saved session state is read, before anything of a turn reads or writes it. */
@@ -974,7 +978,7 @@ export type Room = {
 type Retained = {
 	session: PlannerSession;
 	binding: ActiveOwnerBinding;
-	release: () => Promise<void>;
+	release: (options?: { withdraw?: boolean }) => Promise<void>;
 	/** Called when `binding` ends; a rebound session watches its new binding with it. */
 	ended: () => void;
 	/** The rebind under way from a binding that ended, which every caller of `rebindRetained` shares. */
@@ -1020,6 +1024,22 @@ function ownerSignal(
 		// takes one binding, which the retained session releases with it.
 		let retained = context.chat.retained;
 		if (retained?.session === opened.session) {
+			if (retained.binding !== previous) {
+				if (retained.binding.signal.aborted && !credentialRenewed(retained.binding)) {
+					ended.abort(retained.binding.signal.reason);
+					return;
+				}
+				opened.binding = retained.binding;
+				if (context.chat.agent === opened.session) {
+					context.chat.owner = {
+						sessionId: retained.binding.ownerSessionId,
+						generation: retained.binding.ownerGeneration,
+						revision: retained.binding.credentialRevision,
+					};
+				}
+				watch(retained.binding);
+				return;
+			}
 			let rebound = await rebindRetained(context, retained).catch(() => false);
 			if (released) return;
 			if (!rebound || context.chat.retained !== retained) {
@@ -1027,27 +1047,50 @@ function ownerSignal(
 				return;
 			}
 			opened.binding = retained.binding;
+			if (context.chat.agent === opened.session) {
+				context.chat.owner = {
+					sessionId: retained.binding.ownerSessionId,
+					generation: retained.binding.ownerGeneration,
+					revision: retained.binding.credentialRevision,
+				};
+			}
 			watch(retained.binding);
 			return;
 		}
-		let binding = await context.activeOwner?.().catch(() => undefined);
-		if (released) {
-			binding?.release();
-			return;
+		let settled = Promise.withResolvers<void>();
+		opened.session.rebinding?.(settled.promise);
+		try {
+			let binding = await context.activeOwner?.().catch(() => undefined);
+			if (released) {
+				binding?.release();
+				return;
+			}
+			let sameOwner = !!binding && ((binding.ownerSessionId === previous.ownerSessionId
+				&& binding.ownerGeneration === previous.ownerGeneration)
+				|| (binding.ownerUserId !== undefined
+					&& binding.ownerUserId === previous.ownerUserId));
+			if (
+				!binding || !sameOwner
+				|| binding.repository.id !== previous.repository.id || binding.signal.aborted
+			) {
+				binding?.release();
+				ended.abort(previous.signal.reason);
+				return;
+			}
+			opened.session.rebind(binding);
+			opened.binding = binding;
+			if (context.chat.agent === opened.session) {
+				context.chat.owner = {
+					sessionId: binding.ownerSessionId,
+					generation: binding.ownerGeneration,
+					revision: binding.credentialRevision,
+				};
+			}
+			previous.release();
+			watch(binding);
+		} finally {
+			settled.resolve();
 		}
-		if (
-			!binding || binding.ownerSessionId !== previous.ownerSessionId
-			|| binding.ownerGeneration !== previous.ownerGeneration
-			|| binding.repository.id !== previous.repository.id || binding.signal.aborted
-		) {
-			binding?.release();
-			ended.abort(previous.signal.reason);
-			return;
-		}
-		opened.session.rebind(binding);
-		opened.binding = binding;
-		previous.release();
-		watch(binding);
 	};
 	watch(opened.binding);
 	return {
@@ -1067,7 +1110,12 @@ function ownerSignal(
 function rebindRetained(context: Room, retained: Retained): Promise<boolean> {
 	let previous = retained.binding;
 	if (retained.rebinding?.from === previous) return retained.rebinding.done;
-	let done = rebindRetainedFrom(context, retained, previous);
+	let settled = Promise.withResolvers<void>();
+	retained.session.rebinding?.(settled.promise);
+	let done = rebindRetainedFrom(context, retained, previous).finally(() => {
+		settled.resolve();
+		if (retained.rebinding?.done === done) retained.rebinding = undefined;
+	});
 	retained.rebinding = { from: previous, done };
 	return done;
 }
@@ -1080,17 +1128,29 @@ async function rebindRetainedFrom(
 	if (!retained.session.rebind || !credentialRenewed(previous)) return false;
 	let binding = await context.activeOwner?.();
 	if (!binding) return false;
+	let sameOwner = (binding.ownerSessionId === previous.ownerSessionId
+		&& binding.ownerGeneration === previous.ownerGeneration)
+		|| (binding.ownerUserId !== undefined
+			&& binding.ownerUserId === previous.ownerUserId);
 	if (
-		binding.ownerSessionId !== previous.ownerSessionId
-		|| binding.ownerGeneration !== previous.ownerGeneration
+		!sameOwner
 		|| binding.repository.id !== previous.repository.id
+		|| binding.signal.aborted
 		|| context.chat.retained !== retained
 	) {
 		binding.release();
 		return false;
 	}
+	previous.signal.removeEventListener("abort", retained.ended);
 	retained.session.rebind(binding);
 	retained.binding = binding;
+	if (context.chat.agent === retained.session) {
+		context.chat.owner = {
+			sessionId: binding.ownerSessionId,
+			generation: binding.ownerGeneration,
+			revision: binding.credentialRevision,
+		};
+	}
 	previous.release();
 	binding.signal.addEventListener("abort", retained.ended, { once: true });
 	return true;
@@ -2239,13 +2299,14 @@ export async function draftTasks(
 	planRevision: number,
 	text: string,
 	said: string,
+	onEnded?: () => void,
 ): Promise<TaskDraftResult> {
 	let { chat } = context;
 	if (chat.pendingSends >= MAX_PENDING_SENDS) {
 		return { ok: false, reason: `${PLANNER_NAME} is busy. Try again in a moment.` };
 	}
 	chat.pendingSends++;
-	let post = () => postDraft(context, handle, planRevision, text, said);
+	let post = () => postDraft(context, handle, planRevision, text, said, onEnded);
 	let accepted = chat.sending.then(post, post);
 	let completed = accepted.finally(() => chat.pendingSends--);
 	chat.sending = completed.then(() => {}, () => {});
@@ -2258,6 +2319,7 @@ async function postDraft(
 	planRevision: number,
 	text: string,
 	said: string,
+	onEnded?: () => void,
 ): Promise<TaskDraftResult> {
 	let { chat, config, server, room } = context;
 	if (!config.agent) return { ok: false, reason: `${PLANNER_NAME} is not running` };
@@ -2265,9 +2327,20 @@ async function postDraft(
 	let unattached = await context.plannerNotAttached?.();
 	if (unattached) return { ok: false, reason: unattached, code: "planner-not-attached" };
 	let existing = liveDraft(chat);
-	if (existing) return { ok: true, draft: existing, state: existing.state, existing: true };
+	if (existing) {
+		if (onEnded) {
+			existing.ended ??= [];
+			existing.ended.push(onEnded);
+		}
+		return { ok: true, draft: existing, state: existing.state, existing: true };
+	}
 	if (occupied(chat)) return { ok: false, reason: BUSY_DRAFT };
-	let draft: TaskDraft = { id: ulid(), planRevision, state: "running" };
+	let draft: TaskDraft = {
+		id: ulid(),
+		planRevision,
+		state: "running",
+		...(onEnded ? { ended: [onEnded] } : {}),
+	};
 	chat.draft = draft;
 	let abandon = (reason: string): TaskDraftResult => {
 		if (chat.draft === draft) chat.draft = undefined;
@@ -2302,7 +2375,8 @@ async function postDraft(
 	};
 }
 
-const BUSY_DRAFT = `${PLANNER_NAME} is working on something else. Try again when it has finished.`;
+export const BUSY_DRAFT =
+	`${PLANNER_NAME} is working on something else. Try again when it has finished.`;
 
 let jobState = safeProjection(state);
 let { job, cancelQueuedJobs, stopAfterPersistenceFailure } = createJobQueue({
@@ -2326,7 +2400,7 @@ export async function abort(context: Room, ws: Socket): Promise<void> {
 	if (!turn) {
 		// A Planner that only waits on a question it asked has nothing else to stop: Stop withdraws it.
 		if (chat.retained && chat.retained.session.inputs?.open()) {
-			await chat.retained.release();
+			await chat.retained.release({ withdraw: true });
 			say(chat, server, room, {
 				id: ulid(),
 				author: { kind: "system" },
@@ -2390,8 +2464,9 @@ function retain(
 		let retained: Retained = {
 			...opened,
 			ended: () => {},
-			release: () =>
-				released ??= (async () => {
+			release: options => {
+				if (options?.withdraw) opened.session.withdrawInputs?.();
+				return released ??= (async () => {
 					if (chat.retained === retained) chat.retained = undefined;
 					stopInputs?.();
 					retained.binding.signal.removeEventListener("abort", ended);
@@ -2405,9 +2480,11 @@ function retain(
 							if (!chat.busy) chat.owner = undefined;
 						}
 					}
-				})(),
+				})();
+			},
 		};
 		let ended = () => {
+			if (!retained.binding.signal.aborted) return;
 			// A Planner whose client is away keeps its work through a renewed credential, however
 			// long that is; its session takes the renewed one when it is next used.
 			if (opened.session.suspended?.() && credentialRenewed(retained.binding)) return;
@@ -2444,16 +2521,6 @@ function currentMemberRequest(chat: Chat): ActiveMemberRequest | undefined {
 	return active;
 }
 
-function visualRouting(context: Room): boolean {
-	if (
-		context.visualAdmission || !context.config?.plannerVisuals || !context.decide
-		|| context.chat.job
-		|| context.config.harness !== "copilot-sdk"
-	) return false;
-	let request = currentMemberRequest(context.chat);
-	return !!request && request.text.length <= 1_000;
-}
-
 export function documentRoom(context: Room): DocumentRoom {
 	let { chat, plan, room, server } = context;
 	return {
@@ -2470,17 +2537,7 @@ export function documentRoom(context: Room): DocumentRoom {
 		children: context.children,
 		turnSignal: () => chat.turnController?.signal,
 		...(context.threadAsked && { decisionsAsked: context.threadAsked }),
-		...((!chat.job || chat.job.kind === "decision-followup") && context.visualAdmission && {
-			visualAdmission: input => {
-				let signals = [input.signal, chat.turnController?.signal].filter(
-					(signal): signal is AbortSignal => !!signal,
-				);
-				return context.visualAdmission!({
-					...input,
-					signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0],
-				});
-			},
-		}),
+		...(context.unsentDecisions && { unsentDecisions: context.unsentDecisions }),
 		...(!chat.job && {
 			checkReply: (text, signal) =>
 				checkPlannerReply(
@@ -2558,12 +2615,6 @@ export function documentRoom(context: Room): DocumentRoom {
 				binding.release();
 			}
 		},
-		...(visualRouting(context) && {
-			visual: {
-				ask: (request: JevRequest) =>
-					context.decide!(request, { signal: chat.turnController?.signal }),
-			},
-		}),
 		readReference: async (id, repositoryId) => {
 			let reference = chat.referenceCache.get(id);
 			if (!reference) throw new Error("reference is not available in this Planner session");
@@ -2827,12 +2878,39 @@ async function repositorySession(
 	let isolated = reader || !!context.chat.job;
 	// A background job keeps its isolated session: it never borrows or ends the retained Planner.
 	if (retained && !isolated) {
-		if (!retained.binding.signal.aborted && await retained.binding.revalidate()) {
+		if (!retained.binding.signal.aborted && !retained.binding.currentToken()) {
+			await retained.binding.waitForRebind?.();
+		}
+		let initial = retained.binding;
+		if (
+			context.chat.retained === retained
+			&& !initial.signal.aborted
+			&& await initial.revalidate()
+			&& context.chat.retained === retained
+		) {
 			context.chat.agent = retained.session;
+			context.chat.owner = {
+				sessionId: retained.binding.ownerSessionId,
+				generation: retained.binding.ownerGeneration,
+				revision: retained.binding.credentialRevision,
+			};
 			return { session: retained.session, binding: retained.binding };
 		}
-		if (await rebindRetained(context, retained) && await retained.binding.revalidate()) {
+		let rebound = context.chat.retained === retained
+			&& ((retained.binding !== initial && !retained.binding.signal.aborted)
+				|| await rebindRetained(context, retained));
+		if (
+			rebound
+			&& context.chat.retained === retained
+			&& await retained.binding.revalidate()
+			&& context.chat.retained === retained
+		) {
 			context.chat.agent = retained.session;
+			context.chat.owner = {
+				sessionId: retained.binding.ownerSessionId,
+				generation: retained.binding.ownerGeneration,
+				revision: retained.binding.credentialRevision,
+			};
 			return { session: retained.session, binding: retained.binding };
 		}
 		await retained.release();
@@ -2929,7 +3007,6 @@ async function repositorySession(
 					`${repository.owner}/${repository.name}`,
 					bootstrapInPrompt ? undefined : chosen,
 					workspace,
-					visualRouting(context),
 					noting,
 				);
 			},
@@ -3193,6 +3270,7 @@ async function run(
 	else about?.signal?.addEventListener("abort", invalidate, { once: true });
 	chat.turnController = turnController;
 	let held = isolated ? chat.retained : undefined;
+	let heldBinding = held?.binding;
 	let heldOwner = chat.owner;
 	let heldReferences = held ? new Map(chat.referenceCache) : undefined;
 	try {
@@ -3370,18 +3448,19 @@ async function run(
 				};
 		} else if (!chat.closed && failed && !opened?.session.shuttingDown?.()) {
 			let suspended = !!opened?.session.suspended?.();
+			let dropped = suspended || isPlannerDisconnectedError(err);
 			// Read before `chat.interruption` is cleared below.
 			let failure = turnFailureOf({
 				error: err,
 				interruption: chat.interruption,
-				suspended,
+				suspended: dropped,
 				request: chat.activeRequest?.entryId,
 				focus: chat.focus?.channelId,
 			});
 			say(chat, server, room, {
 				id: ulid(),
 				author: { kind: "system" },
-				text: suspended
+				text: dropped
 					? "The machine's connection dropped during this reply. Its open questions are kept; "
 						+ "ask again once it has reconnected."
 					: failure.kind === "tool"
@@ -3446,7 +3525,13 @@ async function run(
 				// with the references the retained Planner can read.
 				if (held && chat.retained === held) {
 					chat.agent = held.session;
-					chat.owner = heldOwner;
+					chat.owner = held.binding !== heldBinding
+						? {
+							sessionId: held.binding.ownerSessionId,
+							generation: held.binding.ownerGeneration,
+							revision: held.binding.credentialRevision,
+						}
+						: heldOwner;
 					if (heldReferences) chat.referenceCache = heldReferences;
 				}
 			}
@@ -3516,6 +3601,14 @@ async function run(
 		if (draft) {
 			if (chat.draft === draft) chat.draft = undefined;
 			drafting(server, room, draft, "ended");
+			let listeners = draft.ended?.splice(0) ?? [];
+			for (let notify of listeners) {
+				try {
+					notify();
+				} catch (error) {
+					console.error("[chat] draft completion hook failed:", error);
+				}
+			}
 		}
 	}
 
@@ -4317,23 +4410,27 @@ export async function resetAgent(
 	reason?: string,
 ): Promise<void> {
 	let binding = chat.owner ?? chat.openingOwner;
-	if (
-		!binding
-		|| (sessionId && binding.sessionId !== sessionId)
-		|| (revision !== undefined && binding.revision !== revision)
-	) return;
-	chat.lifecycle++;
-	chat.activeRequest = undefined;
-	chat.focus = undefined;
-	if (reason && chat.turnController) chat.interruption = reason;
-	if (chat.job) {
-		chat.job = undefined;
-		chat.jobOutput = undefined;
+	let matches = !!binding
+		&& (!sessionId || binding.sessionId === sessionId)
+		&& (revision === undefined || binding.revision === revision);
+	let rebindable = revision !== undefined
+		&& !chat.job
+		&& !chat.reader
+		&& (!!chat.agent?.rebind || (!chat.busy && !!chat.retained?.session.rebind));
+	if (matches && !rebindable) {
+		chat.lifecycle++;
+		chat.activeRequest = undefined;
+		chat.focus = undefined;
+		if (reason && chat.turnController) chat.interruption = reason;
+		if (chat.job) {
+			chat.job = undefined;
+			chat.jobOutput = undefined;
+		}
+		chat.turnController?.abort();
+		chat.referenceCache.clear();
+		chat.bootstrapEntries = undefined;
+		chat.openingOwner = undefined;
 	}
-	chat.turnController?.abort();
-	chat.referenceCache.clear();
-	chat.bootstrapEntries = undefined;
-	chat.openingOwner = undefined;
 	if (chat.childChats) {
 		for (let child of chat.childChats.values()) {
 			await resetAgent(child, sessionId, revision, reason);

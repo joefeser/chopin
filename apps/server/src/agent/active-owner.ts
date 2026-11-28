@@ -25,9 +25,12 @@ export type ActiveOwnerBinding = {
 	ownerSessionId: string;
 	ownerGeneration: number;
 	credentialRevision: number;
+	/** The GitHub user id of the owning account, kept across login rotations for the same owner. */
+	ownerUserId?: string;
 	expiresAt: Date;
 	signal: AbortSignal;
 	currentToken: () => string | undefined;
+	waitForRebind?: () => Promise<void>;
 	revalidate: () => Promise<boolean>;
 	release: () => void;
 };
@@ -129,9 +132,11 @@ export class ActiveOwnerBindings {
 			ownerSessionId,
 			ownerGeneration,
 			credentialRevision,
+			ownerUserId: owner.user.id,
 			expiresAt: new Date(expiresAt),
 			signal: state.controller.signal,
 			currentToken: () => this.#currentToken(state),
+			waitForRebind: () => this.#auth.sessions.awaitRefresh?.(ownerSessionId) ?? Promise.resolve(),
 			revalidate: () => this.#revalidate(state),
 			release,
 		};

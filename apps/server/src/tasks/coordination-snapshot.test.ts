@@ -185,32 +185,32 @@ describe("coordinationSnapshot", () => {
 		// drafter — persistence carries both, so the snapshot must too.
 		let approvedGraph: Graph = {
 			versions: [{
-				...graph.versions[0]!,
-				state: "approved",
-				approver: "joefeser",
-				operationKey: "partb-20261103T014217Z-approve",
-			}],
-		};
-		let outcome = coordinationSnapshot({
-			channel,
-			revision: 37,
-			creation: { origin: { idempotencyKey: "bridge-create-1" } },
-			records: [open],
-			openQuestions: [],
-			graph: approvedGraph,
-		});
-		expect(outcome?.graph).toEqual({
+			...graph.versions[0]!,
 			state: "approved",
-			version: 2,
-			revision: 3,
-			planRevision: 37,
-			definition: tasks,
-			digest: definitionDigest(tasks),
-			draftedBy: "script",
-			approver: "joefeser",
+			approvedBy: "joefeser",
 			operationKey: "partb-20261103T014217Z-approve",
-		});
+		}],
+	};
+	let outcome = coordinationSnapshot({
+		channel,
+		revision: 37,
+		creation: { origin: { idempotencyKey: "bridge-create-1" } },
+		records: [open],
+		openQuestions: [],
+		graph: approvedGraph,
 	});
+	expect(outcome?.graph).toEqual({
+		state: "approved",
+		version: 2,
+		revision: 3,
+		planRevision: 37,
+		definition: tasks,
+		digest: definitionDigest(tasks),
+		draftedBy: "script",
+		approvedBy: "joefeser",
+		operationKey: "partb-20261103T014217Z-approve",
+	});
+});
 
 	it("refuses a document without MCP provenance", () => {
 		let outcome = coordinationSnapshot({

@@ -67,6 +67,19 @@ describe("the MCP document protocol", () => {
 			archive: { archive: unavailable },
 			restore: { restore: unavailable },
 			invoke: { invoke: async () => ({ kind: "refused", code: "planner-unavailable" }) },
+			answerDecision: {
+				answer: async () => ({ kind: "refused", refusal: { code: "document-unavailable" } }),
+			},
+			buildPlan: {
+				build: async () => ({ status: "refused", code: "document-unavailable" }),
+			},
+			orchestrate: {
+				orchestrate: async () => ({
+					ok: false,
+					reason: "document-unavailable",
+					message: "unavailable",
+				}),
+			},
 			upload: { upload: unavailable },
 			planSources: { record: unavailable },
 			implementations: {
@@ -76,11 +89,10 @@ describe("the MCP document protocol", () => {
 			},
 			coordination: {
 				readSnapshot: async () => ({ kind: "refused", code: "snapshot-unavailable" }),
-				answer: async () => ({ kind: "refused", code: "not-allowed" }),
 				approve: async () => ({ kind: "refused", code: "not-allowed" }),
 			},
 		});
-		let response = await mcp(request({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
+	let response = await mcp(request({ jsonrpc: "2.0", id: 1, method: "tools/list" }));
 		let listed = (await response.json()).result.tools as typeof TOOLS;
 		expect(listed).toEqual(TOOLS);
 		for (let tool of [...TOOLS, ...listed]) {

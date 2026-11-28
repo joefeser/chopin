@@ -3,7 +3,6 @@ import {
 	PLANNER_TOOL_NAMES,
 	REACTION_TOOL_NAMES,
 	THREAD_NOTE_TOOL_NAME,
-	VISUAL_PLANNER_TOOL_NAMES,
 } from "./tool-names";
 import { createJustBashNetworkSandboxSession } from "@ai-sdk/sandbox-just-bash";
 import {
@@ -14,8 +13,6 @@ import {
 	reactionPlannerAgent,
 	refinePlannerAgent,
 	threadPlannerAgent,
-	threadVisualPlannerAgent,
-	visualPlannerAgent,
 } from "./agents";
 import { githubTools, type GitHubToolsError, lazyGithubTools, type Result } from "./github-tools";
 import { registerCredential } from "./harnesses";
@@ -148,6 +145,10 @@ export type PlannerSession = {
 	shuttingDown?: () => boolean;
 	/** Takes the binding of the owner's renewed credential in place of one that ended. */
 	rebind?: (owner: ActiveOwnerBinding) => void;
+	/** Records an in-flight credential rebind so host tools wait for it before failing. */
+	rebinding?: (wait: Promise<void>) => void;
+	/** Explicitly withdraws open questions held by this session (as when a person clicks Stop). */
+	withdrawInputs?: () => void;
 };
 
 export type PlannerSessionDependencies = {
@@ -157,10 +158,8 @@ export type PlannerSessionDependencies = {
 	proseAgent?: PlannerAgent;
 	followupAgent?: PlannerAgent;
 	reactionAgent?: PlannerAgent;
-	visualAgent?: PlannerAgent;
 	/** A thread's full Atomic Planner, which is offered `tell_chat_planner`. */
 	threadAgent?: PlannerAgent;
-	threadVisualAgent?: PlannerAgent;
 	githubTools?: typeof githubTools;
 	createSandbox?: () => Promise<Sandbox>;
 	registerCredential?: typeof registerCredential;
@@ -195,7 +194,109 @@ export async function openPlannerSession(
 		return { ok: false, error: { kind: "Unavailable", cause } };
 	}
 	let current = owner;
-	let tools = lazyGithubTools(current, deps.githubTools ?? githubTools);
+	let pendingRebind: Promise<void> | undefined;
+	let waitForRebind = async (): Promise<void> => {
+		for (let tries = 0; tries < 4; tries++) {
+			let wait = pendingRebind;
+			if (wait) {
+				await wait.catch(() => {});
+				continue;
+			}
+			if (current.currentToken()) return;
+			if (!current.waitForRebind) return;
+			let before = current;
+			await current.waitForRebind().catch(() => {});
+			if (!pendingRebind && current === before) return;
+		}
+	};
+	let rebindable = channel.harness === "remote" && !isolated;
+	let ownerEnded = rebindable ? new AbortController() : undefined;
+	let stopWatchingOwner: (() => void) | undefined;
+	let isSuspended = () => false;
+	let isCredentialRenewal = (signal: AbortSignal): boolean => {
+		let reason = signal.reason;
+		let message = reason instanceof Error ? reason.message : String(reason ?? "");
+		return message === "credential-rotated" || message === "credential-expired";
+	};
+	let watchOwner = (binding: ActiveOwnerBinding) => {
+		stopWatchingOwner?.();
+		stopWatchingOwner = undefined;
+		if (!ownerEnded) return;
+		let onAbort = () => {
+			if (current !== binding) return;
+			if (!isCredentialRenewal(binding.signal)) {
+				ownerEnded?.abort(binding.signal.reason);
+				return;
+			}
+			// Give ownerSignal / rebindRetained (whose abort listener may fire after ours)
+			// a turn to register `pendingRebind` or call `rebind`; abort if neither happens
+			// or if the rebind finishes without replacing this binding.
+			queueMicrotask(() => {
+				if (current !== binding || isSuspended()) return;
+				if (!pendingRebind) {
+					ownerEnded?.abort(binding.signal.reason);
+					return;
+				}
+				void waitForRebind().then(() => {
+					if (current === binding && binding.signal.aborted && !isSuspended()) {
+						ownerEnded?.abort(binding.signal.reason);
+					}
+				});
+			});
+		};
+		if (binding.signal.aborted) onAbort();
+		else {
+			binding.signal.addEventListener("abort", onAbort, { once: true });
+			stopWatchingOwner = () => binding.signal.removeEventListener("abort", onAbort);
+		}
+	};
+	let liveOwner: ActiveOwnerBinding = {
+		get channelId() {
+			return current.channelId;
+		},
+		get token() {
+			return current.token;
+		},
+		get repository() {
+			return current.repository;
+		},
+		get ownerSessionId() {
+			return current.ownerSessionId;
+		},
+		get ownerGeneration() {
+			return current.ownerGeneration;
+		},
+		get credentialRevision() {
+			return current.credentialRevision;
+		},
+		get ownerUserId() {
+			return current.ownerUserId;
+		},
+		get expiresAt() {
+			return current.expiresAt;
+		},
+		get signal() {
+			return ownerEnded ? ownerEnded.signal : current.signal;
+		},
+		currentToken: () => current.currentToken(),
+		waitForRebind,
+		revalidate: async () => {
+			if (pendingRebind || current.signal.aborted || !current.currentToken()) {
+				await waitForRebind();
+			}
+			let active = current;
+			if (await active.revalidate()) return true;
+			if (pendingRebind || active.signal.aborted || !active.currentToken()) {
+				await waitForRebind();
+				if (current !== active || (!current.signal.aborted && !!current.currentToken())) {
+					return current.revalidate();
+				}
+			}
+			return false;
+		},
+		release: () => current.release(),
+	};
+	let tools = lazyGithubTools(() => current, deps.githubTools ?? githubTools, waitForRebind);
 	let sandbox: Sandbox;
 	try {
 		sandbox = await (deps.createSandbox ?? createJustBashNetworkSandboxSession)();
@@ -210,7 +311,10 @@ export async function openPlannerSession(
 	try {
 		if (owner.signal.aborted) throw new Error("Planner owner unavailable");
 		let sessionId = crypto.randomUUID();
-		unregister = (deps.registerCredential ?? registerCredential)(sessionId, owner.currentToken);
+		unregister = (deps.registerCredential ?? registerCredential)(
+			sessionId,
+			() => current.currentToken(),
+		);
 		// Background jobs keep the isolated boundary; only a Planner turn may run as a full session.
 		let workspace = channel.harness === "atomic" && !isolated
 			? await plannerWorkspace(channel.room.id, channel.repository)
@@ -254,6 +358,9 @@ export async function openPlannerSession(
 			if (!isolated) {
 				held.humanInput = report => createHumanInput(channel.room, report, inputs);
 				held.holdInput = () => inputs.hold();
+				if (channel.room.unsentDecisions) {
+					held.unsentDecisions = channel.room.unsentDecisions;
+				}
 				held.toolReport = (id, output, state) => {
 					let chat = channel.chat ?? channel.room.plan.chat;
 					if (state === "running") chat?.toolProgress?.(id, output);
@@ -261,26 +368,23 @@ export async function openPlannerSession(
 				};
 			}
 			remote = held;
+			isSuspended = () => held.suspended === true;
 			unregisterRemote = registerRemotePlanner(sessionId, held);
 		}
 		let noting = !!channel.tellChat && !!planner;
-		let agent = deps.agent ?? (job?.kind === "heading"
-			? deps.headingAgent ?? headingPlannerAgent
+		let agent = job?.kind === "heading"
+			? deps.headingAgent ?? deps.agent ?? headingPlannerAgent
 			: job?.kind === "refine" || job?.kind === "suggest"
-			? deps.refineAgent ?? refinePlannerAgent
+			? deps.refineAgent ?? deps.agent ?? refinePlannerAgent
 			: job?.kind === "prose"
-			? deps.proseAgent ?? prosePlannerAgent
+			? deps.proseAgent ?? deps.agent ?? prosePlannerAgent
 			: job?.kind === "decision-followup"
-			? deps.followupAgent ?? decisionFollowupPlannerAgent
+			? deps.followupAgent ?? deps.agent ?? decisionFollowupPlannerAgent
 			: channel.reader
-			? deps.reactionAgent ?? reactionPlannerAgent
-			: noting && channel.room.visual
-			? deps.threadVisualAgent ?? threadVisualPlannerAgent
+			? deps.reactionAgent ?? deps.agent ?? reactionPlannerAgent
 			: noting
-			? deps.threadAgent ?? threadPlannerAgent
-			: channel.room.visual
-			? deps.visualAgent ?? visualPlannerAgent
-			: plannerAgent);
+			? deps.threadAgent ?? deps.agent ?? threadPlannerAgent
+			: deps.agent ?? plannerAgent;
 		let opening = agent.createSession({ sessionId, sandboxSession: sandbox });
 		let deadline = new Promise<never>((_, reject) => {
 			timeout = setTimeout(
@@ -304,6 +408,7 @@ export async function openPlannerSession(
 			)
 			: channel.instructions;
 		if (owner.signal.aborted) throw new Error("Planner owner unavailable");
+		watchOwner(current);
 		let active = session;
 		let stopped: Promise<void> | undefined;
 		let fixedTools = Object.freeze([
@@ -311,8 +416,6 @@ export async function openPlannerSession(
 				? BACKGROUND_TOOL_NAMES[job.kind]
 				: channel.reader
 				? REACTION_TOOL_NAMES
-				: channel.room.visual
-				? VISUAL_PLANNER_TOOL_NAMES
 				: PLANNER_TOOL_NAMES),
 			...(noting ? [THREAD_NOTE_TOOL_NAME] : []),
 		]);
@@ -328,14 +431,25 @@ export async function openPlannerSession(
 						rebind: (renewed: ActiveOwnerBinding) => {
 							unregister?.();
 							current = renewed;
-							tools = lazyGithubTools(current, deps.githubTools ?? githubTools);
+							if (ownerEnded?.signal.aborted) ownerEnded = new AbortController();
+							watchOwner(renewed);
 							unregister = (deps.registerCredential ?? registerCredential)(
 								sessionId,
-								renewed.currentToken,
+								() => current.currentToken(),
 							);
+						},
+						rebinding: (wait: Promise<void>) => {
+							if (ownerEnded?.signal.aborted && isCredentialRenewal(current.signal)) {
+								ownerEnded = new AbortController();
+							}
+							let tracked = wait.catch(() => {}).finally(() => {
+								if (pendingRebind === tracked) pendingRebind = undefined;
+							});
+							pendingRebind = tracked;
 						},
 						suspended: () => remote.suspended === true,
 						shuttingDown: () => remote.stopping === true,
+						withdrawInputs: () => remote.withdrawInputs?.(),
 					}
 					: {}),
 				stream: (prompt, abortSignal, choice, files, message, context) => {
@@ -362,7 +476,7 @@ export async function openPlannerSession(
 									instructions: context && !planner
 										? `${instructions}\n\n${context}`
 										: instructions,
-									owner: current,
+									owner: liveOwner,
 									githubTools: tools,
 									...(hostTools ? { toolSignal: hostTools.signal } : {}),
 								},
@@ -379,6 +493,7 @@ export async function openPlannerSession(
 							try {
 								await sandbox.destroy();
 							} finally {
+								stopWatchingOwner?.();
 								unregister?.();
 								unregisterFull?.();
 								unregisterRemote?.();

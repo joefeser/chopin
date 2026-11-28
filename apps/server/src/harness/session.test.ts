@@ -11,7 +11,6 @@ import {
 	PLANNER_TOOL_NAMES,
 	REACTION_TOOL_NAMES,
 	THREAD_NOTE_TOOL_NAME,
-	VISUAL_PLANNER_TOOL_NAMES,
 } from "./tool-names";
 import { remotePlanner } from "./remote/registry";
 import { hostInputRoom, laterTimers } from "../testing/decisions";
@@ -93,34 +92,6 @@ describe("openPlannerSession", () => {
 		if (!job.ok) throw new Error("the job session did not open");
 		expect(job.value.steer).toBeUndefined();
 		await job.value.destroy();
-	});
-
-	it("uses the visual Planner profile only when the room has Jev routing", async () => {
-		let { owner, channel, deps } = fixture();
-		let visualOpened = false;
-		deps.agent = undefined;
-		channel.room = {
-			id: "channel",
-			plan: {},
-			server: {},
-			visual: {
-				ask: async () => {
-					throw new Error("unused");
-				},
-			},
-		} as never;
-		deps.visualAgent = {
-			createSession: async () => {
-				visualOpened = true;
-				return { destroy: async () => {} };
-			},
-		} as never;
-		let opened = await openPlannerSession(owner, channel, deps);
-		expect(opened.ok).toBe(true);
-		if (!opened.ok) return;
-		expect(visualOpened).toBe(true);
-		expect(opened.value.activeTools).toEqual(VISUAL_PLANNER_TOOL_NAMES);
-		await opened.value.destroy();
 	});
 
 	it("registers a remote Planner for its document, with Decisions on the client", async () => {
@@ -361,6 +332,109 @@ describe("openPlannerSession", () => {
 		expect(result).toMatchObject({ ok: false, error: { kind: "Timeout" } });
 		expect(destroyed).toEqual({ sandbox: 1, session: 0, unregistered: 1 });
 	});
+
+	it("delegates live owner, githubTools, revalidate, and session signal across mid-turn rebinds", async () => {
+		let { owner, channel, deps } = fixture();
+		let rev1Controller = new AbortController();
+		let rev1Token: string | undefined = "token-1";
+		owner = {
+			...owner,
+			token: "token-1",
+			credentialRevision: 1,
+			signal: rev1Controller.signal,
+			currentToken: () => (rev1Controller.signal.aborted ? undefined : rev1Token),
+			revalidate: async () => !rev1Controller.signal.aborted && rev1Token !== undefined,
+		};
+		let capturedCredential: (() => string | undefined) | undefined;
+		let capturedOptions: {
+			owner: ActiveOwnerBinding;
+			githubTools: Record<string, { execute?: Function }>;
+		} | undefined;
+		let loadedRevisions: number[] = [];
+		deps.registerCredential = (_id, resolve) => {
+			capturedCredential = resolve;
+			return () => {};
+		};
+		deps.githubTools = async binding => {
+			loadedRevisions.push(binding.credentialRevision);
+			return {
+				ok: true,
+				value: {
+					list_pull_requests: {
+						execute: async () => ({ rev: binding.credentialRevision, token: binding.token }),
+					},
+					pull_request_read: {
+						execute: async () => ({}),
+					},
+				} as never,
+			};
+		};
+		deps.agent = {
+			createSession: async () => ({ destroy: async () => {} }),
+			stream: async (call: { options: typeof capturedOptions }) => {
+				capturedOptions = call.options;
+				return { fullStream: (async function*() {})() };
+			},
+		} as never;
+
+		let opened = await openPlannerSession(owner, {
+			...channel,
+			harness: "remote",
+		}, deps);
+		if (!opened.ok) throw new Error("Planner unavailable");
+		try {
+			await opened.value.stream("work", new AbortController().signal);
+			expect(capturedOptions).toBeDefined();
+			let liveOwner = capturedOptions!.owner;
+			let ghTools = capturedOptions!.githubTools;
+
+			expect(liveOwner.currentToken()).toBe("token-1");
+			expect(liveOwner.signal.aborted).toBe(false);
+			expect(capturedCredential?.()).toBe("token-1");
+
+			// Start an in-flight rebind and abort rev 1 as credential-rotated.
+			let rebindGate = Promise.withResolvers<void>();
+			opened.value.rebinding!(rebindGate.promise);
+			rev1Controller.abort(new Error("credential-rotated"));
+			await Bun.sleep(0);
+			// The session-level owner signal must stay non-aborted while rebind is in flight.
+			expect(liveOwner.signal.aborted).toBe(false);
+
+			// Both revalidate() and lazyGithubTools wait for the rebind to finish.
+			let revalidating = liveOwner.revalidate();
+			let prCall = ghTools.list_pull_requests!.execute!(
+				{},
+				{ toolCallId: "pr-1", messages: [], context: { repository: owner.repository } },
+			);
+			await Bun.sleep(0);
+			expect(loadedRevisions).toEqual([]);
+
+			let rev2Controller = new AbortController();
+			let rev2: ActiveOwnerBinding = {
+				...owner,
+				token: "token-2",
+				credentialRevision: 2,
+				signal: rev2Controller.signal,
+				currentToken: () => (rev2Controller.signal.aborted ? undefined : "token-2"),
+				revalidate: async () => !rev2Controller.signal.aborted,
+			};
+			opened.value.rebind!(rev2);
+			rebindGate.resolve();
+
+			expect(await revalidating).toBe(true);
+			expect(await prCall).toEqual({ rev: 2, token: "token-2" });
+			expect(liveOwner.credentialRevision).toBe(2);
+			expect(liveOwner.currentToken()).toBe("token-2");
+			expect(capturedCredential?.()).toBe("token-2");
+			expect(loadedRevisions).toEqual([2]);
+
+			// Full session revocation aborts liveOwner.signal synchronously.
+			rev2Controller.abort(new Error("session-revoked"));
+			expect(liveOwner.signal.aborted).toBe(true);
+		} finally {
+			await opened.value.destroy();
+		}
+	});
 });
 
 describe("Planner workspaces", () => {
@@ -441,12 +515,11 @@ describe("Planner workspaces", () => {
 			let session = await openPlannerSession(owner, {
 				...channel,
 				...given,
-				room: { id: "channel", plan: {}, server: {}, visual: {} } as never,
+				room: { id: "channel", plan: {}, server: {} } as never,
 			}, {
 				...deps,
-				agent: undefined,
-				visualAgent: agent("planner"),
-				threadVisualAgent: agent("thread"),
+				agent: agent("planner"),
+				threadAgent: agent("thread"),
 			});
 			if (!session.ok) throw new Error("the Planner session did not open");
 			tools.push(session.value.activeTools);
@@ -454,10 +527,10 @@ describe("Planner workspaces", () => {
 		}
 		expect(opened).toEqual(["thread", "planner", "planner", "planner"]);
 		expect(tools).toEqual([
-			[...VISUAL_PLANNER_TOOL_NAMES, THREAD_NOTE_TOOL_NAME],
-			VISUAL_PLANNER_TOOL_NAMES,
-			VISUAL_PLANNER_TOOL_NAMES,
-			VISUAL_PLANNER_TOOL_NAMES,
+			[...PLANNER_TOOL_NAMES, THREAD_NOTE_TOOL_NAME],
+			PLANNER_TOOL_NAMES,
+			PLANNER_TOOL_NAMES,
+			PLANNER_TOOL_NAMES,
 		]);
 	});
 
@@ -578,7 +651,6 @@ describe("Planner workspaces", () => {
 it("member Planner sessions include the child tools and background jobs never do", () => {
 	for (let name of ["list_children", "read_child", "edit_child", "anchor_child"]) {
 		expect(PLANNER_TOOL_NAMES).toContain(name);
-		expect(VISUAL_PLANNER_TOOL_NAMES).toContain(name);
 		for (let names of Object.values(BACKGROUND_TOOL_NAMES)) expect(names).not.toContain(name);
 	}
 });

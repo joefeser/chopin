@@ -18,10 +18,15 @@ import {
 	holdingProxy,
 	linkAuth,
 	linkServer,
+	machineToken,
 	MEMBER_TOKEN,
 	RIVAL_TOKEN,
 	scriptedPlanner,
 } from "../testing/agent-link";
+import { Machines } from "../auth/machines";
+import { MachinePlanners } from "../harness/remote/machine-planners";
+import { tool } from "ai";
+import { GITHUB_TOOL_SCHEMAS } from "../harness/github-tools";
 import { AgentRefused, connectAgent } from "@chopin/agent-link/client";
 import { GitHubError } from "../github/client";
 import { laterTimers } from "../testing/decisions";
@@ -32,7 +37,7 @@ import { sessionContextOf } from "./session-context";
 import { plannerCommands } from "../harness/harnesses";
 import { attachedLink } from "../harness/remote/registry";
 import * as Question from "@chopin/question";
-import { answerTurns } from "../questions/answer-turns";
+import { answerTurns, plannerToActOn } from "../questions/answer-turns";
 import * as Questions from "../questions/service";
 import * as Store from "../questions/store";
 import { member } from "../questions/text-response.test-fixtures";
@@ -638,10 +643,16 @@ test("with its link connected, an attached Planner's open question stays open fo
 	await clock.pass(2 * HOUR);
 	expect(context.plan.records.get(id)?.status).toBe("open");
 	expect(context.chat.retained).toBeDefined();
-	// The one bound is the owner: signing out ends what the Planner acted for them on.
+	// The one bound is the owner: signing out releases the retained session and detaches its
+	// waiter while leaving the open Decision in the document for durable handoff.
 	await live.signOut("member");
-	await until(() => context.plan.records.get(id)?.status === "cancelled");
 	await until(() => context.chat.retained === undefined);
+	expect(context.plan.records.get(id)?.status).toBe("open");
+	expect(Store.get(context.plan.questions, id)?.awaited).toBeUndefined();
+	expect(plannerToActOn(
+		context.plan.records.get(id)!,
+		Store.get(context.plan.questions, id)!,
+	)).toBe(true);
 });
 
 test("a question an attached Planner asks while its turn runs keeps the turn going through its owner's credential renewals, and the reply finishes once it is answered", async () => {
@@ -823,7 +834,7 @@ test("a dropped link's grace period only leases ownership: a Stop that ends a qu
 	expect(await down.owner()).toBe(down.logins.get("rival"));
 });
 
-test("the same drop of an attached Planner that did not ask for resumable sessions ends its question as before", async () => {
+test("a drop of an attached Planner that did not ask for resumable sessions ends its session and detaches its waiter while keeping the Decision open", async () => {
 	let room = await remoteRoom();
 	let { context, server } = room;
 	let script = scriptedPlanner();
@@ -853,7 +864,13 @@ test("the same drop of an attached Planner that did not ask for resumable sessio
 	expect(await client.resumption).toBeUndefined();
 	for (let attempt = 0; attempt < 100 && context.chat.retained; attempt++) await Bun.sleep(5);
 	expect(context.chat.retained).toBeUndefined();
-	expect([...context.plan.records.values()].map(record => record.status)).toEqual(["cancelled"]);
+	let [id] = [...context.plan.records.keys()];
+	expect(context.plan.records.get(id!)?.status).toBe("open");
+	expect(Store.get(context.plan.questions, id!)?.awaited).toBeUndefined();
+	expect(plannerToActOn(
+		context.plan.records.get(id!)!,
+		Store.get(context.plan.questions, id!)!,
+	)).toBe(true);
 });
 
 test("a Stop pressed while the attached Planner's link is down withdraws a question it only waits on, as when connected", async () => {
@@ -901,18 +918,23 @@ test("an answer given while the attached Planner's link is down is held for its 
 	expect(context.plan.records.get(id)?.status).toBe("answered");
 });
 
-test("a question its client withdraws while the Planner's link is down ends its wait at once and is withdrawn in Chopin when the client resumes", async () => {
+test("a question omitted from resume after a drop detaches its waiter while keeping the Decision open in Chopin", async () => {
 	let down = await resumablePlanner({ ask: true, withdrawable: true });
 	let { context } = down;
 	let id = [...context.plan.records.keys()][0]!;
 	await down.drop();
-	// The link is down, so the server cannot hear the withdrawal yet; the caller's wait is over.
+	// The link is down, so the client stops waiting locally and omits the request from resume.
 	down.withdraw();
 	expect(await down.asked()).toMatchObject({ status: "cancelled" });
 	expect(context.plan.records.get(id)?.status).toBe("open");
 
 	await down.reconnect();
-	await until(() => context.plan.records.get(id)?.status === "cancelled");
+	await until(() => Store.get(context.plan.questions, id)?.awaited === undefined);
+	expect(context.plan.records.get(id)?.status).toBe("open");
+	expect(plannerToActOn(
+		context.plan.records.get(id)!,
+		Store.get(context.plan.questions, id)!,
+	)).toBe(true);
 	expect(context.plan.records.size).toBe(1);
 });
 
@@ -2037,3 +2059,748 @@ for (let steers of [true, false]) {
 		},
 	);
 }
+
+test("an unplanned disconnect mid-turn with no open input-request keeps the Retry failure banner", async () => {
+	let room = await remoteRoom();
+	let { context, server } = room;
+	let turning = Promise.withResolvers<void>();
+	let client = await connectAgent({
+		url: server.url,
+		token: MEMBER_TOKEN,
+		document: room.channel.id,
+		resumable: true,
+		handlers: {
+			async turn() {
+				turning.resolve();
+				await new Promise(() => {});
+			},
+		},
+	});
+	cleanups.push(() => client.detach());
+	expect(await room.send("@chopin outline the plan")).toMatchObject({ kind: "chat:send" });
+	await turning.promise;
+	for (let socket of server.sockets) socket.close(1001, "network failed");
+	await context.chat.running;
+	let failed = context.chat.entries.filter(entry => entry.turnFailure);
+	expect(failed).toHaveLength(1);
+	expect(failed[0]!.turnFailure).toMatchObject({
+		kind: "error",
+		detail: "The machine disconnected during the turn.",
+	});
+});
+
+test("a fast reconnect that clears suspended before turn catch runs still classifies the interrupted turn as dropped", async () => {
+	let down = await resumablePlanner({ ask: true });
+	let { context, server } = down;
+	let id = [...context.plan.records.keys()][0]!;
+	let turning = Promise.withResolvers<void>();
+	let streamRelease = Promise.withResolvers<void>();
+	let origOpen = context.openPlannerSession!;
+	let retained = context.chat.retained!;
+	let origStream = retained.session.stream.bind(retained.session);
+	retained.session.stream = async (...args) => {
+		let res = await origStream(...args);
+		let inner = res.fullStream;
+		return {
+			...res,
+			fullStream: (async function*() {
+				try {
+					for await (let part of inner) yield part;
+				} finally {
+					// Hold stream teardown until after the client has reconnected and cleared suspended.
+					await streamRelease.promise;
+				}
+			})() as never,
+		};
+	};
+	context.openPlannerSession = origOpen;
+	(down.handlers as any).turn = async () => {
+		turning.resolve();
+		await new Promise(() => {});
+	};
+	let invoked = Chat.invoke(context, RIVAL, "Keep going");
+	await turning.promise;
+	await down.drop();
+	// Client reconnects and resumes (clearing suspended = false) BEFORE turn catch executes.
+	await down.reconnect();
+	await until(() => server.attachments.status(down.channel.id).state === "attached");
+	expect(retained.session.suspended?.()).toBe(false);
+	streamRelease.resolve();
+	await invoked;
+	await context.chat.running;
+	let failed = context.chat.entries.filter(entry => entry.turnFailure);
+	expect(failed).toHaveLength(1);
+	expect(failed[0]!.turnFailure).toMatchObject({ kind: "dropped" });
+	expect(context.plan.records.get(id)?.status).toBe("open");
+});
+
+test("a retained session whose owner credential rotated to a new login and generation while suspended rebinds cleanly for the same owner and repository", async () => {
+	let down = await resumablePlanner({ ask: true });
+	let { context } = down;
+	let id = [...context.plan.records.keys()][0]!;
+	let retained = context.chat.retained!;
+	let originalSession = retained.session;
+	let originalBinding = retained.binding;
+	await down.drop();
+
+	// Simulate credential expiry while suspended AND a freshly minted owner session/generation
+	// for the same user + repository when the machine reconnects.
+	let expired = new AbortController();
+	let previous = {
+		...originalBinding,
+		signal: expired.signal,
+		release: () => expired.abort(new Error("released")),
+	};
+	retained.binding = previous;
+	expired.abort(new Error("credential-expired"));
+
+	let rotatedController = new AbortController();
+	let rotatedBinding = {
+		...originalBinding,
+		ownerSessionId: "delegated-login-rotated",
+		ownerGeneration: originalBinding.ownerGeneration + 1,
+		credentialRevision: originalBinding.credentialRevision + 1,
+		ownerUserId: originalBinding.ownerUserId,
+		signal: rotatedController.signal,
+		revalidate: async () => true,
+		release: () => rotatedController.abort(new Error("released")),
+	};
+	context.activeOwner = async () => rotatedBinding;
+
+	await down.reconnect();
+	expect(await Chat.invoke(context, RIVAL, "Continue after rebind")).toBeUndefined();
+	await context.chat.running;
+	expect(context.chat.retained?.session).toBe(originalSession);
+	expect(context.chat.retained?.binding).toBe(rotatedBinding);
+	expect(context.plan.records.get(id)?.status).toBe("open");
+	await answerChoice(context, id, 0);
+	expect(await down.asked()).toMatchObject({ status: "answered", value: true });
+});
+
+test("when a retained session cannot rebind because another owner took over, releasing it detaches the waiter without withdrawing open Decisions", async () => {
+	let down = await resumablePlanner({ ask: true });
+	let { context } = down;
+	let id = [...context.plan.records.keys()][0]!;
+	let retained = context.chat.retained!;
+	let originalBinding = retained.binding;
+	await down.drop();
+
+	let expired = new AbortController();
+	retained.binding = { ...originalBinding, signal: expired.signal };
+	expired.abort(new Error("credential-expired"));
+
+	let otherController = new AbortController();
+	context.activeOwner = async () => ({
+		...originalBinding,
+		ownerSessionId: "other-user-login",
+		ownerGeneration: originalBinding.ownerGeneration + 1,
+		ownerUserId: "U_other",
+		signal: otherController.signal,
+		revalidate: async () => true,
+		release: () => otherController.abort(new Error("released")),
+	});
+
+	await down.reconnect();
+	await retained.release();
+	expect(context.chat.retained).toBeUndefined();
+	expect(context.plan.records.get(id)?.status).toBe("open");
+	expect(Store.get(context.plan.questions, id)?.awaited).toBeUndefined();
+	expect(plannerToActOn(
+		context.plan.records.get(id)!,
+		Store.get(context.plan.questions, id)!,
+	)).toBe(true);
+});
+
+test("rebinds a running remote Planner turn across consecutive GitHub credential rotations, including host tools during the refresh window, while session revocation still aborts", async () => {
+	let refreshGate:
+		| ReturnType<
+			typeof Promise.withResolvers<{
+				accessToken: string;
+				accessExpiresIn: number;
+				refreshToken: string;
+				refreshExpiresIn: number;
+			}>
+		>
+		| undefined;
+	let { auth, storage, sessions, channel, logins, revocations, rotations, signOut } =
+		await linkAuth(undefined, {
+			refresh: async () => {
+				refreshGate = Promise.withResolvers();
+				return refreshGate.promise;
+			},
+		});
+	let server = linkServer(auth);
+	cleanups.push(server.stop);
+	let lease = (await storage.leases.acquire("writer", "test", 60_000))!;
+	let publisher = { publish() {} } as unknown as Server<SocketData>;
+	let plan = await Plan.open(channel.id, {
+		storage,
+		lease: () => lease,
+		fatal: error => {
+			throw error;
+		},
+	}, publisher);
+	let owners = new ActiveOwnerBindings(auth as unknown as HostedAuth);
+	let revokedTokens = new Set<string>();
+	rotations.add(async (sessionId, revision) => {
+		let stale = revision === 1 ? "member-browser-login" : `member-browser-login-${revision}`;
+		revokedTokens.add(stale);
+		owners.revokeCredential(sessionId, revision);
+		await Chat.resetAgent(
+			plan.chat,
+			sessionId,
+			revision,
+			"GitHub credentials refreshed, so chopin's session was restarted. Ask it to continue.",
+		);
+	});
+	revocations.add(async sessionId => {
+		owners.revokeSession(sessionId);
+		server.attachments.sessionRevoked(sessionId);
+		await Chat.resetAgent(plan.chat, sessionId, undefined, "Your GitHub sign-in ended.");
+	});
+
+	let repoTokens: string[] = [];
+	let originalFetch = globalThis.fetch;
+	globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		let url = String(input);
+		if (url.startsWith("https://api.github.com/repos/octo-org/score/")) {
+			let header = new Headers(init?.headers).get("authorization") ?? "";
+			let bearer = header.replace(/^Bearer /, "");
+			expect(revokedTokens.has(bearer)).toBe(false);
+			repoTokens.push(bearer);
+			return Response.json({
+				type: "file",
+				encoding: "base64",
+				content: Buffer.from(`read-with:${bearer}`).toString("base64"),
+			});
+		}
+		return originalFetch(input, init);
+	}) as typeof fetch;
+	cleanups.push(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	let prTokens: string[] = [];
+	let agent = createPlannerAgent(createRemoteAdapter());
+	let url = `https://chopin.test/documents/octo-org/score/${channel.slug}`;
+	let context: Chat.Room = {
+		decide: decideReplying({ input: { type: "noul", noul: 0 } }),
+		chat: plan.chat,
+		plan,
+		room: channel.id,
+		server: publisher,
+		auth: auth as unknown as HostedAuth,
+		repository: { id: "R_score", owner: "octo-org", name: "score", defaultBranch: "main" },
+		config: configured(REMOTE),
+		claimantSessionId: logins.get("rival"),
+		plannerNotAttached: async () =>
+			await server.attachments.confirmed(channel.id)
+				? undefined
+				: server.attachments.unavailable(channel.id)
+					?? notAttachedMessage(url, "octo-org/score"),
+		activeOwner: () => owners.resolve(channel.id),
+		persist: () => Plan.persist(plan),
+		openPlannerSession: (binding, options) =>
+			openPlannerSession(binding, options, {
+				githubTools: async active => {
+					expect(revokedTokens.has(active.token)).toBe(false);
+					prTokens.push(active.token);
+					return {
+						ok: true,
+						value: {
+							list_pull_requests: tool({
+								inputSchema: GITHUB_TOOL_SCHEMAS.list_pull_requests.inputSchema,
+								execute: async () => ({ prToken: active.token }),
+							}),
+							pull_request_read: tool({
+								inputSchema: GITHUB_TOOL_SCHEMAS.pull_request_read.inputSchema,
+								execute: async () => ({}),
+							}),
+						},
+					};
+				},
+				createSandbox: async () =>
+					({
+						defaultWorkingDirectory: "/tmp",
+						run: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+						destroy: async () => {},
+					}) as never,
+				registerCredential: () => () => {},
+				agent,
+			}),
+	};
+	cleanups.push(async () => {
+		owners.revokeAll();
+		await Chat.close(plan.chat);
+		await Plan.close(plan);
+	});
+
+	let turnNumber = 0;
+	let read1Done = Promise.withResolvers<void>();
+	let duringRotation1 = Promise.withResolvers<void>();
+	let rotation1ToolsStarted = Promise.withResolvers<void>();
+	let rotation1Done = Promise.withResolvers<void>();
+	let rotation2Done = Promise.withResolvers<void>();
+	let turn2Started = Promise.withResolvers<void>();
+	let turn2Ended = Promise.withResolvers<void>();
+	let outputs: unknown[] = [];
+
+	let client = await connectAgent({
+		url: server.url,
+		token: MEMBER_TOKEN,
+		document: channel.id,
+		handlers: {
+			...scriptedPlanner().handlers,
+			async turn(turn) {
+				turnNumber++;
+				if (turnNumber === 1) {
+					outputs.push((await turn.callHostTool("read_repository_file", { path: "a.ts" })).output);
+					let drafted = JSON.parse(
+						String(
+							(await turn.callHostTool("edit_plan", {
+								revision: 0,
+								operations: [{
+									op: "replace_root",
+									source: "# Plan\n\nProvisional storage choice.\n",
+								}],
+							})).output,
+						),
+					) as { revision: number; blocks: Array<{ index: number; digest: string }> };
+					read1Done.resolve();
+					await duringRotation1.promise;
+					let read2 = turn.callHostTool("read_repository_file", { path: "b.ts" });
+					let pr2 = turn.callHostTool("list_pull_requests", {});
+					let decision = turn.callHostTool("open_decisions", {
+						revision: drafted.revision,
+						questions: [{
+							key: "pick_store_db",
+							header: "Storage",
+							question: "Which store?",
+							response: "text",
+							options: [],
+							multiple: false,
+							blocks: [{ index: drafted.blocks[1]!.index, digest: drafted.blocks[1]!.digest }],
+						}],
+					});
+					rotation1ToolsStarted.resolve();
+					outputs.push((await read2).output, (await pr2).output, (await decision).output);
+					rotation1Done.resolve();
+					await rotation2Done.promise;
+					outputs.push((await turn.callHostTool("read_repository_file", { path: "c.ts" })).output);
+					finishTurn(turn);
+					return;
+				}
+				turn2Started.resolve();
+				await turn2Ended.promise;
+			},
+			stop() {
+				turn2Ended.resolve();
+			},
+		} as AgentHandlers,
+		resumable: true,
+	});
+	cleanups.push(() => client.detach());
+
+	let memberSessionId = logins.get("member")!;
+	expect(await Chat.invoke(context, RIVAL, "Inspect repository")).toBeUndefined();
+	await read1Done.promise;
+	expect(context.chat.owner?.revision).toBe(1);
+
+	// Rotation 1 -> 2 while turn 1 is actively running (triggered by a 401 before expiry).
+	let snap1 = (await sessions.resolve(memberSessionId))!;
+	let rotate1 = sessions.use(snap1, async token => {
+		if (token === "member-browser-login") throw new GitHubError("expired", 401);
+		return token;
+	});
+	await until(() => refreshGate !== undefined);
+	duringRotation1.resolve();
+	await rotation1ToolsStarted.promise;
+	await Bun.sleep(10);
+	expect(context.chat.turnController?.signal.aborted).toBe(false);
+	refreshGate!.resolve({
+		accessToken: "member-browser-login-2",
+		accessExpiresIn: 28_800,
+		refreshToken: "refresh-2",
+		refreshExpiresIn: 86_400,
+	});
+	expect((await rotate1).value).toBe("member-browser-login-2");
+	await rotation1Done.promise;
+	expect(context.chat.owner?.revision).toBe(2);
+
+	// Rotation 2 -> 3 (consecutive rotation on the same running turn).
+	refreshGate = undefined;
+	let snap2 = (await sessions.resolve(memberSessionId))!;
+	let rotate2 = sessions.use(snap2, async token => {
+		if (token === "member-browser-login-2") throw new GitHubError("expired", 401);
+		return token;
+	});
+	await until(() => refreshGate !== undefined);
+	refreshGate!.resolve({
+		accessToken: "member-browser-login-3",
+		accessExpiresIn: 28_800,
+		refreshToken: "refresh-3",
+		refreshExpiresIn: 86_400,
+	});
+	expect((await rotate2).value).toBe("member-browser-login-3");
+	await until(() => context.chat.owner?.revision === 3);
+	rotation2Done.resolve();
+
+	await context.chat.running;
+	expect(context.chat.entries.some(entry => entry.turnFailure !== undefined)).toBe(false);
+	expect(repoTokens).toEqual([
+		"member-browser-login",
+		"member-browser-login-2",
+		"member-browser-login-3",
+	]);
+	expect(prTokens).toEqual(["member-browser-login-2"]);
+	expect(String(outputs[0])).toContain("read-with:member-browser-login");
+	expect(String(outputs[1])).toContain("read-with:member-browser-login-2");
+	expect(outputs[2]).toEqual({ prToken: "member-browser-login-2" });
+	expect(String(outputs[4])).toContain("read-with:member-browser-login-3");
+	expect([...context.plan.records.values()].some(record => record.status === "open")).toBe(true);
+
+	// Full session revocation still aborts an active rebindable turn.
+	expect(await Chat.invoke(context, RIVAL, "Second turn")).toBeUndefined();
+	await turn2Started.promise;
+	await signOut("member");
+	await context.chat.running;
+	expect(
+		context.chat.entries.some(entry => entry.text.includes("Your GitHub sign-in ended.")),
+	).toBe(true);
+});
+
+test("keeps host tools working through a delegated machine-token rotation before beforeRefresh fires", async () => {
+	let { auth, storage, sessions, channel, logins, rotations } = await linkAuth();
+	let lease = (await storage.leases.acquire("writer", "test", 60_000))!;
+	let sourceGate:
+		| ReturnType<
+			typeof Promise.withResolvers<{
+				accessToken: string;
+				accessExpiresIn: number;
+				refreshToken: string;
+				refreshExpiresIn: number;
+			}>
+		>
+		| undefined;
+	let machines = new Machines(storage, () => new Date(), {
+		key: new Uint8Array(32).fill(7),
+		origin: auth.config.origin,
+		clientId: "client",
+		authorize: async (userId, token) => (await auth.admission.user(token)).id === userId,
+		refresh: async () => {
+			sourceGate = Promise.withResolvers();
+			return sourceGate.promise;
+		},
+		lease: () => lease,
+	});
+	let planners = new MachinePlanners({
+		machines,
+		sessions,
+		storage,
+		github: auth.github,
+		config: auth.config,
+		clock: () => new Date(),
+	});
+	let server = linkServer(auth, 2_000, undefined, 2_000, undefined, planners);
+	cleanups.push(server.stop);
+	let publisher = { publish() {} } as unknown as Server<SocketData>;
+	let plan = await Plan.open(channel.id, {
+		storage,
+		lease: () => lease,
+		fatal: error => {
+			throw error;
+		},
+	}, publisher);
+	let owners = new ActiveOwnerBindings(auth as unknown as HostedAuth);
+	rotations.add(async (sessionId, revision) => {
+		owners.revokeCredential(sessionId, revision);
+		await Chat.resetAgent(
+			plan.chat,
+			sessionId,
+			revision,
+			"GitHub credentials refreshed, so chopin's session was restarted. Ask it to continue.",
+		);
+	});
+
+	let repoTokens: string[] = [];
+	let originalFetch = globalThis.fetch;
+	globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		let url = String(input);
+		if (url.startsWith("https://api.github.com/repos/octo-org/score/")) {
+			let bearer = (new Headers(init?.headers).get("authorization") ?? "").replace(/^Bearer /, "");
+			repoTokens.push(bearer);
+			return Response.json({
+				type: "file",
+				encoding: "base64",
+				content: Buffer.from(`delegated:${bearer}`).toString("base64"),
+			});
+		}
+		return originalFetch(input, init);
+	}) as typeof fetch;
+	cleanups.push(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	let agent = createPlannerAgent(createRemoteAdapter());
+	let url = `https://chopin.test/documents/octo-org/score/${channel.slug}`;
+	let context: Chat.Room = {
+		decide: decideReplying({ input: { type: "noul", noul: 0 } }),
+		chat: plan.chat,
+		plan,
+		room: channel.id,
+		server: publisher,
+		auth: auth as unknown as HostedAuth,
+		repository: { id: "R_score", owner: "octo-org", name: "score", defaultBranch: "main" },
+		config: configured(REMOTE),
+		claimantSessionId: logins.get("rival"),
+		plannerNotAttached: async () =>
+			await server.attachments.confirmed(channel.id)
+				? undefined
+				: server.attachments.unavailable(channel.id)
+					?? notAttachedMessage(url, "octo-org/score"),
+		activeOwner: () => owners.resolve(channel.id),
+		persist: () => Plan.persist(plan),
+		openPlannerSession: (binding, options) =>
+			openPlannerSession(binding, options, {
+				githubTools: async () => ({ ok: true, value: {} }),
+				createSandbox: async () =>
+					({
+						defaultWorkingDirectory: "/tmp",
+						run: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+						destroy: async () => {},
+					}) as never,
+				registerCredential: () => () => {},
+				agent,
+			}),
+	};
+	cleanups.push(async () => {
+		owners.revokeAll();
+		await Chat.close(plan.chat);
+		await Plan.close(plan);
+	});
+
+	let { machine } = await machines.pair({
+		userId: "U_member",
+		label: "member-laptop",
+		repositories: [],
+		autoRun: false,
+		grant: {
+			accessToken: machineToken("member", 1),
+			accessExpiresIn: 28_800,
+			refreshToken: "member-machine-refresh-1",
+			refreshExpiresIn: 15_897_600,
+		},
+	});
+	let issued = await planners.issue(machine, channel.id);
+
+	let turnStarted = Promise.withResolvers<void>();
+	let callDuringSource = Promise.withResolvers<void>();
+	let toolStarted = Promise.withResolvers<void>();
+	let toolOutput: unknown;
+	let revisionAfterTool: number | undefined;
+	let client = await connectAgent({
+		url: server.url,
+		token: issued.token,
+		document: channel.id,
+		handlers: {
+			...scriptedPlanner().handlers,
+			async turn(turn) {
+				turnStarted.resolve();
+				await callDuringSource.promise;
+				let pending = turn.callHostTool("read_repository_file", { path: "delegated.ts" });
+				toolStarted.resolve();
+				toolOutput = (await pending).output;
+				revisionAfterTool = context.chat.owner?.revision;
+				finishTurn(turn);
+			},
+		} as AgentHandlers,
+		resumable: true,
+	});
+	cleanups.push(() => client.detach());
+
+	expect(await Chat.invoke(context, RIVAL, "Read delegated file")).toBeUndefined();
+	await turnStarted.promise;
+	let delegatedId = (await storage.channels.readAgent(channel.id, new Date()))!.agent!
+		.ownerSessionId!;
+
+	// Trigger delegated rotation: machine.access() -> machines.refresh() is pending and
+	// beforeRefresh has NOT fired yet.
+	let snap = (await sessions.resolve(delegatedId))!;
+	let rotating = sessions.use(snap, async token => {
+		if (token === machineToken("member", 1)) throw new GitHubError("expired", 401);
+		return token;
+	});
+	await until(() => sourceGate !== undefined);
+	expect(sessions.token(delegatedId, 1)).toBeUndefined();
+
+	// Invoke read_repository_file right inside the pre-beforeRefresh delegated source() window.
+	callDuringSource.resolve();
+	await toolStarted.promise;
+	await Bun.sleep(10);
+	sourceGate!.resolve({
+		accessToken: machineToken("member", 2),
+		accessExpiresIn: 28_800,
+		refreshToken: "member-machine-refresh-2",
+		refreshExpiresIn: 15_897_600,
+	});
+	expect((await rotating).value).toBe(machineToken("member", 2));
+	await context.chat.running;
+
+	expect(context.chat.entries.some(entry => entry.turnFailure !== undefined)).toBe(false);
+	expect(repoTokens).toEqual([machineToken("member", 2)]);
+	expect(String(toolOutput)).toContain(`delegated:${machineToken("member", 2)}`);
+	expect(revisionAfterTool).toBe(2);
+});
+
+test("keeps a retained session alive when its credential finishes rebinding between repositorySession and ownerSignal or mid-revalidate", async () => {
+	let revision = 1;
+	let { auth, storage, sessions, channel, logins, rotations } = await linkAuth(undefined, {
+		refresh: async () => {
+			revision++;
+			return {
+				accessToken: `member-browser-login-${revision}`,
+				accessExpiresIn: 28_800,
+				refreshToken: `refresh-${revision}`,
+				refreshExpiresIn: 86_400,
+			};
+		},
+	});
+	let server = linkServer(auth);
+	cleanups.push(server.stop);
+	let lease = (await storage.leases.acquire("writer", "test", 60_000))!;
+	let publisher = { publish() {} } as unknown as Server<SocketData>;
+	let plan = await Plan.open(channel.id, {
+		storage,
+		lease: () => lease,
+		fatal: error => {
+			throw error;
+		},
+	}, publisher);
+	let owners = new ActiveOwnerBindings(auth as unknown as HostedAuth);
+	rotations.add(async (sessionId, rev) => {
+		owners.revokeCredential(sessionId, rev);
+		await Chat.resetAgent(
+			plan.chat,
+			sessionId,
+			rev,
+			"GitHub credentials refreshed, so chopin's session was restarted. Ask it to continue.",
+		);
+	});
+	let agent = createPlannerAgent(createRemoteAdapter());
+	let url = `https://chopin.test/documents/octo-org/score/${channel.slug}`;
+	let context: Chat.Room = {
+		decide: decideReplying({ input: { type: "noul", noul: 0 } }),
+		chat: plan.chat,
+		plan,
+		room: channel.id,
+		server: publisher,
+		auth: auth as unknown as HostedAuth,
+		repository: { id: "R_score", owner: "octo-org", name: "score", defaultBranch: "main" },
+		config: configured(REMOTE),
+		claimantSessionId: logins.get("rival"),
+		plannerNotAttached: async () =>
+			await server.attachments.confirmed(channel.id)
+				? undefined
+				: server.attachments.unavailable(channel.id)
+					?? notAttachedMessage(url, "octo-org/score"),
+		activeOwner: () => owners.resolve(channel.id),
+		persist: () => Plan.persist(plan),
+		openPlannerSession: (binding, options) =>
+			openPlannerSession(binding, options, {
+				githubTools: async () => ({ ok: true, value: {} }),
+				createSandbox: async () =>
+					({
+						defaultWorkingDirectory: "/tmp",
+						run: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+						destroy: async () => {},
+					}) as never,
+				registerCredential: () => () => {},
+				agent,
+			}),
+	};
+	cleanups.push(async () => {
+		owners.revokeAll();
+		await Chat.close(plan.chat);
+		await Plan.close(plan);
+	});
+
+	let asked: Promise<{ status: string; value?: unknown }> | undefined;
+	let client: AgentClient | undefined;
+	client = await connectAgent({
+		url: server.url,
+		token: MEMBER_TOKEN,
+		document: channel.id,
+		handlers: {
+			...scriptedPlanner().handlers,
+			async turn(turn) {
+				if (!asked) {
+					asked = client!.ask(turn.message.session, {
+						method: "confirm",
+						title: "Ship?",
+						message: "Now.",
+					});
+				}
+				finishTurn(turn);
+			},
+		} as AgentHandlers,
+		resumable: true,
+	});
+	cleanups.push(() => client!.detach());
+
+	expect(await Chat.invoke(context, RIVAL, "Open decision")).toBeUndefined();
+	await context.chat.running;
+	await until(() => [...context.plan.records.values()][0]?.status === "open");
+	await until(() => context.chat.retained !== undefined);
+	let id = [...context.plan.records.keys()][0]!;
+	let retained = context.chat.retained!;
+	let originalSession = retained.session;
+	let memberSessionId = logins.get("member")!;
+
+	let triggerRotation = async (expectedToken: string) => {
+		let snap = (await sessions.resolve(memberSessionId))!;
+		await sessions.use(snap, async token => {
+			if (token === expectedToken) throw new GitHubError("expired", 401);
+			return token;
+		});
+	};
+
+	// Case 1: rotation finishes rebinding retained.binding to rev 2 inside takeNotes, AFTER
+	// repositorySession returned rev 1 and BEFORE ownerSignal attaches.
+	context.sessionForks = {
+		prepareTurn: () => ({}),
+		finishTurn: async () => {},
+		takeNotes: async () => {
+			await triggerRotation("member-browser-login");
+			await until(() => retained.binding.credentialRevision === 2);
+			return undefined;
+		},
+	};
+	expect(await Chat.invoke(context, RIVAL, "Continue after pre-ownerSignal rebind"))
+		.toBeUndefined();
+	await context.chat.running;
+	expect(context.chat.entries.some(entry => entry.turnFailure !== undefined)).toBe(false);
+	expect(context.chat.retained?.session).toBe(originalSession);
+	expect(context.chat.retained?.binding.credentialRevision).toBe(2);
+	expect(context.chat.owner?.revision).toBe(2);
+	expect(context.plan.records.get(id)?.status).toBe("open");
+
+	// Case 2: rotation finishes rebinding retained.binding to rev 3 mid-revalidate() inside
+	// repositorySession before revalidate() resolves false.
+	context.sessionForks = undefined;
+	let rev2Binding = retained.binding;
+	let origRevalidate = rev2Binding.revalidate;
+	rev2Binding.revalidate = async () => {
+		await triggerRotation("member-browser-login-2");
+		await until(() => retained.binding.credentialRevision === 3);
+		return origRevalidate();
+	};
+	expect(await Chat.invoke(context, RIVAL, "Continue after mid-revalidate rebind")).toBeUndefined();
+	await context.chat.running;
+	expect(context.chat.entries.some(entry => entry.turnFailure !== undefined)).toBe(false);
+	expect(context.chat.retained?.session).toBe(originalSession);
+	expect(context.chat.retained?.binding.credentialRevision).toBe(3);
+	expect(context.chat.owner?.revision).toBe(3);
+	expect(context.plan.records.get(id)?.status).toBe("open");
+	await answerChoice(context, id, 0);
+	expect(await asked!).toMatchObject({ status: "answered", value: true });
+});

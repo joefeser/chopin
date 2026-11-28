@@ -23,16 +23,34 @@ import { isLifecycleTool, LIFECYCLE_TOOLS, lifecycleCall } from "./mcp/lifecycle
 import { normalizedTitle } from "./channels/title";
 import { documentText, NOTE_BYTES, READING_IN_PARTS, ReadRangeError } from "./document-reading";
 import { planSourceSchema } from "./tasks/plan-source";
+import {
+	DECISION_ANSWER_VALUE_SCHEMA,
+	DECISION_COUNTS_SCHEMA,
+	DECISION_ORIGIN_SCHEMA,
+	DECISION_SNAPSHOT_SCHEMA,
+	DECISION_STATUS_FILTER_SCHEMA,
+	decisionNoteLines,
+	parseDecisionAnswerPayload,
+} from "./mcp/decisions";
+import { parseDecisionOrigin, parseDecisionStatusFilter } from "./questions/read-decisions";
+import { ORCHESTRATE_SCHEMA, orchestrateArguments } from "./agent/orchestrate";
 
 import type { Brief, CreateDocumentInput } from "./mcp/create";
 import type { UpdateDocument } from "./mcp/update";
 import type { UploadImageInput } from "./mcp/image";
+import type {
+	AnswerDecisionOutcome,
+	DecisionAnswerPayload,
+	DecisionReadRequest,
+} from "./mcp/decisions";
+import type { DecisionCounts, DecisionSnapshot } from "./questions/read-decisions";
+import type { OrchestrateArguments, OrchestrateResult } from "./agent/orchestrate";
+import type { StartPlanBuildResult } from "./tasks/start-build";
 import type { Run, Version } from "./tasks/graphs";
 import type { CoordinationSnapshot } from "./tasks/coordination-snapshot";
 import type { unapprovedContext } from "./tasks/open-decisions";
 import type { LifecycleArguments } from "./mcp/lifecycle";
 import type { ImplementationLifecycle } from "./tasks/lifecycle";
-import type { Issue } from "@chopin/dialect";
 
 export type { Brief, CreateDocumentInput, CreationOrigin } from "./mcp/create";
 export type { UploadImageInput } from "./mcp/image";
@@ -57,10 +75,47 @@ export type DocumentReader<Caller> = {
 		repository: string,
 		includeArchived?: boolean,
 	): Promise<DocumentSummary[] | "forbidden">;
-	read(caller: Caller, id: string): Promise<LinkedDocument | undefined>;
+	read(
+		caller: Caller,
+		id: string,
+		options?: DecisionReadRequest,
+	): Promise<LinkedDocument | undefined>;
 };
 
-export type LinkedDocument = Document & { url: string };
+export type LinkedDocument = Document & {
+	url: string;
+	decisions?: DecisionSnapshot[];
+	decisionCounts?: DecisionCounts;
+};
+
+export type AnswerDecisionMcpInput = { id: string } & DecisionAnswerPayload;
+
+export type AnswerDecision<Caller> = {
+	answer(caller: Caller, input: AnswerDecisionMcpInput): Promise<AnswerDecisionOutcome>;
+};
+
+export type BuildPlanInput = {
+	id: string;
+	idempotencyKey?: string;
+	planRevision?: number;
+	requireSettledDecisions?: boolean;
+	draftIfNeeded?: boolean;
+	retry?: boolean;
+	rebuild?: boolean;
+};
+
+export type BuildPlan<Caller> = {
+	build(caller: Caller, input: BuildPlanInput): Promise<StartPlanBuildResult>;
+};
+
+export type OrchestrateMcpInput = {
+	id: string;
+	arguments: OrchestrateArguments;
+};
+
+export type OrchestrateDocuments<Caller> = {
+	orchestrate(caller: Caller, input: OrchestrateMcpInput): Promise<OrchestrateResult>;
+};
 
 export type Implementation = {
 	document: Document;
@@ -109,20 +164,7 @@ export type Implementations<Caller> = {
 	>;
 };
 
-/** The read side of external coordination: decisions and draft graphs. */
-export type AnswerDecisionInput = {
-	id: string;
-	questionId: string;
-	/** The shared-draft revision the answer was prepared against. */
-	revision: number;
-	optionIds: string[];
-	idempotencyKey: string;
-};
-
-export type AnsweredDecision =
-	| { kind: "answered"; settled: { choices: string[]; by: string; at: string } }
-	| { kind: "replayed"; settled: { choices: string[]; by: string; at: string } };
-
+/** What an external review supplies to approve the exact draft it read. */
 export type ApproveImplementationInput = {
 	id: string;
 	graphVersion: number;
@@ -138,7 +180,8 @@ export type ApprovedGraph = {
 	version: number;
 	revision: number;
 	planRevision: number;
-	approver: string;
+	/** Who approved this version, under the name the graph version and `build_plan` use. */
+	approvedBy: string;
 	operationKey: string;
 };
 
@@ -161,23 +204,6 @@ export type ApprovalRefusal = {
 	message?: string;
 };
 
-export type AnswerRefusal = {
-	kind: "refused";
-	code:
-		| "stale"
-		| "resolved"
-		| "invalid"
-		| "draft-in-progress"
-		| "paused"
-		| "implementation-active"
-		| "idempotency-conflict"
-		| "state-diverged"
-		| "unknown-decision"
-		| "not-allowed";
-	message?: string;
-	current?: number;
-};
-
 export type Coordination<Caller> = {
 	readSnapshot(caller: Caller, id: string): Promise<
 		| { kind: "snapshot"; snapshot: CoordinationSnapshot }
@@ -185,16 +211,6 @@ export type Coordination<Caller> = {
 		| { kind: "refused"; code: "provenance-refused" }
 		| { kind: "refused"; code: "snapshot-unavailable" }
 		| { kind: "forbidden" }
-	>;
-	answer?(
-		caller: Caller,
-		input: AnswerDecisionInput,
-	): Promise<
-		| AnsweredDecision
-		| AnswerRefusal
-		| { kind: "forbidden" }
-		| { kind: "unavailable" }
-		| { kind: "archived" }
 	>;
 	approve?(
 		caller: Caller,
@@ -220,7 +236,6 @@ export type CreateDocument<Caller> = {
 		| { kind: "title-taken" }
 		| { kind: "forbidden" }
 		| { kind: "unavailable" }
-		| { kind: "visuals-required"; issues: Issue[] }
 	>;
 };
 
@@ -334,6 +349,9 @@ export type McpOptions<Caller> = {
 	archive?: ArchiveDocument<Caller>;
 	restore?: RestoreDocument<Caller>;
 	invoke?: InvokePlanner<Caller>;
+	answerDecision?: AnswerDecision<Caller>;
+	buildPlan?: BuildPlan<Caller>;
+	orchestrate?: OrchestrateDocuments<Caller>;
 	upload?: UploadImage<Caller>;
 	planSources?: RecordPlanSource<Caller>;
 	implementations?: Implementations<Caller>;
@@ -461,7 +479,9 @@ export const TOOLS: Tool[] = [
 		description: "Read a Chopin document by ID or canonical URL. The text result is a short "
 			+ "header (id, title, revision, url, size), the brief when the document has one, and the "
 			+ "document's Markdown source with its real newlines, verbatim; `structuredContent` "
-			+ `carries the whole document as before. ${READING_IN_PARTS}`,
+			+ "carries the whole document as before. Pass `includeDecisions: true`, `decisionStatus`, "
+			+ "or `decisionOrigin` to also include filtered decision snapshots (`decisions`) and "
+			+ `document-wide counts (\`decisionCounts\`). ${READING_IN_PARTS}`,
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -474,6 +494,20 @@ export const TOOLS: Tool[] = [
 				offset: { type: "integer", minimum: 1 },
 				limit: { type: "integer", minimum: 1 },
 				column: { type: "integer", minimum: 1 },
+				includeDecisions: {
+					type: "boolean",
+					description: "Include decision snapshots and total decisionCounts in the response.",
+				},
+				decisionStatus: {
+					...DECISION_STATUS_FILTER_SCHEMA,
+					description: "Filter decisions by status (`all`, one status, or a non-empty list). "
+						+ "Implies `includeDecisions: true`.",
+				},
+				decisionOrigin: {
+					...DECISION_ORIGIN_SCHEMA,
+					description: "Filter decisions by origin (`planner`, `conversation`, or `human`). "
+						+ "Implies `includeDecisions: true`.",
+				},
 			},
 			required: ["id"],
 			additionalProperties: false,
@@ -486,16 +520,214 @@ export const TOOLS: Tool[] = [
 				source: { type: "string" },
 				revision: { type: "integer", minimum: 0 },
 				url: { type: "string" },
+				decisions: { type: "array", items: DECISION_SNAPSHOT_SCHEMA },
+				decisionCounts: DECISION_COUNTS_SCHEMA,
 			},
 			required: ["id", "title", "source", "revision", "url"],
 			additionalProperties: false,
 		},
 	},
 	{
+		name: "answer_decision",
+		description: "Answer an open or reopened decision on a Chopin document atomically, using "
+			+ "the same validation, projection, persistence, broadcast, and Planner handoff core as "
+			+ "the browser UI. Pass either the decision card ID or any question ID within the card, "
+			+ "the open revision read from `read_document`, and a caller `idempotencyKey`. Exact "
+			+ "retries return the original settled result (`replayed: true`) without re-notifying "
+			+ "the Planner; reusing a key with different inputs returns `idempotency-conflict`. "
+			+ "Refuses with `draft-in-progress` when a collaborator has unsaved edits in the browser.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				id: {
+					type: "string",
+					minLength: 1,
+					maxLength: MAX_DOCUMENT_LOCATOR_LENGTH,
+					pattern: "\\S",
+				},
+				decisionId: {
+					type: "string",
+					minLength: 1,
+					maxLength: 128,
+					pattern: "\\S",
+					description: "The decision card ID or any question ID inside the card.",
+				},
+				revision: {
+					type: "integer",
+					minimum: 0,
+					description: "The open decision revision read from `read_document`.",
+				},
+				idempotencyKey: {
+					type: "string",
+					minLength: 1,
+					maxLength: 128,
+					pattern: "\\S",
+					description: "Stable caller key scoped to the user and document.",
+				},
+				optionIds: {
+					type: "array",
+					items: { type: "string", minLength: 1 },
+					description: "Selected option ID(s) for a single-question choice card.",
+				},
+				text: {
+					type: "string",
+					description: "Written answer text for a single-question text card.",
+				},
+				answers: {
+					type: "object",
+					additionalProperties: DECISION_ANSWER_VALUE_SCHEMA,
+					description: "Answers keyed by question ID (required for multi-question cards).",
+				},
+			},
+			required: ["id", "decisionId", "revision", "idempotencyKey"],
+			additionalProperties: false,
+		},
+		outputSchema: {
+			type: "object",
+			oneOf: [
+				{
+					type: "object",
+					properties: {
+						status: { type: "string", const: "answered" },
+						replayed: { type: "boolean" },
+						decisionId: { type: "string" },
+						committedAt: { type: "integer" },
+						resolver: { type: "string" },
+						answers: { type: "object", additionalProperties: { type: "string" } },
+						decision: DECISION_SNAPSHOT_SCHEMA,
+					},
+					required: [
+						"status",
+						"replayed",
+						"decisionId",
+						"committedAt",
+						"resolver",
+						"answers",
+						"decision",
+					],
+					additionalProperties: false,
+				},
+				{
+					type: "object",
+					properties: {
+						code: {
+							type: "string",
+							enum: [
+								"idempotency-conflict",
+								"unknown-decision",
+								"implementation-active",
+								"paused",
+								"already-settled",
+								"state-diverged",
+								"stale",
+								"draft-in-progress",
+								"invalid-answer",
+								"document-archived",
+								"repository-forbidden",
+								"document-unavailable",
+							],
+						},
+						message: { type: "string" },
+						currentRevision: { type: "integer", minimum: 0 },
+						status: { type: "string" },
+						resolver: { type: "string" },
+					},
+					required: ["code"],
+					additionalProperties: false,
+				},
+			],
+		},
+	},
+	{
+		name: "build_plan",
+		description: "Start (or draft-then-start, retry, or rebuild) a document's build on a paired "
+			+ "machine, recording approval provenance on the graph version. Matches browser Build "
+			+ "parity: open decisions do not block unless `requireSettledDecisions: true` is set. "
+			+ "When no current graph exists for the revision and `draftIfNeeded` is true (default), "
+			+ "asks the Planner to draft tasks and auto-queues the build once saved (refusing with "
+			+ "`graph-required` when the Planner is busy mid-turn so a Planner calls "
+			+ "`edit_implementation_graph` first). Returns `already-building` idempotently when the "
+			+ "caller already has an active build for the revision.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				id: {
+					type: "string",
+					minLength: 1,
+					maxLength: MAX_DOCUMENT_LOCATOR_LENGTH,
+					pattern: "\\S",
+				},
+				idempotencyKey: {
+					type: "string",
+					minLength: 1,
+					maxLength: 128,
+					pattern: "\\S",
+					description: "Optional caller operation key recorded on graph approval.",
+				},
+				planRevision: {
+					type: "integer",
+					minimum: 0,
+					description: "Optional optimistic concurrency fence against the document revision.",
+				},
+				requireSettledDecisions: {
+					type: "boolean",
+					default: false,
+					description:
+						"When true, refuse with `open-decisions` if any decision is open or reopened.",
+				},
+				draftIfNeeded: {
+					type: "boolean",
+					default: true,
+					description:
+						"When true, draft a missing or stale implementation graph and auto-queue once saved.",
+				},
+				retry: {
+					type: "boolean",
+					default: false,
+					description: "When true, allow retrying a stopped or failed build at the same revision.",
+				},
+				rebuild: {
+					type: "boolean",
+					default: false,
+					description:
+						"When true, queue a rebuild for edits on an already-delivered living document.",
+				},
+			},
+			required: ["id"],
+			additionalProperties: false,
+		},
+		outputSchema: { type: "object", properties: {}, additionalProperties: true },
+	},
+	{
+		name: "orchestrate",
+		description: "Coordinate top-level documents created from a source Chopin document "
+			+ "(`createdFrom`): `open` creates up to 20 documents at once; `list` reports Planner, "
+			+ "open Decisions, and build states; `decisions` reads decisions across created documents "
+			+ "with optional status/origin filters; `answer` settles one decision on a created target "
+			+ "document with Planner parity; `instruct` starts stopped Planners and steers/nudges "
+			+ "live working Planners when supported; `build` starts builds (drafting first when "
+			+ "needed); `index` writes or refreshes the table in the source document. Strictly "
+			+ "contained to direct unarchived same-repository top-level documents created from `id`.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				id: {
+					type: "string",
+					minLength: 1,
+					maxLength: MAX_DOCUMENT_LOCATOR_LENGTH,
+					pattern: "\\S",
+					description: "The source document ID or canonical URL.",
+				},
+				...ORCHESTRATE_SCHEMA.properties,
+			},
+			required: ["id", "operation"],
+			additionalProperties: false,
+		},
+		outputSchema: { type: "object", properties: {}, additionalProperties: true },
+	},
+	{
 		name: "create_document",
-		description: "Create a Chopin document from a structured brief and canonical plan. New prose "
-			+ "is assessed for useful visuals before saving. If issues name required diagrams or "
-			+ "tables, add them beside their passages and retry; the refused draft was not saved.",
+		description: "Create a Chopin document from a structured brief and canonical plan.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -540,9 +772,7 @@ export const TOOLS: Tool[] = [
 	},
 	{
 		name: "update_document",
-		description: "Replace a Chopin document's canonical plan against the revision last read. "
-			+ "New prose is assessed for useful visuals before saving. Repair any returned visual "
-			+ "issues beside the named passages and retry against the current revision.",
+		description: "Replace a Chopin document's canonical plan against the revision last read.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -917,29 +1147,6 @@ export const TOOLS: Tool[] = [
 		outputSchema: { type: "object", properties: {}, additionalProperties: true },
 	},
 	{
-		name: "answer_decision",
-		description:
-			"Record a human's answer to an open decision, asserted by the calling bridge: choose by option IDs at a shared-draft revision read from read_coordination_snapshot, naming the decision by its card id (decisions[].id) or by the id of a question inside it (decisions[].questions[].id), with an idempotency key so an identical retry replays the original settle and a conflicting reuse is refused. The answer runs through the same core as the room's own submit path, settles under the caller's GitHub login, and refuses a decision whose shared draft has in-flight edits (draft-in-progress), whose revision moved (stale, carrying the current one), or that is paused, resolved or being implemented; an id matching no decision refuses as unknown-decision. Written-response questions cannot be answered here.",
-		inputSchema: {
-			type: "object",
-			properties: {
-				id: { type: "string", minLength: 1, maxLength: MAX_DOCUMENT_LOCATOR_LENGTH },
-				questionId: { type: "string", minLength: 1, maxLength: 128 },
-				revision: { type: "integer", minimum: 0 },
-				optionIds: {
-					type: "array",
-					items: { type: "string", minLength: 1, maxLength: 256 },
-					minItems: 1,
-					maxItems: 32,
-				},
-				idempotencyKey: { type: "string", minLength: 1, maxLength: 128 },
-			},
-			required: ["id", "questionId", "revision", "optionIds", "idempotencyKey"],
-			additionalProperties: false,
-		},
-		outputSchema: { type: "object", properties: {}, additionalProperties: true },
-	},
-	{
 		name: "approve_implementation",
 		description:
 			"Approve the implementation-graph draft an external review read, proving it approves exactly those bytes: supply the counters and canonical digest read_coordination_snapshot returned, with an idempotency key so an identical retry replays the original approval and a conflicting reuse is refused. Follows the browser build path's own checks — every counter and the digest must match, the plan must be ready, and no decision may still be open or reopened — then records the approver and operation key on the approved version. Refusals are typed: stale-plan, reviewed-graph-changed, digest-mismatch, not-ready (with blockers), open-decision (with the ids), implementation-active, not-draft.",
@@ -1007,24 +1214,46 @@ function documentContent(
 	document: LinkedDocument,
 	range: { offset?: number; limit?: number; column?: number },
 ): ReturnType<typeof text> {
-	let { id, title, description, archivedAt, revision, url, source, brief } = document;
-	let notes = brief
-		? [{
-			title: "Brief:",
-			items: [
-				`goal: ${brief.goal}`,
-				...[
-					["constraint", brief.constraints],
-					["settled decision", brief.settledDecisions],
-					["open question", brief.openQuestions],
-					["repository finding", brief.repositoryFindings],
-				].flatMap(([name, items]) => (items as string[]).map(item => `${name}: ${item}`)),
-			],
-			bytes: NOTE_BYTES.brief,
-			rest: (omitted: number) =>
-				`(${omitted} more brief lines are not shown; the whole brief is in structuredContent.brief.)`,
-		}]
-		: [];
+	let {
+		id,
+		title,
+		description,
+		archivedAt,
+		revision,
+		url,
+		source,
+		brief,
+		decisions,
+		decisionCounts,
+	} = document;
+	let notes = [
+		...(brief
+			? [{
+				title: "Brief:",
+				items: [
+					`goal: ${brief.goal}`,
+					...[
+						["constraint", brief.constraints],
+						["settled decision", brief.settledDecisions],
+						["open question", brief.openQuestions],
+						["repository finding", brief.repositoryFindings],
+					].flatMap(([name, items]) => (items as string[]).map(item => `${name}: ${item}`)),
+				],
+				bytes: NOTE_BYTES.brief,
+				rest: (omitted: number) =>
+					`(${omitted} more brief lines are not shown; the whole brief is in structuredContent.brief.)`,
+			}]
+			: []),
+		...(decisions !== undefined && decisionCounts !== undefined
+			? [{
+				title: "Decisions:",
+				items: decisionNoteLines(decisions, decisionCounts),
+				bytes: NOTE_BYTES.decisions,
+				rest: (omitted: number) =>
+					`(${omitted} more decision lines are not shown; all decisions are in structuredContent.decisions.)`,
+			}]
+			: []),
+	];
 	return {
 		content: [{
 			type: "text",
@@ -1147,29 +1376,6 @@ function approveArguments(value: Record<string, unknown>): ApproveImplementation
 		: undefined;
 }
 
-function answerArguments(value: Record<string, unknown>): AnswerDecisionInput | undefined {
-	let optionIds = Array.isArray(value.optionIds)
-			&& value.optionIds.length >= 1 && value.optionIds.length <= 32
-			&& value.optionIds.every(item => shortText(item, 256))
-		? value.optionIds as string[]
-		: undefined;
-	let revision = typeof value.revision === "number" && Number.isInteger(value.revision)
-			&& value.revision >= 0
-		? value.revision
-		: undefined;
-	return isLocator(value.id)
-			&& shortText(value.questionId, 128) && shortText(value.idempotencyKey, 128)
-			&& revision !== undefined && optionIds
-		? {
-			id: value.id,
-			questionId: value.questionId,
-			revision,
-			optionIds,
-			idempotencyKey: value.idempotencyKey,
-		}
-		: undefined;
-}
-
 function listArguments(
 	value: Record<string, unknown>,
 ): { repository: string; includeArchived: boolean } | undefined {
@@ -1244,6 +1450,9 @@ function serviceInstructions(tools: Tool[]): string | undefined {
 		|| tool.name === "archive_document"
 		|| tool.name === "restore_document"
 		|| tool.name === "invoke_planner"
+		|| tool.name === "answer_decision"
+		|| tool.name === "build_plan"
+		|| tool.name === "orchestrate"
 		|| tool.name === "upload_image"
 		|| tool.name === "record_plan_source"
 	);
@@ -1317,13 +1526,15 @@ export function handler<Caller>(
 		&& (tool.name !== "archive_document" || archiving)
 		&& (tool.name !== "restore_document" || restoring)
 		&& (tool.name !== "invoke_planner" || options.invoke)
+		&& (tool.name !== "answer_decision" || options.answerDecision)
+		&& (tool.name !== "build_plan" || options.buildPlan)
+		&& (tool.name !== "orchestrate" || options.orchestrate)
 		&& (tool.name !== "upload_image" || options.upload)
 		&& (tool.name !== "record_plan_source" || options.planSources)
 		&& (!["read_implementation", "start_implementation"].includes(tool.name)
 			|| options.implementations)
 		&& (!isLifecycleTool(tool.name) || options.implementations?.reportLifecycle)
 		&& (tool.name !== "read_coordination_snapshot" || options.coordination)
-		&& (tool.name !== "answer_decision" || options.coordination?.answer)
 		&& (tool.name !== "approve_implementation" || options.coordination?.approve)
 	);
 	let instructions = serviceInstructions(tools);
@@ -1391,7 +1602,16 @@ export function handler<Caller>(
 						: respond(text({ documents }));
 				}
 				if (tool.name === "read_document") {
-					let { id, offset, limit, column, ...extra } = tool.arguments;
+					let {
+						id,
+						offset,
+						limit,
+						column,
+						includeDecisions,
+						decisionStatus,
+						decisionOrigin,
+						...extra
+					} = tool.arguments;
 					if (Object.keys(extra).length || !isLocator(id)) {
 						return notification
 							? undefined
@@ -1404,7 +1624,61 @@ export function handler<Caller>(
 								: error(call.id, -32602, "offset, limit and column must be integers of at least 1");
 						}
 					}
-					let document = await options.documents.read(caller, id);
+					if (includeDecisions !== undefined && typeof includeDecisions !== "boolean") {
+						return notification
+							? undefined
+							: error(call.id, -32602, "includeDecisions must be a boolean");
+					}
+					let parsedStatus: DecisionReadRequest["decisionStatus"];
+					if (decisionStatus !== undefined) {
+						let checked = parseDecisionStatusFilter(decisionStatus);
+						if (!checked) {
+							return notification
+								? undefined
+								: error(
+									call.id,
+									-32602,
+									"decisionStatus must be `all`, a decision status, or a non-empty list of statuses",
+								);
+						}
+						parsedStatus = typeof checked === "string" ? checked : [...checked];
+					}
+					let parsedOrigin: DecisionReadRequest["decisionOrigin"];
+					if (decisionOrigin !== undefined) {
+						let checked = parseDecisionOrigin(decisionOrigin);
+						if (!checked) {
+							return notification
+								? undefined
+								: error(
+									call.id,
+									-32602,
+									"decisionOrigin must be `planner`, `conversation`, or `human`",
+								);
+						}
+						parsedOrigin = checked;
+					}
+					if (
+						includeDecisions === false
+						&& (parsedStatus !== undefined || parsedOrigin !== undefined)
+					) {
+						return notification
+							? undefined
+							: error(
+								call.id,
+								-32602,
+								"decisionStatus and decisionOrigin cannot be used with includeDecisions: false",
+							);
+					}
+					let wantsDecisions = includeDecisions === true
+						|| parsedStatus !== undefined
+						|| parsedOrigin !== undefined;
+					let document = wantsDecisions
+						? await options.documents.read(caller, id, {
+							includeDecisions: true,
+							...(parsedStatus !== undefined ? { decisionStatus: parsedStatus } : {}),
+							...(parsedOrigin !== undefined ? { decisionOrigin: parsedOrigin } : {}),
+						})
+						: await options.documents.read(caller, id);
 					if (!document) return respond({ content: [], isError: true });
 					try {
 						return respond(
@@ -1419,6 +1693,103 @@ export function handler<Caller>(
 						return notification ? undefined : error(call.id, -32602, err.message);
 					}
 				}
+				if (tool.name === "answer_decision" && options.answerDecision) {
+					let args = tool.arguments;
+					let allowed = new Set([
+						"id",
+						"decisionId",
+						"revision",
+						"idempotencyKey",
+						"optionIds",
+						"text",
+						"answers",
+					]);
+					if (Object.keys(args).some(key => !allowed.has(key)) || !isLocator(args.id)) {
+						return notification
+							? undefined
+							: error(
+								call.id,
+								-32602,
+								"answer_decision requires an id or URL, decisionId, revision, idempotencyKey, and an answer",
+							);
+					}
+					let parsed = parseDecisionAnswerPayload(args);
+					if (!parsed.ok) {
+						return notification ? undefined : error(call.id, -32602, parsed.message);
+					}
+					let outcome = await options.answerDecision.answer(caller, {
+						id: args.id,
+						...parsed.value,
+					});
+					return outcome.kind === "answered"
+						? respond(text(outcome.result))
+						: respond(text(outcome.refusal, true));
+				}
+				if (tool.name === "build_plan" && options.buildPlan) {
+					let args = tool.arguments;
+					let allowed = new Set([
+						"id",
+						"idempotencyKey",
+						"planRevision",
+						"requireSettledDecisions",
+						"draftIfNeeded",
+						"retry",
+						"rebuild",
+					]);
+					if (
+						Object.keys(args).some(key => !allowed.has(key))
+						|| !isLocator(args.id)
+						|| (Object.hasOwn(args, "idempotencyKey") && !isIdempotencyKey(args.idempotencyKey))
+						|| (Object.hasOwn(args, "planRevision")
+							&& (!Number.isSafeInteger(args.planRevision) || (args.planRevision as number) < 0))
+						|| (Object.hasOwn(args, "requireSettledDecisions")
+							&& typeof args.requireSettledDecisions !== "boolean")
+						|| (Object.hasOwn(args, "draftIfNeeded") && typeof args.draftIfNeeded !== "boolean")
+						|| (Object.hasOwn(args, "retry") && typeof args.retry !== "boolean")
+						|| (Object.hasOwn(args, "rebuild") && typeof args.rebuild !== "boolean")
+					) {
+						return notification
+							? undefined
+							: error(
+								call.id,
+								-32602,
+								"build_plan requires an id or URL and valid optional build flags",
+							);
+					}
+					let outcome = await options.buildPlan.build(caller, args as BuildPlanInput);
+					if (outcome.status === "refused") {
+						let { status: _status, ...refusal } = outcome;
+						return respond(text(refusal, true));
+					}
+					return respond(text(outcome));
+				}
+				if (tool.name === "orchestrate" && options.orchestrate) {
+					let { id, ...rest } = tool.arguments;
+					if (!isLocator(id)) {
+						return notification
+							? undefined
+							: error(call.id, -32602, "orchestrate requires a source document id or URL");
+					}
+					let parsed: OrchestrateArguments;
+					try {
+						parsed = orchestrateArguments(rest);
+					} catch (err) {
+						return notification
+							? undefined
+							: error(call.id, -32602, err instanceof Error ? err.message : "invalid arguments");
+					}
+					let outcome = await options.orchestrate.orchestrate(caller, { id, arguments: parsed });
+					if (outcome.ok) return respond(text(outcome));
+					return respond(text({
+						code: outcome.reason,
+						message: outcome.message,
+						...(outcome.currentRevision !== undefined
+							? { currentRevision: outcome.currentRevision }
+							: {}),
+						...(outcome.status !== undefined ? { status: outcome.status } : {}),
+						...(outcome.resolver !== undefined ? { resolver: outcome.resolver } : {}),
+					}, true));
+				}
 				if (tool.name === "create_document" && creation) {
 					let prepared = prepare(tool.arguments);
 					if (!prepared) {
@@ -1428,9 +1799,6 @@ export function handler<Caller>(
 					}
 					if ("issues" in prepared) return respond(text({ issues: prepared.issues }, true));
 					let outcome = await creation.create(caller, prepared.input);
-					if (outcome.kind === "visuals-required") {
-						return respond(text({ issues: outcome.issues }, true));
-					}
 					if (outcome.kind === "created" || outcome.kind === "replayed") {
 						return respond(text(outcome.document));
 					}
@@ -1457,9 +1825,6 @@ export function handler<Caller>(
 						name: client.name,
 						version: client.version,
 					});
-					if (outcome.kind === "visuals-required") {
-						return respond(text({ issues: outcome.issues }, true));
-					}
 					if (outcome.kind === "updated" || outcome.kind === "replayed") {
 						return respond(text(outcome.document));
 					}
@@ -1720,40 +2085,6 @@ export function handler<Caller>(
 						return respond(text({ code: "repository-forbidden" }, true));
 					}
 					return respond(text({ code: outcome.code }, true));
-				}
-				if (tool.name === "answer_decision") {
-					let input = answerArguments(tool.arguments);
-					if (!input) {
-						return notification
-							? undefined
-							: error(
-								call.id,
-								-32602,
-								"answer_decision requires an id or URL, questionId, revision, optionIds and idempotencyKey",
-							);
-					}
-					let answer = options.coordination?.answer;
-					if (!answer) {
-						return respond(text({ code: "not-allowed" }, true));
-					}
-					let outcome = await answer(caller, input);
-					if (outcome.kind === "answered" || outcome.kind === "replayed") {
-						return respond(text({ state: outcome.kind, settled: outcome.settled }));
-					}
-					if (outcome.kind === "forbidden") {
-						return respond(text({ code: "repository-forbidden" }, true));
-					}
-					if (outcome.kind === "unavailable") {
-						return respond(text({ code: "document-unavailable" }, true));
-					}
-					if (outcome.kind === "archived") {
-						return respond(text({ code: "document-archived" }, true));
-					}
-					return respond(text({
-						code: outcome.code,
-						...(outcome.message !== undefined ? { message: outcome.message } : {}),
-						...(outcome.current !== undefined ? { current: outcome.current } : {}),
-					}, true));
 				}
 				if (tool.name === "approve_implementation") {
 					let input = approveArguments(tool.arguments);

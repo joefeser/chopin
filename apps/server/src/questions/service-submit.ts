@@ -1,8 +1,6 @@
 import * as Question from "@chopin/question";
 import * as Y from "yjs";
 
-import { createHash } from "node:crypto";
-
 import { activeSettleDeferral } from "../conversation-plan/preference";
 import { ConversationCapacityError } from "../conversation-plan/events";
 
@@ -25,175 +23,231 @@ import { appendProseEffect, settleIntent } from "../conversation-plan/prose-job"
 import { appendFollowupEffect } from "./decision-followup";
 import { plannerToActOn } from "./answer-turns";
 import { decisionGeneration } from "./card-actions";
+import {
+	isCardDraftUntouched,
+	readDecisionSnapshot,
+	resolveDecisionRecord,
+} from "./read-decisions";
+import type { DecisionSnapshot } from "./read-decisions";
 
 import type { CardEvent } from "./card-event";
 import { announce, emit, pending } from "./card-notifications";
 import { decide } from "./service-definition";
-import { classifyCoordination, coordinationFingerprint } from "../tasks/coordination-ops";
 
-import type { Answer } from "@chopin/question";
-import type { Claim } from "./store-types";
-import type { CoordinationOpRecord } from "../tasks/coordination-ops";
+export type DecisionAnswerValue = {
+	optionIds?: string[];
+	text?: string;
+};
 
-// Exact archive 446a9779a937fa5be7cd3eb52fd7f3023d691ed2 declarations; import/export wrappers only.
-export async function submit(
-	plan: Plan,
-	server: Server<SocketData>,
-	roomId: string,
-	ws: Socket,
-	msg: Request<Wire.Submit.Ask>,
-	onCommitted?: (intent: NonNullable<ReturnType<typeof settleIntent>>) => void,
-	/** A saved answer the Planner asked for without waiting, which it should now act on. */
-	onPlannerAnswer?: (id: string, generation: number) => void,
-): Promise<void> {
-	if (Service.implementationActive(plan)) return fail(ws, msg.rid, "implementation is active");
-	if (pausedForVerification(plan, msg.id)) {
-		return reply(ws, msg.rid, {
-			kind: "question:submit",
-			ts: 0,
-			id: msg.id,
-			ok: false,
-			reason: "invalid",
-			message: "This decision is paused pending verification",
-		});
-	}
-	let claimed = Store.claimSubmit(
-		plan.questions,
-		msg.id,
-		msg.revision,
-		ws.data.handle,
-		msg.suggestedOptionId,
-	);
-	if (!claimed.ok) {
-		return reply(ws, msg.rid, { kind: "question:submit", ts: 0, id: msg.id, ...claimed });
-	}
-	const outcome = await commitAnswer(
-		plan,
-		server,
-		roomId,
-		claimed.claim,
-		claimed.answers,
-		ws.data.handle,
-		{ onCommitted },
-	);
-	if (!outcome.ok) {
-		if (outcome.reason === "invalid") {
-			return reply(ws, msg.rid, {
-				kind: "question:submit",
-				ts: 0,
-				id: msg.id,
-				ok: false,
-				reason: "invalid",
-				message: outcome.message,
-			});
-		}
-		return fail(
-			ws,
-			msg.rid,
-			outcome.error instanceof ConversationCapacityError
-				|| outcome.error instanceof Error && outcome.error.message === "implementation is active"
-				? outcome.error.message
-				: "could not save the decision",
-		);
-	}
-	outcome.finish();
-	let event: CardEvent = {
-		kind: "decided",
-		id: msg.id,
-		...(outcome.record.threadId ? { threadId: outcome.record.threadId } : {}),
-		actor: ws.data.handle,
-		optionIds: outcome.optionIds,
-	};
-	for (
-		let notify of [
-			() =>
-				reply(ws, msg.rid, {
-					kind: "question:submit",
-					ts: 0,
-					id: msg.id,
-					ok: true,
-					answers: outcome.answers,
-					resolver: ws.data.handle,
-				}),
-			() =>
-				plannerToActOn(outcome.record, claimed.claim.entry)
-					? onPlannerAnswer?.(msg.id, decisionGeneration(outcome.record))
-					: undefined,
-		]
-	) {
-		try {
-			notify();
-		} catch (error) {
-			console.error("[questions] could not announce a saved decision:", error);
-		}
-	}
-	notifyAnswered(plan, server, roomId, {
-		id: msg.id,
-		resolver: ws.data.handle,
-		answers: outcome.answers,
-	}, event);
-}
+export type AnswerDecisionInput = {
+	/** Decision card ID or any question ID within the card. */
+	decisionId: string;
+	revision: number;
+	resolver: string;
+	optionIds?: string[];
+	text?: string;
+	answers?: { [questionId: string]: DecisionAnswerValue };
+};
 
-/** Whether a decision is paused pending conversation verification. */
-function pausedForVerification(plan: Plan, id: string): boolean {
+export type AnswerDecisionResult =
+	| {
+		ok: true;
+		decisionId: string;
+		committedAt: number;
+		resolver: string;
+		answers: { [questionId: string]: string };
+		decision: DecisionSnapshot;
+	}
+	| { ok: false; code: "unknown-decision" }
+	| { ok: false; code: "implementation-active" }
+	| { ok: false; code: "paused" }
+	| { ok: false; code: "already-settled"; status: Record["status"]; resolver?: string }
+	| { ok: false; code: "state-diverged" }
+	| { ok: false; code: "stale"; currentRevision: number }
+	| { ok: false; code: "draft-in-progress"; currentRevision: number }
+	| { ok: false; code: "invalid-answer"; message: string };
+
+function isRecordPaused(plan: Plan, id: string): boolean {
 	let record = plan.records.get(id);
 	let thread = plan.conversationPlan.threads.find(item => item.id === record?.threadId);
 	return !!thread && !!activeSettleDeferral(thread, plan.conversationPlan.events);
 }
 
-/** What a claimed settle's durable half did. */
-export type CommitOutcome =
+function buildExplicitAnswers(
+	definition: Question.Definition,
+	input: Pick<AnswerDecisionInput, "optionIds" | "text" | "answers">,
+): { ok: true; answers: Question.Answer[] } | { ok: false; message: string } {
+	let hasMap = input.answers !== undefined;
+	let hasFlat = input.optionIds !== undefined || input.text !== undefined;
+	if (hasMap && hasFlat) {
+		return {
+			ok: false,
+			message: "Provide either `answers` or top-level `optionIds`/`text`, not both.",
+		};
+	}
+	if (!hasMap && !hasFlat) {
+		return {
+			ok: false,
+			message: "An answer is required: provide `optionIds`, `text`, or `answers`.",
+		};
+	}
+	let byQuestion: { [questionId: string]: DecisionAnswerValue };
+	if (hasMap) {
+		let knownQuestions = new Set(definition.questions.map(question => question.id));
+		for (let questionId of Object.keys(input.answers!)) {
+			if (!knownQuestions.has(questionId)) {
+				return { ok: false, message: `Unknown question id: ${questionId}` };
+			}
+		}
+		byQuestion = input.answers!;
+	} else {
+		if (definition.questions.length !== 1) {
+			return {
+				ok: false,
+				message: "This decision has multiple questions; provide `answers` keyed by question ID.",
+			};
+		}
+		byQuestion = {
+			[definition.questions[0]!.id]: {
+				...(input.optionIds !== undefined ? { optionIds: input.optionIds } : {}),
+				...(input.text !== undefined ? { text: input.text } : {}),
+			},
+		};
+	}
+
+	let drafts: Question.Drafts = {};
+	for (let question of definition.questions) {
+		let supplied = byQuestion[question.id];
+		if (!supplied) return { ok: false, message: `${question.header} requires an answer` };
+		if (supplied.optionIds !== undefined && supplied.text !== undefined) {
+			return {
+				ok: false,
+				message: `${question.header} accepts either optionIds or text, not both`,
+			};
+		}
+		if (supplied.optionIds === undefined && supplied.text === undefined) {
+			return { ok: false, message: `${question.header} requires an answer` };
+		}
+		if (supplied.optionIds !== undefined) {
+			if (question.response === "text") {
+				return { ok: false, message: `${question.header} requires a written answer` };
+			}
+			if (supplied.optionIds.length === 0) {
+				return { ok: false, message: `${question.header} requires an answer` };
+			}
+			if (new Set(supplied.optionIds).size !== supplied.optionIds.length) {
+				return { ok: false, message: `${question.header} has duplicate optionIds` };
+			}
+			if (!question.multiple && supplied.optionIds.length > 1) {
+				return { ok: false, message: `${question.header} accepts only one answer` };
+			}
+			let knownOptions = new Set(question.options.map(option => option.id));
+			let unknownOption = supplied.optionIds.find(optionId => !knownOptions.has(optionId));
+			if (unknownOption !== undefined) {
+				return { ok: false, message: `${question.header} has unknown option id: ${unknownOption}` };
+			}
+			let selected = new Set(supplied.optionIds);
+			drafts[question.id] = {
+				mode: "choices",
+				choice: question.multiple ? null : (supplied.optionIds[0] ?? null),
+				options: Object.fromEntries(
+					question.options.map(option => [option.id, selected.has(option.id)]),
+				),
+				custom: "",
+			};
+		} else {
+			let written = supplied.text!;
+			if (!question.verbatim && written.length > Question.limits.MAX_CUSTOM) {
+				return {
+					ok: false,
+					message: `${question.header} exceeds ${Question.limits.MAX_CUSTOM} characters`,
+				};
+			}
+			drafts[question.id] = {
+				mode: "custom",
+				choice: null,
+				options: Object.fromEntries(question.options.map(option => [option.id, false])),
+				custom: written,
+			};
+		}
+	}
+
+	let outcome = Question.derive(definition, drafts);
+	if (!outcome.ok) return { ok: false, message: outcome.message };
+	return { ok: true, answers: outcome.answers };
+}
+
+type SettleAttempt =
 	| {
 		ok: true;
-		answers: Answer[];
-		record: Record;
-		optionIds: string[];
-		/** Closes the claim once the answer is durable; call after announcing. */
 		finish: () => Store.Ended;
+		optionIds: string[];
+		committedAt: number;
 	}
-	| { ok: false; reason: "invalid"; message: string }
-	| { ok: false; reason: "failure"; error: unknown };
+	| {
+		ok: false;
+		invalid?: string;
+		failure?: unknown;
+		reason?:
+			| { code: "unknown-decision" }
+			| { code: "implementation-active" }
+			| { code: "paused" }
+			| { code: "already-settled"; status: Record["status"]; resolver?: string }
+			| { code: "state-diverged" }
+			| { code: "stale"; currentRevision: number };
+	};
 
-export type CommitExtras = {
-	/** Fires with the settle intent once the answer is durable. */
-	onCommitted?: (intent: NonNullable<ReturnType<typeof settleIntent>>) => void;
-	/** A B4 operation record that commits atomically with the answer. */
-	coordination?: CoordinationOpRecord;
-};
-
-/**
- * The durable half of any settle: the same re-checks, staged projection,
- * size check and persist-before-broadcast commit for the room's own submit
- * path and for an external coordination answer, so the two cannot drift.
- */
-async function commitAnswer(
+async function settleClaimed(
 	plan: Plan,
 	server: Server<SocketData>,
 	roomId: string,
-	claim: Claim,
-	answers: Answer[],
+	cardId: string,
 	resolver: string,
-	extras: CommitExtras = {},
-): Promise<CommitOutcome> {
-	let id = claim.id;
+	claim: Store.Claim,
+	claimedAnswers: Question.Answer[],
+	onCommitted?: (intent: NonNullable<ReturnType<typeof settleIntent>>) => void,
+): Promise<SettleAttempt> {
 	let invalid: string | undefined;
 	let failure: unknown;
+	let reason: Extract<SettleAttempt, { ok: false }>["reason"];
 	let finish: (() => Store.Ended) | undefined;
 	let optionIds: string[] = [];
-	let answeredRecord: Record | undefined;
+	let committedAt = 0;
 	try {
 		await Service.exclusive(plan, async () => {
-			if (Service.implementationActive(plan)) throw new Error("implementation is active");
-			if (pausedForVerification(plan, id)) {
+			if (Service.implementationActive(plan)) {
+				reason = { code: "implementation-active" };
+				throw new Error("implementation is active");
+			}
+			if (isRecordPaused(plan, cardId)) {
+				reason = { code: "paused" };
 				invalid = "This decision is paused pending verification";
 				return;
 			}
-			let record = plan.records.get(id);
-			if (!record || !isOpenStatus(record.status)) {
+			let record = plan.records.get(cardId);
+			if (!record) {
+				reason = { code: "unknown-decision" };
 				invalid = "This decision is no longer open";
 				return;
 			}
-			if (plan.questions.open.get(id) !== claim.entry) {
+			if (!isOpenStatus(record.status)) {
+				let settledBy = record.resolver ?? record.owner;
+				reason = {
+					code: "already-settled",
+					status: record.status,
+					...(settledBy !== undefined ? { resolver: settledBy } : {}),
+				};
+				invalid = "This decision is no longer open";
+				return;
+			}
+			let currentEntry = plan.questions.open.get(cardId);
+			if (!currentEntry) {
+				reason = { code: "state-diverged" };
+				invalid = "This decision is no longer open";
+				return;
+			}
+			if (currentEntry !== claim.entry) {
+				reason = { code: "stale", currentRevision: currentEntry.revision };
 				invalid = "This decision is no longer open";
 				return;
 			}
@@ -206,18 +260,19 @@ async function commitAnswer(
 					[],
 				);
 				stagedDocument.seq = plan.document.seq;
-				let projected = decide({ status: "answered", answers }, record.definition);
+				let answers = decide({ status: "answered", answers: claimedAnswers }, record.definition);
 				let chosen: { [question: string]: string[] } = {};
 				record.definition.questions.forEach((question, index) => {
-					let ids = answers[index]?.optionIds;
+					let ids = claimedAnswers[index]?.optionIds;
 					if (ids?.length) chosen[question.id] = ids;
 				});
 				optionIds = Object.values(chosen).flat();
 				let at = Math.floor(Date.now() / 1_000);
+				committedAt = at;
 				let settled = { by: resolver, at: new Date(at * 1_000).toISOString() };
 				// The saved answer keeps a snapshot of the matrix: the draft is replaced on reopen.
-				let marks = answers[0]?.marks;
-				let mutation = room.projectAnswer(stagedDocument, id, projected, settled, chosen, marks);
+				let marks = claimedAnswers[0]?.marks;
+				let mutation = room.projectAnswer(stagedDocument, cardId, answers, settled, chosen, marks);
 				// A long answer can push the document past its size limit, after which the
 				// Planner can no longer edit it; check the staged copy so a refusal changes nothing.
 				try {
@@ -231,7 +286,7 @@ async function commitAnswer(
 				let answered: Record = {
 					...record,
 					status: "answered",
-					answers: projected,
+					answers,
 					resolver,
 					at,
 					owner: resolver,
@@ -240,9 +295,9 @@ async function commitAnswer(
 					...(marks ? { marks } : {}),
 					editors: [...new Set([...record.editors, ...claim.entry.editors])],
 					anchors: Anchors.answer(record),
+					lastRevision: claim.entry.revision,
 				};
-				records.set(id, answered);
-				answeredRecord = answered;
+				records.set(cardId, answered);
 				let intent = settleIntent(answered);
 				let effects = appendFollowupEffect(
 					appendProseEffect(
@@ -264,26 +319,23 @@ async function commitAnswer(
 					questions: stagedQuestions,
 					records,
 					conversationPlanPendingEffects: effects,
-					...(extras.coordination
-						? { coordinationOps: [...plan.coordinationOps, extras.coordination] }
-						: {}),
 					pendingCardActions: pending(
 						plan,
 						record,
 						{
 							kind: "decided",
-							id,
+							id: cardId,
 							actor: resolver,
 							optionIds,
 						},
 						at,
-						answers.map(Question.summarize).join("; "),
+						claimedAnswers.map(Question.summarize).join("; "),
 					),
 				}, mutation);
 				finish = complete;
 				if (intent) {
 					try {
-						extras.onCommitted?.(intent);
+						onCommitted?.(intent);
 					} catch (error) {
 						console.error("[questions] could not capture saved decision claimant:", error);
 					}
@@ -298,45 +350,52 @@ async function commitAnswer(
 	} catch (err) {
 		failure = err;
 	}
-	if (!finish) {
-		Store.rollback(plan.questions, claim);
-		if (invalid !== undefined) return { ok: false, reason: "invalid", message: invalid };
-		return { ok: false, reason: "failure", error: failure };
-	}
-	return {
-		ok: true,
-		answers,
-		record: answeredRecord!,
-		optionIds,
-		finish,
-	};
+	if (!finish) return { ok: false, invalid, failure, reason };
+	return { ok: true, finish, optionIds, committedAt };
 }
 
-/** Tell the room a decision resolved: broadcast, announce, re-anchor, record the event. */
-function notifyAnswered(
+function publishDecisionNotifications(
 	plan: Plan,
 	server: Server<SocketData>,
 	roomId: string,
-	detail: { id: string; resolver: string; answers: Answer[] },
-	event: CardEvent,
+	cardId: string,
+	resolver: string,
+	answers: Question.Answer[],
+	optionIds: string[],
+	entry: Store.Claim["entry"],
+	onPlannerAnswer?: (id: string, generation: number) => void,
+	beforeBroadcast?: () => void,
 ): void {
-	for (
-		let notify of [
-			() =>
-				broadcast(server, roomId, {
-					kind: "question:resolved",
-					ts: 0,
-					id: detail.id,
-					status: "answered",
-					resolver: detail.resolver,
-					answers: detail.answers,
-				}),
-			() => announce(plan, server, roomId, detail.id),
-			// An answer can put a review on the Planner's list; readers learn its prose is owed.
-			() => Service.anchors(plan, server, roomId),
-			() => emit(plan, event),
-		]
-	) {
+	let record = plan.records.get(cardId)!;
+	let event: CardEvent = {
+		kind: "decided",
+		id: cardId,
+		...(record.threadId ? { threadId: record.threadId } : {}),
+		actor: resolver,
+		optionIds,
+	};
+	let notifications = [
+		...(beforeBroadcast ? [beforeBroadcast] : []),
+		() =>
+			broadcast(server, roomId, {
+				kind: "question:resolved",
+				ts: 0,
+				id: cardId,
+				status: "answered",
+				resolver,
+				answers,
+			}),
+		() => announce(plan, server, roomId, cardId),
+		// An answer can put a review on the Planner's list; readers learn its prose is owed.
+		() => Service.anchors(plan, server, roomId),
+		() => emit(plan, event),
+		() => {
+			if (plannerToActOn(record, entry)) {
+				onPlannerAnswer?.(cardId, decisionGeneration(record));
+			}
+		},
+	];
+	for (let notify of notifications) {
 		try {
 			notify();
 		} catch (error) {
@@ -345,243 +404,184 @@ function notifyAnswered(
 	}
 }
 
-export type ExternalAnswerInput = {
-	questionId: string;
-	/** The shared-draft revision the answer was prepared against. */
-	revision: number;
-	optionIds: string[];
-	/** GitHub login of the allowlisted caller; the identity the answer settles by. */
-	resolver: string;
-	idempotencyKey: string;
-};
-
-export type ExternalAnswer =
-	| {
-		kind: "answered";
-		answers: Answer[];
-		settled: { choices: string[]; by: string; at: string };
-	}
-	| { kind: "replayed"; settled: { choices: string[]; by: string; at: string } }
-	| {
-		kind: "refused";
-		code:
-			| "stale"
-			| "resolved"
-			| "invalid"
-			| "draft-in-progress"
-			| "paused"
-			| "implementation-active"
-			| "idempotency-conflict"
-			| "state-diverged"
-			| "unknown-decision";
-		message?: string;
-		current?: number;
-	};
-
-/** The complete reviewed request an external answer asks to settle. */
-function answerPayloadDigest(input: ExternalAnswerInput): string {
-	return createHash("sha256").update(JSON.stringify({
-		idempotencyKey: input.idempotencyKey,
-		questionId: input.questionId,
-		revision: input.revision,
-		optionIds: [...input.optionIds],
-	})).digest("hex");
-}
-
 /**
- * The decision a claim names. The store keys its entries by the decision
- * card's id, and read_coordination_snapshot exposes both the card and the
- * question ids inside it, so accept either: the card id itself, or a
- * question id mapped to its owning card through the durable records.
- * Anything else is unknown — the caller hears exactly that, never a
- * synthesized cancellation.
+ * Answer an open or reopened decision explicitly (by card ID or any question ID) using the exact
+ * same atomic staging, projection, persistence, broadcast, and Planner handoff core as browser
+ * WebSocket submission.
  */
-function resolveDecisionId(plan: Plan, ref: string): string | undefined {
-	if (plan.records.has(ref)) return ref;
-	for (let [id, record] of plan.records) {
-		if (record.definition.questions.some(question => question.id === ref)) return id;
-	}
-	return undefined;
-}
-
-/**
- * Record a human's answer, asserted by an external coordination caller,
- * through the same durable core as the room's own submit path: the same
- * pre-checks and re-checks, the same staged projection and size check, the
- * same persist-before-broadcast commit, with the B4 operation record riding
- * that commit so the answer and its idempotency ledger cannot diverge. The
- * Planner handoff is the room's own too: a decision the Planner left open to
- * act on later hands its answer over exactly as a Save would, so an external
- * settle starts the Planner's turn instead of starving it.
- */
-export async function answerExternal(
+export async function answerDecision(
 	plan: Plan,
 	server: Server<SocketData>,
 	roomId: string,
-	input: ExternalAnswerInput,
-	onPlannerAnswer?: (id: string, generation: number) => void,
-): Promise<ExternalAnswer> {
-	let decisionId = resolveDecisionId(plan, input.questionId);
-	if (!decisionId) {
+	input: AnswerDecisionInput,
+	callbacks?: {
+		onCommitted?: (intent: NonNullable<ReturnType<typeof settleIntent>>) => void;
+		onPlannerAnswer?: (id: string, generation: number) => void;
+	},
+): Promise<AnswerDecisionResult> {
+	let record = resolveDecisionRecord(plan.records, input.decisionId);
+	if (!record) return { ok: false, code: "unknown-decision" };
+	let cardId = record.id;
+	if (Service.implementationActive(plan)) return { ok: false, code: "implementation-active" };
+	if (isRecordPaused(plan, cardId)) return { ok: false, code: "paused" };
+	if (!isOpenStatus(record.status)) {
+		let settledBy = record.resolver ?? record.owner;
 		return {
-			kind: "refused",
-			code: "unknown-decision",
-			message: `no decision matches ${input.questionId}`,
+			ok: false,
+			code: "already-settled",
+			status: record.status,
+			...(settledBy !== undefined ? { resolver: settledBy } : {}),
 		};
 	}
-	if (Service.implementationActive(plan)) {
-		return { kind: "refused", code: "implementation-active" };
+	let entry = plan.questions.open.get(cardId);
+	if (!entry) return { ok: false, code: "state-diverged" };
+	if (entry.claim || entry.revision !== input.revision) {
+		return { ok: false, code: "stale", currentRevision: entry.revision };
 	}
-	if (pausedForVerification(plan, decisionId)) {
-		return { kind: "refused", code: "paused" };
-	}
-
-	let payloadDigest = answerPayloadDigest(input);
-	let fingerprint = coordinationFingerprint({
-		idempotencyKey: input.idempotencyKey,
-		kind: "answer",
-		principal: input.resolver,
-		payloadDigest,
-	});
-	let classified = classifyCoordination(plan.coordinationOps, {
-		idempotencyKey: input.idempotencyKey,
-		fingerprint,
-	});
-	if (classified.kind === "replay") {
-		let settled = classified.record.result;
-		if (!("choices" in settled)) {
-			return { kind: "refused", code: "idempotency-conflict" };
-		}
-		let record = settled;
+	let existingDrafts: Question.Drafts;
+	try {
+		existingDrafts = Question.read(entry.model, entry.definition);
+	} catch (err) {
 		return {
-			kind: "replayed",
-			settled: {
-				choices: record.choices,
-				by: record.settledBy,
-				at: classified.record.committedAt,
-			},
+			ok: false,
+			code: "invalid-answer",
+			message: err instanceof Error ? err.message : "invalid draft",
 		};
 	}
-	if (classified.kind === "conflict") {
-		return { kind: "refused", code: "idempotency-conflict" };
+	if (!isCardDraftUntouched(entry.definition, existingDrafts)) {
+		return { ok: false, code: "draft-in-progress", currentRevision: entry.revision };
 	}
+	let derived = buildExplicitAnswers(entry.definition, input);
+	if (!derived.ok) return { ok: false, code: "invalid-answer", message: derived.message };
 
-	let claimed = Store.claimAnswer(
-		plan.questions,
-		decisionId,
-		input.revision,
-		input.resolver,
-		input.optionIds,
-	);
-	if (!claimed.ok) {
-		if (claimed.reason === "stale") {
-			return { kind: "refused", code: "stale", current: claimed.current };
-		}
-		if (claimed.reason === "resolved") {
-			// The store synthesizes "cancelled by system" when the entry is
-			// missing from both maps. A durable record with a known outcome
-			// means the entry simply never existed under the claimed key —
-			// say what actually happened to the decision, never blame a
-			// cancellation nobody performed. A record that is still open
-			// while its entry is gone means this plan's question state has
-			// diverged from the document.
-			let record = plan.records.get(decisionId);
-			if (
-				claimed.status === "cancelled" && claimed.resolver === "system"
-				&& record !== undefined
-			) {
-				if (isOpenStatus(record.status)) {
-					return {
-						kind: "refused",
-						code: "state-diverged",
-						message:
-							"the open decision's shared-draft entry is missing from this plan; reopen the document and retry",
-					};
-				}
-				// Terminal record: name the durable outcome. Attribution appears
-				// only when the record carries it — records permit a
-				// resolver-less settle, and inventing "by system" would
-				// fabricate a cancellation nobody performed.
-				return {
-					kind: "refused",
-					code: "resolved",
-					message: record.resolver !== undefined
-						? `already ${record.status} by ${record.resolver}`
-						: `already ${record.status}`,
-				};
-			}
-			return {
-				kind: "refused",
-				code: "resolved",
-				message: `already ${claimed.status} by ${claimed.resolver}`,
-			};
-		}
-		if (claimed.reason === "draft-in-progress") {
-			return { kind: "refused", code: "draft-in-progress" };
-		}
-		return { kind: "refused", code: "invalid", message: claimed.message };
-	}
-
-	let optionIds = claimed.answers.flatMap(answer => answer.optionIds ?? []);
-	let committedAt = new Date().toISOString();
-	let outcome = await commitAnswer(
+	entry.claim = "submit";
+	let claim: Store.Claim = {
+		id: cardId,
+		entry,
+		result: { status: "answered", answers: derived.answers, resolver: input.resolver },
+	};
+	let settled = await settleClaimed(
 		plan,
 		server,
 		roomId,
+		cardId,
+		input.resolver,
+		claim,
+		derived.answers,
+		callbacks?.onCommitted,
+	);
+	if (!settled.ok) {
+		Store.rollback(plan.questions, claim);
+		if (settled.reason) return { ok: false, ...settled.reason };
+		if (settled.invalid) return { ok: false, code: "invalid-answer", message: settled.invalid };
+		throw settled.failure ?? new Error("could not save the decision");
+	}
+	settled.finish();
+	publishDecisionNotifications(
+		plan,
+		server,
+		roomId,
+		cardId,
+		input.resolver,
+		derived.answers,
+		settled.optionIds,
+		entry,
+		callbacks?.onPlannerAnswer,
+	);
+	let saved = plan.records.get(cardId)!;
+	return {
+		ok: true,
+		decisionId: cardId,
+		committedAt: settled.committedAt,
+		resolver: input.resolver,
+		answers: saved.answers ? { ...saved.answers } : {},
+		decision: readDecisionSnapshot(saved, plan.questions, plan.conversationPlan),
+	};
+}
+
+// Exact archive 446a9779a937fa5be7cd3eb52fd7f3023d691ed2 declarations; import/export wrappers only.
+export async function submit(
+	plan: Plan,
+	server: Server<SocketData>,
+	roomId: string,
+	ws: Socket,
+	msg: Request<Wire.Submit.Ask>,
+	onCommitted?: (intent: NonNullable<ReturnType<typeof settleIntent>>) => void,
+	/** A saved answer the Planner asked for without waiting, which it should now act on. */
+	onPlannerAnswer?: (id: string, generation: number) => void,
+): Promise<void> {
+	if (Service.implementationActive(plan)) return fail(ws, msg.rid, "implementation is active");
+	if (isRecordPaused(plan, msg.id)) {
+		return reply(ws, msg.rid, {
+			kind: "question:submit",
+			ts: 0,
+			id: msg.id,
+			ok: false,
+			reason: "invalid",
+			message: "This decision is paused pending verification",
+		});
+	}
+	let claimed = Store.claimSubmit(
+		plan.questions,
+		msg.id,
+		msg.revision,
+		ws.data.handle,
+		msg.suggestedOptionId,
+	);
+	if (!claimed.ok) {
+		return reply(ws, msg.rid, { kind: "question:submit", ts: 0, id: msg.id, ...claimed });
+	}
+	let settled = await settleClaimed(
+		plan,
+		server,
+		roomId,
+		msg.id,
+		ws.data.handle,
 		claimed.claim,
 		claimed.answers,
-		input.resolver,
-		{
-			coordination: {
-				idempotencyKey: input.idempotencyKey,
-				kind: "answer",
-				fingerprint,
-				principal: input.resolver,
-				payloadDigest,
-				result: { questionId: decisionId, choices: optionIds, settledBy: input.resolver },
-				committedAt,
-			},
-		},
+		onCommitted,
 	);
-	if (!outcome.ok) {
-		if (outcome.reason === "invalid") {
-			return { kind: "refused", code: "invalid", message: outcome.message };
+	if (!settled.ok) {
+		Store.rollback(plan.questions, claimed.claim);
+		if (settled.invalid) {
+			return reply(ws, msg.rid, {
+				kind: "question:submit",
+				ts: 0,
+				id: msg.id,
+				ok: false,
+				reason: "invalid",
+				message: settled.invalid,
+			});
 		}
-		return {
-			kind: "refused",
-			code: outcome.error instanceof ConversationCapacityError
-					|| outcome.error instanceof Error && outcome.error.message === "implementation is active"
-				? "implementation-active"
-				: "invalid",
-			message: outcome.error instanceof Error ? outcome.error.message : undefined,
-		};
+		return fail(
+			ws,
+			msg.rid,
+			settled.failure instanceof ConversationCapacityError
+				|| settled.failure instanceof Error
+					&& settled.failure.message === "implementation is active"
+				? settled.failure.message
+				: "could not save the decision",
+		);
 	}
-	outcome.finish();
-	// A decision the Planner left open to act on later (an `open_decisions`
-	// card, or an ask whose turn has since gone) hands its answer over the
-	// same way the room's own Save does, so the Planner's turn starts no
-	// matter which path settled it. A throwing handoff is logged and the
-	// settle still announces, exactly as the room's own Save tolerates its
-	// callbacks — and a replay would not re-fire the hook, so the room
-	// notification must stay reachable.
-	if (plannerToActOn(outcome.record, claimed.claim.entry)) {
-		try {
-			onPlannerAnswer?.(decisionId, decisionGeneration(outcome.record));
-		} catch (error) {
-			console.error("[questions] could not announce a saved decision:", error);
-		}
-	}
-	notifyAnswered(plan, server, roomId, {
-		id: decisionId,
-		resolver: input.resolver,
-		answers: outcome.answers,
-	}, {
-		kind: "decided",
-		id: decisionId,
-		...(outcome.record.threadId ? { threadId: outcome.record.threadId } : {}),
-		actor: input.resolver,
-		optionIds: outcome.optionIds,
-	});
-	let settled = { choices: optionIds, by: input.resolver, at: committedAt };
-	return { kind: "answered", answers: outcome.answers, settled };
+	settled.finish();
+	publishDecisionNotifications(
+		plan,
+		server,
+		roomId,
+		msg.id,
+		ws.data.handle,
+		claimed.answers,
+		settled.optionIds,
+		claimed.claim.entry,
+		onPlannerAnswer,
+		() =>
+			reply(ws, msg.rid, {
+				kind: "question:submit",
+				ts: 0,
+				id: msg.id,
+				ok: true,
+				answers: claimed.answers,
+				resolver: ws.data.handle,
+			}),
+	);
 }

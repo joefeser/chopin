@@ -59,13 +59,13 @@ describe("approveExternal", () => {
 			state: "approved",
 			version: 1,
 			revision: 1,
-			planRevision: review.input.planRevision,
-			approver: "octocat",
-			operationKey: "bridge:approve:1",
-		});
-		let version = review.plan.graph!.versions.at(-1)!;
-		expect(version.state).toBe("approved");
-		expect(version).toMatchObject({ approver: "octocat", operationKey: "bridge:approve:1" });
+		planRevision: review.input.planRevision,
+		approvedBy: "octocat",
+		operationKey: "bridge:approve:1",
+	});
+	let version = review.plan.graph!.versions.at(-1)!;
+	expect(version.state).toBe("approved");
+	expect(version).toMatchObject({ approvedBy: "octocat", operationKey: "bridge:approve:1" });
 		expect(review.plan.coordinationOps).toHaveLength(1);
 		expect(review.plan.coordinationOps[0]).toMatchObject({
 			kind: "approve",
@@ -210,7 +210,7 @@ describe("approveExternal", () => {
 		expect(outcome).toMatchObject({ kind: "refused", code: "durability" });
 		let version = review.plan.graph!.versions.at(-1)!;
 		expect(version.state).toBe("draft");
-		expect(version.approver).toBeUndefined();
+		expect(version.approvedBy).toBeUndefined();
 		expect(review.plan.coordinationOps).toHaveLength(0);
 	});
 });

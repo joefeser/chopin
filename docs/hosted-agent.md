@@ -371,10 +371,10 @@ Chopin's tools available to the Planner under every harness are:
   never offered to background jobs, and unexpected storage errors reach the
   model only as a generic message;
 - `create_document`, which makes new top-level documents for the person whose
-  message drives the turn, and `orchestrate`, which opens, lists, instructs and
-  indexes the documents this one created (see
-  [Creating documents](#creating-documents)); neither is offered to background
-  jobs;
+  message drives the turn, and `orchestrate`, which opens, lists, reads
+  decisions on, answers decisions on, instructs, builds, and indexes the
+  documents this one created (see [Creating documents](#creating-documents));
+  neither is offered to background jobs;
 - bounded file and tree reads plus commit history using the session's default
   branch, or an explicitly supplied full commit ID when inspecting investigation evidence;
 - repository-scoped code search, post-filtered by repository node ID; and
@@ -415,26 +415,13 @@ REST tools construct owner and repository coordinates on the server, bound
 response sizes and line ranges, reject path escape, and post-filter code search
 by GitHub repository node ID.
 
-Foreground Planner writes on every harness and MCP document creation and updates
-share a server-owned visual admission check. New prose, lists and nested passages
-are assessed for whether a faithful visual is possible, helpful, and which native
-type fits. A selected diagram or comparison table must appear beside its passage
-before the write is accepted. A successful prose judgment permits prose; there is
-no diagram quota. This applies to blank drafts, long requests, and imported plans
-without requiring `PLANNER_VISUALS`.
-
-Assessments run in bounded batches outside the room queue. Failed or malformed
-assessments refuse the write. Admission follows the shared assessment's probability
-thresholds and selected type, including an explicit no-suitable-type result. It
-does not add a confidence veto: confidence describes competition between types,
-not whether the document write is valid. Every selected visual is still required
-and validated. Refusals identify the passage and required representation and
-include syntax guidance for repair.
-Successful assessments are cached by passage and context while diagrams are
-repaired. Unchanged prose with its existing visual is preserved. A concurrent edit
-still invalidates the proposed revision. Background jobs retain their isolated
-contracts. The legacy `assess_visual` single-paragraph handoff remains available
-to sessions without the shared gate.
+Document writes through Planner tools (`edit_plan`, `edit_child`,
+`write_decision_scope`, `create_document`, `orchestrate`) and MCP
+(`create_document`, `update_document`) are validated against the plan dialect
+before saving, without an additional server-side visual admission gate. Default
+document shape and visual authoring suggestions yield to any specific document
+format, section template, or diagram convention supplied by the Planner's
+session, repository instructions, or loaded skills.
 
 The isolated Planner does not see a user's local checkout, current branch, working tree,
 or uncommitted changes. A coding agent must compare the repository context
@@ -756,7 +743,11 @@ Decision, for which the document is opened if nobody has it open. Startup's rese
 browser sign-in that has stored credentials; a paired machine's hold names the machine
 and no login, which a restart cannot keep: the machine's backend attaches again with its
 credential, which is stored by digest and so accepted at once, and its new login takes over
-the hold.
+the hold. A reconnecting connector's Planner assignment list includes every unarchived
+document with a parked or restored hold for that machine, even before anyone reopens the
+document after a restart, so the connector keeps the backend running while it resumes.
+Likewise, a connector socket dropping while its Planner is actively replying or waiting on
+an open question does not stop that Planner.
 
 **The hand-over window.** A hold whose link the cut closed is given `HANDOVER_PLANNER_WINDOW_MS`
 from the release of the lease, the time its client is told it has. The cut cannot know when the
@@ -893,21 +884,30 @@ their structured result as the turn's JSON. The job runner starts no worker for
 a document with no attached client; its job stays pending until one attaches. A turn ends with `turn-end`. An abort waits briefly for the
 client's `turn-end`, then ends the turn anyway. A turn that ends while one of
 its host tools still runs, such as an `ask` waiting on Decisions, stops that tool
-and withdraws the cards it opened. A connection that closes mid-turn ends the turn
-with an error rather than as a stop and its open questions are withdrawn; nothing
-waits on a client that has gone. A
+and withdraws the cards it opened. An unplanned connection drop mid-turn ends the
+turn as a connection drop (`dropped`, never `"Couldn't finish the reply."`) even
+when no `input-request` was open or the client reconnects quickly; waiters on open
+`input-request` Decisions detach rather than withdraw so the Decision cards stay
+open in the document and any human answers given while offline or before
+acknowledgement are delivered durably to the Planner once one is attached. A
 session the client refuses or does not start in time is destroyed, and any
 question it asked while starting is withdrawn.
 
 **Questions.** An `input-request` carries one Atomic `HostInput` call
 (`questionnaire`, `confirm`, `select`, `input`, or `editor`) and becomes Decisions
 through the same path as the [full Atomic Planner](#full-atomic-planner): the same
-verbatim text, the same 30-minute expiry, and cancellation that withdraws open
-cards. `input-result` returns what Atomic would have received in
-process, with a status that tells an expiry from a cancellation. Stopping a turn
-withdraws the questions it asked while it ran, as Stop
-does an Atomic Planner's, and cancels at once any it asks before it ends, so a
-Decision the turn waited on never keeps its session for the next message.
+verbatim text, no time limit, and explicit withdrawal when cancelled directly.
+`input-result` returns what Atomic would have received in process. Only an
+explicit withdrawal — pressing **Stop** in Chat (during a turn or on a kept
+session waiting on a question), a member cancelling the card, archiving or
+deleting the document, or the client sending `input-cancel` — cancels and removes
+open Decision cards. Detaching or dropping a link, switching machines, abandoning
+a parked hold, omitting a request on `resume`, or ending a retained session after
+a credential rebind failure detaches the waiter while leaving open Decision cards
+in the document (`awaited` cleared), so a later Save hands the answer to the
+Planner as a turn. Stopping a turn withdraws the questions it asked while it ran,
+as Stop does an Atomic Planner's, and cancels at once any it asks before it ends,
+so a Decision the turn waited on never keeps its session for the next message.
 
 **Work the client keeps.** Chopin keeps no workflow runs of a client's and shows no run cards: a
 client's own work that outlives its turn is the client's to report in its replies. A session is
@@ -1989,14 +1989,14 @@ holds its rules:
   `invoke_planner` message drives may create documents; a turn nobody typed, a comment turn and a
   background job are refused. That person is the creator. Their own live browser
   login is asked again for push or administration access to the repository, as
-  `chat:send` is, both before and after the visual assessment; the Planner owner's
+  `chat:send` is; the Planner owner's
   credential never authorizes a new document. A person with no live login is
   refused.
 - **What it makes.** A top-level document in the creating document's repository,
   with its own Chat, Decisions and Planner session, sharing no transcript with the
   creating one. Its recorded base is the creating document's own (from its MCP
   creation), or else the repository's default branch at its current commit. The
-  draft goes through MCP's `prepare` and the same visual assessment
+  draft goes through MCP's `prepare` validation
   (`createDocument` in `apps/server/src/mcp/hosted.ts` serves both). It is given
   the creating document's model and thinking level, stored with the creator as
   its chooser in the same transaction that creates the document, fenced by the
@@ -2031,12 +2031,14 @@ kept, when the creating document is deleted.
 ### Working with created documents
 
 `orchestrate` (`apps/server/src/agent/orchestrate.ts`) lets a document's Planner
-open, inspect, instruct, and index the documents this document created. It is
-offered alongside `create_document` under the same rules: only a turn driven by
-a person's message may call it, that person's live browser login is rechecked
-for write access, and it is never offered to background jobs or child rooms. It
-reaches only unarchived top-level documents in the same repository whose stored
-`createdFrom` link (migration 054) points to this document.
+(and external `/mcp` callers via the matching MCP `orchestrate` tool) open,
+inspect, answer decisions on, instruct, build, and index the documents this
+document created. As a Planner host tool it is offered alongside
+`create_document` under the same rules: only a turn driven by a person's message
+may call it, that person's live browser login is rechecked for write access, and
+it is never offered to background jobs or child rooms. It reaches only
+unarchived top-level documents in the same repository whose stored `createdFrom`
+link (migration 054) points directly to this document (non-transitive).
 
 Each call takes one `operation`:
 
@@ -2047,26 +2049,47 @@ Each call takes one `operation`:
   state (`working` while a turn runs, `idle` while a session or attached
   machine holds it, otherwise `stopped`), open Decisions count, and build state
   (`building`, `built`, `failed`, `stopped`, or `not built`).
+- **`decisions`** reads decisions across all or named (`targets`) created
+  documents with optional `status` (`all`, a single status, or a non-empty list)
+  and `origin` (`planner`, `conversation`, `human`) filters, returning each
+  document's filtered snapshots and document-wide `decisionCounts`.
+- **`answer`** settles one open or reopened decision on a created `target`
+  document (`decisionId` card or question ID, open `revision`,
+  `idempotencyKey`, and `optionIds`/`text`/`answers`) through the shared
+  atomic decision core with full Planner handoff parity.
 - **`instruct`** posts one `instruction` (up to 64 KiB) to every created
   document's Chat—or only to `targets` matched by `id` or `url`—as the person's
-  message, exactly as `invoke_planner` does, starting stopped Planners. It
-  reports each document's outcome; a busy Planner returns `planner-busy` and
-  can be retried later. Any target not created from this document is returned
-  in `unknown`.
+  message, exactly as `invoke_planner` does: starting idle/stopped Planners and
+  steering/nudging live working Planners (`steered: true`) when their harness
+  supports mid-run input. A busy Planner on a non-steerable harness returns
+  `planner-busy` and can be retried once its turn ends. Any target not created
+  from this document is returned in `unknown`.
+- **`build`** starts builds across all or named (`targets`) created documents
+  through the shared `build_plan` core (`draftIfNeeded` default `true`,
+  `requireSettledDecisions` default `false`, `retry`, `rebuild`), returning
+  per-document status (`started`, `drafting`, `already-building`, `rebuilding`,
+  or `refused`) and refreshing an existing index table.
 - **`index`** writes or updates a table of the created documents under the
   heading `## Documents created from this one` (`orchestrate-index.ts`). Chopin
   owns only that heading and the one block after it; the rest of the document
-  is left alone. `open` and `list` refresh an existing table, and nothing is
-  written when the table would not change.
+  is left alone. `open`, `list`, `answer`, and `build` refresh an existing
+  table, and nothing is written when the table would not change.
+
+A paired machine's **Planner** MCP launch token (`experiments/routes.ts`) can
+also reach its document's direct same-repository top-level `createdFrom`
+documents (non-transitive) in addition to the document itself and its direct
+children; **run** launch tokens remain restricted strictly to their own
+document.
 
 **Limits:**
 
 - Documents created before `createdFrom` (migration 054) have no parent link,
-  so `orchestrate` cannot list, instruct, or index them.
-- The index table refreshes only when `open`, `list`, or `index` runs; Chopin
-  does not push status changes into the parent document automatically.
-- `open` accepts at most 20 documents per call; `list`, `instruct`, and `index`
-  cover up to 200 created documents.
+  so `orchestrate` cannot list, inspect, answer, instruct, build, or index them.
+- The index table refreshes only when `open`, `list`, `answer`, `build`, or
+  `index` runs; Chopin does not push status changes into the parent document
+  automatically.
+- `open` accepts at most 20 documents per call; `list`, `decisions`, `instruct`,
+  `build`, and `index` cover up to 200 created documents.
 
 ## Background jobs
 
@@ -2107,27 +2130,23 @@ completed description, if any, remains visible while work is pending or failed.
 
 ## Diagrams and wireframes
 
-The prompt teaches two validated fence languages. `seecode` holds a JSON spec
-for any registered SeeCode diagram or numerical chart. The ordinary prompt lists
-the full native catalog, including bar, line, scatter, radar, polar, waterfall,
-treemap, heatmap, and Sankey. Numerical aliases have variant-specific purpose
-and data requirements; the guide includes labelled synthetic bar, Marimekko and
-dumbbell examples that are checked against the renderer.
-This capability and the shared visual admission check do not require `PLANNER_VISUALS`.
-Ordinary and Atomic Planners
-prefer native `seecode` whenever a registered type can represent the required
-information. Mermaid is a fallback only for a representation the native catalogue
-cannot provide or an explicit user request; it supports numerical charts such as
-pie and bar/line charts. Jev-routed diagrams must keep the selected native type
-and SeeCode fence, with no Mermaid substitution. `wireframe` holds an indented
-outline of interface parts for layouts and mockups; the prompt asks for low
-fidelity (short labels on key areas, `lines`, `image` and `grid` with `repeat`
-for content, `w=` and `flush` for proportions and app chrome) and forbids
-box-drawing or ASCII art in text fences. `edit_plan` and MCP `update_document`
-refuse a batch that introduces or changes an invalid fence of either language;
-a wireframe refusal names the failing lines, counted inside the fence. An
-unchanged malformed fence, such as one a person left mid-edit, is carried
-through unrelated edits and moves rather than blocking them.
+The prompt documents three diagram and layout fence languages alongside Markdown
+tables and uploaded images: `seecode` (a JSON spec for registered SeeCode
+diagrams and numerical charts, with the full catalog including bar, line,
+scatter, radar, polar, waterfall, treemap, heatmap, and Sankey plus labelled
+synthetic bar, Marimekko, and dumbbell examples checked against the renderer),
+`mermaid` (diagrams and numerical charts such as `pie` and `xychart-beta`
+bar/line charts), and `wireframe` (an indented outline of low-fidelity interface
+parts for layouts and mockups, using short labels on key areas, `lines`, `image`,
+and `grid` with `repeat` for content, `w=` and `flush` for proportions and app
+chrome, instead of box-drawing or ASCII art in text fences). The Planner is free
+to pick whichever supported representation best fits the document's format and
+conventions; there is no server-side visual admission gate forcing a specific
+fence type. `edit_plan` and MCP `update_document` refuse a batch that introduces
+or changes an invalid `seecode` or `wireframe` fence; a wireframe refusal names
+the failing lines, counted inside the fence. An unchanged malformed fence, such
+as one a person left mid-edit, is carried through unrelated edits and moves
+rather than blocking them.
 
 ## Implementation graph status
 

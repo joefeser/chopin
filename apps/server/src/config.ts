@@ -97,8 +97,6 @@ export type Config = {
 	 */
 	decisionsModel?: string;
 	decisionsTimeoutMs?: number;
-	/** Legacy single-paragraph visual tool; shared write admission is always enabled. */
-	plannerVisuals?: boolean;
 	/** The chopin release `chopin update` installs from this server, and a refusal names. */
 	connectorVersion?: string;
 	/** Keep a finished build's document as the source for later rebuilds. */
@@ -390,7 +388,6 @@ export function load(): Config {
 		15_000,
 		60_000,
 	);
-	let plannerVisuals = process.env.PLANNER_VISUALS === "on" && agent;
 	let liveBuild = process.env.LIVE_BUILD === "on";
 	let liveSpikes = process.env.LIVE_SPIKES === "on";
 	let liveSpikesRegexJudge = liveSpikes && process.env.LIVE_SPIKES_REGEX_JUDGE === "on";
@@ -429,8 +426,6 @@ export function load(): Config {
 	}
 	let needsDecisions = conversationPlan
 		? "CONVERSATION_PLAN=on"
-		: plannerVisuals
-		? "PLANNER_VISUALS=on"
 		: agent
 		? "AGENT is enabled"
 		: undefined;
@@ -499,7 +494,6 @@ export function load(): Config {
 		conversationInitiativeSilenceMs,
 		decisionsModel,
 		decisionsTimeoutMs,
-		plannerVisuals,
 		connectorVersion: connectorVersion(),
 		liveBuild,
 		buildResumeMs: milliseconds("CHOPIN_BUILD_RESUME_MS", 600_000, 3_600_000),
@@ -554,7 +548,6 @@ export function describe(config: Config): string {
 		config.conversationPlan
 			? `conversation plan: ${config.decisionsModel}`
 			: "conversation plan: off",
-		`visual assessment: ${config.decisionsModel ?? "unavailable"}`,
 		config.liveBuild ? "live build: on" : "live build: off",
 		config.liveSpikes ? "live spikes: on" : "live spikes: off",
 		admission,

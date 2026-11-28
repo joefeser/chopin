@@ -40,7 +40,8 @@ export type ApprovedGraph = {
 	version: number;
 	revision: number;
 	planRevision: number;
-	approver: string;
+	/** Who approved this version, under the name the graph version and `build_plan` use. */
+	approvedBy: string;
 	operationKey: string;
 };
 
@@ -80,7 +81,7 @@ function approvalOf(version: {
 	number: number;
 	revision: number;
 	planRevision: number;
-	approver: string;
+	approvedBy: string;
 	operationKey: string;
 }): ApprovedGraph {
 	return {
@@ -88,7 +89,7 @@ function approvalOf(version: {
 		version: version.number,
 		revision: version.revision,
 		planRevision: version.planRevision,
-		approver: version.approver,
+		approvedBy: version.approvedBy,
 		operationKey: version.operationKey,
 	};
 }
@@ -131,7 +132,9 @@ export async function approveExternal(
 					version: result.graphVersion,
 					revision: result.graphRevision,
 					planRevision: result.planRevision,
-					approver: result.approver,
+					// The ledger record keeps its own `approver` field; the tool's
+					// answer names it as the graph version does.
+					approvedBy: result.approver,
 					operationKey: classified.record.idempotencyKey,
 				},
 			};
@@ -194,7 +197,8 @@ export async function approveExternal(
 		let result = approveGraph({
 			graph: plan.graph,
 			revision: plan.revision,
-			approval: { approver: input.approver, operationKey: input.idempotencyKey },
+			approvedBy: input.approver,
+			operationKey: input.idempotencyKey,
 		});
 		if (!result.ok) {
 			// A graph that is not a draft — approved, locked, superseded — is
@@ -238,7 +242,7 @@ export async function approveExternal(
 				number: approved.number,
 				revision: approved.revision,
 				planRevision: approved.planRevision,
-				approver: approved.approver!,
+				approvedBy: approved.approvedBy!,
 				operationKey: approved.operationKey!,
 			}),
 		};

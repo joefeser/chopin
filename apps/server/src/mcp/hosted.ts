@@ -16,26 +16,44 @@ import { documentSlug } from "../channels/slug";
 import { claimsMcpToken } from "../experiments/mcp-token";
 import { GitHubError } from "../github/client";
 import * as Plan from "../plan/service";
+import * as Questions from "../questions/service";
 import * as Rooms from "../rooms";
 import { claimImplementation, reportImplementationLifecycle } from "../tasks/plan-graphs";
 import { coordinationSnapshot } from "../tasks/coordination-snapshot";
-import { answerExternal, type Record as QuestionRecord } from "../questions/service";
+import { type Record as QuestionRecord } from "../questions/service";
 import { approveExternal } from "../coordination/approve";
 import { StorageError } from "../storage/errors";
 import { implementationLifecycle } from "../tasks/lifecycle";
 import { unapprovedContext } from "../tasks/open-decisions";
 import { planSourceFor, withPlanSource } from "../tasks/plan-source";
 import { imagePath } from "../images/format";
+import { deterministicChannelId as deterministicId } from "../channels/id";
+import { prepare as prepareCreate } from "./create";
+import { answerDecisionFingerprint, IdempotentDecisionAnswers } from "./decisions";
 import { IdempotentInvocations, invocationFingerprint } from "./invoke";
+import { readDecisions } from "../questions/read-decisions";
+import { buildState, orchestrate as runOrchestrate } from "../agent/orchestrate";
+import { writeIndex } from "../agent/orchestrate-index";
 
 import type { Server } from "bun";
+import type { BuildRequest } from "@chopin/protocol/implementation";
 import type { HostedAuth } from "../auth/routes";
 import type { KeyedInvocation } from "./invoke";
 import type { GitHubUser, Repository as GitHubRepository } from "../github/client";
 import type { AuthenticatedSession } from "../auth/session";
 import type { HostedRepository } from "../agent/repository";
+import type { DocumentRoom } from "../agent/tools";
+import type { IndexWriter, PlannerState } from "../agent/orchestrate";
+import type { NewDocumentRequest, NewDocumentResult } from "../agent/new-documents";
 import type {
-	AnswerDecisionInput,
+	AnswerDecisionOutcome,
+	DecisionAnswerPayload,
+	DecisionReadRequest,
+} from "./decisions";
+import type { DecisionFilter, ReadDecisionsResult } from "../questions/read-decisions";
+import type { settleIntent } from "../conversation-plan/prose-job";
+import type { StartPlanBuildInput, StartPlanBuildResult } from "../tasks/start-build";
+import type {
 	ApproveImplementationInput,
 	DocumentSummary,
 	Implementation,
@@ -47,7 +65,6 @@ import type {
 } from "../mcp";
 import type { CreateDocumentInput } from "./create";
 import type { UpdateClient, UpdateDocumentInput } from "./update";
-import type { Issue } from "@chopin/dialect";
 import type { LifecycleArguments } from "./lifecycle";
 import type {
 	ChannelArchiveResult,
@@ -59,7 +76,6 @@ import type {
 import type { ClaimResult, Graph, Run } from "../tasks/graphs";
 import type { Lifecycle } from "../tasks/lifecycle";
 import type { SocketData } from "../wire";
-import type { VisualAdmission } from "../agent/visual-admission";
 import type { PlanSource } from "../tasks/plan-source";
 
 export type HostedCaller = {
@@ -95,7 +111,6 @@ export type PlannerInvocation = {
 
 export type ImplementationPersistence = { lease(): Lease };
 export type HostedCallbacks = {
-	visualAdmission?: VisualAdmission;
 	archiveChannel?: (channelId: string, now: Date) => Promise<ChannelArchiveResult>;
 	restoreChannel?: (channelId: string, now: Date) => Promise<ChannelArchiveResult>;
 	isChannelDeleting?: (channelId: string) => boolean;
@@ -109,8 +124,21 @@ export type HostedCallbacks = {
 	launchCaller?: (token: string) => Promise<HostedCaller | undefined>;
 	/** What `planner-not-attached` says for a document, at its URL; how to attach one by default. */
 	plannerNotAttached?: (channelId: string, url: string, repository: string) => Promise<string>;
-	/** Hand a Planner-left-open decision's external answer to the Planner, as the room's own Save does. */
-	onPlannerAnswer?: (channelId: string, id: string, generation: number) => void;
+	/** Notified after a decision answer commits (for waking background prose follow-ups). */
+	onDecisionCommitted?: (
+		plan: Plan.Plan,
+		intent: NonNullable<ReturnType<typeof settleIntent>>,
+	) => void;
+	/** Notified after an unawaited Planner decision is answered (durable Planner turn handoff). */
+	onPlannerAnswer?: (channelId: string, decisionId: string, generation: number) => void;
+	/** Optional shared idempotency coordinator for `answer_decision` and `orchestrate answer`. */
+	decisionAnswers?: IdempotentDecisionAnswers;
+	/** Shared build starter for MCP `build_plan` and `orchestrate build`. */
+	startBuild?: (input: StartPlanBuildInput) => Promise<StartPlanBuildResult>;
+	/** Reports the live Planner state of a document for `orchestrate list` / `instruct`. */
+	plannerState?: (channelId: string) => PlannerState;
+	/** Inherits a source document's Planner model choice when `orchestrate open` creates children. */
+	modelChoice?: (from: string, userId: string) => Promise<CreateChannel["modelChoice"]>;
 };
 
 const BEARER = new RegExp("^Bearer ([A-Za-z0-9._~+/-]+=*)$", "i");
@@ -319,8 +347,6 @@ export type HostedCoordination = {
 export type DocumentCreator = {
 	user: GitHubUser;
 	repository: GitHubRepository;
-	/** Asks again, after the visual assessment, whether the creator may still write the repository. */
-	stillWrites: () => Promise<boolean>;
 	/** The Planner model choice to store in the transaction that creates the document. */
 	modelChoice?: () => Promise<CreateChannel["modelChoice"]>;
 	/** The document whose Planner creates this one, stored as its `createdFrom`. */
@@ -337,8 +363,7 @@ export type CreatedDocument =
 	| { kind: "conflict" }
 	| { kind: "title-taken" }
 	| { kind: "forbidden" }
-	| { kind: "unavailable" }
-	| { kind: "visuals-required"; issues: Issue[] };
+	| { kind: "unavailable" };
 
 /**
  * Create a top-level document from a prepared draft, or return the one an earlier call with the
@@ -348,7 +373,7 @@ export async function createDocument(
 	auth: Pick<HostedAuth, "storage" | "clock">,
 	callbacks: Pick<
 		HostedCallbacks,
-		"visualAdmission" | "isChannelDeleting" | "onChannelCreated" | "onDocumentPersisted"
+		"isChannelDeleting" | "onChannelCreated" | "onDocumentPersisted"
 	>,
 	creator: DocumentCreator,
 	input: CreateDocumentInput,
@@ -385,15 +410,8 @@ export async function createDocument(
 			}),
 		};
 	};
-	// A durable replay must not rerun model judgments or reject a previously saved import.
 	let stored = await auth.storage.collaboration.load(id, auth.clock());
 	if (stored) return replay(stored);
-	if (callbacks.visualAdmission) {
-		let issues = await callbacks.visualAdmission({ sources: [input.plan], signal });
-		if (issues.length) return { kind: "visuals-required", issues };
-		if (!await creator.stillWrites()) return { kind: "forbidden" };
-		if (callbacks.isChannelDeleting?.(id)) return { kind: "unavailable" };
-	}
 	if (signal?.aborted) return { kind: "unavailable" };
 	await auth.storage.users.put({
 		id: user.id,
@@ -511,15 +529,18 @@ export function hosted(
 	let silentServer = { publish() {} } as unknown as Server<SocketData>;
 	let invocations = persistence
 		&& new IdempotentInvocations(auth.storage.mcpInvocations, persistence.lease, auth.clock);
+	let decisionAnswers = callbacks.decisionAnswers
+		?? (persistence
+			&& new IdempotentDecisionAnswers(auth.storage.mcpInvocations, persistence.lease, auth.clock));
 
-	async function withPlan<T>(
+	async function withOpenedPlan<T>(
 		channelId: string,
 		action: (plan: Plan.Plan) => Promise<T>,
 	): Promise<T> {
 		let live = Rooms.get(channelId)?.plan;
 		if (live) {
 			await Plan.drain(live);
-			return Plan.exclusive(live, () => action(live));
+			return action(live);
 		}
 		if (!persistence) throw new Error("document is unavailable");
 		let opened = await Plan.open(channelId, {
@@ -533,7 +554,7 @@ export function hosted(
 			onChannelRenamed: callbacks.onChannelRenamed,
 		}, silentServer);
 		try {
-			return await Plan.exclusive(opened, () => action(opened));
+			return await action(opened);
 		} finally {
 			await Plan.close(opened);
 		}
@@ -569,6 +590,123 @@ export function hosted(
 		} finally {
 			await Plan.close(opened);
 		}
+	}
+
+	async function withPlan<T>(
+		channelId: string,
+		action: (plan: Plan.Plan) => Promise<T>,
+	): Promise<T> {
+		return withOpenedPlan(channelId, plan => Plan.exclusive(plan, () => action(plan)));
+	}
+
+	async function readDocumentDecisions(
+		channelId: string,
+		filter?: DecisionFilter,
+	): Promise<ReadDecisionsResult> {
+		let live = Rooms.get(channelId)?.plan;
+		if (live) {
+			return Plan.exclusive(
+				live,
+				async () => readDecisions(live.records, live.questions, live.conversationPlan, filter),
+			);
+		}
+		let stored = await auth.storage.collaboration.load(channelId, auth.clock());
+		if (!stored) return readDecisions([], undefined, undefined, filter);
+		let projected = await Plan.readStored(stored);
+		return readDecisions(
+			projected.records ?? [],
+			projected.openQuestions,
+			projected.conversationPlan,
+			filter,
+		);
+	}
+
+	async function answerChannelDecision(
+		channel: ChannelRecord,
+		user: GitHubUser,
+		payload: DecisionAnswerPayload,
+	): Promise<AnswerDecisionOutcome> {
+		if (!decisionAnswers) throw new Error("storage writer lease is unavailable");
+		return decisionAnswers.run(
+			{ userId: user.id, channelId: channel.id, key: payload.idempotencyKey },
+			answerDecisionFingerprint(payload),
+			async () => {
+				let current = await auth.storage.channels.get(channel.id);
+				if (!current || callbacks.isChannelDeleting?.(channel.id)) {
+					return { kind: "refused", refusal: { code: "document-unavailable" } };
+				}
+				if (current.archivedAt) {
+					return { kind: "refused", refusal: { code: "document-archived" } };
+				}
+				try {
+					return await serializeDocument(
+						channel.id,
+						() =>
+							withOpenedPlan(channel.id, async plan => {
+								let settled = await Questions.answerDecision(
+									plan,
+									plan.server,
+									channel.id,
+									{
+										decisionId: payload.decisionId,
+										revision: payload.revision,
+										resolver: user.login,
+										...(payload.optionIds !== undefined ? { optionIds: payload.optionIds } : {}),
+										...(payload.text !== undefined ? { text: payload.text } : {}),
+										...(payload.answers !== undefined ? { answers: payload.answers } : {}),
+									},
+									{
+										onCommitted: intent => callbacks.onDecisionCommitted?.(plan, intent),
+										onPlannerAnswer: (id, generation) =>
+											callbacks.onPlannerAnswer?.(channel.id, id, generation),
+									},
+								);
+								if (!settled.ok) {
+									let { ok: _ok, ...refusal } = settled;
+									return { kind: "refused" as const, refusal };
+								}
+								return {
+									kind: "answered" as const,
+									result: {
+										status: "answered" as const,
+										replayed: false,
+										decisionId: settled.decisionId,
+										committedAt: settled.committedAt,
+										resolver: settled.resolver,
+										answers: settled.answers,
+										decision: settled.decision,
+									},
+								};
+							}),
+					);
+				} catch (err) {
+					if (err instanceof Error && err.message === "document is unavailable") {
+						return { kind: "refused", refusal: { code: "document-unavailable" } };
+					}
+					if (err instanceof StorageError && err.failure === "missing") {
+						return { kind: "refused", refusal: { code: "document-unavailable" } };
+					}
+					throw err;
+				}
+			},
+		);
+	}
+
+	function plannerStateOf(channelId: string): PlannerState {
+		if (callbacks.plannerState) return callbacks.plannerState(channelId);
+		let chat = Rooms.get(channelId)?.plan?.chat;
+		if (chat?.busy || chat?.starting) return "working";
+		if (chat?.agent) return "idle";
+		return "stopped";
+	}
+
+	async function buildStateOf(channelId: string) {
+		let plan = Rooms.get(channelId)?.plan;
+		if (plan) return buildState(plan);
+		let stored = await auth.storage.collaboration.load(channelId, auth.clock());
+		let sidecar = stored?.sidecar as { builds?: unknown; live?: unknown } | null | undefined;
+		let builds = Array.isArray(sidecar?.builds) ? sidecar.builds as BuildRequest[] : [];
+		return buildState({ builds, live: sidecar?.live });
 	}
 
 	return {
@@ -697,17 +835,27 @@ export function hosted(
 				} while (cursor);
 				return documents;
 			},
-			async read(caller, id) {
+			async read(caller, id, readOptions?: DecisionReadRequest) {
 				let located = await locatedChannel(caller, id);
 				if (!located || located === "forbidden") return undefined;
 				let { channel } = located;
 				let url = await documentUrl(channel, auth.storage.channels);
+				let filter: DecisionFilter | undefined = readOptions?.includeDecisions
+					? {
+						...(readOptions.decisionStatus !== undefined
+							? { status: readOptions.decisionStatus }
+							: {}),
+						...(readOptions.decisionOrigin !== undefined
+							? { origin: readOptions.decisionOrigin }
+							: {}),
+					}
+					: undefined;
 
 				let live = Rooms.get(channel.id)?.plan;
 				if (live) {
 					try {
-						return await Plan.exclusive(live, async () =>
-							document({
+						return await Plan.exclusive(live, async () => {
+							let base = document({
 								id: channel.id,
 								title: channel.title,
 								...(channel.description ? { description: channel.description.value } : {}),
@@ -716,7 +864,16 @@ export function hosted(
 								revision: live.revision,
 								archivedAt: channel.archivedAt,
 								url,
-							}));
+							});
+							if (!filter) return base;
+							let { decisions, decisionCounts } = readDecisions(
+								live.records,
+								live.questions,
+								live.conversationPlan,
+								filter,
+							);
+							return { ...base, decisions, decisionCounts };
+						});
 					} catch {
 						return undefined;
 					}
@@ -732,7 +889,7 @@ export function hosted(
 				) return undefined;
 				try {
 					let projected = await Plan.readStored(stored);
-					return document({
+					let base = document({
 						id: channel.id,
 						title: channel.title,
 						...(channel.description ? { description: channel.description.value } : {}),
@@ -742,6 +899,14 @@ export function hosted(
 						archivedAt: channel.archivedAt,
 						url,
 					});
+					if (!filter) return base;
+					let { decisions, decisionCounts } = readDecisions(
+						projected.records ?? [],
+						projected.openQuestions,
+						projected.conversationPlan,
+						filter,
+					);
+					return { ...base, decisions, decisionCounts };
 				} catch {
 					return undefined;
 				}
@@ -849,11 +1014,6 @@ export function hosted(
 				let outcome = await createDocument(auth, callbacks, {
 					user: caller.user,
 					repository,
-					stillWrites: async () => {
-						let current = await directRepository(caller, parts[0]!, parts[1]!);
-						return !!current && current.id === repository.id
-							&& (current.permissions.push || current.permissions.admin);
-					},
 					...(caller.signal ? { signal: caller.signal } : {}),
 				}, input);
 				if (outcome.kind !== "created" && outcome.kind !== "replayed") return outcome;
@@ -864,37 +1024,7 @@ export function hosted(
 			async update(caller, input: UpdateDocumentInput, client: UpdateClient) {
 				let access = await writableChannel(caller, input.id);
 				if (access.kind !== "allowed") return access;
-				let assessed = !callbacks.visualAdmission;
 				try {
-					if (callbacks.visualAdmission) {
-						let preflight = await serializeDocument(access.channel.id, async () => {
-							let channel = await auth.storage.channels.get(access.channel.id);
-							if (!channel || callbacks.isChannelDeleting?.(channel.id)) {
-								return { kind: "unavailable" as const };
-							}
-							return withPlan(channel.id, async plan => {
-								if (plan.mcpUpdates.some(entry => entry.idempotencyKey === input.idempotencyKey)) {
-									return { kind: "replay" as const };
-								}
-								if (channel.archivedAt) return { kind: "archived" as const };
-								if (Plan.implementationActive(plan)) return { kind: "locked" as const };
-								if (plan.revision !== input.revision) {
-									return { kind: "revision-conflict" as const, revision: plan.revision };
-								}
-								return { kind: "assess" as const, before: Plan.source(plan) };
-							});
-						});
-						if (preflight.kind === "assess") {
-							// Classifier I/O must not hold the room queue or block collaborators.
-							let issues = await callbacks.visualAdmission({
-								before: preflight.before,
-								sources: [input.plan],
-								signal: caller.signal,
-							});
-							if (issues.length) return { kind: "visuals-required" as const, issues };
-							assessed = true;
-						} else if (preflight.kind !== "replay") return preflight;
-					}
 					return await serializeDocument(access.channel.id, async () => {
 						let current = await writableChannel(caller, access.channel.id);
 						if (current.kind !== "allowed") return current;
@@ -923,7 +1053,7 @@ export function hosted(
 							}
 							if (channel.archivedAt) return { kind: "archived" as const };
 							if (Plan.implementationActive(plan)) return { kind: "locked" as const };
-							if (!assessed || caller.signal?.aborted) return { kind: "unavailable" as const };
+							if (caller.signal?.aborted) return { kind: "unavailable" as const };
 							// History credits the rewrite to this person, so they need a user row.
 							await auth.storage.users.put({
 								id: caller.user.id,
@@ -1065,47 +1195,14 @@ export function hosted(
 							revision: projected.revision,
 							creation: projected.creation,
 							records: projected.records ?? [],
-							openQuestions: projected.openQuestions,
+							openQuestions: projected.openQuestions ?? [],
 							...(projected.graph ? { graph: projected.graph } : {}),
 						});
-						return snapshot
-							? { kind: "snapshot" as const, snapshot }
-							: { kind: "refused" as const, code: "provenance-refused" as const };
-					},
-					async answer(caller: HostedCaller, input: AnswerDecisionInput) {
-						if (!coordination.approvers.includes(caller.user.login.toLowerCase())) {
-							return { kind: "refused" as const, code: "not-allowed" as const };
-						}
-						return serializeDocument(input.id, async () => {
-							let access = await writableChannel(caller, input.id);
-							if (access.kind === "unavailable") return { kind: "unavailable" as const };
-							if (access.kind === "forbidden") return { kind: "forbidden" as const };
-							let { channel } = access;
-							if (channel.archivedAt) return { kind: "archived" as const };
-							try {
-								return await withPlanAccess(
-									channel.id,
-									async plan =>
-										answerExternal(plan, plan.server, channel.id, {
-											questionId: input.questionId,
-											revision: input.revision,
-											optionIds: input.optionIds,
-											resolver: caller.user.login,
-											idempotencyKey: input.idempotencyKey,
-										}, (id, generation) => callbacks.onPlannerAnswer?.(channel.id, id, generation)),
-								);
-							} catch (err) {
-								if (err instanceof Error && err.message === "document is unavailable") {
-									return { kind: "unavailable" as const };
-								}
-								if (err instanceof StorageError && err.failure === "missing") {
-									return { kind: "unavailable" as const };
-								}
-								throw err;
-							}
-						});
-					},
-					async approve(caller: HostedCaller, input: ApproveImplementationInput) {
+							return snapshot
+								? { kind: "snapshot" as const, snapshot }
+								: { kind: "refused" as const, code: "provenance-refused" as const };
+						},
+						async approve(caller: HostedCaller, input: ApproveImplementationInput) {
 						if (!coordination.approvers.includes(caller.user.login.toLowerCase())) {
 							return { kind: "refused" as const, code: "not-allowed" as const };
 						}
@@ -1141,6 +1238,355 @@ export function hosted(
 			: {}),
 		...(persistence
 			? {
+				answerDecision: {
+					async answer(caller, input) {
+						let located = await locatedChannel(caller, input.id);
+						if (!located) {
+							return { kind: "refused", refusal: { code: "document-unavailable" } };
+						}
+						if (
+							located === "forbidden"
+							|| (!located.repository.permissions.push && !located.repository.permissions.admin)
+						) {
+							return { kind: "refused", refusal: { code: "repository-forbidden" } };
+						}
+						let { channel } = located;
+						if (callbacks.isChannelDeleting?.(channel.id)) {
+							return { kind: "refused", refusal: { code: "document-unavailable" } };
+						}
+						return answerChannelDecision(channel, caller.user, input);
+					},
+				},
+				...(callbacks.startBuild
+					? {
+						buildPlan: {
+							async build(caller, input) {
+								let located = await locatedChannel(caller, input.id);
+								if (!located) {
+									return { status: "refused", code: "document-unavailable" };
+								}
+								if (
+									located === "forbidden"
+									|| (!located.repository.permissions.push
+										&& !located.repository.permissions.admin)
+								) {
+									return { status: "refused", code: "repository-forbidden" };
+								}
+								let { channel, repository } = located;
+								if (callbacks.isChannelDeleting?.(channel.id)) {
+									return { status: "refused", code: "document-unavailable" };
+								}
+								await auth.storage.users.put({
+									id: caller.user.id,
+									login: caller.user.login,
+									avatarUrl: caller.user.avatarUrl,
+									now: auth.clock(),
+								});
+								let session = await auth.sessions.forUser(caller.user.id);
+								return callbacks.startBuild!({
+									channel,
+									repository: {
+										id: repository.id,
+										owner: repository.owner,
+										name: repository.name,
+										defaultBranch: repository.defaultBranch,
+									},
+									user: caller.user,
+									...(session ? { session } : {}),
+									...(input.idempotencyKey !== undefined
+										? { idempotencyKey: input.idempotencyKey }
+										: {}),
+									...(input.planRevision !== undefined
+										? { planRevision: input.planRevision }
+										: {}),
+									...(input.requireSettledDecisions !== undefined
+										? { requireSettledDecisions: input.requireSettledDecisions }
+										: {}),
+									...(input.draftIfNeeded !== undefined
+										? { draftIfNeeded: input.draftIfNeeded }
+										: {}),
+									...(input.retry !== undefined ? { retry: input.retry } : {}),
+									...(input.rebuild !== undefined ? { rebuild: input.rebuild } : {}),
+								});
+							},
+						},
+					}
+					: {}),
+				orchestrate: {
+					async orchestrate(caller, { id, arguments: args }) {
+						let located = await locatedChannel(caller, id);
+						if (!located) {
+							return {
+								ok: false,
+								reason: "document-unavailable",
+								message: "The source document is unavailable.",
+							};
+						}
+						if (located === "forbidden") {
+							return {
+								ok: false,
+								reason: "repository-forbidden",
+								message: "Repository access is required.",
+							};
+						}
+						let { channel: source, repository } = located;
+						if (
+							callbacks.isChannelDeleting?.(source.id) || source.archivedAt
+							|| source.parentChannelId
+						) {
+							return {
+								ok: false,
+								reason: "document-unavailable",
+								message: "This document is archived, deleted or closing.",
+							};
+						}
+						let canWrite = repository.permissions.push || repository.permissions.admin;
+						let readOnlyOp = args.operation === "list" || args.operation === "decisions";
+						if (!readOnlyOp && !canWrite) {
+							return {
+								ok: false,
+								reason: "repository-forbidden",
+								message: "Repository write access is required.",
+							};
+						}
+						let writeMcpIndex: IndexWriter = async (documents, create) => {
+							if (!canWrite) return { state: "absent" };
+							return serializeDocument(source.id, () =>
+								withOpenedPlan(source.id, async plan => {
+									let room: DocumentRoom = {
+										id: source.id,
+										plan,
+										server: plan.server,
+										publish: mutation => Plan.publish(plan, plan.server, source.id, mutation),
+										persist: () => Plan.persistExclusive(plan),
+										exclusive: action => Plan.exclusive(plan, action),
+										anchors: () => Plan.anchors(plan, plan.server, source.id),
+										changes: found =>
+											Plan.changes(plan, plan.server, source.id, found, { cursor: false }),
+									};
+									return writeIndex(room, documents, create, caller.signal);
+								}));
+						};
+						let openViaMcp = async (req: NewDocumentRequest): Promise<NewDocumentResult> => {
+							if (caller.launch) {
+								return {
+									ok: false,
+									reason: "repository-forbidden",
+									message: "A launch token cannot create new documents over MCP.",
+								};
+							}
+							let owner = source.repositoryOwner;
+							let name = source.repositoryName;
+							let key = `planner:${source.id}:${req.arguments.idempotencyKey}`;
+							let earlierId = deterministicId(source.repositoryId, key);
+							let loadOrigin = async (channelId: string) => {
+								let live = Rooms.get(channelId)?.plan;
+								if (live) return live.creation?.origin;
+								let stored = await auth.storage.collaboration.load(channelId, auth.clock());
+								return stored ? (await Plan.readStored(stored)).creation?.origin : undefined;
+							};
+							let earlier = await loadOrigin(earlierId);
+							let inherited = earlier ?? await loadOrigin(source.id);
+							let base = inherited && (earlier || inherited.repository === `${owner}/${name}`)
+								? { baseBranch: inherited.baseBranch, baseCommit: inherited.baseCommit }
+								: undefined;
+							if (!base) {
+								if (!auth.github.branchHead) {
+									return {
+										ok: false,
+										reason: "unavailable",
+										message: "The base branch's commit cannot be read.",
+									};
+								}
+								let baseBranch = repository.defaultBranch;
+								let baseCommit = await auth.github.branchHead(
+									caller.oauthToken,
+									owner,
+									name,
+									baseBranch,
+								);
+								base = { baseBranch, baseCommit };
+							}
+							let prepared = prepareCreate({
+								idempotencyKey: key,
+								repository: `${owner}/${name}`,
+								...base,
+								title: req.arguments.title,
+								brief: req.arguments.brief,
+								plan: req.arguments.document,
+							});
+							if (!prepared) {
+								return {
+									ok: false,
+									reason: "invalid-document",
+									message: "title, brief and document must match the create_document schema",
+								};
+							}
+							if ("issues" in prepared) {
+								return {
+									ok: false,
+									reason: "invalid-document",
+									message: "The document is not valid in the dialect.",
+									issues: prepared.issues,
+								};
+							}
+							let created = await createDocument(auth, callbacks, {
+								user: caller.user,
+								repository,
+								...(callbacks.modelChoice
+									? { modelChoice: () => callbacks.modelChoice!(source.id, caller.user.id) }
+									: {}),
+								createdFrom: source.id,
+								...(caller.signal ? { signal: caller.signal } : {}),
+							}, prepared.input);
+							if (created.kind === "conflict") {
+								return {
+									ok: false,
+									reason: "idempotency-conflict",
+									message:
+										"Another document was already created with this idempotencyKey and different content.",
+								};
+							}
+							if (created.kind === "title-taken") {
+								return {
+									ok: false,
+									reason: "title-taken",
+									message: "The repository already has a document with this title.",
+								};
+							}
+							if (created.kind === "forbidden") {
+								return {
+									ok: false,
+									reason: "repository-forbidden",
+									message: "Repository write access is required.",
+								};
+							}
+							if (created.kind === "unavailable") {
+								return {
+									ok: false,
+									reason: "unavailable",
+									message: "The document could not be created now.",
+								};
+							}
+							let url = new URL(created.document.url, auth.config.origin).href;
+							let doc = { id: created.channel.id, title: created.channel.title, url };
+							if (created.kind === "replayed") {
+								return {
+									ok: true,
+									document: doc,
+									replayed: true,
+									next:
+										"An earlier call with this idempotencyKey made this document; nothing new was created or started.",
+								};
+							}
+							if (req.arguments.instruction === undefined) {
+								return {
+									ok: true,
+									document: doc,
+									next: "The document is created and listed in the repository.",
+								};
+							}
+							if (!callbacks.invokePlanner) {
+								return {
+									ok: true,
+									document: doc,
+									instruction: { started: false, reason: "planner-unavailable" },
+									next: "The document was created, but its Planner could not be started.",
+								};
+							}
+							let session = await auth.sessions.forUser(caller.user.id);
+							let code = await callbacks.invokePlanner({
+								channel: created.channel,
+								repository: {
+									id: repository.id,
+									owner: repository.owner,
+									name: repository.name,
+									defaultBranch: repository.defaultBranch,
+								},
+								user: caller.user,
+								...(session ? { session } : {}),
+								instruction: req.arguments.instruction,
+							});
+							if (code) {
+								let message = code === "planner-busy"
+									? CANNOT_STEER
+									: code === "planner-not-attached"
+									? await callbacks.plannerNotAttached?.(
+										created.channel.id,
+										url,
+										`${repository.owner}/${repository.name}`,
+									) ?? notAttachedMessage(url, `${repository.owner}/${repository.name}`)
+									: undefined;
+								return {
+									ok: true,
+									document: doc,
+									instruction: { started: false, reason: code, ...(message ? { message } : {}) },
+									next: "The document was created, but its Planner did not start.",
+								};
+							}
+							return {
+								ok: true,
+								document: doc,
+								instruction: { started: true },
+								next: "The document was created and its Planner started on the instruction.",
+							};
+						};
+						return runOrchestrate(
+							{
+								channel: channelId => auth.storage.channels.get(channelId),
+								deleting: channelId => !!callbacks.isChannelDeleting?.(channelId),
+								login: async () => await auth.sessions.forUser(caller.user.id),
+								repository: async () => repository,
+								branchHead: async () => {
+									throw new Error("branchHead is handled by openDocument in MCP mode");
+								},
+								origin: async () => undefined,
+								created: async () => undefined,
+								create: async () => ({ kind: "unavailable" }),
+								modelChoice: async () => undefined,
+								invoke: async input =>
+									callbacks.invokePlanner
+										? callbacks.invokePlanner(input)
+										: "planner-unavailable",
+								refusal: async (code, channel, url) => {
+									if (code === "planner-busy") return CANNOT_STEER;
+									if (code !== "planner-not-attached") return undefined;
+									let fullName = `${channel.repositoryOwner}/${channel.repositoryName}`;
+									return await callbacks.plannerNotAttached?.(channel.id, url, fullName)
+										?? notAttachedMessage(url, fullName);
+								},
+								appOrigin: auth.config.origin,
+								createdFrom: async (sourceId, limit) =>
+									(await auth.storage.channels.createdFrom(sourceId, limit))
+										.filter(channel => caller.launch?.allows(channel) ?? true),
+								planner: plannerStateOf,
+								build: buildStateOf,
+								decisions: readDocumentDecisions,
+								answerDecision: input => answerChannelDecision(input.channel, input.user, input),
+								...(callbacks.startBuild ? { startBuild: callbacks.startBuild } : {}),
+								authorize: async () => {
+									if (!canWrite) return { ok: false, reason: "repository-forbidden" };
+									let session = await auth.sessions.forUser(caller.user.id);
+									return {
+										ok: true,
+										user: caller.user,
+										repository,
+										...(session ? { session } : {}),
+									};
+								},
+								openDocument: openViaMcp,
+							},
+							{
+								sourceId: source.id,
+								creator: { userId: caller.user.id, handle: caller.user.login },
+								arguments: args,
+								announce: async () => {},
+								index: writeMcpIndex,
+								...(caller.signal ? { signal: caller.signal } : {}),
+							},
+						);
+					},
+				},
 				planSources: {
 					async record(caller: HostedCaller, input: RecordPlanSourceInput) {
 						let access = await writableChannel(caller, input.id);

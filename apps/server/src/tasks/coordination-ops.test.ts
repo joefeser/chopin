@@ -163,15 +163,41 @@ describe("graph version attribution restore", () => {
 		let attributed = {
 			versions: [{
 				...draft,
-				approver: "joefeser",
+				approvedBy: "joefeser",
 				operationKey: "bridge:approve:1",
 				draftedBy: "script",
 			}],
 		};
 		let restored = restore(attributed);
-		expect(restored?.versions[0]?.approver).toBe("joefeser");
+		expect(restored?.versions[0]?.approvedBy).toBe("joefeser");
 		expect(restored?.versions[0]?.operationKey).toBe("bridge:approve:1");
 		expect(restored?.versions[0]?.draftedBy).toBe("script");
+	});
+
+	// Graphs this fork approved before the field took upstream's name are
+	// stored with `approver`; the full-dress rehearsal's document among them.
+	it("reads the fork's earlier `approver` as `approvedBy` and writes only that name", () => {
+		let restored = restore({
+			versions: [{
+				...draft,
+				approver: "joefeser",
+				operationKey: "fulldress:approve:1",
+				draftedBy: "script",
+			}],
+		});
+		expect(restored?.versions[0]).toEqual({
+			...draft,
+			approvedBy: "joefeser",
+			operationKey: "fulldress:approve:1",
+			draftedBy: "script",
+		});
+		expect(restored?.versions[0]).not.toHaveProperty("approver");
+	});
+
+	it("refuses a version carrying both names for who approved it", () => {
+		expect(
+			restore({ versions: [{ ...draft, approver: "joefeser", approvedBy: "octocat" }] }),
+		).toBeUndefined();
 	});
 
 	it("restores legacy versions without attribution unchanged", () => {
@@ -180,6 +206,8 @@ describe("graph version attribution restore", () => {
 
 	it("refuses invalid attribution instead of dropping it silently", () => {
 		expect(restore({ versions: [{ ...draft, approver: "" }] })).toBeUndefined();
+		expect(restore({ versions: [{ ...draft, approvedBy: "" }] })).toBeUndefined();
+		expect(restore({ versions: [{ ...draft, operationKey: 7 }] })).toBeUndefined();
 		expect(restore({ versions: [{ ...draft, draftedBy: 7 }] })).toBeUndefined();
 	});
 });

@@ -1,7 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { ulid } from "@chopin/dialect";
 
-import * as Questions from "../questions/service";
 import { hosted as roomsHosted } from "./hosted";
 import * as Room from "../plan/room";
 import { hosted as room } from "../plan/conversation-persistence.test-fixtures";
@@ -42,126 +40,6 @@ function caller(login: string) {
 		user: { id: `U_${login}`, login } as GitHubUser,
 	};
 }
-
-describe("hosted coordination answering", () => {
-	/** A persisted document with one open card, and the hosted MCP options over it. */
-	async function bridge() {
-		let context = await room();
-		let plan = await seededPlan(context);
-		let optionId = ulid();
-		let id = await Questions.insertConversationCard(plan, context.server, context.channel.id, {
-			threadId: ulid(),
-			header: "Format",
-			question: "Which format should the report use?",
-			options: [{ id: optionId, label: "Markdown" }, { id: ulid(), label: "JSON" }],
-		});
-		let entry = plan.questions.open.get(id);
-		if (!entry) throw new Error("card was not open");
-		let questionId = plan.records.get(id)?.definition.questions[0]?.id;
-		if (!questionId) throw new Error("card had no question");
-		// Close the seeding instance so the hosted adapter opens the document
-		// from storage alone; two live plan instances would conflict on commit.
-		await Service.close(plan);
-		let options = roomsHosted(
-			authority(context),
-			{
-				lease() {
-					if (!context.lease) throw new Error("test lease was released");
-					return context.lease;
-				},
-			},
-			{},
-			{ approvers: ["octocat"] },
-		);
-		return {
-			context,
-			options,
-			id,
-			questionId,
-			optionId,
-			revision: entry.revision,
-			input: {
-				id: context.channel.id,
-				questionId: id,
-				revision: entry.revision,
-				optionIds: [optionId],
-				idempotencyKey: "hosted:answer:1",
-			},
-		};
-	}
-
-	it("answers a cold document without deadlocking on the plan queue", async () => {
-		let state = await bridge();
-		let answered = await state.options.coordination!.answer!(caller("octocat"), state.input);
-		if (answered.kind !== "answered") {
-			throw new Error(`hosted answer failed: ${JSON.stringify(answered)}`);
-		}
-		expect(answered.settled.by).toBe("octocat");
-		expect(answered.settled.choices).toEqual([state.optionId]);
-	});
-
-	it("keeps the ledger openable: the answer survives a close and reopen", async () => {
-		let state = await bridge();
-		let answered = await state.options.coordination!.answer!(caller("octocat"), state.input);
-		if (answered.kind !== "answered") throw new Error("hosted answer failed");
-
-		// The stored sidecar, with its coordination record, must reopen cleanly.
-		let reopened = await Service.open(
-			state.context.channel.id,
-			state.context.backend,
-			state.context.server,
-		);
-		try {
-			expect(reopened.records.get(state.id)?.status).toBe("answered");
-			expect(reopened.coordinationOps).toHaveLength(1);
-			expect(reopened.coordinationOps[0]).toMatchObject({
-				idempotencyKey: "hosted:answer:1",
-				kind: "answer",
-				result: { questionId: state.id, choices: [state.optionId], settledBy: "octocat" },
-			});
-		} finally {
-			await Service.close(reopened);
-		}
-	});
-
-	it("resolves a question-level id to its owning card", async () => {
-		let state = await bridge();
-		// The snapshot exposes both the card id and the ids of the questions
-		// inside it; a caller naming the question must reach the same settle.
-		let answered = await state.options.coordination!.answer!(caller("octocat"), {
-			...state.input,
-			questionId: state.questionId,
-		});
-		if (answered.kind !== "answered") {
-			throw new Error(`hosted answer failed: ${JSON.stringify(answered)}`);
-		}
-		expect(answered.settled.choices).toEqual([state.optionId]);
-	});
-
-	it("refuses an id matching no decision instead of calling it cancelled", async () => {
-		let state = await bridge();
-		let refused = await state.options.coordination!.answer!(caller("octocat"), {
-			...state.input,
-			questionId: ulid(),
-		});
-		expect(refused).toMatchObject({ kind: "refused", code: "unknown-decision" });
-	});
-
-	it("replays an identical retry and refuses callers outside the allowlist", async () => {
-		let state = await bridge();
-		let first = await state.options.coordination!.answer!(caller("octocat"), state.input);
-		if (first.kind !== "answered") throw new Error("hosted answer failed");
-
-		let retry = await state.options.coordination!.answer!(caller("octocat"), state.input);
-		expect(retry).toEqual({ kind: "replayed", settled: first.settled });
-
-		let outsider = await state.options.coordination!.answer!(
-			caller("someone-else"),
-			{ ...state.input, idempotencyKey: "hosted:answer:2" },
-		);
-		expect(outsider).toEqual({ kind: "refused", code: "not-allowed" });
-	});
-});
 
 describe("hosted coordination approving", () => {
 	/** A cold document with one scripted draft, and the hosted options over it. */
@@ -262,7 +140,7 @@ describe("hosted coordination approving", () => {
 		}
 		expect(outcome.graph).toMatchObject({
 			state: "approved",
-			approver: "octocat",
+			approvedBy: "octocat",
 			operationKey: "hosted:approve:1",
 		});
 
@@ -275,7 +153,7 @@ describe("hosted coordination approving", () => {
 		try {
 			let version = reopened.graph!.versions.at(-1)!;
 			expect(version.state).toBe("approved");
-			expect(version).toMatchObject({ approver: "octocat", operationKey: "hosted:approve:1" });
+			expect(version).toMatchObject({ approvedBy: "octocat", operationKey: "hosted:approve:1" });
 			expect(reopened.coordinationOps).toHaveLength(1);
 			expect(reopened.coordinationOps[0]).toMatchObject({
 				kind: "approve",

@@ -237,6 +237,19 @@ export function rejoin(questions: Questions, id: string): Promise<Ended> | undef
 	});
 }
 
+/**
+ * Detaches the in-memory waiter from an open questionnaire without removing or cancelling it.
+ *
+ * The card stays open in the document with `awaited` cleared so a later human Save hands its
+ * answer to the Planner through `answerTurns`.
+ */
+export function unawait(questions: Questions, id: string): void {
+	let entry = questions.open.get(id);
+	if (!entry) return;
+	delete entry.awaited;
+	delete entry.settle;
+}
+
 export function get(questions: Questions, id: string): Open | undefined {
 	return questions.open.get(id);
 }
@@ -455,100 +468,6 @@ export function claimSubmit(
 		ok: true,
 		answers: outcome.answers,
 		...(entry.widget ? { widget: entry.widget } : {}),
-		claim: { id, entry, result: { status: "answered", answers: outcome.answers, resolver } },
-	};
-}
-
-/** How reserving an external answer can be refused beyond the shared-draft ways. */
-export type AnswerRefusal = SubmitRefusal | { ok: false; reason: "draft-in-progress" };
-
-/**
- * Reserve an answer built from supplied option IDs, never the shared draft.
- *
- * The revision must match, as with a shared-draft submit. Every question the
- * options answer must still have an untouched shared draft: settling under a
- * collaborator's in-flight edits would silently orphan them. An answer that
- * names no option for a question leaves it unanswered, which refusing the
- * derive step reports, so an external settle is always complete.
- */
-export function claimAnswer(
-	questions: Questions,
-	id: string,
-	revision: number,
-	resolver: string,
-	optionIds: readonly string[],
-): { ok: true; claim: Claim; answers: Answer[] } | AnswerRefusal {
-	let ended = questions.closed.get(id);
-	if (ended) return resolved(ended);
-
-	let entry = questions.open.get(id);
-	if (!entry) {
-		return { ok: false, reason: "resolved", status: "cancelled", resolver: "system" };
-	}
-	if (entry.claim) return { ok: false, reason: "stale", current: entry.revision };
-	if (revision !== entry.revision) return { ok: false, reason: "stale", current: entry.revision };
-
-	let drafts: Drafts;
-	try {
-		drafts = Question.read(entry.model, entry.definition);
-	} catch (err) {
-		return {
-			ok: false,
-			reason: "invalid",
-			message: err instanceof Error ? err.message : "invalid",
-		};
-	}
-
-	let chosen = new Map<string, string[]>();
-	for (let optionId of optionIds) {
-		let owner = entry.definition.questions.find(question =>
-			question.options.some(option => option.id === optionId)
-		);
-		if (!owner) {
-			return { ok: false, reason: "invalid", message: `Unknown option ${optionId}` };
-		}
-		let ids = chosen.get(owner.id) ?? [];
-		ids.push(optionId);
-		chosen.set(owner.id, ids);
-	}
-	for (let [questionId, ids] of chosen) {
-		let question = entry.definition.questions.find(item => item.id === questionId)!;
-		if (!question.multiple && ids.length > 1) {
-			return {
-				ok: false,
-				reason: "invalid",
-				message: `${question.header} accepts only one answer`,
-			};
-		}
-		let draft = drafts[questionId];
-		// `untouched` ignores criterion marks, so an active matrix cell blocks the
-		// settle on its own: a fresh-draft answer would silently drop that work.
-		if (!draft || !untouched(draft) || Object.keys(Question.marked(draft)).length > 0) {
-			return { ok: false, reason: "draft-in-progress" };
-		}
-	}
-
-	// Fresh drafts: the shared draft decides only whether settling is safe,
-	// never what the external answer says.
-	let explicit: Drafts = {};
-	for (let question of entry.definition.questions) {
-		let ids = chosen.get(question.id) ?? [];
-		explicit[question.id] = {
-			mode: "choices",
-			choice: !question.multiple && ids.length === 1 ? ids[0]! : null,
-			options: Object.fromEntries(
-				question.options.map(option => [option.id, ids.includes(option.id)]),
-			),
-			custom: "",
-		};
-	}
-	let outcome = Question.derive(entry.definition, explicit);
-	if (!outcome.ok) return { ok: false, reason: "invalid", message: outcome.message };
-
-	entry.claim = "submit";
-	return {
-		ok: true,
-		answers: outcome.answers,
 		claim: { id, entry, result: { status: "answered", answers: outcome.answers, resolver } },
 	};
 }

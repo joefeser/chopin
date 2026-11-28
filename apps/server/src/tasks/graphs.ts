@@ -30,9 +30,10 @@ export type Version = {
 	planRevision: number;
 	state: State;
 	definition: Definition;
-	/** GitHub login that approved this version through an external coordination operation. */
-	approver?: string;
-	/** Idempotency key of the external coordination operation that approved it. */
+	/** Who approved this version, when recorded (for example, through build_plan
+	 * or approve_implementation). */
+	approvedBy?: string;
+	/** Caller-supplied idempotency or operation key recorded at approval. */
 	operationKey?: string;
 	/** Set when a script drafted this version, so the disclosure is durable. */
 	draftedBy?: string;
@@ -195,20 +196,6 @@ function item(value: unknown, keys: string[]): Record<string, unknown> | undefin
 	return found.length === expected.length && found.every((key, index) => key === expected[index])
 		? record
 		: undefined;
-}
-
-/** Like item(), tolerating any subset of the optional keys and nothing else. */
-function shape(
-	value: unknown,
-	required: string[],
-	optional: string[],
-): Record<string, unknown> | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	let record = value as Record<string, unknown>;
-	let keys = Object.keys(record);
-	let extra = keys.filter(key => !required.includes(key) && !optional.includes(key));
-	let missing = required.filter(key => !(key in record));
-	return extra.length === 0 && missing.length === 0 ? record : undefined;
 }
 
 function definition(value: unknown): Definition | undefined {
@@ -409,36 +396,50 @@ function revise(definition: Definition, operations: unknown[]): Result<Definitio
 	return validate(next);
 }
 
-/** Read a graph back from a sidecar without trusting handwritten JSON. */
-/** Optional attribution fields on stored graph versions: undefined = absent, null = invalid. */
-function attribution(value: unknown, maximum: number): string | null | undefined {
-	if (value === undefined) return undefined;
-	return typeof value === "string" && value.length > 0 && Array.from(value).length <= maximum
+function boundedString(value: unknown, max: number): string | undefined {
+	return typeof value === "string" && value.trim().length > 0 && Array.from(value).length <= max
 		? value
-		: null;
+		: undefined;
 }
 
+/** Read a graph back from a sidecar without trusting handwritten JSON. */
 export function restore(value: unknown): Graph | undefined {
 	let stored = item(value, ["versions"]);
 	if (!stored || !Array.isArray(stored.versions) || stored.versions.length === 0) return undefined;
+	// `approver` is what this fork called `approvedBy` before the name was
+	// shared with upstream. It is read as the same field so graphs approved
+	// before then still restore, and written only under the shared name.
+	let optionalKeys = new Set(["revision", "approvedBy", "approver", "operationKey", "draftedBy"]);
+	let requiredKeys = ["definition", "number", "planRevision", "state"];
 	let versions: Version[] = [];
 	for (let [index, value] of stored.versions.entries()) {
-		let version = shape(
-			value,
-			["definition", "number", "planRevision", "state"],
-			["revision", "approver", "operationKey", "draftedBy"],
-		);
-		let checked = version && definition(version.definition);
-		let number = version?.number;
-		let revision = version?.revision ?? 1;
-		let planRevision = version?.planRevision;
-		let versionState = state(version?.state);
-		let approver = attribution(version?.approver, 100);
-		let operationKey = attribution(version?.operationKey, 128);
-		let draftedBy = attribution(version?.draftedBy, 100);
+		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+		let version = value as Record<string, unknown>;
+		let keys = Object.keys(version);
+		let hasApprover = Object.hasOwn(version, "approver");
+		let hasApprovedBy = Object.hasOwn(version, "approvedBy");
 		if (
-			!version
-			|| typeof number !== "number"
+			requiredKeys.some(key => !Object.hasOwn(version, key))
+			|| keys.some(key => !requiredKeys.includes(key) && !optionalKeys.has(key))
+			// Two names for who approved one version is a contradiction, not a choice to make.
+			|| (hasApprover && hasApprovedBy)
+		) return undefined;
+		let checked = definition(version.definition);
+		let number = version.number;
+		let revision = version.revision ?? 1;
+		let planRevision = version.planRevision;
+		let versionState = state(version.state);
+		let approvedBy = hasApprovedBy || hasApprover
+			? boundedString(version[hasApprovedBy ? "approvedBy" : "approver"], 128)
+			: undefined;
+		let operationKey = Object.hasOwn(version, "operationKey")
+			? boundedString(version.operationKey, 128)
+			: undefined;
+		let draftedBy = Object.hasOwn(version, "draftedBy")
+			? boundedString(version.draftedBy, 100)
+			: undefined;
+		if (
+			typeof number !== "number"
 			|| number !== index + 1
 			|| typeof revision !== "number"
 			|| !Number.isInteger(revision)
@@ -448,9 +449,9 @@ export function restore(value: unknown): Graph | undefined {
 			|| planRevision < 0
 			|| !versionState
 			|| !checked
-			|| approver === null
-			|| operationKey === null
-			|| draftedBy === null
+			|| ((hasApprovedBy || hasApprover) && !approvedBy)
+			|| (Object.hasOwn(version, "operationKey") && !operationKey)
+			|| (Object.hasOwn(version, "draftedBy") && !draftedBy)
 		) return undefined;
 		versions.push({
 			number,
@@ -458,9 +459,9 @@ export function restore(value: unknown): Graph | undefined {
 			planRevision,
 			state: versionState,
 			definition: checked,
-			...(approver !== undefined ? { approver } : {}),
-			...(operationKey !== undefined ? { operationKey } : {}),
-			...(draftedBy !== undefined ? { draftedBy } : {}),
+			...(approvedBy ? { approvedBy } : {}),
+			...(operationKey ? { operationKey } : {}),
+			...(draftedBy ? { draftedBy } : {}),
 		});
 	}
 	return history(versions) ? { versions } : undefined;
@@ -564,20 +565,17 @@ export class Graphs<Document> {
 	}
 }
 
-/** Who approved a version through an external coordination operation. */
-export type GraphApproval = {
-	/** GitHub login of the approving caller. */
-	approver: string;
-	/** Idempotency key of the approving operation. */
-	operationKey: string;
-};
-
 export function approveGraph(
-	{ graph, revision, approval }: {
+	{
+		graph,
+		revision,
+		approvedBy,
+		operationKey,
+	}: {
 		graph?: Graph;
 		revision?: number;
-		/** Present only for external approvals; a browser Build press leaves none. */
-		approval?: GraphApproval;
+		approvedBy?: string;
+		operationKey?: string;
 	},
 ): Result<Graph> {
 	graph = graph ? copy(graph) : undefined;
@@ -596,9 +594,8 @@ export function approveGraph(
 		...graph.versions[graph.versions.length - 1],
 		state: "approved",
 		definition: checked.value,
-		...(approval
-			? { approver: approval.approver, operationKey: approval.operationKey }
-			: {}),
+		...(approvedBy ? { approvedBy } : {}),
+		...(operationKey ? { operationKey } : {}),
 	};
 	return { ok: true, value: graph };
 }
